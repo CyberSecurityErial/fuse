@@ -309,57 +309,6 @@ using N160PureGemm = cutlass::gemm::kernel::GemmUniversal<
     N160Epilogue,
     cutlass::gemm::PersistentScheduler>;
 
-// The one-wave experiment derives CTA N directly from the caller-provided
-// communication budget.  The CTA collective requires N to be 16-aligned even
-// though the underlying Hopper WGMMA instruction family has 8-wide variants;
-// the runtime selector derives and rounds the shape instead of ranking it.
-template <int32_t TileN>
-struct A2ALhsOneWaveCollective {
-  static_assert(TileN >= 128 && TileN <= 256 && TileN % 16 == 0);
-  using Tile = Shape<_128, Int<TileN>, _64>;
-  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm90,
-      cutlass::arch::OpClassTensorOp,
-      Tile,
-      ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
-      Accumulator,
-      Accumulator,
-      void,
-      LayoutD,
-      kAlignment,
-      Element,
-      LayoutD,
-      kAlignment,
-      cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
-  using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm90,
-      cutlass::arch::OpClassTensorOp,
-      Element,
-      LayoutA,
-      kAlignment,
-      Element,
-      LayoutB,
-      kAlignment,
-      Accumulator,
-      Tile,
-      ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
-      cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
-  using ReadyMainloop = detail::A2ALhsReadyMainloop<Mainloop>;
-  using Gemm = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int32_t, int32_t, int32_t, int32_t>,
-      ReadyMainloop,
-      Epilogue,
-      detail::MonolithicPersistentScheduler>;
-  using PureGemm = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int32_t, int32_t, int32_t, int32_t>,
-      Mainloop,
-      Epilogue,
-      cutlass::gemm::PersistentScheduler>;
-};
-
 using A2ALhsTelemetryMainloop =
     detail::A2ALhsReadyMainloop<BaseMainloop, 1, true>;
 using A2ALhsTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
@@ -2361,89 +2310,6 @@ cudaError_t launch_a2a_lhs_gemm_policy(
       sm_count);
 }
 
-template <int32_t TileN>
-cudaError_t launch_a2a_lhs_one_wave_tile(
-    const A2AGemmParams& params,
-    cudaStream_t stream,
-    int32_t sm_count,
-    int32_t device) {
-  using Collective = A2ALhsOneWaveCollective<TileN>;
-  using Kernel = detail::MonolithicGemm<
-      typename Collective::Gemm, A2ALhsInputComm>;
-  static_assert(
-      sizeof(typename Kernel::SharedStorage) >=
-          kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
-              kA2ALhsBulkSlots * sizeof(uint64_t));
-  return launch_a2a_lhs_gemm_policy<
-      typename Collective::Gemm, Kernel>(
-          params, stream, sm_count, device);
-}
-
-cudaError_t launch_a2a_lhs_one_wave(
-    const A2AGemmParams& params,
-    cudaStream_t stream,
-    int32_t sm_count,
-    int32_t device,
-    int32_t tile_n) {
-#define FUSE_ONE_WAVE_CASE(N)                                      \
-  case N:                                                         \
-    return launch_a2a_lhs_one_wave_tile<N>(                        \
-        params, stream, sm_count, device)
-  switch (tile_n) {
-    FUSE_ONE_WAVE_CASE(128);
-    FUSE_ONE_WAVE_CASE(144);
-    FUSE_ONE_WAVE_CASE(160);
-    FUSE_ONE_WAVE_CASE(176);
-    FUSE_ONE_WAVE_CASE(192);
-    FUSE_ONE_WAVE_CASE(208);
-    FUSE_ONE_WAVE_CASE(224);
-    FUSE_ONE_WAVE_CASE(240);
-    FUSE_ONE_WAVE_CASE(256);
-    default:
-      return cudaErrorNotSupported;
-  }
-#undef FUSE_ONE_WAVE_CASE
-}
-
-template <int32_t TileN>
-cudaError_t launch_a2a_lhs_one_wave_reference_tile(
-    const A2AGemmParams& params,
-    cudaStream_t stream,
-    int32_t sm_count,
-    int32_t device,
-    int32_t reserved_comm_ctas) {
-  using Collective = A2ALhsOneWaveCollective<TileN>;
-  return launch_a2a_lhs_reference_impl<typename Collective::PureGemm>(
-      params, stream, sm_count, device, reserved_comm_ctas);
-}
-
-cudaError_t launch_a2a_lhs_one_wave_reference(
-    const A2AGemmParams& params,
-    cudaStream_t stream,
-    int32_t sm_count,
-    int32_t device,
-    int32_t reserved_comm_ctas,
-    int32_t tile_n) {
-#define FUSE_ONE_WAVE_REFERENCE_CASE(N)                            \
-  case N:                                                         \
-    return launch_a2a_lhs_one_wave_reference_tile<N>(              \
-        params, stream, sm_count, device, reserved_comm_ctas)
-  switch (tile_n) {
-    FUSE_ONE_WAVE_REFERENCE_CASE(128);
-    FUSE_ONE_WAVE_REFERENCE_CASE(144);
-    FUSE_ONE_WAVE_REFERENCE_CASE(160);
-    FUSE_ONE_WAVE_REFERENCE_CASE(176);
-    FUSE_ONE_WAVE_REFERENCE_CASE(192);
-    FUSE_ONE_WAVE_REFERENCE_CASE(208);
-    FUSE_ONE_WAVE_REFERENCE_CASE(224);
-    FUSE_ONE_WAVE_REFERENCE_CASE(240);
-    FUSE_ONE_WAVE_REFERENCE_CASE(256);
-    default:
-      return cudaErrorNotSupported;
-  }
-#undef FUSE_ONE_WAVE_REFERENCE_CASE
-}
-
 struct LhsPolicyCandidate {
   A2ALhsGemmPolicy policy;
   int32_t tile_m;
@@ -2487,7 +2353,6 @@ A2ALhsPolicyInfo score_a2a_lhs_policy(
   info.last_wave_ctas = static_cast<int32_t>(
       info.tile_count - static_cast<int64_t>(info.waves - 1) *
           info.compute_ctas);
-  info.one_wave_feasible = info.waves == 1;
 
   // DeepGEMM-style SM90 wave model.  Tensor-core work and HBM bytes are
   // invariant across candidates; this compares the variable L1/L2 traffic
@@ -2527,46 +2392,51 @@ A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
     int32_t num_comm_ctas,
     int32_t sm_count,
     A2ALhsGemmPolicy requested) {
-  if (requested == A2ALhsGemmPolicy::kOneWaveAuto) {
-    const int32_t compute_ctas = sm_count - num_comm_ctas;
-    constexpr int32_t tile_m = 128;
-    constexpr int32_t min_tile_n = 128;
-    constexpr int32_t max_tile_n = 256;
-    constexpr int32_t tile_n_granularity = 16;
-    const int64_t m_tiles = ceil_div(problem.m, tile_m);
-    const int64_t m_tiles_total = m_tiles * problem.l;
-    int32_t tile_n = max_tile_n;
-    if (compute_ctas > 0 && m_tiles_total > 0) {
-      const int64_t n_tiles_budget = compute_ctas / m_tiles_total;
-      if (n_tiles_budget > 0) {
-        const int64_t required_tile_n =
-            ceil_div(problem.n, n_tiles_budget);
-        tile_n = static_cast<int32_t>(std::min<int64_t>(
-            max_tile_n,
-            std::max<int64_t>(
-                min_tile_n,
-                ceil_div(required_tile_n, tile_n_granularity) *
-                    tile_n_granularity)));
-      }
-    }
-    return score_a2a_lhs_policy(
-        problem,
-        num_comm_ctas,
-        sm_count,
-        {A2ALhsGemmPolicy::kOneWaveAuto, tile_m, tile_n, 1});
-  }
-
   A2ALhsPolicyInfo best{};
   best.estimated_cycles = std::numeric_limits<double>::infinity();
+  const bool one_wave_auto =
+      requested == A2ALhsGemmPolicy::kOneWaveAuto;
   for (const auto& candidate : kLhsPolicyCandidates) {
-    if (requested != A2ALhsGemmPolicy::kAuto &&
+    if (requested != A2ALhsGemmPolicy::kAuto && !one_wave_auto &&
         requested != candidate.policy) {
       continue;
     }
     const auto current = score_a2a_lhs_policy(
         problem, num_comm_ctas, sm_count, candidate);
-    if (requested != A2ALhsGemmPolicy::kAuto) {
+    if (requested != A2ALhsGemmPolicy::kAuto && !one_wave_auto) {
       return current;
+    }
+    if (one_wave_auto) {
+      if (current.estimated_cycles ==
+          std::numeric_limits<double>::infinity()) {
+        continue;
+      }
+      if (best.policy == A2ALhsGemmPolicy::kAuto) {
+        best = current;
+        continue;
+      }
+      // num_comm_ctas is the caller-controlled variable.  It fixes
+      // compute_ctas, and the tile geometry follows deterministically:
+      //   1. minimize the number of resident waves;
+      //   2. maximize useful CTA occupancy across those waves;
+      //   3. use the traffic estimate only to break an exact geometry tie.
+      // This intentionally keeps the first experiment free of calibrated
+      // per-shape constants.
+      const int64_t current_slots =
+          static_cast<int64_t>(current.waves) * current.compute_ctas;
+      const int64_t best_slots =
+          static_cast<int64_t>(best.waves) * best.compute_ctas;
+      const bool fewer_waves = current.waves < best.waves;
+      const bool same_waves = current.waves == best.waves;
+      const bool fuller_waves = same_waves &&
+          current.tile_count * best_slots > best.tile_count * current_slots;
+      const bool same_fill = same_waves &&
+          current.tile_count * best_slots == best.tile_count * current_slots;
+      if (fewer_waves || fuller_waves ||
+          (same_fill && current.estimated_cycles < best.estimated_cycles)) {
+        best = current;
+      }
+      continue;
     }
     // A two-CTA multicast cluster makes a one-wave input consumer advance at
     // the slower ready tile in each pair. Independent CTAs are stronger when
@@ -2592,9 +2462,6 @@ cudaError_t launch_a2a_lhs_gemm_impl(
       sm_count,
       params.lhs_policy);
   switch (selected.policy) {
-    case A2ALhsGemmPolicy::kOneWaveAuto:
-      return launch_a2a_lhs_one_wave(
-          params, stream, sm_count, device, selected.tile_n);
     case A2ALhsGemmPolicy::kM64N128:
       return launch_a2a_lhs_gemm_policy<
           A2ALhsM64Gemm, A2ALhsM64GemmKernel, A2ALhsM64InputComm>(
@@ -3502,14 +3369,6 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
         sm_count,
         params.lhs_policy);
     switch (selected.policy) {
-      case A2ALhsGemmPolicy::kOneWaveAuto:
-        return launch_a2a_lhs_one_wave_reference(
-            params,
-            stream,
-            sm_count,
-            device,
-            reserved_comm_ctas,
-            selected.tile_n);
       case A2ALhsGemmPolicy::kM64N128:
         return launch_a2a_lhs_reference_impl<M64PureGemm>(
             params, stream, sm_count, device, reserved_comm_ctas);
