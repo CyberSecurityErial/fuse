@@ -22,17 +22,23 @@ class Model:
     name: str
     hidden: int
     q_heads: int
+    head_dim: int
     aliases: str
+
+    @property
+    def attention_width(self) -> int:
+        return self.q_heads * self.head_dim
 
 
 MODELS = {
     model.name: model
     for model in (
-        Model("qwen_dense_2k", 2048, 16, "current production Qwen dense"),
-        Model("qwen25_7b", 3584, 28, "Qwen2.5-7B; same O-proj as Gemma2-9B"),
-        Model("llama3_8b", 4096, 32, "Llama3-8B; same O-proj as Mistral/Mixtral"),
-        Model("qwen25_32b", 5120, 40, "Qwen2.5-32B"),
-        Model("llama31_70b", 8192, 64, "Llama3.1-70B; same O-proj as Qwen-72B"),
+        Model("qwen_dense_2k", 2048, 16, 128, "current production Qwen dense"),
+        Model("qwen25_7b", 3584, 28, 128, "Qwen2.5-7B"),
+        Model("gemma2_9b", 3584, 16, 256, "Gemma2-9B"),
+        Model("llama3_8b", 4096, 32, 128, "Llama3-8B; same O-proj as Mistral/Mixtral"),
+        Model("qwen25_32b", 5120, 40, 128, "Qwen2.5-32B"),
+        Model("llama31_70b", 8192, 64, 128, "Llama3.1-70B; same O-proj as Qwen-72B"),
     )
 }
 SEQUENCES = (1024, 2048, 4096, 8192, 16384, 32768, 65536)
@@ -109,11 +115,10 @@ def key(model: Model, seq: int, cp: int) -> str:
 
 def cases(args: argparse.Namespace):
     for model in selected_models(args.models):
-        if model.q_heads * 128 != model.hidden:
-            raise ValueError(f"{model.name}: hidden must equal q_heads * 128")
         for seq in args.seqs:
             for cp in args.cps:
-                if cp not in VISIBLE_DEVICES or seq % cp != 0:
+                if (cp not in VISIBLE_DEVICES or seq % cp != 0 or
+                        model.q_heads % cp != 0):
                     continue
                 yield model, seq, cp
 
@@ -132,10 +137,10 @@ def fuse_command(
         "--mode", "a2a_gemm_lhs",
         "--m", str(seq // cp),
         "--n", str(model.hidden),
-        "--k", str(model.hidden),
+        "--k", str(model.attention_width),
         "--batch", "1",
         "--q-heads", str(model.q_heads),
-        "--head-dim", "128",
+        "--head-dim", str(model.head_dim),
         "--comm-ctas", str(comm),
         "--lhs-policy", "auto",
         "--raster", "n",
@@ -193,7 +198,7 @@ def nccl_configs() -> list[tuple[int, int, int]]:
 
 
 def tuned_bucket_config(model: Model, seq: int, cp: int) -> tuple[int, int, int]:
-    payload = (seq // cp) * model.hidden * 2
+    payload = (seq // cp) * model.attention_width * 2
     if payload < 8 * 1024 * 1024:
         return 32, 1024, 16
     if payload < 64 * 1024 * 1024:
@@ -218,7 +223,7 @@ def external_command(
         "--hidden", str(model.hidden),
         "--batch", "1",
         "--q-heads", str(model.q_heads),
-        "--head-dim", "128",
+        "--head-dim", str(model.head_dim),
         "--warmup", str(warmup),
         "--iters", str(iters),
         "--cuda-graph", "--nccl-high-priority",
@@ -312,7 +317,8 @@ def aggregate(args: argparse.Namespace) -> None:
         pure = fused["results"]["cublaslt_autotuned"]
         row = {
             "model": model.name, "aliases": model.aliases, "cp": cp,
-            "global_seq": seq, "m": seq // cp, "n": model.hidden, "k": model.hidden,
+            "global_seq": seq, "m": seq // cp, "n": model.hidden,
+            "k": model.attention_width,
             "comm_ctas": fused["comm_ctas"], "policy": fused["lhs_policy"]["name"],
             "tile_m": fused["lhs_policy"]["tile_m"], "tile_n": fused["lhs_policy"]["tile_n"],
             "waves": fused["lhs_policy"]["waves"], "last_wave_ctas": fused["lhs_policy"]["last_wave_ctas"],
