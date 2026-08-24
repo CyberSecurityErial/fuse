@@ -531,6 +531,18 @@ def run_oproj(
         "include_te": args.include_te,
         "cuda_graph": args.cuda_graph,
         "nccl_high_priority": args.nccl_high_priority,
+        "environment": {
+            name: os.environ.get(name)
+            for name in (
+                "NCCL_MIN_P2P_NCHANNELS",
+                "NCCL_MAX_P2P_NCHANNELS",
+                "NCCL_P2P_NVL_CHUNKSIZE",
+                "NCCL_P2P_LL_THRESHOLD",
+                "NCCL_GRAPH_REGISTER",
+                "NCCL_LOCAL_REGISTER",
+                "NCCL_IB_DISABLE",
+            )
+        },
         "devices": devices,
         "software": {
             "torch": torch.__version__,
