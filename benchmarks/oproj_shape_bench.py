@@ -41,8 +41,11 @@ MODELS = {
         Model("llama31_70b", 8192, 64, 128, "Llama3.1-70B; same O-proj as Qwen-72B"),
     )
 }
-SEQUENCES = (1024, 2048, 4096, 8192, 16384, 32768, 65536)
-CONTEXT_PARALLEL = (4, 8)
+# Representative production O-projection geometries.  With CP4 these map to
+# per-rank GEMM M={256, 1024, 4096}; N=K=2048 stays fixed.
+DEFAULT_MODELS = ("qwen_dense_2k",)
+SEQUENCES = (1024, 4096, 16384)
+CONTEXT_PARALLEL = (4,)
 COMM_CANDIDATES = (4, 8, 12, 14, 16, 20, 24, 32)
 VISIBLE_DEVICES = {4: "0,2,4,5", 8: "0,1,2,3,4,5,6,7"}
 NCCL_CHANNELS = (8, 16, 24, 32)
@@ -76,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         ),
         required=True,
     )
-    parser.add_argument("--models", default=",".join(MODELS))
+    parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument("--seqs", type=parse_csv_ints, default=SEQUENCES)
     parser.add_argument("--cps", type=parse_csv_ints, default=CONTEXT_PARALLEL)
     parser.add_argument("--comm-ctas", type=parse_csv_ints, default=COMM_CANDIDATES)
