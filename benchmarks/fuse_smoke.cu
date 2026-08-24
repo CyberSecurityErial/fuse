@@ -1124,6 +1124,31 @@ void smoke_a2a_lhs_gemm(
   }
 }
 
+void smoke_a2a_lhs_policy_selection() {
+  struct Case {
+    fuse::GemmProblem problem;
+    int32_t comm_ctas;
+    fuse::A2ALhsGemmPolicy expected;
+    int32_t expected_waves;
+  };
+  const Case cases[] = {
+      {{1024, 2048, 2048, 1}, 14,
+       fuse::A2ALhsGemmPolicy::kM128N160, 1},
+      {{2048, 5120, 4096, 1}, 12,
+       fuse::A2ALhsGemmPolicy::kM128N256ClusterM2, 3},
+      {{4096, 10240, 8192, 1}, 4,
+       fuse::A2ALhsGemmPolicy::kM128N256ClusterM2, 10},
+  };
+  for (const auto& test : cases) {
+    const auto selected = fuse::select_a2a_lhs_gemm_policy(
+        test.problem, test.comm_ctas, 132);
+    if (selected.policy != test.expected ||
+        selected.waves != test.expected_waves) {
+      throw std::runtime_error("A2A LHS wave-policy selection failed");
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1134,6 +1159,7 @@ int main(int argc, char** argv) {
     }
     g_epoch_iterations = quick ? 1 : 8;
     smoke_qkv_gqa_route();
+    smoke_a2a_lhs_policy_selection();
     int world = 0;
     CUDA_CHECK(cudaGetDeviceCount(&world));
     world = std::min(world, fuse::kMaxWorldSize);

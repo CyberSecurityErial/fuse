@@ -44,6 +44,30 @@ enum class A2AGemmOperand : int32_t {
   kRhs = 1,
 };
 
+// Finite, precompiled Hopper policies for inverse A2A -> dense GEMM.  Auto
+// ranks the same candidates from the actual problem and resident compute-CTA
+// budget; explicit values are useful for reproducible policy sweeps.
+enum class A2ALhsGemmPolicy : int32_t {
+  kAuto = 0,
+  kM64N128 = 1,
+  kM128N128 = 2,
+  kM128N160 = 3,
+  kM128N256ClusterM2 = 4,
+};
+
+struct A2ALhsPolicyInfo {
+  A2ALhsGemmPolicy policy = A2ALhsGemmPolicy::kAuto;
+  int32_t tile_m = 0;
+  int32_t tile_n = 0;
+  int32_t tile_k = 0;
+  int32_t cluster_m = 0;
+  int32_t compute_ctas = 0;
+  int64_t tile_count = 0;
+  int32_t waves = 0;
+  int32_t last_wave_ctas = 0;
+  double estimated_cycles = 0.0;
+};
+
 // A2A -> dense/strided-batched GEMM. kLhs prepares the row-major activation
 // matrix consumed by an output projection; kRhs prepares a natural row-major
 // RHS for the optional deferred-V and grouped paths. The compute role waits
@@ -81,6 +105,7 @@ struct A2AGemmParams {
   A2AGemmLayout layout;
   UlyssesRoute route;
   int32_t num_comm_ctas = 0;
+  A2ALhsGemmPolicy lhs_policy = A2ALhsGemmPolicy::kAuto;
   uint32_t epoch = 0;
   uint32_t input_epoch = 0;
   float alpha = 1.0f;
@@ -206,6 +231,12 @@ int64_t a2a_gemm_ready_elements(const A2AGemmLayout& layout);
 int64_t a2a_lhs_gemm_ready_elements(
     const GemmProblem& problem,
     const UlyssesRoute& route);
+
+A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    A2ALhsGemmPolicy requested = A2ALhsGemmPolicy::kAuto);
 
 int32_t recommended_gemm_a2a_comm_ctas(
     const GemmProblem& problem,

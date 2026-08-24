@@ -64,6 +64,7 @@ struct Options {
   int swizzle = 1;
   bool role_telemetry = false;
   bool defer_v_a2a = false;
+  fuse::A2ALhsGemmPolicy lhs_policy = fuse::A2ALhsGemmPolicy::kAuto;
   std::string json_out;
   std::string trace_out;
 };
@@ -74,6 +75,34 @@ int parse_int(const std::string& value, const char* name) {
     throw std::runtime_error(std::string(name) + " must be positive");
   }
   return parsed;
+}
+
+const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
+  switch (policy) {
+    case fuse::A2ALhsGemmPolicy::kM64N128:
+      return "m64n128";
+    case fuse::A2ALhsGemmPolicy::kM128N128:
+      return "m128n128";
+    case fuse::A2ALhsGemmPolicy::kM128N160:
+      return "m128n160";
+    case fuse::A2ALhsGemmPolicy::kM128N256ClusterM2:
+      return "m128n256_cluster_m2";
+    default:
+      return "auto";
+  }
+}
+
+fuse::A2ALhsGemmPolicy parse_lhs_policy(const std::string& value) {
+  if (value == "auto") return fuse::A2ALhsGemmPolicy::kAuto;
+  if (value == "m64n128") return fuse::A2ALhsGemmPolicy::kM64N128;
+  if (value == "m128n128") return fuse::A2ALhsGemmPolicy::kM128N128;
+  if (value == "m128n160") return fuse::A2ALhsGemmPolicy::kM128N160;
+  if (value == "m128n256c2") {
+    return fuse::A2ALhsGemmPolicy::kM128N256ClusterM2;
+  }
+  throw std::runtime_error(
+      "--lhs-policy must be auto, m64n128, m128n128, m128n160, or "
+      "m128n256c2");
 }
 
 Options parse_options(int argc, char** argv) {
@@ -104,6 +133,8 @@ Options parse_options(int argc, char** argv) {
       options.head_dim = parse_int(take("--head-dim"), "--head-dim");
     } else if (argument == "--comm-ctas") {
       options.comm_ctas = parse_int(take("--comm-ctas"), "--comm-ctas");
+    } else if (argument == "--lhs-policy") {
+      options.lhs_policy = parse_lhs_policy(take("--lhs-policy"));
     } else if (argument == "--qkv-comm-ctas") {
       options.qkv_comm_ctas =
           parse_int(take("--qkv-comm-ctas"), "--qkv-comm-ctas");
@@ -1423,7 +1454,8 @@ void write_json(
     double route_payload_bytes,
     const char* route_name,
     double overlap,
-    const std::vector<std::pair<std::string, const std::vector<float>*>>& results) {
+    const std::vector<std::pair<std::string, const std::vector<float>*>>& results,
+    const fuse::A2ALhsPolicyInfo* lhs_policy = nullptr) {
   if (options.json_out.empty()) {
     return;
   }
@@ -1446,8 +1478,22 @@ void write_json(
                  : "bfloat16")
          << "\",\n"
          << "  \"timing\": \"max-rank critical path\",\n"
-         << "  \"overlap_ratio\": " << overlap << ",\n"
-         << "  \"results\": {\n";
+         << "  \"overlap_ratio\": " << overlap << ",\n";
+  if (lhs_policy != nullptr) {
+    output << "  \"lhs_policy\": {\"name\": \""
+           << lhs_policy_name(lhs_policy->policy)
+           << "\", \"tile_m\": " << lhs_policy->tile_m
+           << ", \"tile_n\": " << lhs_policy->tile_n
+           << ", \"tile_k\": " << lhs_policy->tile_k
+           << ", \"cluster_m\": " << lhs_policy->cluster_m
+           << ", \"compute_ctas\": " << lhs_policy->compute_ctas
+           << ", \"tile_count\": " << lhs_policy->tile_count
+           << ", \"waves\": " << lhs_policy->waves
+           << ", \"last_wave_ctas\": " << lhs_policy->last_wave_ctas
+           << ", \"estimated_cycles\": " << lhs_policy->estimated_cycles
+           << "},\n";
+  }
+  output << "  \"results\": {\n";
   for (size_t index = 0; index < results.size(); ++index) {
     const auto& [name, samples] = results[index];
     const Summary stats = summarize(*samples);
@@ -1809,7 +1855,15 @@ void benchmark_a2a_lhs_gemm(
     p.route = route;
     p.route.rank = rank;
     p.num_comm_ctas = options.comm_ctas;
+    p.lhs_policy = options.lhs_policy;
   }
+
+  int sm_count = 0;
+  CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, 0));
+  const auto policy_info = fuse::select_a2a_lhs_gemm_policy(
+      problem, options.comm_ctas, sm_count, options.lhs_policy);
 
   uint32_t fused_epoch = 0;
   const auto fused = time_all_ranks(
@@ -1975,6 +2029,10 @@ void benchmark_a2a_lhs_gemm(
             << " B=" << options.batch << " S_global=" << global_seq
             << " Hq=" << options.q_heads << " D=" << options.head_dim
             << " comm_ctas=" << options.comm_ctas
+            << " policy=" << lhs_policy_name(policy_info.policy)
+            << " tile=" << policy_info.tile_m << "x" << policy_info.tile_n
+            << " waves=" << policy_info.waves
+            << " last_wave=" << policy_info.last_wave_ctas
             << " exact_mismatches=" << exact_mismatches << "\n";
   print_result("cuBLAS BF16", cublas, flops, world, pure_mean);
   print_result("cuBLASLt BF16", cublaslt, flops, world, pure_mean);
@@ -2031,7 +2089,8 @@ void benchmark_a2a_lhs_gemm(
        {"inverse_a2a_route", &inverse_route},
        {"same_policy_sequential", &sequential},
        {"cublaslt_sequential", &cublaslt_sequential},
-       {"fused", &fused}});
+       {"fused", &fused}},
+      &policy_info);
   if (options.role_telemetry) {
     const std::string trace_path = options.trace_out.empty()
         ? "/home/chen/workspace/oproj_overlap_trace.json"
