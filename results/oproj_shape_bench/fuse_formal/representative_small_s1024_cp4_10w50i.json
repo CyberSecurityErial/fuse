@@ -1,0 +1,22 @@
+{
+  "mode": "a2a_gemm_lhs",
+  "shape": {"m": 256, "n": 4096, "k": 4096, "l": 1},
+  "world_size": 4,
+  "comm_ctas": 4,
+  "warmup": 10,
+  "iterations": 50,
+  "dtype": "bfloat16",
+  "timing": "max-rank critical path",
+  "overlap_ratio": 0.4525954827,
+  "lhs_policy": {"name": "m64n128", "tile_m": 64, "tile_n": 128, "tile_k": 64, "cluster_m": 1, "compute_ctas": 128, "tile_count": 128, "waves": 1, "last_wave_ctas": 128, "estimated_cycles": 33056.3584},
+  "results": {
+    "cublas": {"mean_ms": 0.02335040003, "p50_ms": 0.02329600044, "p95_ms": 0.02388959937, "min_ms": 0.02246399969, "max_ms": 0.02678400092, "tflops_per_gpu": 367.8709821, "aggregate_tflops": 1471.483928},
+    "cublaslt_autotuned": {"mean_ms": 0.02247679997, "p50_ms": 0.02230400033, "p95_ms": 0.02291199937, "min_ms": 0.02172799967, "max_ms": 0.02793600038, "tflops_per_gpu": 382.1689299, "aggregate_tflops": 1528.675719},
+    "same_policy_cutlass": {"mean_ms": 0.02868415993, "p50_ms": 0.02872000076, "p95_ms": 0.02907359973, "min_ms": 0.02806399949, "max_ms": 0.02915200032, "tflops_per_gpu": 299.4661379, "aggregate_tflops": 1197.864552},
+    "compute_subgrid_cutlass": {"mean_ms": 0.02882303994, "p50_ms": 0.02872000076, "p95_ms": 0.02944800071, "min_ms": 0.02803199925, "max_ms": 0.03331200033, "tflops_per_gpu": 298.0231998, "aggregate_tflops": 1192.092799},
+    "inverse_a2a_route": {"mean_ms": 0.02109503988, "p50_ms": 0.02094399929, "p95_ms": 0.0217311997, "min_ms": 0.02009600028, "max_ms": 0.02556799911, "tflops_per_gpu": 407.2016284, "aggregate_tflops": 1628.806514, "payload_gbps_per_gpu": 99.41446007, "remote_gbps_per_gpu": 74.56084505},
+    "same_policy_sequential": {"mean_ms": 0.04661823981, "p50_ms": 0.04664000124, "p95_ms": 0.04731360078, "min_ms": 0.04518400133, "max_ms": 0.05267199874, "tflops_per_gpu": 184.2612383, "aggregate_tflops": 737.044953},
+    "cublaslt_sequential": {"mean_ms": 0.03772863999, "p50_ms": 0.03758399934, "p95_ms": 0.03868959844, "min_ms": 0.03641600162, "max_ms": 0.0426560007, "tflops_per_gpu": 227.6767621, "aggregate_tflops": 910.7070485},
+    "fused": {"mean_ms": 0.04023168005, "p50_ms": 0.04009599984, "p95_ms": 0.04193279892, "min_ms": 0.03814399987, "max_ms": 0.04524800181, "tflops_per_gpu": 213.5117047, "aggregate_tflops": 854.0468189}
+  }
+}
