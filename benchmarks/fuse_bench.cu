@@ -87,6 +87,8 @@ int parse_nonnegative_int(const std::string& value, const char* name) {
 
 const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
   switch (policy) {
+    case fuse::A2ALhsGemmPolicy::kOneWaveAuto:
+      return "one-wave";
     case fuse::A2ALhsGemmPolicy::kM64N128:
       return "m64n128";
     case fuse::A2ALhsGemmPolicy::kM128N128:
@@ -102,6 +104,7 @@ const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
 
 fuse::A2ALhsGemmPolicy parse_lhs_policy(const std::string& value) {
   if (value == "auto") return fuse::A2ALhsGemmPolicy::kAuto;
+  if (value == "one-wave") return fuse::A2ALhsGemmPolicy::kOneWaveAuto;
   if (value == "m64n128") return fuse::A2ALhsGemmPolicy::kM64N128;
   if (value == "m128n128") return fuse::A2ALhsGemmPolicy::kM128N128;
   if (value == "m128n160") return fuse::A2ALhsGemmPolicy::kM128N160;
@@ -109,8 +112,8 @@ fuse::A2ALhsGemmPolicy parse_lhs_policy(const std::string& value) {
     return fuse::A2ALhsGemmPolicy::kM128N256ClusterM2;
   }
   throw std::runtime_error(
-      "--lhs-policy must be auto, m64n128, m128n128, m128n160, or "
-      "m128n256c2");
+      "--lhs-policy must be auto, one-wave, m64n128, m128n128, m128n160, "
+      "or m128n256c2");
 }
 
 Options parse_options(int argc, char** argv) {
@@ -1808,6 +1811,11 @@ void benchmark_a2a_lhs_gemm(
   problem.raster = options.raster;
   problem.max_swizzle_size = options.swizzle;
   Options launch_options = options;
+  if (launch_options.lhs_policy == fuse::A2ALhsGemmPolicy::kOneWaveAuto &&
+      launch_options.comm_ctas == 0) {
+    throw std::runtime_error(
+        "--lhs-policy one-wave requires an explicit positive --comm-ctas");
+  }
   if (launch_options.comm_ctas == 0) {
     launch_options.comm_ctas =
         fuse::recommended_a2a_lhs_gemm_comm_ctas(problem);
