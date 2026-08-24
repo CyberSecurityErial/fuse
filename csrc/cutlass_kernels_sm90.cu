@@ -2422,15 +2422,6 @@ A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
       //   3. use the traffic estimate only to break an exact geometry tie.
       // This intentionally keeps the first experiment free of calibrated
       // per-shape constants.
-      // TODO: Generalize this fixed-candidate policy to a zero-tail wave
-      // planner.  Given num_comm_ctas, split the useful M tiles across two
-      // nearby legal N collectives so tile_count is exactly
-      // waves * compute_ctas, then minimize waves.  A first heterogeneous
-      // BN144/BN160 prototype was correct but slower than the uniform policy;
-      // resource cost, communication-aware band ordering, multi-wave shapes,
-      // L>1, and the fair same-policy GEMM baseline remain unresolved.  Keep
-      // that experiment out of the production path until those cases are
-      // generalized and measured.
       const int64_t current_slots =
           static_cast<int64_t>(current.waves) * current.compute_ctas;
       const int64_t best_slots =
