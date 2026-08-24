@@ -1502,8 +1502,6 @@ void write_json(
            << ", \"tile_count\": " << lhs_policy->tile_count
            << ", \"waves\": " << lhs_policy->waves
            << ", \"last_wave_ctas\": " << lhs_policy->last_wave_ctas
-           << ", \"one_wave_feasible\": "
-           << (lhs_policy->one_wave_feasible ? "true" : "false")
            << ", \"estimated_cycles\": " << lhs_policy->estimated_cycles
            << "},\n";
   }
