@@ -53,7 +53,10 @@ DEFAULT_MODELS = (
 )
 SEQUENCES = (1024, 4096, 16384)
 CONTEXT_PARALLEL = (4,)
-VISIBLE_DEVICES = {4: "0,2,4,5", 8: "0,1,2,3,4,5,6,7"}
+VISIBLE_DEVICES = {
+    4: os.environ.get("FUSE_CP4_DEVICES", "0,2,4,5"),
+    8: os.environ.get("FUSE_CP8_DEVICES", "0,1,2,3,4,5,6,7"),
+}
 NCCL_CHANNELS = (8, 16, 24, 32)
 NCCL_CHUNK_KIB = (128, 256, 512, 1024)
 NCCL_LL_KIB = (16, 64, 128)
@@ -462,7 +465,7 @@ def baseline_aggregate(args: argparse.Namespace) -> None:
     if rows:
         fields = sorted({field for row in rows for field in row})
         with (args.results / "baseline_summary.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
 
@@ -495,7 +498,7 @@ def write_shape_table(args: argparse.Namespace) -> None:
         json.dump(rows, handle, indent=2)
     fields = list(rows[0])
     with (args.results / "shape_matrix.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     with (args.results / "shape_matrix.md").open("w") as handle:

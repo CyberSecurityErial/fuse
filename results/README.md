@@ -21,8 +21,8 @@ Committed directories:
   baselines, summaries, and shape definitions;
 - `oproj_shape_bench_cp8`: the corresponding CP8 dataset.
 
-The exhaustive NCCL and execution-mode search points are intentionally not
-committed. They are reproducible with `benchmarks/oproj_shape_bench.py`; the
-selected configurations and formal reruns are preserved here.
+The exhaustive NCCL and execution-mode search points are committed alongside
+the formal reruns, so the selected baseline can be independently audited.
+They are reproducible with `benchmarks/oproj_shape_bench.py`.
 
 The code snapshot is tagged `oproj-a2a-golden-auto-20260825`.
