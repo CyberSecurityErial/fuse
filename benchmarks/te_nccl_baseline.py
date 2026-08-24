@@ -26,7 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("qkv_gemm_a2a", "a2a_gemm", "ulysses_forward"),
+        choices=(
+            "qkv_gemm_a2a",
+            "a2a_gemm",
+            "oproj_a2a_gemm",
+            "ulysses_forward",
+        ),
         required=True,
     )
     parser.add_argument("--global-seq", type=int, default=4096)
@@ -371,6 +376,180 @@ def validate(args: argparse.Namespace, world: int) -> None:
         raise ValueError("Q heads must be divisible by KV heads")
 
 
+def run_oproj(
+    args: argparse.Namespace,
+    rank: int,
+    world: int,
+    device: torch.device,
+    devices: list[dict[str, object] | None],
+) -> dict[str, object]:
+    """TE/PyTorch BLAS + NCCL reference for inverse-A2A then O projection."""
+    seq_local = args.global_seq // world
+    local_heads = args.q_heads // world
+    gemm_m = args.batch * seq_local
+    gemm_k = args.q_heads * args.head_dim
+    gemm_n = args.hidden
+    generator = torch.Generator(device=device).manual_seed(2701 + rank)
+
+    attention_output = torch.empty(
+        (args.batch, args.global_seq, local_heads, args.head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-0.125, 0.125, generator=generator)
+    linear = te.Linear(
+        gemm_k,
+        gemm_n,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device=device,
+        name="ulysses_output_projection",
+    ).eval()
+    dist.broadcast(linear.weight, src=0)
+    cp_stream = torch.cuda.Stream(device=device)
+    chunk_ids = get_seq_chunk_ids_for_reordering_before_attn(world, device)
+
+    def inverse_a2a() -> torch.Tensor:
+        return flash_attn_a2a_communicate(
+            attention_output,
+            chunk_ids,
+            1,
+            world,
+            dist.group.WORLD,
+            cp_stream,
+            False,
+            qkv_format="bshd",
+            a2a_input_names=["out"],
+        )
+
+    staging = inverse_a2a().reshape(gemm_m, gemm_k)
+    cublas_output = torch.empty(
+        (gemm_m, gemm_n), dtype=torch.bfloat16, device=device
+    )
+
+    def te_project() -> torch.Tensor:
+        return linear(staging)
+
+    def cublas_project() -> torch.Tensor:
+        return torch.mm(staging, linear.weight.t(), out=cublas_output)
+
+    def te_boundary() -> torch.Tensor:
+        routed = inverse_a2a().reshape(gemm_m, gemm_k)
+        return linear(routed)
+
+    def cublas_boundary() -> torch.Tensor:
+        routed = inverse_a2a().reshape(gemm_m, gemm_k)
+        return torch.mm(routed, linear.weight.t(), out=cublas_output)
+
+    check: dict[str, int] = {}
+    if args.check:
+        peers = [torch.empty_like(attention_output) for _ in range(world)]
+        dist.all_gather(peers, attention_output)
+        causal_chunks = [2 * peer for peer in range(world)] + [
+            2 * world - 2 * peer - 1 for peer in range(world)
+        ]
+        selected_chunks = causal_chunks[2 * rank : 2 * rank + 2]
+        chunk_tokens = args.global_seq // (2 * world)
+        expected_parts = [
+            peer.view(
+                args.batch,
+                2 * world,
+                chunk_tokens,
+                local_heads,
+                args.head_dim,
+            )[:, selected_chunks]
+            for peer in peers
+        ]
+        expected = torch.stack(expected_parts, dim=3).reshape(
+            args.batch * seq_local, args.q_heads, args.head_dim
+        )
+        mismatch = torch.count_nonzero(
+            staging.view(args.batch * seq_local, args.q_heads, args.head_dim)
+            != expected
+        ).to(torch.int64)
+        dist.all_reduce(mismatch, op=dist.ReduceOp.SUM)
+        check["inverse_a2a_reference_mismatches"] = int(mismatch.item())
+        if mismatch.item():
+            raise RuntimeError(f"O-projection route correctness failed: {check}")
+
+    flops = 2 * gemm_m * gemm_n * gemm_k
+    payload_bytes = attention_output.numel() * attention_output.element_size()
+    metrics: dict[str, dict[str, object]] = {}
+
+    def measure(
+        name: str,
+        fn: Callable[[], object],
+        *,
+        metric_flops: int | None = None,
+        metric_payload_bytes: int | None = None,
+    ) -> None:
+        samples = timed_critical(
+            fn,
+            args.warmup,
+            args.iters,
+            device,
+            use_cuda_graph=args.cuda_graph,
+        )
+        metrics[name] = {
+            "samples_ms": samples,
+            "stats": summarize(
+                samples,
+                flops=metric_flops,
+                world=world,
+                payload_bytes=metric_payload_bytes,
+            ),
+        }
+
+    if args.include_te:
+        measure("te_oproj_gemm", te_project, metric_flops=flops)
+    measure("cublas_oproj_gemm", cublas_project, metric_flops=flops)
+    measure(
+        "te_nccl_inverse_a2a",
+        inverse_a2a,
+        metric_payload_bytes=payload_bytes,
+    )
+    if args.include_te:
+        measure("te_nccl_oproj_boundary", te_boundary, metric_flops=flops)
+    measure("cublas_nccl_oproj_boundary", cublas_boundary, metric_flops=flops)
+
+    return {
+        "mode": args.mode,
+        "model_shape": {
+            "batch": args.batch,
+            "global_seq": args.global_seq,
+            "seq_local": seq_local,
+            "hidden": args.hidden,
+            "q_heads": args.q_heads,
+            "head_dim": args.head_dim,
+        },
+        "gemm_shape": {"m": gemm_m, "n": gemm_n, "k": gemm_k, "l": 1},
+        "world_size": world,
+        "warmup": args.warmup,
+        "iterations": args.iters,
+        "dtype": "bfloat16",
+        "timing": "per-sample max-rank CUDA-event critical path",
+        "scope": "TE Ulysses inverse A2A (including reorder) + output projection",
+        "include_te": args.include_te,
+        "cuda_graph": args.cuda_graph,
+        "nccl_high_priority": args.nccl_high_priority,
+        "devices": devices,
+        "software": {
+            "torch": torch.__version__,
+            "transformer_engine": transformer_engine.__version__,
+            "torch_cuda": torch.version.cuda,
+            "nccl": ".".join(str(value) for value in torch.cuda.nccl.version()),
+        },
+        "implementations": {
+            "te_oproj": "transformer_engine.pytorch.Linear",
+            "cublas_oproj": "torch.mm(out=...), PyTorch CUDA BLAS",
+            "inverse_a2a": "TE flash_attn_a2a_communicate / NCCL",
+        },
+        "correctness": check,
+        "derived": {},
+        "results": {name: entry["stats"] for name, entry in metrics.items()},
+        "samples_ms": {name: entry["samples_ms"] for name, entry in metrics.items()},
+    }
+
+
 def exact_route_check(
     routes: UlyssesRoutes,
     qkv: torch.Tensor,
@@ -533,6 +712,8 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
     }
     devices: list[dict[str, object] | None] = [None] * world
     dist.all_gather_object(devices, local_device)
+    if args.mode == "oproj_a2a_gemm":
+        return run_oproj(args, rank, world, device, devices)
     seq_local = args.global_seq // world
     qkv_m = args.batch * seq_local
     qkv_n = (args.q_heads + 2 * args.kv_heads) * args.head_dim
