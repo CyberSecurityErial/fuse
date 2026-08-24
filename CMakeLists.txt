@@ -50,3 +50,10 @@ target_compile_options(
   cublaslt_bench
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
+
+add_library(fuse_cublaslt_runner SHARED csrc/cublaslt_runner.cu)
+target_link_libraries(fuse_cublaslt_runner PRIVATE CUDA::cublasLt CUDA::cudart)
+target_compile_options(
+  fuse_cublaslt_runner
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)

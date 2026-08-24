@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import gc
 import json
 import math
 import os
@@ -20,6 +22,155 @@ from transformer_engine.pytorch.attention.dot_product_attention.context_parallel
     flash_attn_a2a_communicate,
     get_seq_chunk_ids_for_reordering_before_attn,
 )
+
+
+class CublasLtInfo(ctypes.Structure):
+    _fields_ = [
+        ("returned", ctypes.c_int),
+        ("valid", ctypes.c_int),
+        ("algo_id", ctypes.c_int),
+        ("tile_id", ctypes.c_int),
+        ("stages_id", ctypes.c_int),
+        ("split_k", ctypes.c_int),
+        ("reduction", ctypes.c_int),
+        ("cta_swizzle", ctypes.c_int),
+        ("custom", ctypes.c_int),
+        ("inner_shape", ctypes.c_int),
+        ("cluster_shape", ctypes.c_int),
+        ("workspace_bytes", ctypes.c_uint64),
+        ("tune_ms", ctypes.c_float),
+        ("waves", ctypes.c_float),
+    ]
+
+
+class CublasLtRunner:
+    """Locally autotuned BF16 NT cuBLASLt plan, callable on a Torch stream."""
+
+    def __init__(
+        self,
+        library: Path,
+        a: torch.Tensor,
+        b_nt: torch.Tensor,
+        d: torch.Tensor,
+        *,
+        tune_warmup: int,
+        tune_iters: int,
+        workspace_mib: int,
+    ) -> None:
+        self.library = ctypes.CDLL(str(library))
+        self.library.fuse_cublaslt_last_error.restype = ctypes.c_char_p
+        self.library.fuse_cublaslt_bf16_create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+        ]
+        self.library.fuse_cublaslt_bf16_create.restype = ctypes.c_void_p
+        self.library.fuse_cublaslt_bf16_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.library.fuse_cublaslt_bf16_run.restype = ctypes.c_int
+        self.library.fuse_cublaslt_bf16_info.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(CublasLtInfo),
+        ]
+        self.library.fuse_cublaslt_bf16_info.restype = ctypes.c_int
+        self.library.fuse_cublaslt_bf16_destroy.argtypes = [ctypes.c_void_p]
+        self.library.fuse_cublaslt_bf16_destroy.restype = None
+        if a.dtype != torch.bfloat16 or b_nt.dtype != torch.bfloat16 or d.dtype != torch.bfloat16:
+            raise TypeError("cuBLASLt runner requires BF16 tensors")
+        if not (a.is_contiguous() and b_nt.is_contiguous() and d.is_contiguous()):
+            raise ValueError("cuBLASLt runner requires contiguous row-major tensors")
+        m, k = a.shape
+        n, weight_k = b_nt.shape
+        if weight_k != k or d.shape != (m, n):
+            raise ValueError("incompatible cuBLASLt matrix shapes")
+        stream = torch.cuda.current_stream(a.device).cuda_stream
+        self.handle = self.library.fuse_cublaslt_bf16_create(
+            a.device.index,
+            m,
+            n,
+            k,
+            a.data_ptr(),
+            b_nt.data_ptr(),
+            d.data_ptr(),
+            stream,
+            tune_warmup,
+            tune_iters,
+            workspace_mib << 20,
+        )
+        if not self.handle:
+            error = self.library.fuse_cublaslt_last_error().decode()
+            raise RuntimeError(f"cuBLASLt autotune failed: {error}")
+        raw = CublasLtInfo()
+        if not self.library.fuse_cublaslt_bf16_info(self.handle, ctypes.byref(raw)):
+            raise RuntimeError("cuBLASLt plan info query failed")
+        self.info = {name: getattr(raw, name) for name, _ in raw._fields_}
+
+    def __call__(self, a: torch.Tensor, b_nt: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        stream = torch.cuda.current_stream(a.device).cuda_stream
+        if not self.library.fuse_cublaslt_bf16_run(
+            self.handle, a.data_ptr(), b_nt.data_ptr(), d.data_ptr(), stream
+        ):
+            error = self.library.fuse_cublaslt_last_error().decode()
+            raise RuntimeError(f"cuBLASLt launch failed: {error}")
+        return d
+
+    def close(self) -> None:
+        if self.handle:
+            self.library.fuse_cublaslt_bf16_destroy(self.handle)
+            self.handle = None
+
+
+_CUBLASLT_RUNNERS: dict[tuple[object, ...], CublasLtRunner] = {}
+
+
+def cached_cublaslt_runner(
+    args: argparse.Namespace,
+    a: torch.Tensor,
+    b_nt: torch.Tensor,
+    d: torch.Tensor,
+) -> CublasLtRunner:
+    m, k = a.shape
+    n = b_nt.shape[0]
+    key = (
+        a.device.index,
+        m,
+        n,
+        k,
+        str(args.cublaslt_library.resolve()),
+        args.cublaslt_tune_warmup,
+        args.cublaslt_tune_iters,
+        args.cublaslt_workspace_mib,
+    )
+    if key not in _CUBLASLT_RUNNERS:
+        _CUBLASLT_RUNNERS[key] = CublasLtRunner(
+            args.cublaslt_library,
+            a,
+            b_nt,
+            d,
+            tune_warmup=args.cublaslt_tune_warmup,
+            tune_iters=args.cublaslt_tune_iters,
+            workspace_mib=args.cublaslt_workspace_mib,
+        )
+    return _CUBLASLT_RUNNERS[key]
+
+
+def close_cublaslt_runners() -> None:
+    for runner in _CUBLASLT_RUNNERS.values():
+        runner.close()
+    _CUBLASLT_RUNNERS.clear()
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +210,19 @@ def parse_args() -> argparse.Namespace:
         "--nccl-high-priority", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument(
+        "--matrix-manifest",
+        type=Path,
+        help="JSON list of NCCL/execution configurations and output paths",
+    )
+    parser.add_argument(
+        "--cublaslt-library",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "build" / "libfuse_cublaslt_runner.so",
+    )
+    parser.add_argument("--cublaslt-tune-warmup", type=int, default=5)
+    parser.add_argument("--cublaslt-tune-iters", type=int, default=30)
+    parser.add_argument("--cublaslt-workspace-mib", type=int, default=64)
     return parser.parse_args()
 
 
@@ -429,16 +593,22 @@ def run_oproj(
     def te_project() -> torch.Tensor:
         return linear(staging)
 
-    def cublas_project() -> torch.Tensor:
-        return torch.mm(staging, linear.weight.t(), out=cublas_output)
+    cublaslt = cached_cublaslt_runner(
+        args, staging, linear.weight, cublas_output
+    )
+    rank_cublaslt_plans: list[dict[str, object] | None] = [None] * world
+    dist.all_gather_object(rank_cublaslt_plans, cublaslt.info)
+
+    def cublaslt_project() -> torch.Tensor:
+        return cublaslt(staging, linear.weight, cublas_output)
 
     def te_boundary() -> torch.Tensor:
         routed = inverse_a2a().reshape(gemm_m, gemm_k)
         return linear(routed)
 
-    def cublas_boundary() -> torch.Tensor:
+    def cublaslt_boundary() -> torch.Tensor:
         routed = inverse_a2a().reshape(gemm_m, gemm_k)
-        return torch.mm(routed, linear.weight.t(), out=cublas_output)
+        return cublaslt(routed, linear.weight, cublas_output)
 
     check: dict[str, int] = {}
     if args.check:
@@ -470,6 +640,14 @@ def run_oproj(
         check["inverse_a2a_reference_mismatches"] = int(mismatch.item())
         if mismatch.item():
             raise RuntimeError(f"O-projection route correctness failed: {check}")
+        cublaslt_project()
+        torch.cuda.synchronize(device)
+        reference_output = torch.mm(staging, linear.weight.t())
+        max_abs = (cublas_output.float() - reference_output.float()).abs().max()
+        dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
+        check["cublaslt_vs_torch_mm_max_abs"] = float(max_abs.item())
+        if not torch.isfinite(max_abs):
+            raise RuntimeError(f"cuBLASLt produced non-finite output: {check}")
 
     flops = 2 * gemm_m * gemm_n * gemm_k
     payload_bytes = attention_output.numel() * attention_output.element_size()
@@ -501,7 +679,7 @@ def run_oproj(
 
     if args.include_te:
         measure("te_oproj_gemm", te_project, metric_flops=flops)
-    measure("cublas_oproj_gemm", cublas_project, metric_flops=flops)
+    measure("cublaslt_oproj_gemm", cublaslt_project, metric_flops=flops)
     measure(
         "te_nccl_inverse_a2a",
         inverse_a2a,
@@ -509,9 +687,9 @@ def run_oproj(
     )
     if args.include_te:
         measure("te_nccl_oproj_boundary", te_boundary, metric_flops=flops)
-    measure("cublas_nccl_oproj_boundary", cublas_boundary, metric_flops=flops)
+    measure("cublaslt_nccl_oproj_boundary", cublaslt_boundary, metric_flops=flops)
 
-    return {
+    result = {
         "mode": args.mode,
         "model_shape": {
             "batch": args.batch,
@@ -550,9 +728,10 @@ def run_oproj(
             "torch_cuda": torch.version.cuda,
             "nccl": ".".join(str(value) for value in torch.cuda.nccl.version()),
         },
+        "cublaslt_plans": rank_cublaslt_plans,
         "implementations": {
             "te_oproj": "transformer_engine.pytorch.Linear",
-            "cublas_oproj": "torch.mm(out=...), PyTorch CUDA BLAS",
+            "cublaslt_oproj": "explicit cuBLASLt, 64 heuristic candidates, locally timed winner",
             "inverse_a2a": "TE flash_attn_a2a_communicate / NCCL",
         },
         "correctness": check,
@@ -560,6 +739,7 @@ def run_oproj(
         "results": {name: entry["stats"] for name, entry in metrics.items()},
         "samples_ms": {name: entry["samples_ms"] for name, entry in metrics.items()},
     }
+    return result
 
 
 def exact_route_check(
@@ -1052,38 +1232,82 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
     }
 
 
-def main() -> None:
-    args = parse_args()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+def print_and_write_result(
+    args: argparse.Namespace,
+    result: dict[str, object],
+    rank: int,
+) -> None:
+    if rank != 0:
+        return
+    for name, values in result["results"].items():
+        suffix = ""
+        if "tflops_per_gpu" in values:
+            suffix += f" TFLOPS/GPU={values['tflops_per_gpu']:.1f}"
+        if "payload_gbps_per_gpu" in values:
+            suffix += f" payload={values['payload_gbps_per_gpu']:.1f} GB/s"
+        print(
+            f"{name:31s} mean={values['mean_ms']:.4f} ms "
+            f"p50={values['p50_ms']:.4f} p95={values['p95_ms']:.4f}{suffix}",
+            flush=True,
+        )
+    print(f"correctness={result['correctness']}", flush=True)
+    print(f"derived={json.dumps(result['derived'], sort_keys=True)}", flush=True)
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(result, indent=2) + "\n")
+
+
+def run_one_process_group(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    init_method: str | None = None,
+) -> None:
     process_group_options = dist.ProcessGroupNCCL.Options()
     process_group_options.is_high_priority_stream = args.nccl_high_priority
+    init_kwargs: dict[str, object] = {}
+    if init_method is not None:
+        init_kwargs.update({
+            "init_method": init_method,
+            "rank": int(os.environ["RANK"]),
+            "world_size": int(os.environ["WORLD_SIZE"]),
+        })
     dist.init_process_group(
-        "nccl", device_id=device, pg_options=process_group_options
+        "nccl", device_id=device, pg_options=process_group_options, **init_kwargs
     )
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = False
     result = run(args, rank, world, device)
-    if rank == 0:
-        for name, values in result["results"].items():
-            suffix = ""
-            if "tflops_per_gpu" in values:
-                suffix += f" TFLOPS/GPU={values['tflops_per_gpu']:.1f}"
-            if "payload_gbps_per_gpu" in values:
-                suffix += f" payload={values['payload_gbps_per_gpu']:.1f} GB/s"
-            print(
-                f"{name:31s} mean={values['mean_ms']:.4f} ms "
-                f"p50={values['p50_ms']:.4f} p95={values['p95_ms']:.4f}{suffix}",
-                flush=True,
-            )
-        print(f"correctness={result['correctness']}", flush=True)
-        print(f"derived={json.dumps(result['derived'], sort_keys=True)}", flush=True)
-        if args.json_out:
-            args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(json.dumps(result, indent=2) + "\n")
+    print_and_write_result(args, result, rank)
+    torch.cuda.synchronize(device)
     dist.destroy_process_group()
+    del result
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def main() -> None:
+    args = parse_args()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if not args.matrix_manifest:
+        run_one_process_group(args, device)
+        close_cublaslt_runners()
+        return
+
+    entries = json.loads(args.matrix_manifest.read_text())
+    for entry in entries:
+        for name, value in entry["environment"].items():
+            os.environ[name] = str(value)
+        args.cuda_graph = bool(entry["cuda_graph"])
+        args.nccl_high_priority = bool(entry["nccl_high_priority"])
+        args.json_out = Path(entry["json_out"])
+        run_one_process_group(
+            args, device, init_method=f"file://{entry['rendezvous_file']}"
+        )
+    close_cublaslt_runners()
 
 
 if __name__ == "__main__":
