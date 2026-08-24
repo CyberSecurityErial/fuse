@@ -26,6 +26,8 @@
 #include <cutlass/util/packed_stride.hpp>
 
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <type_traits>
 
 namespace fuse {
@@ -2308,24 +2310,111 @@ cudaError_t launch_a2a_lhs_gemm_policy(
       sm_count);
 }
 
-bool use_wide_a2a_lhs_policy(const A2AGemmParams& params) {
-  return params.gemm.n >= 4096;
+struct LhsPolicyCandidate {
+  A2ALhsGemmPolicy policy;
+  int32_t tile_m;
+  int32_t tile_n;
+  int32_t cluster_m;
+};
+
+constexpr std::array<LhsPolicyCandidate, 4> kLhsPolicyCandidates{{
+    {A2ALhsGemmPolicy::kM64N128, 64, 128, 1},
+    {A2ALhsGemmPolicy::kM128N128, 128, 128, 1},
+    {A2ALhsGemmPolicy::kM128N160, 128, 160, 1},
+    {A2ALhsGemmPolicy::kM128N256ClusterM2, 128, 256, 2},
+}};
+
+A2ALhsPolicyInfo score_a2a_lhs_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    const LhsPolicyCandidate& candidate) {
+  A2ALhsPolicyInfo info{};
+  info.policy = candidate.policy;
+  info.tile_m = candidate.tile_m;
+  info.tile_n = candidate.tile_n;
+  info.tile_k = 64;
+  info.cluster_m = candidate.cluster_m;
+  info.compute_ctas = sm_count - num_comm_ctas;
+  if (problem.m <= 0 || problem.n <= 0 || problem.k <= 0 || problem.l <= 0 ||
+      info.compute_ctas <= 0 ||
+      (candidate.cluster_m > 1 &&
+       (num_comm_ctas % candidate.cluster_m != 0 ||
+        info.compute_ctas % candidate.cluster_m != 0))) {
+    info.estimated_cycles = std::numeric_limits<double>::infinity();
+    return info;
+  }
+
+  const int64_t m_tiles = ceil_div(problem.m, candidate.tile_m);
+  const int64_t n_tiles = ceil_div(problem.n, candidate.tile_n);
+  info.tile_count = m_tiles * n_tiles * problem.l;
+  info.waves = static_cast<int32_t>(
+      ceil_div(info.tile_count, static_cast<int64_t>(info.compute_ctas)));
+  info.last_wave_ctas = static_cast<int32_t>(
+      info.tile_count - static_cast<int64_t>(info.waves - 1) *
+          info.compute_ctas);
+
+  // DeepGEMM-style SM90 wave model.  Tensor-core work and HBM bytes are
+  // invariant across candidates; this compares the variable L1/L2 traffic
+  // after accounting for cluster-B multicast and partial-wave occupancy.
+  constexpr double kL2BytesPerCycle = 8.0e6 / 1.3e3;
+  const double l2_bandwidth = std::min(
+      64.0 * info.compute_ctas, kL2BytesPerCycle);
+  const double l1_bandwidth = 128.0 * info.compute_ctas;
+  constexpr double element_bytes = sizeof(Element);
+  const double l2_bytes_per_tile =
+      static_cast<double>(problem.k) *
+          (candidate.tile_m +
+           static_cast<double>(candidate.tile_n) / candidate.cluster_m) *
+          element_bytes +
+      static_cast<double>(candidate.tile_m) * candidate.tile_n *
+          element_bytes;
+  const double l1_bytes_per_tile =
+      static_cast<double>(problem.k) *
+          (candidate.tile_m + candidate.tile_n) * element_bytes +
+      static_cast<double>(problem.k) *
+          (std::max(64, candidate.tile_m) + candidate.tile_n) *
+          element_bytes +
+      2.0 * candidate.tile_m * candidate.tile_n * element_bytes;
+  const double wave_efficiency = static_cast<double>(info.tile_count) /
+      (static_cast<double>(info.waves) * info.compute_ctas);
+  const double l2_cycles =
+      l2_bytes_per_tile * info.tile_count / l2_bandwidth;
+  const double l1_cycles =
+      l1_bytes_per_tile * info.tile_count / l1_bandwidth;
+  info.estimated_cycles =
+      std::max(l1_cycles, l2_cycles) / wave_efficiency;
+  return info;
 }
 
-bool use_m64_a2a_lhs_policy(
-    const A2AGemmParams& params, int32_t compute_ctas) {
-  const int64_t m128_tiles = ceil_div(params.gemm.m, kBlockM);
-  const int64_t n128_tiles = ceil_div(params.gemm.n, kBlockN);
-  return m128_tiles * n128_tiles * params.gemm.l < compute_ctas;
-}
-
-bool use_n160_a2a_lhs_policy(
-    const A2AGemmParams& params, int32_t compute_ctas) {
-  const int64_t m_tiles = ceil_div(params.gemm.m, 128);
-  const int64_t n128_tiles = ceil_div(params.gemm.n, 128);
-  const int64_t n160_tiles = ceil_div(params.gemm.n, 160);
-  return m_tiles * n128_tiles * params.gemm.l > compute_ctas &&
-      m_tiles * n160_tiles * params.gemm.l <= compute_ctas;
+A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    A2ALhsGemmPolicy requested) {
+  A2ALhsPolicyInfo best{};
+  best.estimated_cycles = std::numeric_limits<double>::infinity();
+  for (const auto& candidate : kLhsPolicyCandidates) {
+    if (requested != A2ALhsGemmPolicy::kAuto &&
+        requested != candidate.policy) {
+      continue;
+    }
+    const auto current = score_a2a_lhs_policy(
+        problem, num_comm_ctas, sm_count, candidate);
+    if (requested != A2ALhsGemmPolicy::kAuto) {
+      return current;
+    }
+    // A two-CTA multicast cluster makes a one-wave input consumer advance at
+    // the slower ready tile in each pair. Independent CTAs are stronger when
+    // the whole GEMM already fits in one wave.
+    if (candidate.cluster_m > 1 && current.waves == 1) {
+      continue;
+    }
+    if (current.estimated_cycles < best.estimated_cycles) {
+      best = current;
+    }
+  }
+  return best;
 }
 
 cudaError_t launch_a2a_lhs_gemm_impl(
@@ -2333,30 +2422,31 @@ cudaError_t launch_a2a_lhs_gemm_impl(
     cudaStream_t stream,
     int32_t sm_count,
     int32_t device) {
-  if (use_wide_a2a_lhs_policy(params)) {
-    if (params.num_comm_ctas % 2 != 0 ||
-        (sm_count - params.num_comm_ctas) % 2 != 0) {
-      return cudaErrorInvalidValue;
-    }
-    return launch_a2a_lhs_gemm_policy<
-        A2ALhsProjectionGemm, A2ALhsProjectionGemmKernel>(
-            params, stream, sm_count, device);
+  const auto selected = select_a2a_lhs_policy_impl(
+      params.gemm,
+      params.num_comm_ctas,
+      sm_count,
+      params.lhs_policy);
+  switch (selected.policy) {
+    case A2ALhsGemmPolicy::kM64N128:
+      return launch_a2a_lhs_gemm_policy<
+          A2ALhsM64Gemm, A2ALhsM64GemmKernel, A2ALhsM64InputComm>(
+              params, stream, sm_count, device);
+    case A2ALhsGemmPolicy::kM128N128:
+      return launch_a2a_lhs_gemm_policy<
+          A2ALhsInputGemm, A2ALhsGemmKernel, A2ALhsInputComm>(
+              params, stream, sm_count, device);
+    case A2ALhsGemmPolicy::kM128N160:
+      return launch_a2a_lhs_gemm_policy<
+          A2ALhsN160Gemm, A2ALhsN160GemmKernel>(
+              params, stream, sm_count, device);
+    case A2ALhsGemmPolicy::kM128N256ClusterM2:
+      return launch_a2a_lhs_gemm_policy<
+          A2ALhsProjectionGemm, A2ALhsProjectionGemmKernel>(
+              params, stream, sm_count, device);
+    default:
+      return cudaErrorNotSupported;
   }
-  if (use_n160_a2a_lhs_policy(
-          params, sm_count - params.num_comm_ctas)) {
-    return launch_a2a_lhs_gemm_policy<
-        A2ALhsN160Gemm, A2ALhsN160GemmKernel>(
-            params, stream, sm_count, device);
-  }
-  if (use_m64_a2a_lhs_policy(
-          params, sm_count - params.num_comm_ctas)) {
-    return launch_a2a_lhs_gemm_policy<
-        A2ALhsM64Gemm, A2ALhsM64GemmKernel, A2ALhsM64InputComm>(
-            params, stream, sm_count, device);
-  }
-  return launch_a2a_lhs_gemm_policy<
-      A2ALhsInputGemm, A2ALhsGemmKernel, A2ALhsInputComm>(
-          params, stream, sm_count, device);
 }
 
 template <class GemmKernel, class Comm, class Params>
@@ -2843,6 +2933,15 @@ int64_t a2a_lhs_gemm_ready_elements(
       route.world_size * kReadyFlagStride;
 }
 
+A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    A2ALhsGemmPolicy requested) {
+  return select_a2a_lhs_policy_impl(
+      problem, num_comm_ctas, sm_count, requested);
+}
+
 int32_t recommended_gemm_a2a_comm_ctas(
   const GemmProblem& problem,
   const UlyssesRoute& route) {
@@ -2911,11 +3010,12 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     return cudaErrorInvalidValue;
   }
   if (launch_params.input_operand == A2AGemmOperand::kLhs) {
-    if (use_wide_a2a_lhs_policy(launch_params)) {
-      return cudaErrorNotSupported;
-    }
-    if (use_m64_a2a_lhs_policy(
-            launch_params, sm_count - launch_params.num_comm_ctas)) {
+    const auto selected = select_a2a_lhs_policy_impl(
+        launch_params.gemm,
+        launch_params.num_comm_ctas,
+        sm_count,
+        launch_params.lhs_policy);
+    if (selected.policy == A2ALhsGemmPolicy::kM64N128) {
       return launch_a2a_lhs_gemm_policy<
           A2ALhsM64TelemetryGemm,
           A2ALhsM64TelemetryKernel,
@@ -2929,6 +3029,9 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
               timeline_capacity,
               peer_timeline,
               peer_timeline_capacity);
+    }
+    if (selected.policy != A2ALhsGemmPolicy::kM128N128) {
+      return cudaErrorNotSupported;
     }
     return launch_a2a_lhs_gemm_policy<
         A2ALhsTelemetryGemm,
@@ -3222,26 +3325,31 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
   }
 
   if (params.input_operand == A2AGemmOperand::kLhs) {
-    if (use_wide_a2a_lhs_policy(params)) {
-      if (reserved_comm_ctas % 2 != 0 ||
-          (sm_count - reserved_comm_ctas) % 2 != 0) {
-        return cudaErrorInvalidValue;
-      }
-      return launch_a2a_lhs_reference_impl<ProjectionPureGemm>(
-          params, stream, sm_count, device, reserved_comm_ctas);
+    const auto selected = select_a2a_lhs_policy_impl(
+        params.gemm,
+        params.num_comm_ctas,
+        sm_count,
+        params.lhs_policy);
+    switch (selected.policy) {
+      case A2ALhsGemmPolicy::kM64N128:
+        return launch_a2a_lhs_reference_impl<M64PureGemm>(
+            params, stream, sm_count, device, reserved_comm_ctas);
+      case A2ALhsGemmPolicy::kM128N128:
+        return launch_a2a_lhs_reference_impl<PureGemm>(
+            params, stream, sm_count, device, reserved_comm_ctas);
+      case A2ALhsGemmPolicy::kM128N160:
+        return launch_a2a_lhs_reference_impl<N160PureGemm>(
+            params, stream, sm_count, device, reserved_comm_ctas);
+      case A2ALhsGemmPolicy::kM128N256ClusterM2:
+        if (reserved_comm_ctas % 2 != 0 ||
+            (sm_count - reserved_comm_ctas) % 2 != 0) {
+          return cudaErrorInvalidValue;
+        }
+        return launch_a2a_lhs_reference_impl<ProjectionPureGemm>(
+            params, stream, sm_count, device, reserved_comm_ctas);
+      default:
+        return cudaErrorNotSupported;
     }
-    if (use_n160_a2a_lhs_policy(
-            params, sm_count - params.num_comm_ctas)) {
-      return launch_a2a_lhs_reference_impl<N160PureGemm>(
-          params, stream, sm_count, device, reserved_comm_ctas);
-    }
-    if (use_m64_a2a_lhs_policy(
-            params, sm_count - reserved_comm_ctas)) {
-      return launch_a2a_lhs_reference_impl<M64PureGemm>(
-          params, stream, sm_count, device, reserved_comm_ctas);
-    }
-    return launch_a2a_lhs_reference_impl<PureGemm>(
-        params, stream, sm_count, device, reserved_comm_ctas);
   }
 
   typename RowMajorBPureGemm::Arguments args{};
@@ -3369,9 +3477,12 @@ cudaError_t launch_a2a_gemm_copy_reference(
     if (status != cudaSuccess) {
       return status;
     }
-    if (!use_wide_a2a_lhs_policy(params) &&
-        use_m64_a2a_lhs_policy(
-            params, sm_count - params.num_comm_ctas)) {
+    const auto selected = select_a2a_lhs_policy_impl(
+        params.gemm,
+        params.num_comm_ctas,
+        sm_count,
+        params.lhs_policy);
+    if (selected.policy == A2ALhsGemmPolicy::kM64N128) {
       return launch_a2a_lhs_copy_reference_impl<A2ALhsM64InputComm>(
           params, stream);
     }
