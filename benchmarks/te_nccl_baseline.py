@@ -525,7 +525,6 @@ def validate(args: argparse.Namespace, world: int) -> None:
         args.hidden,
         args.batch,
         args.q_heads,
-        args.kv_heads,
         args.head_dim,
         args.warmup,
         args.iters,
@@ -534,10 +533,15 @@ def validate(args: argparse.Namespace, world: int) -> None:
         raise ValueError("all shape and sampling arguments must be positive")
     if args.global_seq % world:
         raise ValueError("global sequence must be divisible by CP world size")
-    if args.q_heads % world or args.kv_heads % world:
-        raise ValueError("Q and KV head counts must be divisible by CP world size")
-    if args.q_heads % args.kv_heads:
-        raise ValueError("Q heads must be divisible by KV heads")
+    if args.q_heads % world:
+        raise ValueError("Q head count must be divisible by CP world size")
+    if args.mode != "oproj_a2a_gemm":
+        if args.kv_heads <= 0:
+            raise ValueError("KV head count must be positive")
+        if args.kv_heads % world:
+            raise ValueError("KV head count must be divisible by CP world size")
+        if args.q_heads % args.kv_heads:
+            raise ValueError("Q heads must be divisible by KV heads")
 
 
 def run_oproj(
