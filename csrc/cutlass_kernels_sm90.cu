@@ -2933,6 +2933,10 @@ int64_t a2a_lhs_gemm_ready_elements(
       route.world_size * kReadyFlagStride;
 }
 
+int32_t recommended_a2a_lhs_gemm_comm_ctas(const GemmProblem& problem) {
+  return problem.n >= 4096 ? 4 : 8;
+}
+
 A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
     const GemmProblem& problem,
     int32_t num_comm_ctas,
@@ -2970,7 +2974,7 @@ cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t st
   A2AGemmParams launch_params = params;
   if (launch_params.num_comm_ctas == 0) {
     launch_params.num_comm_ctas = params.input_operand == A2AGemmOperand::kLhs
-        ? (params.gemm.n >= 4096 ? 4 : 8)
+        ? recommended_a2a_lhs_gemm_comm_ctas(params.gemm)
         : recommended_a2a_gemm_comm_ctas(params.gemm, params.layout);
   }
   if (launch_params.num_comm_ctas <= 0 || launch_params.num_comm_ctas >= sm_count) {
