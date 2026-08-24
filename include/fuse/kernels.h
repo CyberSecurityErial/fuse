@@ -53,6 +53,10 @@ enum class A2ALhsGemmPolicy : int32_t {
   kM128N128 = 2,
   kM128N160 = 3,
   kM128N256ClusterM2 = 4,
+  // Experimental policy: the caller supplies num_comm_ctas and therefore
+  // fixes the resident compute-CTA budget.  Rank legal tile shapes by wave
+  // count first and wave fill second; no communication heuristic is involved.
+  kOneWaveAuto = 5,
 };
 
 struct A2ALhsPolicyInfo {
