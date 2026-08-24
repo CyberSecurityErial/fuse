@@ -77,6 +77,14 @@ int parse_int(const std::string& value, const char* name) {
   return parsed;
 }
 
+int parse_nonnegative_int(const std::string& value, const char* name) {
+  const int parsed = std::stoi(value);
+  if (parsed < 0) {
+    throw std::runtime_error(std::string(name) + " must be nonnegative");
+  }
+  return parsed;
+}
+
 const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
   switch (policy) {
     case fuse::A2ALhsGemmPolicy::kM64N128:
@@ -132,7 +140,8 @@ Options parse_options(int argc, char** argv) {
     } else if (argument == "--head-dim") {
       options.head_dim = parse_int(take("--head-dim"), "--head-dim");
     } else if (argument == "--comm-ctas") {
-      options.comm_ctas = parse_int(take("--comm-ctas"), "--comm-ctas");
+      options.comm_ctas =
+          parse_nonnegative_int(take("--comm-ctas"), "--comm-ctas");
     } else if (argument == "--lhs-policy") {
       options.lhs_policy = parse_lhs_policy(take("--lhs-policy"));
     } else if (argument == "--qkv-comm-ctas") {
@@ -1798,6 +1807,11 @@ void benchmark_a2a_lhs_gemm(
   fuse::GemmProblem problem{m, n, k, 1};
   problem.raster = options.raster;
   problem.max_swizzle_size = options.swizzle;
+  Options launch_options = options;
+  if (launch_options.comm_ctas == 0) {
+    launch_options.comm_ctas =
+        fuse::recommended_a2a_lhs_gemm_comm_ctas(problem);
+  }
   const int64_t ready_count =
       fuse::a2a_lhs_gemm_ready_elements(problem, route);
 
@@ -1854,7 +1868,7 @@ void benchmark_a2a_lhs_gemm(
     p.gemm = problem;
     p.route = route;
     p.route.rank = rank;
-    p.num_comm_ctas = options.comm_ctas;
+    p.num_comm_ctas = launch_options.comm_ctas;
     p.lhs_policy = options.lhs_policy;
   }
 
@@ -1863,7 +1877,7 @@ void benchmark_a2a_lhs_gemm(
   CUDA_CHECK(cudaDeviceGetAttribute(
       &sm_count, cudaDevAttrMultiProcessorCount, 0));
   const auto policy_info = fuse::select_a2a_lhs_gemm_policy(
-      problem, options.comm_ctas, sm_count, options.lhs_policy);
+      problem, launch_options.comm_ctas, sm_count, options.lhs_policy);
 
   uint32_t fused_epoch = 0;
   const auto fused = time_all_ranks(
@@ -1902,7 +1916,7 @@ void benchmark_a2a_lhs_gemm(
         CUDA_CHECK(cudaSetDevice(rank));
         params[rank].output = cutlass_output[rank];
         CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_reference(
-            params[rank], runtime[rank].stream, options.comm_ctas));
+            params[rank], runtime[rank].stream, launch_options.comm_ctas));
       });
 
   auto cublaslt_plan = autotune_cublaslt_bf16(
@@ -2028,7 +2042,7 @@ void benchmark_a2a_lhs_gemm(
             << " N=" << n << " K=" << k << " L=1 CP=" << world
             << " B=" << options.batch << " S_global=" << global_seq
             << " Hq=" << options.q_heads << " D=" << options.head_dim
-            << " comm_ctas=" << options.comm_ctas
+            << " comm_ctas=" << launch_options.comm_ctas
             << " policy=" << lhs_policy_name(policy_info.policy)
             << " tile=" << policy_info.tile_m << "x" << policy_info.tile_n
             << " waves=" << policy_info.waves
@@ -2075,7 +2089,7 @@ void benchmark_a2a_lhs_gemm(
             << subgrid_overlap * 100.0 << "%\n";
 
   write_json(
-      options,
+      launch_options,
       world,
       1,
       flops,
