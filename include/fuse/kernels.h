@@ -69,6 +69,7 @@ struct A2ALhsPolicyInfo {
   int64_t tile_count = 0;
   int32_t waves = 0;
   int32_t last_wave_ctas = 0;
+  bool one_wave_feasible = false;
   double estimated_cycles = 0.0;
 };
 
