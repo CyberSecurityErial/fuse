@@ -39,14 +39,20 @@ MODELS = {
         Model("llama3_8b", 4096, 32, 128, "Llama3-8B; same O-proj as Mistral/Mixtral"),
         Model("qwen25_32b", 5120, 40, 128, "Qwen2.5-32B"),
         Model("llama31_70b", 8192, 64, 128, "Llama3.1-70B; same O-proj as Qwen-72B"),
+        Model("representative_small", 4096, 32, 128, "single-digit-B median-like O-proj"),
+        Model("representative_medium", 5120, 40, 128, "tens-of-B median-like O-proj"),
+        Model("representative_large", 7168, 128, 128, "hundreds-of-B median-like O-proj"),
     )
 }
-# Representative production O-projection geometries.  With CP4 these map to
-# per-rank GEMM M={256, 1024, 4096}; N=K=2048 stays fixed.
-DEFAULT_MODELS = ("qwen_dense_2k",)
+# Three model-width representatives crossed with three independent per-rank
+# token counts.  No entry identifies an exact model or an exact-shape policy.
+DEFAULT_MODELS = (
+    "representative_small",
+    "representative_medium",
+    "representative_large",
+)
 SEQUENCES = (1024, 4096, 16384)
 CONTEXT_PARALLEL = (4,)
-COMM_CANDIDATES = (4, 8, 12, 14, 16, 20, 24, 32)
 VISIBLE_DEVICES = {4: "0,2,4,5", 8: "0,1,2,3,4,5,6,7"}
 NCCL_CHANNELS = (8, 16, 24, 32)
 NCCL_CHUNK_KIB = (128, 256, 512, 1024)
@@ -74,7 +80,6 @@ def parse_args() -> argparse.Namespace:
             "baseline-formal",
             "baseline-aggregate",
             "shape-table",
-            "fuse-sweep",
             "fuse-formal",
         ),
         required=True,
@@ -82,7 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument("--seqs", type=parse_csv_ints, default=SEQUENCES)
     parser.add_argument("--cps", type=parse_csv_ints, default=CONTEXT_PARALLEL)
-    parser.add_argument("--comm-ctas", type=parse_csv_ints, default=COMM_CANDIDATES)
     parser.add_argument("--nccl-channels", type=parse_csv_ints, default=NCCL_CHANNELS)
     parser.add_argument("--nccl-chunk-kib", type=parse_csv_ints, default=NCCL_CHUNK_KIB)
     parser.add_argument("--nccl-ll-kib", type=parse_csv_ints, default=NCCL_LL_KIB)
@@ -189,7 +193,6 @@ def fuse_command(
     model: Model,
     seq: int,
     cp: int,
-    comm: int,
     warmup: int,
     iters: int,
     output: Path,
@@ -203,7 +206,9 @@ def fuse_command(
         "--batch", "1",
         "--q-heads", str(model.q_heads),
         "--head-dim", str(model.head_dim),
-        "--comm-ctas", str(comm),
+        # Zero delegates CTA count to the production runtime heuristic.  The
+        # benchmark never selects a per-shape winner from a manual sweep.
+        "--comm-ctas", "0",
         "--lhs-policy", "auto",
         "--raster", "n",
         "--swizzle", "1",
@@ -219,33 +224,11 @@ def gpu_env(cp: int) -> dict[str, str]:
     return env
 
 
-def run_fuse_sweep(args: argparse.Namespace) -> None:
-    for model, seq, cp in cases(args):
-        directory = args.results / "fuse_sweep" / key(model, seq, cp)
-        for comm in args.comm_ctas:
-            output = directory / f"comm{comm}_{args.sweep_warmup}w{args.sweep_iters}i.json"
-            run(
-                fuse_command(model, seq, cp, comm, args.sweep_warmup, args.sweep_iters, output),
-                env=gpu_env(cp), output=output, resume=args.resume,
-            )
-
-
-def best_fuse_sweep(args: argparse.Namespace, model: Model, seq: int, cp: int) -> dict:
-    files = sorted((args.results / "fuse_sweep" / key(model, seq, cp)).glob(
-        f"*_{args.sweep_warmup}w{args.sweep_iters}i.json"
-    ))
-    if not files:
-        raise FileNotFoundError(f"missing fuse sweep for {key(model, seq, cp)}")
-    return min((load(path) for path in files), key=lambda item: item["results"]["fused"]["mean_ms"])
-
-
 def run_fuse_formal(args: argparse.Namespace) -> None:
     for model, seq, cp in cases(args):
-        winner = best_fuse_sweep(args, model, seq, cp)
-        comm = int(winner["comm_ctas"])
         output = args.results / "fuse_formal" / f"{key(model, seq, cp)}_{args.formal_warmup}w{args.formal_iters}i.json"
         run(
-            fuse_command(model, seq, cp, comm, args.formal_warmup, args.formal_iters, output),
+            fuse_command(model, seq, cp, args.formal_warmup, args.formal_iters, output),
             env=gpu_env(cp), output=output, resume=args.resume,
         )
 
@@ -538,7 +521,6 @@ def main() -> None:
             "baseline-formal": run_baseline_formal,
             "baseline-aggregate": baseline_aggregate,
             "shape-table": write_shape_table,
-            "fuse-sweep": run_fuse_sweep,
             "fuse-formal": run_fuse_formal,
         }[phase](args)
 
