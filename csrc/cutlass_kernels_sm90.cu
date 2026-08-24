@@ -2394,49 +2394,15 @@ A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
     A2ALhsGemmPolicy requested) {
   A2ALhsPolicyInfo best{};
   best.estimated_cycles = std::numeric_limits<double>::infinity();
-  const bool one_wave_auto =
-      requested == A2ALhsGemmPolicy::kOneWaveAuto;
   for (const auto& candidate : kLhsPolicyCandidates) {
-    if (requested != A2ALhsGemmPolicy::kAuto && !one_wave_auto &&
+    if (requested != A2ALhsGemmPolicy::kAuto &&
         requested != candidate.policy) {
       continue;
     }
     const auto current = score_a2a_lhs_policy(
         problem, num_comm_ctas, sm_count, candidate);
-    if (requested != A2ALhsGemmPolicy::kAuto && !one_wave_auto) {
+    if (requested != A2ALhsGemmPolicy::kAuto) {
       return current;
-    }
-    if (one_wave_auto) {
-      if (current.estimated_cycles ==
-          std::numeric_limits<double>::infinity()) {
-        continue;
-      }
-      if (best.policy == A2ALhsGemmPolicy::kAuto) {
-        best = current;
-        continue;
-      }
-      // num_comm_ctas is the caller-controlled variable.  It fixes
-      // compute_ctas, and the tile geometry follows deterministically:
-      //   1. minimize the number of resident waves;
-      //   2. maximize useful CTA occupancy across those waves;
-      //   3. use the traffic estimate only to break an exact geometry tie.
-      // This intentionally keeps the first experiment free of calibrated
-      // per-shape constants.
-      const int64_t current_slots =
-          static_cast<int64_t>(current.waves) * current.compute_ctas;
-      const int64_t best_slots =
-          static_cast<int64_t>(best.waves) * best.compute_ctas;
-      const bool fewer_waves = current.waves < best.waves;
-      const bool same_waves = current.waves == best.waves;
-      const bool fuller_waves = same_waves &&
-          current.tile_count * best_slots > best.tile_count * current_slots;
-      const bool same_fill = same_waves &&
-          current.tile_count * best_slots == best.tile_count * current_slots;
-      if (fewer_waves || fuller_waves ||
-          (same_fill && current.estimated_cycles < best.estimated_cycles)) {
-        best = current;
-      }
-      continue;
     }
     // A two-CTA multicast cluster makes a one-wave input consumer advance at
     // the slower ready tile in each pair. Independent CTAs are stronger when
