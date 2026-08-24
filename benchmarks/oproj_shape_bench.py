@@ -81,7 +81,18 @@ def run(command: list[str], *, env: dict[str, str], output: Path, resume: bool) 
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     print("RUN", " ".join(command), flush=True)
-    subprocess.run(command, cwd=ROOT, env=env, check=True)
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        print(completed.stdout, end="")
+        print(completed.stderr, end="")
+        completed.check_returncode()
 
 
 def selected_models(value: str) -> list[Model]:
