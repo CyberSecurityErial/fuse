@@ -81,20 +81,12 @@ def parse_args() -> argparse.Namespace:
             "baseline-aggregate",
             "shape-table",
             "fuse-formal",
-            "fuse-one-wave-comm-sweep",
-            "fuse-one-wave-formal",
         ),
         required=True,
     )
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument("--seqs", type=parse_csv_ints, default=SEQUENCES)
     parser.add_argument("--cps", type=parse_csv_ints, default=CONTEXT_PARALLEL)
-    parser.add_argument(
-        "--one-wave-comm-ctas",
-        type=parse_csv_ints,
-        default=tuple(range(2, 25)),
-        help="Only tunable variable for the one-wave experiment.",
-    )
     parser.add_argument("--nccl-channels", type=parse_csv_ints, default=NCCL_CHANNELS)
     parser.add_argument("--nccl-chunk-kib", type=parse_csv_ints, default=NCCL_CHUNK_KIB)
     parser.add_argument("--nccl-ll-kib", type=parse_csv_ints, default=NCCL_LL_KIB)
@@ -204,8 +196,6 @@ def fuse_command(
     warmup: int,
     iters: int,
     output: Path,
-    comm_ctas: int = 0,
-    lhs_policy: str = "auto",
 ) -> list[str]:
     return [
         str(ROOT / "build" / "fuse_bench"),
@@ -216,10 +206,10 @@ def fuse_command(
         "--batch", "1",
         "--q-heads", str(model.q_heads),
         "--head-dim", str(model.head_dim),
-        # The production baseline passes zero and uses its generic heuristic.
-        # The one-wave experiment passes the only swept variable explicitly.
-        "--comm-ctas", str(comm_ctas),
-        "--lhs-policy", lhs_policy,
+        # Zero delegates CTA count to the production runtime heuristic.  The
+        # benchmark never selects a per-shape winner from a manual sweep.
+        "--comm-ctas", "0",
+        "--lhs-policy", "auto",
         "--raster", "n",
         "--swizzle", "1",
         "--warmup", str(warmup),
@@ -239,69 +229,6 @@ def run_fuse_formal(args: argparse.Namespace) -> None:
         output = args.results / "fuse_formal" / f"{key(model, seq, cp)}_{args.formal_warmup}w{args.formal_iters}i.json"
         run(
             fuse_command(model, seq, cp, args.formal_warmup, args.formal_iters, output),
-            env=gpu_env(cp), output=output, resume=args.resume,
-        )
-
-
-def run_fuse_one_wave_comm_sweep(args: argparse.Namespace) -> None:
-    for model, seq, cp in cases(args):
-        for comm_ctas in args.one_wave_comm_ctas:
-            output = args.results / "fuse_one_wave_comm_sweep" / (
-                f"{key(model, seq, cp)}_comm{comm_ctas}_"
-                f"{args.sweep_warmup}w{args.sweep_iters}i.json"
-            )
-            run(
-                fuse_command(
-                    model,
-                    seq,
-                    cp,
-                    args.sweep_warmup,
-                    args.sweep_iters,
-                    output,
-                    comm_ctas,
-                    "one-wave",
-                ),
-                env=gpu_env(cp), output=output, resume=args.resume,
-            )
-
-
-def best_one_wave_comm(
-    args: argparse.Namespace,
-    model: Model,
-    seq: int,
-    cp: int,
-) -> int:
-    directory = args.results / "fuse_one_wave_comm_sweep"
-    files = sorted(directory.glob(
-        f"{key(model, seq, cp)}_comm*_{args.sweep_warmup}w{args.sweep_iters}i.json"
-    ))
-    if not files:
-        raise FileNotFoundError(f"missing one-wave comm sweep for {key(model, seq, cp)}")
-    winner = min(
-        (load(path) for path in files),
-        key=lambda item: item["results"]["fused"]["mean_ms"],
-    )
-    return int(winner["comm_ctas"])
-
-
-def run_fuse_one_wave_formal(args: argparse.Namespace) -> None:
-    for model, seq, cp in cases(args):
-        comm_ctas = best_one_wave_comm(args, model, seq, cp)
-        output = args.results / "fuse_one_wave_formal" / (
-            f"{key(model, seq, cp)}_comm{comm_ctas}_"
-            f"{args.formal_warmup}w{args.formal_iters}i.json"
-        )
-        run(
-            fuse_command(
-                model,
-                seq,
-                cp,
-                args.formal_warmup,
-                args.formal_iters,
-                output,
-                comm_ctas,
-                "one-wave",
-            ),
             env=gpu_env(cp), output=output, resume=args.resume,
         )
 
@@ -595,8 +522,6 @@ def main() -> None:
             "baseline-aggregate": baseline_aggregate,
             "shape-table": write_shape_table,
             "fuse-formal": run_fuse_formal,
-            "fuse-one-wave-comm-sweep": run_fuse_one_wave_comm_sweep,
-            "fuse-one-wave-formal": run_fuse_one_wave_formal,
         }[phase](args)
 
 
