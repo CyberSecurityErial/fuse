@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
+#define CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED 1
 #include "fuse/kernels.h"
 
 #include "fuse/cutlass_collectives.cuh"
@@ -37,6 +38,7 @@ using Fp8Element = Fp8E4m3;
 using Accumulator = float;
 using TileShape = Shape<_128, _128, _64>;
 using M64TileShape = Shape<_64, _128, _64>;
+using N160TileShape = Shape<_128, _160, _64>;
 using ProjectionTileShape = Shape<_128, _256, _64>;
 using Fp8TileShape = Shape<_128, _128, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
@@ -258,6 +260,52 @@ using A2ALhsInputGemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsInputMainloop,
     BaseEpilogue,
     detail::MonolithicPersistentScheduler>;
+
+using N160Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        N160TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+
+using N160Mainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutB,
+        kAlignment,
+        Accumulator,
+        N160TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename N160Epilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using A2ALhsN160Mainloop = detail::A2ALhsReadyMainloop<N160Mainloop>;
+using A2ALhsN160Gemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    A2ALhsN160Mainloop,
+    N160Epilogue,
+    detail::MonolithicPersistentScheduler>;
+using N160PureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N160Mainloop,
+    N160Epilogue,
+    cutlass::gemm::PersistentScheduler>;
 
 using A2ALhsTelemetryMainloop =
     detail::A2ALhsReadyMainloop<BaseMainloop, 1, true>;
@@ -1131,6 +1179,8 @@ using A2ALhsM64TelemetryInputComm = A2ALhsInputCommT<64, true>;
 using A2AGemmKernel = detail::MonolithicGemm<A2AInputGemm, A2AInputComm>;
 using A2ALhsGemmKernel =
     detail::MonolithicGemm<A2ALhsInputGemm, A2ALhsInputComm>;
+using A2ALhsN160GemmKernel =
+    detail::MonolithicGemm<A2ALhsN160Gemm, A2ALhsInputComm>;
 using A2ALhsTelemetryBase =
     detail::MonolithicGemm<A2ALhsTelemetryGemm, A2ALhsTelemetryInputComm>;
 using A2ALhsTelemetryKernel =
@@ -1156,6 +1206,11 @@ static_assert(
         kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
             kA2ALhsBulkSlots * sizeof(uint64_t),
     "A2A LHS monolithic shared storage must hold every bulk slot");
+static_assert(
+    sizeof(typename A2ALhsN160GemmKernel::SharedStorage) >=
+        kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
+            kA2ALhsBulkSlots * sizeof(uint64_t),
+    "N160 A2A LHS monolithic shared storage must hold every bulk slot");
 static_assert(
     sizeof(typename A2ALhsProjectionGemmKernel::SharedStorage) >=
         kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
@@ -2264,6 +2319,15 @@ bool use_m64_a2a_lhs_policy(
   return m128_tiles * n128_tiles * params.gemm.l < compute_ctas;
 }
 
+bool use_n160_a2a_lhs_policy(
+    const A2AGemmParams& params, int32_t compute_ctas) {
+  const int64_t m_tiles = ceil_div(params.gemm.m, 128);
+  const int64_t n128_tiles = ceil_div(params.gemm.n, 128);
+  const int64_t n160_tiles = ceil_div(params.gemm.n, 160);
+  return m_tiles * n128_tiles * params.gemm.l > compute_ctas &&
+      m_tiles * n160_tiles * params.gemm.l <= compute_ctas;
+}
+
 cudaError_t launch_a2a_lhs_gemm_impl(
     const A2AGemmParams& params,
     cudaStream_t stream,
@@ -2276,6 +2340,12 @@ cudaError_t launch_a2a_lhs_gemm_impl(
     }
     return launch_a2a_lhs_gemm_policy<
         A2ALhsProjectionGemm, A2ALhsProjectionGemmKernel>(
+            params, stream, sm_count, device);
+  }
+  if (use_n160_a2a_lhs_policy(
+          params, sm_count - params.num_comm_ctas)) {
+    return launch_a2a_lhs_gemm_policy<
+        A2ALhsN160Gemm, A2ALhsN160GemmKernel>(
             params, stream, sm_count, device);
   }
   if (use_m64_a2a_lhs_policy(
@@ -3158,6 +3228,11 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
         return cudaErrorInvalidValue;
       }
       return launch_a2a_lhs_reference_impl<ProjectionPureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas);
+    }
+    if (use_n160_a2a_lhs_policy(
+            params, sm_count - params.num_comm_ctas)) {
+      return launch_a2a_lhs_reference_impl<N160PureGemm>(
           params, stream, sm_count, device, reserved_comm_ctas);
     }
     if (use_m64_a2a_lhs_policy(
