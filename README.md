@@ -100,3 +100,4 @@ python3 benchmarks/oproj_shape_bench.py \
 | 8 | 9 | 1.35×–2.86× | 58.5%–83.2% |
 
 完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)。
+其中也包含全局序列 128K/256K/512K 的 CP4/CP8 完整基线配置与融合结果。

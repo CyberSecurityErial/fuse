@@ -1,0 +1,266 @@
+{
+  "mode": "oproj_a2a_gemm",
+  "model_shape": {
+    "batch": 1,
+    "global_seq": 131072,
+    "seq_local": 32768,
+    "hidden": 4096,
+    "q_heads": 32,
+    "head_dim": 128
+  },
+  "gemm_shape": {
+    "m": 32768,
+    "n": 4096,
+    "k": 4096,
+    "l": 1
+  },
+  "world_size": 4,
+  "warmup": 3,
+  "iterations": 12,
+  "dtype": "bfloat16",
+  "timing": "per-sample max-rank CUDA-event critical path",
+  "scope": "TE Ulysses inverse A2A (including reorder) + output projection",
+  "include_te": true,
+  "cuda_graph": true,
+  "nccl_high_priority": true,
+  "environment": {
+    "NCCL_MIN_P2P_NCHANNELS": "24",
+    "NCCL_MAX_P2P_NCHANNELS": "24",
+    "NCCL_P2P_NVL_CHUNKSIZE": "1048576",
+    "NCCL_P2P_LL_THRESHOLD": "131072",
+    "NCCL_GRAPH_REGISTER": "1",
+    "NCCL_LOCAL_REGISTER": "1",
+    "NCCL_IB_DISABLE": "1"
+  },
+  "devices": [
+    {
+      "rank": 0,
+      "name": "NVIDIA L20X",
+      "compute_capability": "9.0",
+      "sm_count": 132,
+      "total_memory_bytes": 150121021440
+    },
+    {
+      "rank": 1,
+      "name": "NVIDIA L20X",
+      "compute_capability": "9.0",
+      "sm_count": 132,
+      "total_memory_bytes": 150121021440
+    },
+    {
+      "rank": 2,
+      "name": "NVIDIA L20X",
+      "compute_capability": "9.0",
+      "sm_count": 132,
+      "total_memory_bytes": 150121021440
+    },
+    {
+      "rank": 3,
+      "name": "NVIDIA L20X",
+      "compute_capability": "9.0",
+      "sm_count": 132,
+      "total_memory_bytes": 150121021440
+    }
+  ],
+  "software": {
+    "torch": "2.9.0+cu128",
+    "transformer_engine": "2.19.0.dev0+a7aec214",
+    "torch_cuda": "12.8",
+    "nccl": "2.27.5"
+  },
+  "cublaslt_plans": [
+    {
+      "returned": 8,
+      "valid": 8,
+      "algo_id": 66,
+      "tile_id": 209,
+      "stages_id": 35,
+      "split_k": 1,
+      "reduction": 0,
+      "cta_swizzle": 0,
+      "custom": 6,
+      "inner_shape": 0,
+      "cluster_shape": 5,
+      "workspace_bytes": 4,
+      "tune_ms": 1.441951036453247,
+      "waves": 28.5
+    },
+    {
+      "returned": 8,
+      "valid": 8,
+      "algo_id": 66,
+      "tile_id": 209,
+      "stages_id": 35,
+      "split_k": 1,
+      "reduction": 0,
+      "cta_swizzle": 0,
+      "custom": 6,
+      "inner_shape": 0,
+      "cluster_shape": 5,
+      "workspace_bytes": 4,
+      "tune_ms": 1.455947756767273,
+      "waves": 28.5
+    },
+    {
+      "returned": 8,
+      "valid": 8,
+      "algo_id": 66,
+      "tile_id": 209,
+      "stages_id": 35,
+      "split_k": 1,
+      "reduction": 0,
+      "cta_swizzle": 0,
+      "custom": 6,
+      "inner_shape": 0,
+      "cluster_shape": 5,
+      "workspace_bytes": 4,
+      "tune_ms": 1.397066593170166,
+      "waves": 28.5
+    },
+    {
+      "returned": 8,
+      "valid": 8,
+      "algo_id": 66,
+      "tile_id": 209,
+      "stages_id": 35,
+      "split_k": 1,
+      "reduction": 0,
+      "cta_swizzle": 0,
+      "custom": 6,
+      "inner_shape": 0,
+      "cluster_shape": 5,
+      "workspace_bytes": 4,
+      "tune_ms": 1.4552608728408813,
+      "waves": 28.5
+    }
+  ],
+  "implementations": {
+    "te_oproj": "transformer_engine.pytorch.Linear",
+    "cublaslt_oproj": "explicit cuBLASLt, 64 heuristic candidates, locally timed winner",
+    "inverse_a2a": "TE flash_attn_a2a_communicate / NCCL"
+  },
+  "correctness": {
+    "inverse_a2a_reference_mismatches": 0,
+    "cublaslt_vs_torch_mm_max_abs": 0.0
+  },
+  "derived": {},
+  "results": {
+    "te_oproj_gemm": {
+      "mean_ms": 1.4444000124931335,
+      "p50_ms": 1.44404798746109,
+      "p95_ms": 1.4471136450767519,
+      "min_ms": 1.4411200284957886,
+      "max_ms": 1.4473600387573242,
+      "tflops_per_gpu": 761.2237733771321,
+      "aggregate_tflops": 3044.8950935085286
+    },
+    "cublaslt_oproj_gemm": {
+      "mean_ms": 1.5220933357874553,
+      "p50_ms": 1.5115360021591187,
+      "p95_ms": 1.5443983852863312,
+      "min_ms": 1.5041279792785645,
+      "max_ms": 1.54476797580719,
+      "tflops_per_gpu": 722.3680716052589,
+      "aggregate_tflops": 2889.4722864210357
+    },
+    "te_nccl_inverse_a2a": {
+      "mean_ms": 2.0705546935399375,
+      "p50_ms": 2.070080041885376,
+      "p95_ms": 2.0799152731895445,
+      "min_ms": 2.0557119846343994,
+      "max_ms": 2.080672025680542,
+      "payload_gbps_per_gpu": 129.6442237616373,
+      "remote_gbps_per_gpu": 97.23316782122798
+    },
+    "te_nccl_oproj_boundary": {
+      "mean_ms": 3.3047146797180176,
+      "p50_ms": 3.3034400939941406,
+      "p95_ms": 3.316911911964416,
+      "min_ms": 3.2911999225616455,
+      "max_ms": 3.3170878887176514,
+      "tflops_per_gpu": 332.7100020234783,
+      "aggregate_tflops": 1330.8400080939132
+    },
+    "cublaslt_nccl_oproj_boundary": {
+      "mean_ms": 3.2921573321024575,
+      "p50_ms": 3.2915520668029785,
+      "p95_ms": 3.3042655110359194,
+      "min_ms": 3.277535915374756,
+      "max_ms": 3.3101439476013184,
+      "tflops_per_gpu": 333.9790650508866,
+      "aggregate_tflops": 1335.9162602035465
+    }
+  },
+  "samples_ms": {
+    "te_oproj_gemm": [
+      1.4423359632492065,
+      1.4440319538116455,
+      1.4473600387573242,
+      1.4411200284957886,
+      1.4419840574264526,
+      1.4468159675598145,
+      1.4438079595565796,
+      1.44486403465271,
+      1.4426560401916504,
+      1.4469120502471924,
+      1.4440640211105347,
+      1.4468480348587036
+    ],
+    "cublaslt_oproj_gemm": [
+      1.5126080513000488,
+      1.508895993232727,
+      1.5415359735488892,
+      1.542464017868042,
+      1.5440959930419922,
+      1.5380480289459229,
+      1.54476797580719,
+      1.505087971687317,
+      1.5076160430908203,
+      1.5041279792785645,
+      1.5054080486297607,
+      1.5104639530181885
+    ],
+    "te_nccl_inverse_a2a": [
+      2.080672025680542,
+      2.0787839889526367,
+      2.079296112060547,
+      2.0736958980560303,
+      2.075103998184204,
+      2.0664000511169434,
+      2.0653440952301025,
+      2.0636160373687744,
+      2.0557119846343994,
+      2.0722880363464355,
+      2.0678720474243164,
+      2.0678720474243164
+    ],
+    "te_nccl_oproj_boundary": [
+      3.316767930984497,
+      3.3041601181030273,
+      3.3150720596313477,
+      3.2981760501861572,
+      3.302720069885254,
+      3.2976319789886475,
+      3.3011200428009033,
+      3.3170878887176514,
+      3.291520118713379,
+      3.2911999225616455,
+      3.3044159412384033,
+      3.316704034805298
+    ],
+    "cublaslt_nccl_oproj_boundary": [
+      3.2929279804229736,
+      3.2810239791870117,
+      3.2994558811187744,
+      3.277535915374756,
+      3.292448043823242,
+      3.2962241172790527,
+      3.289760112762451,
+      3.290656089782715,
+      3.2985599040985107,
+      3.288991928100586,
+      3.3101439476013184,
+      3.2881600856781006
+    ]
+  }
+}
