@@ -92,12 +92,11 @@ python3 benchmarks/oproj_shape_bench.py \
 
 ## 性能
 
-实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 取 TE、cuBLAS、cuBLASLt 中较快者。吞吐只计算 GEMM FLOPs，延迟包含通信。
+实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
 | CP | case 数 | 相对最优分离 | 纯 GEMM 的百分比 |
 |---:|---:|---:|---:|
-| 4 | 9 | 1.17×–2.23× | 50.9%–80.1% |
-| 8 | 9 | 1.35×–2.86× | 58.5%–83.2% |
+| 4 | 18 | 1.17×–2.23× | 54.7%–90.2% |
+| 8 | 18 | 1.12×–2.86× | 59.8%–97.1% |
 
-完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)。
-其中也包含全局序列 128K/256K/512K 的 CP4/CP8 完整基线配置与融合结果。
+全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)。
