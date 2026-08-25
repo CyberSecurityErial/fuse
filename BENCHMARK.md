@@ -8,6 +8,83 @@
 - 融合吞吐只计算 GEMM FLOPs，耗时包含 A2A；
 - correctness 失败的配置不进入比较。
 
+## 常见 GQA 模型的 O-projection N/K
+
+O-projection 的逻辑 GEMM 为 `[M, K] × [K, N] -> [M, N]`：
+
+```text
+N = hidden_size
+K = num_attention_heads × head_dim = Hq × D
+M = batch × global_sequence_length / CP
+```
+
+下表只收录 `1 < Hkv < Hq` 的 GQA 模型；MHA、MQA 和 MLA 不在表内。`Hkv` 会影响 QKV projection 和 KV cache，但不会缩小 O-projection 的 `K`。Base/Instruct 或量化版只要 attention config 相同就合并为一行。这是 shape 对照表，不表示下列 checkpoint 都已进入 Golden 性能表。
+
+| 模型 / 系列 | N | Hq | Hkv | D | K |
+|---|---:|---:|---:|---:|---:|
+| 本项目生产 Qwen dense | 2,048 | 16 | 8 | 128 | 2,048 |
+| Llama 2 70B | 8,192 | 64 | 8 | 128 | 8,192 |
+| Llama 3 / 3.1 8B，Llama 3.2 Vision 11B | 4,096 | 32 | 8 | 128 | 4,096 |
+| Llama 3 / 3.1 / 3.3 70B，Llama 3.2 Vision 90B | 8,192 | 64 | 8 | 128 | 8,192 |
+| Llama 3.1 405B | 16,384 | 128 | 8 | 128 | 16,384 |
+| Llama 3.2 1B | 2,048 | 32 | 8 | 64 | 2,048 |
+| Llama 3.2 3B | 3,072 | 24 | 8 | 128 | 3,072 |
+| Llama 4 Scout 17B-16E / Maverick 17B-128E | 5,120 | 40 | 8 | 128 | 5,120 |
+| Qwen2 / Qwen2.5 0.5B | 896 | 14 | 2 | 64 | 896 |
+| Qwen2 / Qwen2.5 1.5B，Qwen2.5-Coder 1.5B | 1,536 | 12 | 2 | 128 | 1,536 |
+| Qwen2.5 3B | 2,048 | 16 | 2 | 128 | 2,048 |
+| Qwen2 / Qwen2.5 7B，Qwen2.5-Coder 7B | 3,584 | 28 | 4 | 128 | 3,584 |
+| Qwen2.5 14B | 5,120 | 40 | 8 | 128 | 5,120 |
+| Qwen1.5 32B，Qwen2.5 32B / Coder 32B | 5,120 | 40 | 8 | 128 | 5,120 |
+| Qwen1.5 110B，Qwen2 / Qwen2.5 72B | 8,192 | 64 | 8 | 128 | 8,192 |
+| Qwen3 0.6B | 1,024 | 16 | 8 | 128 | 2,048 |
+| Qwen3 1.7B | 2,048 | 16 | 8 | 128 | 2,048 |
+| Qwen3 4B | 2,560 | 32 | 8 | 128 | 4,096 |
+| Qwen3 8B | 4,096 | 32 | 8 | 128 | 4,096 |
+| Qwen3 14B | 5,120 | 40 | 8 | 128 | 5,120 |
+| Qwen3 32B | 5,120 | 64 | 8 | 128 | 8,192 |
+| Qwen3 30B-A3B | 2,048 | 32 | 4 | 128 | 4,096 |
+| Qwen3 235B-A22B | 4,096 | 64 | 4 | 128 | 8,192 |
+| Qwen3-Next 80B-A3B（Gated Attention 层） | 2,048 | 16 | 2 | 256 | 4,096 |
+| Mistral 7B / Mixtral 8x7B / Ministral 8B | 4,096 | 32 | 8 | 128 | 4,096 |
+| Mixtral 8x22B | 6,144 | 48 | 8 | 128 | 6,144 |
+| Mistral-Nemo 12B / Mistral Small 24B | 5,120 | 32 | 8 | 128 | 4,096 |
+| Mistral Large 123B | 12,288 | 96 | 8 | 128 | 12,288 |
+| Gemma 2 2B | 2,304 | 8 | 4 | 256 | 2,048 |
+| Gemma 2 9B | 3,584 | 16 | 8 | 256 | 4,096 |
+| Gemma 2 27B | 4,608 | 32 | 16 | 128 | 4,096 |
+| Gemma 3 4B | 2,560 | 8 | 4 | 256 | 2,048 |
+| Gemma 3 12B | 3,840 | 16 | 8 | 256 | 4,096 |
+| Gemma 3 27B | 5,376 | 32 | 16 | 128 | 4,096 |
+| Phi-3 Small 7B | 4,096 | 32 | 8 | 128 | 4,096 |
+| Phi-3 Medium 14B / Phi-4 14B | 5,120 | 40 | 10 | 128 | 5,120 |
+| Phi-4 Mini 3.8B | 3,072 | 24 | 8 | 128 | 3,072 |
+| InternLM2.5 1.8B | 2,048 | 16 | 8 | 128 | 2,048 |
+| InternLM2.5 7B | 4,096 | 32 | 8 | 128 | 4,096 |
+| InternLM2.5 20B | 6,144 | 48 | 8 | 128 | 6,144 |
+| GLM-4 9B | 4,096 | 32 | 2 | 128 | 4,096 |
+| GLM-4.5-Air | 4,096 | 96 | 8 | 128 | 12,288 |
+| GLM-4.5 | 5,120 | 96 | 8 | 128 | 12,288 |
+| GPT-OSS 20B / 120B | 2,880 | 64 | 8 | 64 | 4,096 |
+| Nemotron-4 340B | 18,432 | 96 | 8 | 192 | 18,432 |
+| Granite 3.1 MoE 1B-A400M | 1,024 | 16 | 8 | 64 | 1,024 |
+| Granite 3.1 MoE 3B-A800M | 1,536 | 24 | 8 | 64 | 1,536 |
+| Granite 3.1 2B | 2,048 | 32 | 8 | 64 | 2,048 |
+| Granite 3.1/3.2/3.3 8B | 4,096 | 32 | 8 | 128 | 4,096 |
+| Falcon3 1B | 2,048 | 8 | 4 | 256 | 2,048 |
+| Falcon3 3B / 7B / 10B | 3,072 | 12 | 4 | 256 | 3,072 |
+| StarCoder2 3B | 3,072 | 24 | 2 | 128 | 3,072 |
+| StarCoder2 7B | 4,608 | 36 | 4 | 128 | 4,608 |
+| StarCoder2 15B | 6,144 | 48 | 4 | 128 | 6,144 |
+| TinyLlama 1.1B | 2,048 | 32 | 4 | 64 | 2,048 |
+| StableLM 2 12B | 5,120 | 32 | 8 | 160 | 5,120 |
+| MiniCPM4 0.5B | 1,024 | 16 | 2 | 64 | 1,024 |
+| MiniCPM4 8B | 4,096 | 32 | 2 | 128 | 4,096 |
+
+表中数值逐项取自公开 checkpoint 的 `config.json` 或官方架构清单，主要入口包括 [Meta Llama model SKUs](https://github.com/meta-llama/llama-models/blob/main/models/sku_list.py)、[Qwen2.5](https://huggingface.co/Qwen/Qwen2.5-72B/blob/main/config.json)、[Qwen3](https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json)、[Qwen3-Next](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json)、[Mistral](https://huggingface.co/mistralai/Mistral-Small-24B-Base-2501/blob/main/config.json)、[Gemma 2](https://huggingface.co/docs/transformers/model_doc/gemma2)、[Gemma 3](https://huggingface.co/docs/transformers/model_doc/gemma3)、[Phi](https://huggingface.co/microsoft/phi-4/blob/main/config.json)、[InternLM](https://huggingface.co/internlm/internlm2_5-20b/blob/main/config.json)、[GLM-4.5](https://huggingface.co/zai-org/GLM-4.5/blob/main/config.json)、[GPT-OSS](https://huggingface.co/openai/gpt-oss-120b/blob/main/original/config.json)、[Nemotron-4](https://huggingface.co/nvidia/Nemotron-4-340B-Instruct/blob/main/model_config.yaml)、[Granite](https://huggingface.co/ibm-granite/granite-3.3-8b-base/blob/main/config.json)、[Falcon3](https://huggingface.co/tiiuae/Falcon3-10B-Base/blob/main/config.json)、[StarCoder2](https://huggingface.co/bigcode/starcoder2-15b/blob/main/config.json) 和 [MiniCPM4](https://huggingface.co/openbmb/MiniCPM4-8B/blob/main/config.json)。
+
+对当前 Golden 的解读：`4096×4096` 和 `5120×5120` 覆盖了大量主流 GQA 模型；`7168×16384` 是宽 K 压力 shape，不对应上表中的某个具体 GQA checkpoint。GQA 泛化后续应优先补 `N≠K` 的家族，特别是 `1024×2048`、`2560×4096`、`5120×4096`、`4096×8192`、`2880×4096` 和 `4096×12288`。
+
 ## 基线如何调优
 
 纯 GEMM 同时测 TE Linear、经典 cuBLAS 和 cuBLASLt。cuBLASLt 使用64 MiB workspace，请求最多64个 heuristic；每个可运行候选做5次 warmup + 30次计时，保留本地实测最快项。
