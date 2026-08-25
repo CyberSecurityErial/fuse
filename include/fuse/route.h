@@ -13,7 +13,6 @@ namespace fuse {
 
 enum class RouteKind : int32_t {
   kHeadToSequence = 0,
-  kSequenceToHead = 1,
   kQkvGqaPack = 2,
 };
 

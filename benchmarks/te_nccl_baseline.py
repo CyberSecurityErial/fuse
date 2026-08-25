@@ -218,9 +218,7 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=(
             "qkv_gemm_a2a",
-            "a2a_gemm",
             "oproj_a2a_gemm",
-            "ulysses_forward",
         ),
         required=True,
     )
@@ -892,28 +890,6 @@ def exact_te_source_route_check(
     return int(total)
 
 
-def expand_gqa_value(
-    value: torch.Tensor,
-    *,
-    batch: int,
-    local_q_heads: int,
-    local_kv_heads: int,
-) -> torch.Tensor:
-    """Expose local KV groups to query groups without copying the common case."""
-    global_seq, head_dim = value.shape[1], value.shape[-1]
-    base = value.permute(0, 2, 1, 3).reshape(
-        batch * local_kv_heads, global_seq, head_dim
-    )
-    aliases = local_q_heads // local_kv_heads
-    if batch == 1 and local_kv_heads == 1:
-        return base.expand(local_q_heads, global_seq, head_dim)
-    return (
-        base.view(batch, local_kv_heads, 1, global_seq, head_dim)
-        .expand(batch, local_kv_heads, aliases, global_seq, head_dim)
-        .reshape(batch * local_q_heads, global_seq, head_dim)
-    )
-
-
 def overlap_summary(
     compute: dict[str, float],
     communication: dict[str, float],
@@ -953,7 +929,6 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
     qkv_m = args.batch * seq_local
     qkv_n = (args.q_heads + 2 * args.kv_heads) * args.head_dim
     local_q_heads = args.q_heads // world
-    pv_l = args.batch * local_q_heads
     generator = torch.Generator(device=device).manual_seed(1701 + rank)
 
     x = torch.empty(
@@ -1080,7 +1055,7 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             ),
         }
 
-    if args.mode in ("qkv_gemm_a2a", "ulysses_forward"):
+    if args.mode == "qkv_gemm_a2a":
         if args.include_te:
             measure("te_qkv_gemm", te_project, flops=qkv_flops)
         measure("cublas_qkv_gemm", cublas_project, flops=qkv_flops)
@@ -1111,71 +1086,8 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
                 "te_source_qkv_gemm_a2a", te_source_qkv_gemm_a2a, flops=qkv_flops
             )
 
-    if args.mode in ("a2a_gemm", "ulysses_forward"):
-        probability = torch.empty(
-            (pv_l, args.global_seq, args.global_seq),
-            dtype=torch.bfloat16,
-            device=device,
-        ).uniform_(-0.125, 0.125, generator=generator)
-        pv_output = torch.empty(
-            (pv_l, args.global_seq, args.head_dim),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        value = routes.v(qkv_cublas)
-
-        def cublas_bmm() -> torch.Tensor:
-            return torch.bmm(probability, value, out=pv_output)
-
-        def nccl_v_a2a() -> torch.Tensor:
-            return routes.v(qkv_cublas)
-
-        def nccl_v_a2a_bmm() -> torch.Tensor:
-            routed = routes.v(qkv_cublas)
-            return torch.bmm(probability, routed, out=pv_output)
-
-        pv_flops = 2 * pv_l * args.global_seq * args.global_seq * args.head_dim
-        measure("nccl_v_a2a", nccl_v_a2a, payload_bytes=v_payload)
-        measure("cublas_pv_bmm", cublas_bmm, flops=pv_flops)
-        measure("nccl_v_a2a_cublas_pv_bmm", nccl_v_a2a_bmm, flops=pv_flops)
-
-        if args.mode == "ulysses_forward":
-            total_flops = qkv_flops + pv_flops
-
-            def te_boundary_pair() -> torch.Tensor:
-                qkv = te_project()
-                routes.qk(qkv)
-                routed_v = routes.v(qkv)
-                return torch.bmm(probability, routed_v, out=pv_output)
-
-            def cublas_boundary_pair() -> torch.Tensor:
-                qkv = cublas_project()
-                routes.qk(qkv)
-                routed_v = routes.v(qkv)
-                return torch.bmm(probability, routed_v, out=pv_output)
-
-            def te_source_boundary_pair() -> torch.Tensor:
-                _, _, value_source = te_source_qkv_a2a(te_project())
-                routed_v = expand_gqa_value(
-                    value_source,
-                    batch=args.batch,
-                    local_q_heads=local_q_heads,
-                    local_kv_heads=args.kv_heads // world,
-                )
-                return torch.bmm(probability, routed_v, out=pv_output)
-
-            if args.include_te:
-                measure("te_nccl_boundary_pair", te_boundary_pair, flops=total_flops)
-            measure(
-                "cublas_nccl_boundary_pair", cublas_boundary_pair, flops=total_flops
-            )
-            if args.include_source:
-                measure(
-                    "te_source_boundary_pair", te_source_boundary_pair, flops=total_flops
-                )
-
     derived: dict[str, object] = {}
-    if args.mode in ("qkv_gemm_a2a", "ulysses_forward"):
+    if args.mode == "qkv_gemm_a2a":
         if args.include_te:
             derived["te_qkv_qk_overlap"] = overlap_summary(
                 metrics["te_qkv_gemm"]["stats"],
@@ -1187,29 +1099,6 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             metrics["nccl_qk_a2a"]["stats"],
             metrics["cublas_qkv_gemm_qk_a2a"]["stats"],
         )
-    if args.mode in ("a2a_gemm", "ulysses_forward"):
-        derived["nccl_v_cublas_pv_overlap"] = overlap_summary(
-            metrics["cublas_pv_bmm"]["stats"],
-            metrics["nccl_v_a2a"]["stats"],
-            metrics["nccl_v_a2a_cublas_pv_bmm"]["stats"],
-        )
-    if args.mode == "ulysses_forward":
-        prefixes = ("te", "cublas") if args.include_te else ("cublas",)
-        for prefix in prefixes:
-            separated_mean = (
-                metrics[f"{prefix}_qkv_gemm_qk_a2a"]["stats"]["mean_ms"]
-                + metrics["nccl_v_a2a_cublas_pv_bmm"]["stats"]["mean_ms"]
-            )
-            separated_p50 = (
-                metrics[f"{prefix}_qkv_gemm_qk_a2a"]["stats"]["p50_ms"]
-                + metrics["nccl_v_a2a_cublas_pv_bmm"]["stats"]["p50_ms"]
-            )
-            pair = metrics[f"{prefix}_nccl_boundary_pair"]["stats"]
-            derived[f"{prefix}_joint_boundary_pair"] = {
-                "mean_separate_over_joint": separated_mean / pair["mean_ms"],
-                "p50_separate_over_joint": separated_p50 / pair["p50_ms"],
-            }
-
     return {
         "mode": args.mode,
         "model_shape": {
@@ -1223,19 +1112,13 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         },
         "gemm_shapes": {
             "qkv": {"m": qkv_m, "n": qkv_n, "k": args.hidden, "l": 1},
-            "pv": {
-                "m": args.global_seq,
-                "n": args.head_dim,
-                "k": args.global_seq,
-                "l": pv_l,
-            },
         },
         "world_size": world,
         "warmup": args.warmup,
         "iterations": args.iters,
         "dtype": "bfloat16",
         "timing": "per-sample max-rank CUDA-event critical path",
-        "scope": "QKV projection + Q/K A2A and V A2A + PV; QK/softmax excluded",
+        "scope": "QKV projection followed by the forward Ulysses Q/K/V A2A",
         "include_te": args.include_te,
         "include_source": args.include_source,
         "cuda_graph": args.cuda_graph,
@@ -1265,7 +1148,6 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         "implementations": {
             "te_qkv": "transformer_engine.pytorch.Linear",
             "cublas_qkv": "torch.mm(out=...), PyTorch CUDA BLAS",
-            "pv": "torch.bmm(out=...), PyTorch CUDA BLAS",
             "a2a": "torch.distributed.all_to_all_single / NCCL grouped send-recv",
         },
         "correctness": check,
