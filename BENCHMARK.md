@@ -107,7 +107,13 @@ python3 benchmarks/oproj_shape_bench.py \
 
 融合侧内部 exact correctness 全部通过。外部基线中，CP4 大模型 256K/512K 与 CP8 大模型 512K 的物化 PyTorch 参考张量达到单次 CUDA launch 索引上限，因此这些 case 的外部正式计时使用 `--no-check`；TE/NCCL 与 cuBLASLt/NCCL 的计时路径不变。
 
-配置缩写：`ch/chunk/LL/G/HP` 分别表示 NCCL channel 数、P2P chunk KiB、LL threshold KiB、CUDA Graph 和高优先级 stream。cuBLASLt 的 `A/T/S/C/U/SK` 分别是 algo、tile、stages、cluster、custom option 和 split-K；同一格多个 plan 表示不同 rank 的本地 autotune winner 不同。
+配置缩写说明：
+
+- `ch`：NCCL P2P channel 数；channel 越多，并行通信队列越多，同时也会增加调度与资源开销。
+- `chunk`：NVLink P2P 每个 channel 一次推进的数据块大小，单位 KiB；`LL` 是切换 NCCL LL 协议的消息阈值，单位 KiB。
+- `G`：是否使用 CUDA Graph；`HP`：NCCL stream 是否使用高优先级。`1` 表示开启，`0` 表示关闭。
+- cuBLASLt 的 `A/T/S/C/U/SK` 分别是 algo ID、tile ID、pipeline stage ID、cluster shape ID、custom option 和 split-K 数。它们是 cuBLASLt 返回的内部枚举，与 CUDA/cuBLASLt 版本绑定；同一格出现多个 plan，表示各 rank 本地 autotune 得到的 winner 不同。
+- 经典 cuBLAS 表中的 `T/N` 是 column-major ABI 下的转置参数；对应的逻辑运算仍是 row-major `A × B^T`。BF16 输入输出，FP32 累加，Tensor Core 路径。
 
 ### TE + NCCL 最优配置
 
