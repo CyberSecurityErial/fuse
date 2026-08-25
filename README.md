@@ -41,7 +41,6 @@ DeepGEMM           ec757bd0ba89bc3458d7c47456e197b10179bc8c
 ```bash
 git clone https://github.com/CyberSecurityErial/fuse.git
 cd fuse
-git checkout oproj-a2a-golden-auto-20260825
 
 CUTLASS_ROOT=/path/to/TransformerEngine/3rdparty/cutlass \
 DEEPGEMM_ROOT=/path/to/DeepGEMM \

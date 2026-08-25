@@ -256,7 +256,7 @@ python3 benchmarks/oproj_shape_bench.py \
 | 8 | 大 | 256K | `32768×7168×16384` | Lt+NCCL 20.306 / 379.0 | 11.310 | 680.5 | 1.795× | 97.1% | `comm4/M128N256 C2` |
 | 8 | 大 | 512K | `65536×7168×16384` | Lt+NCCL 33.456 / 460.1 | 22.949 | 670.7 | 1.458× | 94.6% | `comm4/M128N256 C2` |
 
-正式归档目录：`results/oproj_shape_bench`、`results/oproj_shape_bench_cp8`、`results/oproj_shape_bench_longseq_cp4`、`results/oproj_shape_bench_longseq_cp8`。长序列目录还保留了融合侧 1M 数据；由于没有正式外部分离基线，1M 不进入上述 SOTA 对照表。
+正式归档目录：`results/oproj_shape_bench`、`results/oproj_shape_bench_cp8`、`results/oproj_shape_bench_longseq_cp4`、`results/oproj_shape_bench_longseq_cp8`。每个目录的 `baseline_summary.*` 保存外部 winner，`fused_summary.*` 保存我方正式延迟、吞吐、tile 和 wave，`shape_matrix.*` 保存形状。长序列目录还保留融合侧 1M 数据；由于没有正式外部分离基线，1M 不进入上述 SOTA 对照表。
 
 ## TE Userbuffers 强基线（独立对照）
 
@@ -328,4 +328,4 @@ python3 benchmarks/oproj_shape_bench.py \
 - 大宽度长序列六个点全部领先，延迟比为1.048×～1.148×。当前实现的优势随`N=7168,K=16384`这类高计算密度shape变得稳定。
 - TE UB的获胜配置同时包含SM copy与Copy Engine，因此现有数据不支持把差距归结为某一种搬运引擎。后续定位需在完全相同的本地M上分别测pure GEMM、route和融合timeline。
 
-调优脚本为 `benchmarks/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/te_userbuffers_oproj.py`。正式汇总位于 `results/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/te_userbuffers_shape_bench_longseq/summary.{json,csv}`，每行都保留 sweep winner 与 formal JSON 的路径。
+调优脚本为 `benchmarks/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/te_userbuffers_oproj.py`。正式汇总位于 `results/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/te_userbuffers_shape_bench_longseq/summary.{json,csv}`；每行直接保存 winner 配置、正式延迟和吞吐，原始 sweep 文件可由脚本重建。

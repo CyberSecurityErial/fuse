@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
             "baseline-aggregate",
             "shape-table",
             "fuse-formal",
+            "fuse-aggregate",
         ),
         required=True,
     )
@@ -234,6 +235,75 @@ def run_fuse_formal(args: argparse.Namespace) -> None:
             fuse_command(model, seq, cp, args.formal_warmup, args.formal_iters, output),
             env=gpu_env(cp), output=output, resume=args.resume,
         )
+
+
+def fuse_aggregate(args: argparse.Namespace) -> None:
+    rows = []
+    for model, seq, cp in cases(args):
+        formal = sorted(
+            (args.results / "fuse_formal").glob(f"{key(model, seq, cp)}_*.json")
+        )
+        if not formal:
+            raise FileNotFoundError(
+                f"missing fused formal result for {key(model, seq, cp)}"
+            )
+        data = load(formal[0])
+        shape = data["shape"]
+        flops = 2.0 * shape["m"] * shape["n"] * shape["k"]
+
+        def p50_tflops(name: str) -> float:
+            return flops / data["results"][name]["p50_ms"] / 1.0e9
+
+        fused = data["results"]["fused"]
+        cublas = data["results"]["cublas"]
+        cublaslt = data["results"]["cublaslt_autotuned"]
+        pure_best_p50 = min(cublas["p50_ms"], cublaslt["p50_ms"])
+        policy = data["lhs_policy"]
+        rows.append({
+            "model": model.name,
+            "aliases": model.aliases,
+            "global_seq": seq,
+            "cp": cp,
+            "m": shape["m"],
+            "n": shape["n"],
+            "k": shape["k"],
+            "comm_ctas": data["comm_ctas"],
+            "policy": policy["name"],
+            "tile_m": policy["tile_m"],
+            "tile_n": policy["tile_n"],
+            "tile_k": policy["tile_k"],
+            "cluster_m": policy["cluster_m"],
+            "waves": policy["waves"],
+            "last_wave_ctas": policy["last_wave_ctas"],
+            "fused_mean_ms": fused["mean_ms"],
+            "fused_p50_ms": fused["p50_ms"],
+            "fused_p95_ms": fused["p95_ms"],
+            "fused_p50_tflops_per_gpu": p50_tflops("fused"),
+            "cublas_p50_ms": cublas["p50_ms"],
+            "cublas_p50_tflops_per_gpu": p50_tflops("cublas"),
+            "cublaslt_p50_ms": cublaslt["p50_ms"],
+            "cublaslt_p50_tflops_per_gpu": p50_tflops("cublaslt_autotuned"),
+            "fused_throughput_as_cublas_percent":
+                100.0 * cublas["p50_ms"] / fused["p50_ms"],
+            "fused_throughput_as_best_pure_percent":
+                100.0 * pure_best_p50 / fused["p50_ms"],
+            "same_policy_p50_ms":
+                data["results"]["same_policy_cutlass"]["p50_ms"],
+            "compute_subgrid_p50_ms":
+                data["results"]["compute_subgrid_cutlass"]["p50_ms"],
+            "route_p50_ms": data["results"]["inverse_a2a_route"]["p50_ms"],
+            "sequential_p50_ms":
+                data["results"]["same_policy_sequential"]["p50_ms"],
+            "overlap_ratio": data["overlap_ratio"],
+        })
+    args.results.mkdir(parents=True, exist_ok=True)
+    with (args.results / "fused_summary.json").open("w") as handle:
+        json.dump(rows, handle, indent=2)
+    fields = list(rows[0])
+    with (args.results / "fused_summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def nccl_configs(args: argparse.Namespace) -> list[tuple[int, int, int]]:
@@ -532,6 +602,7 @@ def main() -> None:
             "baseline-aggregate": baseline_aggregate,
             "shape-table": write_shape_table,
             "fuse-formal": run_fuse_formal,
+            "fuse-aggregate": fuse_aggregate,
         }[phase](args)
 
 

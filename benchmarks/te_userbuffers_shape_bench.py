@@ -227,7 +227,7 @@ def summarize(args: argparse.Namespace) -> None:
     rows = []
     for name, hidden, q_heads, head_dim, seq, cp in cases(args):
         key = base_key(name, seq, cp)
-        config, sweep_path = best_sweep(args.results, key)
+        config, _ = best_sweep(args.results, key)
         formal_paths = list((args.results / "formal").glob(f"{key}_*.json"))
         if not formal_paths:
             continue
@@ -241,7 +241,6 @@ def summarize(args: argparse.Namespace) -> None:
             **asdict(config), "math_sm": config.math_sm,
             "p50_ms": stats["p50_ms"], "p95_ms": stats["p95_ms"],
             "p50_tflops_per_gpu": p50_tflops,
-            "sweep_json": str(sweep_path), "formal_json": str(formal_path),
         })
     args.results.mkdir(parents=True, exist_ok=True)
     (args.results / "summary.json").write_text(json.dumps(rows, indent=2) + "\n")

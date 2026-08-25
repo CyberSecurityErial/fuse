@@ -19,31 +19,6 @@ constexpr int kReadyFlagStride = 32;
 using Bf16 = cutlass::bfloat16_t;
 using Fp8E4m3 = cutlass::float_e4m3_t;
 
-// Generic layout for strided RHS shards consumed by A2A -> GEMM.  Each peer
-// owns [outer_batch, rows_per_peer, global_input_groups, group_width].  This
-// rank gathers its contiguous input-group shard from every peer, concatenates
-// the row shards, optionally aliases each input group to multiple local GEMM
-// groups, and writes the transposed GEMM RHS.
-struct A2AGemmLayout {
-  int32_t world_size = 1;
-  int32_t rank = 0;
-  int32_t outer_batch = 1;
-  int32_t rows_per_peer = 0;
-  int32_t global_rows = 0;
-  int32_t global_input_groups = 0;
-  int32_t local_gemm_groups = 0;
-  int32_t group_width = 0;
-};
-
-enum class A2AGemmOperand : int32_t {
-  // Communication produces GEMM A. Used by inverse head-to-sequence A2A
-  // followed by the dense attention output projection.
-  kLhs = 0,
-  // Communication produces GEMM B. Retained for the optional deferred-V
-  // path and other grouped/strided RHS gathers.
-  kRhs = 1,
-};
-
 // Finite, precompiled Hopper policies for inverse A2A -> dense GEMM.  Auto
 // ranks the same candidates from the actual problem and resident compute-CTA
 // budget; explicit values are useful for reproducible policy sweeps.
@@ -68,41 +43,26 @@ struct A2ALhsPolicyInfo {
   double estimated_cycles = 0.0;
 };
 
-// A2A -> dense/strided-batched GEMM. kLhs prepares the row-major activation
-// matrix consumed by an output projection; kRhs prepares a natural row-major
-// RHS for the optional deferred-V and grouped paths. The compute role waits
-// only at contiguous ready-group boundaries along K.
-//   lhs:         [gemm.l, gemm.m, gemm.k]
-//   peer_rhs[r]: [outer_batch, rows_per_peer,
-//                 global_input_groups, group_width]
-//   rhs_nt:      [gemm.l, gemm.k, gemm.n], or one shared [gemm.k, gemm.n]
-//                matrix when gemm.stride_b.batch is zero
+// Inverse head-to-sequence A2A followed by dense O-projection. Communication
+// prepares the row-major activation matrix consumed by GEMM; the compute role
+// waits only at contiguous peer boundaries along K.
+//   peer_input[r]: [batch, global_seq, local_heads, head_dim]
+//   input_staging: [gemm.m, gemm.k]
+//   rhs_nt:        [gemm.k, gemm.n]
 //   output:      [gemm.l, gemm.m, gemm.n]
-// ready requires a2a_lhs_gemm_ready_elements(gemm, route) entries for kLhs or
-// a2a_gemm_ready_elements(layout) entries for kRhs. Epoch zero is reserved and
-// the same shape must be used while a ready buffer is reused monotonically.
+// ready requires a2a_lhs_gemm_ready_elements(gemm, route) entries. Epoch zero
+// is reserved and the same shape must be used while a ready buffer is reused
+// monotonically.
 struct A2AGemmParams {
-  A2AGemmOperand input_operand = A2AGemmOperand::kRhs;
-  const Bf16* lhs = nullptr;
-  // kLhs input: peer_input[r] is [batch, global_seq, local_heads, head_dim].
-  // input_staging is [gemm.m, gemm.k] and becomes CUTLASS operand A.
   const Bf16* peer_input[kMaxWorldSize]{};
   Bf16* input_staging = nullptr;
-  const Bf16* peer_rhs[kMaxWorldSize]{};
-  // Optional producer epochs for peer_rhs. When input_epoch is nonzero, the
-  // communication role waits for peer_input_ready[peer] before reading that
-  // peer. This permits producer and consumer kernels on different GPUs to be
-  // submitted without a host-side all-rank barrier.
+  // Optional producer epochs. When input_epoch is nonzero, communication waits
+  // for peer_input_ready[peer] before reading that peer.
   const uint32_t* peer_input_ready[kMaxWorldSize]{};
-  // Elements between adjacent [global_input_groups, group_width] rows. A
-  // negative value selects the packed global_input_groups * group_width
-  // stride.
-  int64_t peer_rhs_row_stride = -1;
   Bf16* rhs_nt = nullptr;
   Bf16* output = nullptr;
   uint32_t* ready = nullptr;
   GemmShape4D gemm;
-  A2AGemmLayout layout;
   UlyssesRoute route;
   int32_t num_comm_ctas = 0;
   A2ALhsGemmPolicy lhs_policy = A2ALhsGemmPolicy::kAuto;
@@ -111,16 +71,10 @@ struct A2AGemmParams {
   float alpha = 1.0f;
 };
 
-// Generic dense/strided-batched GEMM followed by an output route.
-// lhs:          [l, m, k]
-// rhs_nt:       [l, n, k]
-// local_output: [l, m, n]
-//
-// HEAD_TO_SEQUENCE:
-//   peer_output[r]: [batch, seq_local, global_heads, head_dim]
-// SEQUENCE_TO_HEAD:
-//   peer_output[r]: [batch, local_heads, global_seq, head_dim]
-// QKV_GQA_PACK (l=1 dense QKV projection):
+// Dense QKV projection followed by the forward Ulysses A2A pack.
+//   lhs:          [m, k]
+//   rhs_nt:       [n, k]
+//   local_output: [m, n]
 //   peer_output[r] is one allocation containing three contiguous tensors:
 //     Q [batch, global_seq, q_heads/world, head_dim]
 //     K [batch, global_seq, kv_heads/world, head_dim]
@@ -221,12 +175,6 @@ KernelTraits cutlass_kernel_traits();
 KernelTraits projection_cutlass_kernel_traits();
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem);
 KernelTraits fp8_cutlass_kernel_traits();
-
-int32_t recommended_a2a_gemm_comm_ctas(
-    const GemmProblem& problem,
-    const A2AGemmLayout& layout);
-
-int64_t a2a_gemm_ready_elements(const A2AGemmLayout& layout);
 
 int64_t a2a_lhs_gemm_ready_elements(
     const GemmProblem& problem,

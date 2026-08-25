@@ -787,162 +787,6 @@ void smoke_fp8_qkv_gqa_pack(
   }
 }
 
-void smoke_a2a_gemm(
-    int world,
-    const std::vector<RankRuntime>& runtimes,
-    int seq_local = 64) {
-  constexpr int batch = 1;
-  constexpr int local_q_heads = 8;
-  constexpr int local_kv_heads = 1;
-  constexpr int head_dim = 128;
-  const int global_seq = seq_local * world;
-  const int q_heads = local_q_heads * world;
-  const int kv_heads = local_kv_heads * world;
-  const int qkv_width = (q_heads + 2 * kv_heads) * head_dim;
-  const int v_offset = (q_heads + kv_heads) * head_dim;
-  const int l = batch * local_q_heads;
-  fuse::A2AGemmLayout ready_layout{};
-  ready_layout.world_size = world;
-  ready_layout.outer_batch = batch;
-  ready_layout.rows_per_peer = seq_local;
-  ready_layout.global_rows = global_seq;
-  ready_layout.global_input_groups = kv_heads;
-  ready_layout.local_gemm_groups = local_q_heads;
-  ready_layout.group_width = head_dim;
-  const int64_t ready_count = fuse::a2a_gemm_ready_elements(ready_layout);
-  const int64_t probability_elements =
-      static_cast<int64_t>(l) * global_seq * global_seq;
-  const int64_t value_elements =
-      static_cast<int64_t>(batch) * seq_local * qkv_width;
-  const int64_t staging_elements =
-      static_cast<int64_t>(head_dim) * global_seq;
-  const int64_t output_elements =
-      static_cast<int64_t>(l) * global_seq * head_dim;
-
-  std::vector<Bf16*> probability(world);
-  std::vector<Bf16*> peer_value(world);
-  std::vector<Bf16*> staging(world);
-  std::vector<Bf16*> output(world);
-  std::vector<Bf16*> reference(world);
-  std::vector<uint32_t*> ready(world);
-  std::vector<std::vector<Bf16>> host_value(world);
-  std::vector<std::vector<Bf16>> host_staging(world);
-  std::vector<fuse::A2AGemmParams> params(world);
-
-  for (int rank = 0; rank < world; ++rank) {
-    const auto host_probability =
-        make_values(probability_elements, 401 + rank);
-    host_value[rank] = make_values(value_elements, 503 + rank);
-    probability[rank] = device_alloc<Bf16>(rank, probability_elements);
-    peer_value[rank] = device_alloc<Bf16>(rank, value_elements);
-    staging[rank] = device_alloc<Bf16>(rank, staging_elements);
-    output[rank] = device_alloc<Bf16>(rank, output_elements);
-    reference[rank] = device_alloc<Bf16>(rank, output_elements);
-    ready[rank] = device_alloc<uint32_t>(rank, ready_count);
-    upload(rank, probability[rank], host_probability);
-    upload(rank, peer_value[rank], host_value[rank]);
-    CUDA_CHECK(cudaMemsetAsync(
-        staging[rank],
-        0,
-        staging_elements * sizeof(Bf16),
-        runtimes[rank].stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        output[rank],
-        0,
-        output_elements * sizeof(Bf16),
-        runtimes[rank].stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        reference[rank],
-        0,
-        output_elements * sizeof(Bf16),
-        runtimes[rank].stream));
-    CUDA_CHECK(cudaMemsetAsync(
-        ready[rank],
-        0,
-        ready_count * sizeof(uint32_t),
-        runtimes[rank].stream));
-  }
-
-  for (int rank = 0; rank < world; ++rank) {
-    auto& p = params[rank];
-    p.lhs = probability[rank];
-    for (int peer = 0; peer < world; ++peer) {
-      p.peer_rhs[peer] = peer_value[peer] + v_offset;
-    }
-    p.peer_rhs_row_stride = qkv_width;
-    p.rhs_nt = staging[rank];
-    p.output = output[rank];
-    p.ready = ready[rank];
-    p.gemm = {global_seq, head_dim, global_seq, l};
-    p.gemm.stride_b.batch = 0;
-    p.layout.world_size = world;
-    p.layout.rank = rank;
-    p.layout.outer_batch = batch;
-    p.layout.rows_per_peer = seq_local;
-    p.layout.global_rows = global_seq;
-    p.layout.global_input_groups = kv_heads;
-    p.layout.local_gemm_groups = local_q_heads;
-    p.layout.group_width = head_dim;
-    p.num_comm_ctas = 8;
-    p.epoch = 1;
-  }
-
-  for (uint32_t epoch = 1; epoch <= g_epoch_iterations; ++epoch) {
-    for (int rank = 0; rank < world; ++rank) {
-      CUDA_CHECK(cudaSetDevice(rank));
-      params[rank].epoch = epoch;
-      CUDA_CHECK(fuse::launch_a2a_gemm_cutlass(
-          params[rank], runtimes[rank].stream));
-    }
-    sync_all(runtimes);
-  }
-
-  float route_error = 0.0f;
-  for (int rank = 0; rank < world; ++rank) {
-    auto& expected = host_staging[rank];
-    expected.resize(staging_elements);
-    const int global_kv = rank * local_kv_heads;
-    for (int global_token = 0; global_token < global_seq; ++global_token) {
-      for (int d = 0; d < head_dim; ++d) {
-        const int peer = global_token / seq_local;
-        const int local_token = global_token - peer * seq_local;
-        const int64_t src =
-            static_cast<int64_t>(local_token) * qkv_width + v_offset +
-            global_kv * head_dim + d;
-        const int64_t dst =
-            static_cast<int64_t>(global_token) * head_dim + d;
-        expected[dst] = host_value[peer][src];
-      }
-    }
-    const auto actual = download(rank, staging[rank], staging_elements);
-    route_error = std::max(route_error, max_abs_diff(actual, expected));
-    upload(rank, staging[rank], expected);
-    auto reference_params = params[rank];
-    reference_params.output = reference[rank];
-    CUDA_CHECK(cudaSetDevice(rank));
-    CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_reference(
-        reference_params, runtimes[rank].stream));
-  }
-  sync_all(runtimes);
-
-  ErrorMetrics worst{};
-  for (int rank = 0; rank < world; ++rank) {
-    const auto actual = download(rank, output[rank], output_elements);
-    const auto expected = download(rank, reference[rank], output_elements);
-    const auto error = error_metrics(actual, expected);
-    worst.max_abs = std::max(worst.max_abs, error.max_abs);
-    worst.max_relative = std::max(worst.max_relative, error.max_relative);
-    worst.relative_l2 = std::max(worst.relative_l2, error.relative_l2);
-  }
-  std::cout << "V A2A->PV CP=" << world
-            << " route_max_abs=" << route_error
-            << " output_max_abs=" << worst.max_abs
-            << " output_rel_l2=" << worst.relative_l2 << "\n";
-  if (route_error != 0.0f || worst.max_abs != 0.0f) {
-    throw std::runtime_error("V A2A->PV correctness failed");
-  }
-}
-
 void smoke_a2a_lhs_gemm(
     int world,
     const std::vector<RankRuntime>& runtimes,
@@ -1028,7 +872,6 @@ void smoke_a2a_lhs_gemm(
 
   for (int rank = 0; rank < world; ++rank) {
     auto& p = params[rank];
-    p.input_operand = fuse::A2AGemmOperand::kLhs;
     for (int peer = 0; peer < world; ++peer) {
       p.peer_input[peer] = peer_input[peer];
     }
@@ -1188,19 +1031,11 @@ int main(int argc, char** argv) {
               << " threads=" << fp8_traits.threads
               << " smem=" << fp8_traits.dynamic_smem_bytes << "\n";
     if (quick) {
-      // Two 128-row readiness groups per peer exercise the fine-grained K
-      // publication path without making the quick smoke test large.
-      smoke_a2a_gemm(2, runtimes, 256);
       smoke_a2a_lhs_gemm(2, runtimes, 1, 150, 8, 64, 512, true, true);
       smoke_qkv_gqa_pack(2, runtimes, 1, 150, 8, 4, 80, true);
       smoke_qkv_gqa_pack(2, runtimes, 1, 128, 8, 4, 64, false, false);
       smoke_fp8_qkv_gqa_pack(2, runtimes, 1, 128, 8, 4, 64, false);
     } else {
-      for (int cp : {2, 4, 8}) {
-        if (cp <= world) {
-          smoke_a2a_gemm(cp, runtimes);
-        }
-      }
       smoke_a2a_lhs_gemm(2, runtimes, 1, 128, 8, 64, 512, false, false);
       smoke_qkv_gqa_pack(2, runtimes, 1, 128, 8, 4, 64, false);
       smoke_fp8_qkv_gqa_pack(2, runtimes, 1, 128, 8, 4, 64, false);
