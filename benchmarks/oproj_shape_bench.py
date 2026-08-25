@@ -253,7 +253,7 @@ def external_matrix_command(
     warmup: int,
     iters: int,
 ) -> list[str]:
-    return [
+    command = [
         str(args.torchrun), "--standalone", f"--nproc-per-node={cp}",
         str(ROOT / "benchmarks" / "te_nccl_baseline.py"),
         "--mode", "oproj_a2a_gemm",
@@ -266,6 +266,13 @@ def external_matrix_command(
         "--cublaslt-tune-warmup", str(args.cublaslt_tune_warmup),
         "--cublaslt-tune-iters", str(args.cublaslt_tune_iters),
     ]
+    # PyTorch's materialized route reference exceeds a single CUDA launch's
+    # indexing limit at 2^30 BF16 elements.  The timed TE/NCCL path remains
+    # valid; exact fused-route checks are performed by fuse_bench.
+    route_elements = seq * (model.q_heads // cp) * model.head_dim
+    if route_elements >= (1 << 30):
+        command.append("--no-check")
+    return command
 
 
 def nccl_environment_values(config: tuple[int, int, int]) -> dict[str, str]:

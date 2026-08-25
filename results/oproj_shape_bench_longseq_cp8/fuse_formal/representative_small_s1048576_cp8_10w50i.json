@@ -1,0 +1,22 @@
+{
+  "mode": "a2a_gemm_lhs",
+  "shape": {"m": 131072, "n": 4096, "k": 4096, "l": 1},
+  "world_size": 8,
+  "comm_ctas": 4,
+  "warmup": 10,
+  "iterations": 50,
+  "dtype": "bfloat16",
+  "timing": "max-rank critical path",
+  "overlap_ratio": 0.8273972225,
+  "lhs_policy": {"name": "m128n256_cluster_m2", "tile_m": 128, "tile_n": 256, "tile_k": 64, "cluster_m": 2, "compute_ctas": 128, "tile_count": 16384, "waves": 128, "last_wave_ctas": 128, "estimated_cycles": 6422528},
+  "results": {
+    "cublas": {"mean_ms": 6.346833248, "p50_ms": 6.344304085, "p95_ms": 6.364526749, "min_ms": 6.33734417, "max_ms": 6.394783974, "tflops_per_gpu": 692.9513254, "aggregate_tflops": 5543.610603},
+    "cublaslt_autotuned": {"mean_ms": 6.262065258, "p50_ms": 6.260975838, "p95_ms": 6.271692753, "min_ms": 6.251167774, "max_ms": 6.277311802, "tflops_per_gpu": 702.3316318, "aggregate_tflops": 5618.653054},
+    "same_policy_cutlass": {"mean_ms": 6.390300789, "p50_ms": 6.398943901, "p95_ms": 6.430692673, "min_ms": 6.336256027, "max_ms": 6.470399857, "tflops_per_gpu": 688.2377929, "aggregate_tflops": 5505.902343},
+    "compute_subgrid_cutlass": {"mean_ms": 6.555652494, "p50_ms": 6.563008308, "p95_ms": 6.580563068, "min_ms": 6.504928112, "max_ms": 6.59833622, "tflops_per_gpu": 670.8785304, "aggregate_tflops": 5367.028243},
+    "inverse_a2a_route": {"mean_ms": 9.592819214, "p50_ms": 9.59201622, "p95_ms": 9.677932739, "min_ms": 9.502528191, "max_ms": 9.720159531, "tflops_per_gpu": 458.4727819, "aggregate_tflops": 3667.782255, "payload_gbps_per_gpu": 111.9318315, "remote_gbps_per_gpu": 97.94035258},
+    "same_policy_sequential": {"mean_ms": 16.04716854, "p50_ms": 16.04105759, "p95_ms": 16.14609909, "min_ms": 15.90563202, "max_ms": 16.20998383, "tflops_per_gpu": 274.0699395, "aggregate_tflops": 2192.559516},
+    "cublaslt_sequential": {"mean_ms": 15.89741566, "p50_ms": 15.89020824, "p95_ms": 15.99174881, "min_ms": 15.76387215, "max_ms": 16.0435524, "tflops_per_gpu": 276.651665, "aggregate_tflops": 2213.21332},
+    "fused": {"mean_ms": 10.69580288, "p50_ms": 10.69134331, "p95_ms": 10.77310848, "min_ms": 10.61497593, "max_ms": 10.78102398, "tflops_per_gpu": 411.1936767, "aggregate_tflops": 3289.549414}
+  }
+}

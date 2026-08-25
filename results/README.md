@@ -20,6 +20,16 @@ Committed directories:
 - `oproj_shape_bench`: CP4 formal fused results, selected formal external
   baselines, summaries, and shape definitions;
 - `oproj_shape_bench_cp8`: the corresponding CP8 dataset.
+- `oproj_shape_bench_longseq_cp4`: CP4 data for global sequence lengths
+  128K, 256K, and 512K, plus fused-only 1M measurements;
+- `oproj_shape_bench_longseq_cp8`: the corresponding CP8 long-sequence data.
+
+The long-sequence SOTA comparison excludes 1M because no formal external
+TE/NCCL or cuBLASLt/NCCL rerun was requested for that length. Fused internal
+exact checks passed. A small number of very large external cases use
+`--no-check` only for the materialized PyTorch reference, whose single-launch
+indexing limit is exceeded; the timed baseline path is unchanged. Exact files
+and scope are recorded in each JSON.
 
 The exhaustive NCCL and execution-mode search points are committed alongside
 the formal reruns, so the selected baseline can be independently audited.
