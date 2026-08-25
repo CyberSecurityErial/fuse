@@ -56,6 +56,7 @@ class CublasLtRunner:
         tune_warmup: int,
         tune_iters: int,
         workspace_mib: int,
+        sm_count_target: int = 0,
     ) -> None:
         self.library = ctypes.CDLL(str(library))
         self.library.fuse_cublaslt_last_error.restype = ctypes.c_char_p
@@ -73,6 +74,11 @@ class CublasLtRunner:
             ctypes.c_uint64,
         ]
         self.library.fuse_cublaslt_bf16_create.restype = ctypes.c_void_p
+        self.library.fuse_cublaslt_bf16_create_ex.argtypes = [
+            *self.library.fuse_cublaslt_bf16_create.argtypes,
+            ctypes.c_int,
+        ]
+        self.library.fuse_cublaslt_bf16_create_ex.restype = ctypes.c_void_p
         self.library.fuse_cublaslt_bf16_run.argtypes = [
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -81,6 +87,15 @@ class CublasLtRunner:
             ctypes.c_void_p,
         ]
         self.library.fuse_cublaslt_bf16_run.restype = ctypes.c_int
+        self.library.fuse_cublaslt_bf16_run_beta.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_float,
+        ]
+        self.library.fuse_cublaslt_bf16_run_beta.restype = ctypes.c_int
         self.library.fuse_cublaslt_bf16_info.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(CublasLtInfo),
@@ -97,7 +112,12 @@ class CublasLtRunner:
         if weight_k != k or d.shape != (m, n):
             raise ValueError("incompatible cuBLASLt matrix shapes")
         stream = torch.cuda.current_stream(a.device).cuda_stream
-        self.handle = self.library.fuse_cublaslt_bf16_create(
+        create = (
+            self.library.fuse_cublaslt_bf16_create_ex
+            if sm_count_target > 0
+            else self.library.fuse_cublaslt_bf16_create
+        )
+        create_args = [
             a.device.index,
             m,
             n,
@@ -109,7 +129,10 @@ class CublasLtRunner:
             tune_warmup,
             tune_iters,
             workspace_mib << 20,
-        )
+        ]
+        if sm_count_target > 0:
+            create_args.append(sm_count_target)
+        self.handle = create(*create_args)
         if not self.handle:
             error = self.library.fuse_cublaslt_last_error().decode()
             raise RuntimeError(f"cuBLASLt autotune failed: {error}")
@@ -122,6 +145,22 @@ class CublasLtRunner:
         stream = torch.cuda.current_stream(a.device).cuda_stream
         if not self.library.fuse_cublaslt_bf16_run(
             self.handle, a.data_ptr(), b_nt.data_ptr(), d.data_ptr(), stream
+        ):
+            error = self.library.fuse_cublaslt_last_error().decode()
+            raise RuntimeError(f"cuBLASLt launch failed: {error}")
+        return d
+
+    def accumulate(
+        self, a: torch.Tensor, b_nt: torch.Tensor, d: torch.Tensor, *, beta: float
+    ) -> torch.Tensor:
+        stream = torch.cuda.current_stream(a.device).cuda_stream
+        if not self.library.fuse_cublaslt_bf16_run_beta(
+            self.handle,
+            a.data_ptr(),
+            b_nt.data_ptr(),
+            d.data_ptr(),
+            stream,
+            beta,
         ):
             error = self.library.fuse_cublaslt_last_error().decode()
             raise RuntimeError(f"cuBLASLt launch failed: {error}")

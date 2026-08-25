@@ -1,4 +1,5 @@
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -83,9 +84,9 @@ int algo_u16(const cublasLtMatmulAlgo_t& algorithm,
 }
 
 bool launch(Plan* plan, const void* a, const void* b_nt, void* d,
-            cudaStream_t stream, const cublasLtMatmulAlgo_t& algorithm) {
+            cudaStream_t stream, const cublasLtMatmulAlgo_t& algorithm,
+            float beta = 0.0f) {
   const float alpha = 1.0f;
-  const float beta = 0.0f;
   cublasStatus_t status = cublasLtMatmul(
       plan->handle, plan->operation, &alpha, a, plan->a, b_nt, plan->b,
       &beta, d, plan->c, d, plan->d, &algorithm, plan->workspace,
@@ -128,9 +129,55 @@ float time_candidate(Plan* plan, const void* a, const void* b_nt, void* d,
   return elapsed / iterations;
 }
 
+__global__ void validate_bf16_accumulate_kernel(
+    const __nv_bfloat16* once, const __nv_bfloat16* twice,
+    int64_t count, unsigned int* mismatches) {
+  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  const __nv_bfloat16 expected = __float2bfloat16_rn(2.0f * __bfloat162float(once[index]));
+  if (*reinterpret_cast<const uint16_t*>(&expected) !=
+      *reinterpret_cast<const uint16_t*>(&twice[index])) {
+    atomicAdd(mismatches, 1u);
+  }
+}
+
+bool supports_inplace_accumulate(Plan* plan, const void* a, const void* b_nt,
+                                 void* d, cudaStream_t stream,
+                                 const cublasLtMatmulAlgo_t& algorithm) {
+  const int64_t count = plan->m * plan->n;
+  __nv_bfloat16* once = nullptr;
+  unsigned int* mismatches = nullptr;
+  if (cudaMalloc(&once, static_cast<size_t>(count) * sizeof(*once)) != cudaSuccess ||
+      cudaMalloc(&mismatches, sizeof(*mismatches)) != cudaSuccess) {
+    if (once) cudaFree(once);
+    if (mismatches) cudaFree(mismatches);
+    return false;
+  }
+  bool ok = launch(plan, a, b_nt, d, stream, algorithm, 0.0f) &&
+            cudaMemcpyAsync(once, d, static_cast<size_t>(count) * sizeof(*once),
+                            cudaMemcpyDeviceToDevice, stream) == cudaSuccess &&
+            cudaMemsetAsync(mismatches, 0, sizeof(*mismatches), stream) == cudaSuccess &&
+            launch(plan, a, b_nt, d, stream, algorithm, 1.0f);
+  if (ok) {
+    constexpr int threads = 256;
+    validate_bf16_accumulate_kernel<<<(count + threads - 1) / threads, threads, 0, stream>>>(
+        once, static_cast<const __nv_bfloat16*>(d), count, mismatches);
+    ok = cudaGetLastError() == cudaSuccess;
+  }
+  unsigned int host_mismatches = 1;
+  if (ok) {
+    ok = cudaMemcpyAsync(&host_mismatches, mismatches, sizeof(host_mismatches),
+                         cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+         cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  cudaFree(mismatches);
+  cudaFree(once);
+  return ok && host_mismatches == 0;
+}
+
 bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
                 cudaStream_t stream, int tune_warmup, int tune_iters,
-                size_t workspace_bytes) {
+                size_t workspace_bytes, int sm_count_target = 0) {
   CUDA_TRY(cudaSetDevice(plan->device));
   CUBLAS_TRY(cublasLtCreate(&plan->handle));
   CUBLAS_TRY(cublasLtMatmulDescCreate(
@@ -141,6 +188,11 @@ bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
   CUBLAS_TRY(cublasLtMatmulDescSetAttribute(
       plan->operation, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
+  if (sm_count_target > 0) {
+    CUBLAS_TRY(cublasLtMatmulDescSetAttribute(
+        plan->operation, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,
+        &sm_count_target, sizeof(sm_count_target)));
+  }
   CUBLAS_TRY(cublasLtMatrixLayoutCreate(
       &plan->a, CUDA_R_16BF, plan->m, plan->k, plan->k));
   CUBLAS_TRY(cublasLtMatrixLayoutCreate(
@@ -175,6 +227,8 @@ bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
   for (int i = 0; i < plan->returned; ++i) {
     if (heuristics[i].state != CUBLAS_STATUS_SUCCESS ||
         heuristics[i].workspaceSize > plan->workspace_capacity)
+      continue;
+    if (!supports_inplace_accumulate(plan, a, b_nt, d, stream, heuristics[i].algo))
       continue;
     const float ms = time_candidate(
         plan, a, b_nt, d, stream, heuristics[i].algo,
@@ -253,6 +307,26 @@ void* fuse_cublaslt_bf16_create(
   return plan.release();
 }
 
+void* fuse_cublaslt_bf16_create_ex(
+    int device, int64_t m, int64_t n, int64_t k,
+    const void* a, const void* b_nt, void* d, void* stream,
+    int tune_warmup, int tune_iters, uint64_t workspace_bytes,
+    int sm_count_target) {
+  last_error.clear();
+  auto plan = std::make_unique<Plan>();
+  plan->device = device;
+  plan->m = m;
+  plan->n = n;
+  plan->k = k;
+  if (!initialize(plan.get(), a, b_nt, d,
+                  reinterpret_cast<cudaStream_t>(stream),
+                  tune_warmup, tune_iters, workspace_bytes, sm_count_target)) {
+    destroy(plan.release());
+    return nullptr;
+  }
+  return plan.release();
+}
+
 int fuse_cublaslt_bf16_run(
     void* opaque, const void* a, const void* b_nt, void* d, void* stream) {
   last_error.clear();
@@ -263,6 +337,18 @@ int fuse_cublaslt_bf16_run(
   }
   return launch(plan, a, b_nt, d, reinterpret_cast<cudaStream_t>(stream),
                 plan->algorithm) ? 1 : 0;
+}
+
+int fuse_cublaslt_bf16_run_beta(
+    void* opaque, const void* a, const void* b_nt, void* d, void* stream, float beta) {
+  last_error.clear();
+  auto* plan = reinterpret_cast<Plan*>(opaque);
+  if (!plan) {
+    last_error = "null cuBLASLt plan";
+    return 0;
+  }
+  return launch(plan, a, b_nt, d, reinterpret_cast<cudaStream_t>(stream),
+                plan->algorithm, beta) ? 1 : 0;
 }
 
 int fuse_cublaslt_bf16_info(void* opaque, FuseCublasLtInfo* info) {
