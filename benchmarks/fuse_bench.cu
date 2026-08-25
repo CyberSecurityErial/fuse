@@ -64,6 +64,7 @@ struct Options {
   int swizzle = 1;
   bool role_telemetry = false;
   bool defer_v_a2a = false;
+  bool cuda_graph = false;
   fuse::A2ALhsGemmPolicy lhs_policy = fuse::A2ALhsGemmPolicy::kAuto;
   std::string json_out;
   std::string trace_out;
@@ -186,6 +187,8 @@ Options parse_options(int argc, char** argv) {
       options.role_telemetry = true;
     } else if (argument == "--defer-v-a2a") {
       options.defer_v_a2a = true;
+    } else if (argument == "--cuda-graph") {
+      options.cuda_graph = true;
     } else {
       throw std::runtime_error("unknown argument: " + argument);
     }
@@ -1265,6 +1268,79 @@ std::vector<float> time_all_ranks(
   return samples;
 }
 
+// Pre-instantiate one single-kernel graph per monotonic ready epoch.  Replaying
+// one fixed graph would be incorrect because the fused A2A protocol accumulates
+// arrivals by epoch; graph construction and instantiation remain outside timing.
+std::vector<float> time_all_ranks_graph_sequence(
+    const std::vector<Runtime>& runtime,
+    int warmup,
+    int iterations,
+    uint32_t& epoch,
+    const Launch& launch) {
+  const int world = static_cast<int>(runtime.size());
+  const int total = warmup + iterations;
+  const uint32_t first_epoch = epoch + 1;
+  std::vector<std::vector<cudaGraph_t>> graphs(
+      world, std::vector<cudaGraph_t>(total, nullptr));
+  std::vector<std::vector<cudaGraphExec_t>> graph_execs(
+      world, std::vector<cudaGraphExec_t>(total, nullptr));
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    for (int step = 0; step < total; ++step) {
+      CUDA_CHECK(cudaStreamBeginCapture(
+          runtime[rank].stream, cudaStreamCaptureModeThreadLocal));
+      launch(rank, first_epoch + step);
+      CUDA_CHECK(cudaStreamEndCapture(
+          runtime[rank].stream, &graphs[rank][step]));
+      CUDA_CHECK(cudaGraphInstantiate(
+          &graph_execs[rank][step], graphs[rank][step], nullptr, nullptr, 0));
+    }
+  }
+
+  for (int step = 0; step < warmup; ++step) {
+    for (int rank = 0; rank < world; ++rank) {
+      CUDA_CHECK(cudaSetDevice(rank));
+      CUDA_CHECK(cudaGraphLaunch(
+          graph_execs[rank][step], runtime[rank].stream));
+    }
+    synchronize(runtime);
+  }
+
+  std::vector<float> samples;
+  samples.reserve(iterations);
+  for (int sample = 0; sample < iterations; ++sample) {
+    const int step = warmup + sample;
+    for (int rank = 0; rank < world; ++rank) {
+      CUDA_CHECK(cudaSetDevice(rank));
+      CUDA_CHECK(cudaEventRecord(runtime[rank].start, runtime[rank].stream));
+      CUDA_CHECK(cudaGraphLaunch(
+          graph_execs[rank][step], runtime[rank].stream));
+      CUDA_CHECK(cudaEventRecord(runtime[rank].stop, runtime[rank].stream));
+    }
+    float critical = 0.0f;
+    for (int rank = 0; rank < world; ++rank) {
+      CUDA_CHECK(cudaSetDevice(rank));
+      CUDA_CHECK(cudaEventSynchronize(runtime[rank].stop));
+      float milliseconds = 0.0f;
+      CUDA_CHECK(cudaEventElapsedTime(
+          &milliseconds, runtime[rank].start, runtime[rank].stop));
+      critical = std::max(critical, milliseconds);
+    }
+    samples.push_back(critical);
+  }
+  epoch += total;
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    for (int step = 0; step < total; ++step) {
+      CUDA_CHECK(cudaGraphExecDestroy(graph_execs[rank][step]));
+      CUDA_CHECK(cudaGraphDestroy(graphs[rank][step]));
+    }
+  }
+  return samples;
+}
+
 std::vector<float> time_two_stage_all_ranks(
     const std::vector<Runtime>& runtime,
     int warmup,
@@ -1480,6 +1556,11 @@ void write_json(
          << "  \"comm_ctas\": " << options.comm_ctas << ",\n"
          << "  \"warmup\": " << options.warmup << ",\n"
          << "  \"iterations\": " << options.iterations << ",\n"
+         << "  \"fused_cuda_graph\": "
+         << (options.cuda_graph ? "true" : "false") << ",\n"
+         << "  \"cuda_graph_epoch_mode\": \""
+         << (options.cuda_graph ? "preinstantiated_monotonic_epochs" : "eager")
+         << "\",\n"
          << "  \"dtype\": \""
          << (options.mode == "qkv_gemm_a2a_fp8" ||
                      options.mode == "a2a_gemm_fp8"
@@ -1880,18 +1961,20 @@ void benchmark_a2a_lhs_gemm(
       problem, launch_options.comm_ctas, sm_count, options.lhs_policy);
 
   uint32_t fused_epoch = 0;
-  const auto fused = time_all_ranks(
-      runtime,
-      options.warmup,
-      options.iterations,
-      fused_epoch,
-      [&](int rank, uint32_t epoch) {
-        CUDA_CHECK(cudaSetDevice(rank));
-        params[rank].epoch = epoch;
-        params[rank].output = fused_output[rank];
-        CUDA_CHECK(fuse::launch_a2a_gemm_cutlass(
-            params[rank], runtime[rank].stream));
-      });
+  const Launch fused_launch = [&](int rank, uint32_t epoch) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    params[rank].epoch = epoch;
+    params[rank].output = fused_output[rank];
+    CUDA_CHECK(fuse::launch_a2a_gemm_cutlass(
+        params[rank], runtime[rank].stream));
+  };
+  const auto fused = options.cuda_graph
+      ? time_all_ranks_graph_sequence(
+            runtime, options.warmup, options.iterations, fused_epoch,
+            fused_launch)
+      : time_all_ranks(
+            runtime, options.warmup, options.iterations, fused_epoch,
+            fused_launch);
 
   uint32_t cutlass_epoch = 0;
   const auto cutlass = time_all_ranks(
@@ -3570,6 +3653,10 @@ void validate_fast_path(const Options& options, int world) {
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
+    if (options.cuda_graph && options.mode != "a2a_gemm_lhs") {
+      throw std::runtime_error(
+          "--cuda-graph currently supports only --mode a2a_gemm_lhs");
+    }
     if (setpriority(PRIO_PROCESS, 0, -20) != 0) {
       std::cerr << "note: CPU nice=-20 unavailable; CUDA streams still use highest priority\n";
     }
