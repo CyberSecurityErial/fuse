@@ -85,6 +85,50 @@ M = batch × global_sequence_length / CP
 
 对当前 Golden 的解读：`4096×4096` 和 `5120×5120` 覆盖了大量主流 GQA 模型；`7168×16384` 是宽 K 压力 shape，不对应上表中的某个具体 GQA checkpoint。GQA 泛化后续应优先补 `N≠K` 的家族，特别是 `1024×2048`、`2560×4096`、`5120×4096`、`4096×8192`、`2880×4096` 和 `4096×12288`。
 
+### 稀疏、混合与线性注意力的 MNK
+
+下面统一按 `[M,K] × [K,N] -> [M,N]` 写 GEMM：
+
+```text
+M = batch × global_sequence_length / CP    单卡处理的 token 数
+N = 输出通道数
+K = reduction 维，也就是输入通道数
+```
+
+对普通 GQA，前后两条边界的 shape 是：
+
+```text
+QKVProj + A2A: M × ((Hq + 2Hkv)D) × hidden_size
+A2A + OProj:   M × hidden_size × (HqDv)
+```
+
+`Hq/Hkv` 是 Q/KV head 数，`D` 是普通 GQA 共用的 Q/K/V head dimension，`Dv` 是 value/output head dimension。GQA 描述 KV head 如何共享，稀疏或线性 attention 描述 token 如何混合，是两条独立维度；同一层可以同时使用 GQA 和滑窗稀疏。
+
+滑窗、分块和 token-sparse attention 通常只减少 QK/PV 内部访问的 token pair，仍会给每个 token 做 QKV 和 O projection，因此不会自动缩小这里的 `M/N/K`。线性 attention 会增加 gate、短卷积和状态更新，输入侧往往不再是一条普通 QKV GEMM；下表在这种情况下列真实的 projection 组合。
+
+| 模型 / attention 层 | attention 结构 | 输入侧 projection，M×N×K | O-projection，M×N×K | 当前融合边界 |
+|---|---|---|---|---|
+| Llama 4 Scout / Maverick | chunked GQA | `M×7168×5120` | `M×5120×5120` | QKV、O；CP4/CP8 |
+| Gemma 3 27B | sliding/full GQA | `M×8192×5376` | `M×5376×4096` | QKV、O；CP4/CP8 |
+| GPT-OSS 20B / 120B | sliding/full GQA | `M×5120×2880` | `M×2880×4096` | QKV、O；CP4/CP8 |
+| MiniMax-M2.1 | full GQA；稀疏来自 MoE | `M×8192×3072` | `M×3072×6144` | QKV、O；CP4/CP8 |
+| MiMo-V2-Flash GA / SWA | 1层 global + 5层 sliding；QK `D=192`，V `Dv=128` | GA `M×13568×4096`；SWA `M×14848×4096` | `M×4096×8192` | QKV 需支持不同 QK/V 维；O shape 可复用 |
+| Qwen3-Next Gated Attention | 每4层1层 gated GQA | Q+gate+K+V：`M×9216×2048` | `M×2048×4096` | QKV 需扩 gate 且 `Hkv=2` 不适配 CP4/8；O 在 gate 后可复用 |
+| Qwen3-Next Gated DeltaNet | linear attention | QKVZ `M×12288×2048`；BA `M×64×2048` | `M×2048×4096` | 需要线性 attention 的状态并行边界 |
+| Kimi Linear KDA | 3层 KDA + 1层 global MLA | Q+K+V `M×12288×2304`，另有 gate/conv | `M×2304×4096` | 需要 KDA 状态并行边界 |
+| Kimi Linear global MLA | MLA | Q `M×6144×2304`；KV-A `M×576×2304`；KV-B `M×8192×512` | `M×2304×4096` | QKV 不适用；O shape 可复用 |
+| DeepSeek-V3.2 | DSA + MLA | Q-A `M×1536×7168`；Q-B `M×24576×1536`；KV-A `M×576×7168`；KV-B `M×32768×512`，另有 DSA indexer | `M×7168×16384` | QKV 不适用；O shape 可复用 |
+| Falcon-H1 34B 的 attention 支路 | Mamba2 + GQA hybrid | `M×3584×5120` | `M×5120×2560` | QKV、O；CP4。CP8 的 head 数不可整分 |
+| Nemotron-H 56B 的 attention 层 | Mamba2 + GQA hybrid | `M×10240×8192` | `M×8192×8192` | QKV、O；CP4/CP8 |
+
+当前 Golden 的 `N=5120,K=5120` 正好覆盖 Llama 4 O-projection，`N=7168,K=16384` 正好覆盖 DeepSeek-V3.2 O-projection。MiMo、Qwen3-Next、Kimi Linear 和 Nemotron-H 暴露出的下一组关键 O shape 是 `4096×8192`、`2048×4096`、`2304×4096` 和 `8192×8192`。
+
+表中的“QKV”指 QKVProj+A2A，“O”指 A2A+OProj。“shape 可复用”只表示 O-projection 的 GEMM 几何与当前 kernel 一致；模型还要把 attention 输出接成 `[B,S,Hq,Dv]` 的 Ulysses head-shard 布局。若 sparse attention 直接保留 sequence shard，边界上没有 A2A，也就不该调用这个融合算子。KDA、DeltaNet 一类线性 attention 通常沿 sequence 传递 recurrent state，不能直接套用现有 A2A 协议。
+
+当前 QKV 路径的 head 约束是 `Hq % Hkv == 0`、`Hq % CP == 0`、`Hkv % CP == 0`，且 Q/K/V 共用一个 head dimension；O 路径对应的 head 约束只有 `Hq % CP == 0` 和 `K=Hq×Dv`。两条路径仍需满足数据类型的向量对齐。变长 packing 若导致各 rank 的本地 token 数不同，还需要 ragged route metadata，不能只把表中的 `M` 换成不同数值。
+
+表中架构与数值取自官方配置和实现：[Llama 4](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama4/configuration_llama4.py)、[Gemma 3](https://huggingface.co/docs/transformers/model_doc/gemma3)、[GPT-OSS](https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json)、[MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1/blob/main/config.json)、[MiMo-V2-Flash](https://github.com/XiaomiMiMo/MiMo-V2-Flash)、[Qwen3-Next](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py)、[Kimi Linear](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/main/modeling_kimi.py)、[DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/config.json)、[Falcon-H1](https://huggingface.co/tiiuae/Falcon-H1-34B-Base/blob/main/config.json) 和 [Nemotron-H](https://huggingface.co/nvidia/Nemotron-H-56B-Base-8K/blob/main/config.json)。MoE 只让 FFN 稀疏，不等于 attention 稀疏。
+
 ## 基线如何调优
 
 纯 GEMM 同时测 TE Linear、经典 cuBLAS 和 cuBLASLt。cuBLASLt 使用64 MiB workspace，请求最多64个 heuristic；每个可运行候选做5次 warmup + 30次计时，保留本地实测最快项。
