@@ -10,6 +10,10 @@
 #include <cutlass/bfloat16.h>
 #include <cutlass/float8.h>
 
+#ifndef FUSE_ENABLE_PROFILING
+#define FUSE_ENABLE_PROFILING 0
+#endif
+
 namespace fuse {
 
 constexpr int kMaxWorldSize = 8;
@@ -28,6 +32,9 @@ enum class A2ALhsGemmPolicy : int32_t {
   kM128N128 = 2,
   kM128N160 = 3,
   kM128N256ClusterM2 = 4,
+  // Wide-N cluster policy used when its cluster wave exactly covers complete
+  // M frontiers.
+  kM128N320ClusterM2 = 5,
 };
 
 struct A2ALhsPolicyInfo {
@@ -37,9 +44,15 @@ struct A2ALhsPolicyInfo {
   int32_t tile_k = 0;
   int32_t cluster_m = 0;
   int32_t compute_ctas = 0;
+  int32_t compute_clusters = 0;
   int64_t tile_count = 0;
+  int64_t cluster_tile_count = 0;
+  int32_t n_tiles = 0;
   int32_t waves = 0;
+  int32_t last_wave_clusters = 0;
   int32_t last_wave_ctas = 0;
+  int32_t frontier_aligned = 0;
+  int32_t full_last_wave = 0;
   double estimated_cycles = 0.0;
 };
 
