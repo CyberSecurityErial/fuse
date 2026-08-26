@@ -34,14 +34,14 @@ target_compile_options(
 set_target_properties(fuse_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
 find_package(CUDAToolkit REQUIRED)
-add_executable(fuse_smoke benchmarks/fuse_smoke.cu)
+add_executable(fuse_smoke "benchmarks/a2a+Oproj/fuse_smoke.cu")
 target_link_libraries(fuse_smoke PRIVATE fuse_kernels CUDA::cublas CUDA::cudart)
 target_compile_options(
   fuse_smoke
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
-add_executable(fuse_bench benchmarks/fuse_bench.cu)
+add_executable(fuse_bench "benchmarks/a2a+Oproj/fuse_bench.cu")
 target_link_libraries(
   fuse_bench PRIVATE fuse_kernels CUDA::cublas CUDA::cublasLt CUDA::cudart)
 target_compile_options(
@@ -49,7 +49,23 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
-add_executable(cublaslt_bench benchmarks/cublaslt_bench.cu)
+add_executable(qkvproj_a2a_smoke "benchmarks/QKVproj+a2a/fuse_smoke.cu")
+target_link_libraries(
+  qkvproj_a2a_smoke PRIVATE fuse_kernels CUDA::cublas CUDA::cudart)
+target_compile_options(
+  qkvproj_a2a_smoke
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+
+add_executable(qkvproj_a2a_bench "benchmarks/QKVproj+a2a/fuse_bench.cu")
+target_link_libraries(
+  qkvproj_a2a_bench PRIVATE fuse_kernels CUDA::cublas CUDA::cublasLt CUDA::cudart)
+target_compile_options(
+  qkvproj_a2a_bench
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+
+add_executable(cublaslt_bench "benchmarks/GEMM/cublaslt_bench.cu")
 target_link_libraries(cublaslt_bench PRIVATE CUDA::cublasLt CUDA::cudart)
 target_compile_options(
   cublaslt_bench

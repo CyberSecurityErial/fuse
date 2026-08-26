@@ -54,8 +54,8 @@ indexing limit is exceeded; the timed baseline path is unchanged. The scope
 and selected parameters are recorded in the aggregate JSON files.
 
 The NCCL/execution-mode search is reproducible with
-`benchmarks/oproj_shape_bench.py`; the TE Userbuffers search is reproducible
-with `benchmarks/te_userbuffers_shape_bench.py`. Reproduction writes raw
+`benchmarks/a2a+Oproj/oproj_shape_bench.py`; the TE Userbuffers search is reproducible
+with `benchmarks/a2a+Oproj/te_userbuffers_shape_bench.py`. Reproduction writes raw
 search points to the caller-selected result directory without adding them to
 Git.
 
