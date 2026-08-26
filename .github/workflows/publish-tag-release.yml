@@ -8,6 +8,12 @@ on:
       - "v*"
     paths:
       - .github/workflows/publish-tag-release.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Annotated tag to publish
+        required: true
+        default: v2.0
 
 permissions:
   contents: write
@@ -17,26 +23,81 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Publish GitHub release
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            release_tag="$GITHUB_REF_NAME"
-          else
-            release_tag="v1.0"
-          fi
+          REQUESTED_TAG: ${{ inputs.tag }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const tag = context.ref.startsWith("refs/tags/")
+              ? context.ref.slice("refs/tags/".length)
+              : (process.env.REQUESTED_TAG || "v2.0");
 
-          if gh release view "$release_tag" >/dev/null 2>&1; then
-            exit 0
-          fi
+            const releases = {
+              "v1.0": {
+                name: "v1.0 — A2A + O-projection",
+                body: [
+                  "首个固化的 A2A + O-projection 版本。",
+                  "",
+                  "核心优化：运行时根据 problem shape 与通信 CTA 预算，在已验证 policy 中自动选择 tile，均衡 GEMM waves，避免 Golden shape 上的 wave-cliff 尾波。",
+                  "",
+                  "v1.0 的优化范围是 A2A + OProj；QKVProj + A2A 与 MegaMoE 不属于本版本的性能承诺。",
+                ].join("\n"),
+              },
+              "v2.0": {
+                name: "v2.0 — A2A + O-projection",
+                body: [
+                  "第二个固化的 A2A + O-projection 版本。",
+                  "",
+                  "核心优化：GEMM wave 按 compute cluster 计数并对齐 N frontier，加入 `M128N320 cluster-M2` 与窄 peer shard 的约 8 KiB 3D TMA store；生产入口根据 M、CP、N 和 NVLink 带宽自动选择 `comm4/6/8`。",
+                  "",
+                  "🩵 **相对 v1.0，v2.0 在 25/36 个 case 上更快，36 点延迟比几何平均为 1.089×。** 完整 36-case 表在 `BENCHMARK.md` 现有主表中增加了 `v1 p50 / v1→v2` 列，没有另建表。",
+                  "",
+                  "36/36 case 快于调优后的 TE+NCCL/cuBLASLt+NCCL 最强分离基线，29/36 快于 TE Userbuffers，相对 TE Userbuffers 几何平均 1.110×。",
+                  "",
+                  "生产入口保持 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`。实验性全量成本模型可用 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 开启，默认关闭。",
+                  "",
+                  "v2.0 的优化范围仍是 A2A + OProj；QKVProj + A2A 与 MegaMoE 不属于本版本已收口的性能承诺。",
+                ].join("\n"),
+              },
+            };
 
-          title="$release_tag"
-          if [[ "$release_tag" == "v1.0" ]]; then
-            title="v1.0 — A2A + O-projection"
-          fi
+            const release = releases[tag];
+            if (!release) {
+              core.setFailed(`No curated release notes for ${tag}`);
+              return;
+            }
 
-          gh release create "$release_tag" \
-            --verify-tag \
-            --title "$title" \
-            --notes-from-tag
+            let existing = null;
+            try {
+              existing = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.data.id,
+                tag_name: tag,
+                name: release.name,
+                body: release.body,
+                draft: false,
+                prerelease: false,
+              });
+            } else {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tag,
+                name: release.name,
+                body: release.body,
+                draft: false,
+                prerelease: false,
+              });
+            }
