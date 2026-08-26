@@ -27,6 +27,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 
@@ -2483,8 +2486,213 @@ int64_t a2a_lhs_gemm_ready_elements(
       route.world_size * kReadyFlagStride;
 }
 
-int32_t recommended_a2a_lhs_gemm_comm_ctas(const GemmProblem& problem) {
-  return problem.n >= 4096 ? 4 : 8;
+double a2a_lhs_nvlink_bidirectional_gbps(int32_t device) {
+  if (const char* value = std::getenv("FUSE_NVLINK_BIDIR_GBPS")) {
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (end != value && parsed > 0.0) {
+      return parsed;
+    }
+  }
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+      std::strstr(properties.name, "H800") != nullptr) {
+    return 400.0;
+  }
+  return 900.0;
+}
+
+double a2a_lhs_compute_time_us(
+    const A2ALhsPolicyInfo& policy,
+    int32_t world_size) {
+  // H200 calibration of
+  //   Tcompute = launch + policy_scale * estimated_cycles / rate(waves).
+  // The four constants are a nonlinear least-squares fit to the standalone
+  // compute-subgrid measurements from the CP4 3-width x 6-sequence sweep.
+  // rate is in model-cycles/us; it decays from the short one-wave rate to the
+  // steady persistent-grid rate as the number of waves grows.
+  constexpr double kRateSteady = 1542.6;
+  constexpr double kRateFirstWave = 1739.1;
+  constexpr double kWaveDecay = 10.56;
+  constexpr double kLaunchUs = 5.80;
+  double policy_scale = 1.0;
+  switch (policy.policy) {
+    case A2ALhsGemmPolicy::kM64N128:
+      policy_scale = 1.205;
+      break;
+    case A2ALhsGemmPolicy::kM128N160:
+      policy_scale = 1.019;
+      break;
+    case A2ALhsGemmPolicy::kM128N256ClusterM2:
+      policy_scale = 1.410;
+      break;
+    case A2ALhsGemmPolicy::kM128N320ClusterM2:
+      policy_scale = 1.478;
+      break;
+    default:
+      break;
+  }
+  const double wave_rate = kRateSteady +
+      (kRateFirstWave - kRateSteady) *
+          std::exp(-static_cast<double>(policy.waves - 1) / kWaveDecay);
+  const double cp_scale = std::pow(
+      std::max(1.0, static_cast<double>(world_size) / 4.0), 0.4883);
+  return (kLaunchUs + policy.estimated_cycles * policy_scale / wave_rate) *
+      cp_scale;
+}
+
+double a2a_lhs_route_time_us(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    const A2ALhsPolicyInfo& policy,
+    int32_t comm_ctas,
+    double nvlink_bidirectional_gbps) {
+  // H200 calibration of
+  //   Troute = launch + payload/B(comm) + rows/(comm*row_rate)
+  //            + task_waves/task_rate.
+  // These constants are a log-error least-squares fit to the matching CP4
+  // standalone route sweep.  B(comm)=Bmax*(1-exp(-comm/cta_scale)); the
+  // explicit row and task terms retain the effects of shard width, ReadyBlockM
+  // and the four bulk-TMA issuers in each communication CTA.
+  constexpr double kLaunchUs = 9.20;
+  constexpr double kCopyBmaxGbs = 528.8;
+  constexpr double kCopyCtaScale = 4.961;
+  constexpr double kStoreRowsPerUs = 41912.0;
+  constexpr double kTasksPerUs = 0.3874;
+  const int32_t world_size = route.world_size;
+  const int32_t row_bytes = problem.k / world_size * sizeof(Element);
+  const int32_t max_rows = row_bytes > 0
+      ? kA2ALhsBulkStageBytes / row_bytes
+      : 0;
+  const int32_t comm_rows = max_rows > 0
+      ? std::min(policy.tile_m, max_rows)
+      : kA2ALhsCommRows;
+  const int64_t chunks_per_tile = ceil_div(policy.tile_m, comm_rows);
+  const int64_t tasks =
+      ceil_div(problem.m, policy.tile_m) * world_size * chunks_per_tile;
+  const int64_t task_waves =
+      ceil_div(tasks, static_cast<int64_t>(comm_ctas * kA2ALhsBulkSlots));
+
+  const double issuer_bandwidth = kCopyBmaxGbs *
+      (1.0 - std::exp(-static_cast<double>(comm_ctas) / kCopyCtaScale));
+  const double remote_fraction =
+      static_cast<double>(world_size - 1) / world_size;
+  const double fabric_bandwidth = remote_fraction > 0.0
+      ? 0.5 * nvlink_bidirectional_gbps / remote_fraction
+      : kCopyBmaxGbs;
+  const double bandwidth = std::min(issuer_bandwidth, fabric_bandwidth);
+  const double payload_bytes =
+      static_cast<double>(problem.m) * problem.k * sizeof(Element);
+  const double copy_us = payload_bytes / bandwidth / 1000.0;
+  const double store_us =
+      static_cast<double>(problem.m) * world_size /
+      (comm_ctas * kStoreRowsPerUs);
+  const double task_us = task_waves / kTasksPerUs;
+  const double cp_scale = std::pow(
+      std::max(1.0, static_cast<double>(world_size) / 4.0), 0.2022);
+  return (kLaunchUs + copy_us + store_us + task_us) * cp_scale;
+}
+
+int32_t experimental_a2a_lhs_gemm_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t sm_count,
+    int32_t device) {
+  constexpr std::array<int32_t, 10> kCommCandidates{
+      2, 4, 6, 8, 10, 12, 14, 16, 20, 24};
+  // Candidate score:
+  //   compute + route_weight*max(0, route-hidden_fraction*compute)
+  //           + contention_weight*compute*(comm_ctas/sm_count)^power.
+  // The four dimensionless coefficients minimize selection regret over the
+  // complete CP4/CP8 3-width x 6-sequence sweeps; CP4 10+50 finalists carry
+  // twice the quick-sweep weight.  Shape enters only through the compute and
+  // route models above: there is no fitted sequence-length threshold.
+  constexpr double kExposedRouteWeight = 0.584;
+  constexpr double kHiddenRouteFraction = 0.365;
+  constexpr double kCommContentionWeight = 7.84;
+  constexpr double kCommContentionPower = 1.737;
+  const double nvlink_gbps = a2a_lhs_nvlink_bidirectional_gbps(device);
+  int32_t best_comm_ctas = 4;
+  double best_score = std::numeric_limits<double>::infinity();
+  for (const int32_t comm_ctas : kCommCandidates) {
+    if (comm_ctas >= sm_count) {
+      continue;
+    }
+    const auto policy = select_a2a_lhs_policy_impl(
+        problem, comm_ctas, sm_count, A2ALhsGemmPolicy::kAuto);
+    if (!std::isfinite(policy.estimated_cycles)) {
+      continue;
+    }
+    const double compute_us =
+        a2a_lhs_compute_time_us(policy, route.world_size);
+    const double route_us = a2a_lhs_route_time_us(
+        problem, route, policy, comm_ctas, nvlink_gbps);
+    const double exposed_route =
+        std::max(0.0, route_us - kHiddenRouteFraction * compute_us);
+    const double comm_fraction =
+        static_cast<double>(comm_ctas) / sm_count;
+    const double score = compute_us +
+        kExposedRouteWeight * exposed_route +
+        kCommContentionWeight * compute_us *
+            std::pow(comm_fraction, kCommContentionPower);
+    if (score < best_score) {
+      best_score = score;
+      best_comm_ctas = comm_ctas;
+    }
+  }
+  return best_comm_ctas;
+}
+
+int32_t default_a2a_lhs_gemm_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t device) {
+  // The default deliberately uses the small, auditable rule established by
+  // the long-sequence sweep.  Short/medium M keeps the mature comm4 policy.
+  // For M>=32768, BF16 remote bytes / GEMM FLOPs simplifies to
+  //   (world-1) / (world*N).
+  // On the CP4 H200 long-sequence matrix, threshold 1.65e-4 selects comm8 for
+  // N=4096 and comm6 for N=5120/7168 (8/9 oracle matches; <=0.022% worst loss).
+  // Scaling by 900/device_bandwidth preserves the same balance on H800.
+  if (problem.m < 32768 || route.world_size <= 1 || problem.n <= 0) {
+    return 4;
+  }
+  constexpr double kH200NvlinkGbs = 900.0;
+  constexpr double kHighPressure = 1.65e-4;
+  const double remote_bytes_per_flop =
+      static_cast<double>(route.world_size - 1) /
+      (static_cast<double>(route.world_size) * problem.n);
+  const double normalized_pressure = remote_bytes_per_flop *
+      kH200NvlinkGbs / a2a_lhs_nvlink_bidirectional_gbps(device);
+  return normalized_pressure >= kHighPressure ? 8 : 6;
+}
+
+int32_t recommended_a2a_lhs_gemm_comm_ctas_impl(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t sm_count,
+    int32_t device) {
+  // The fitted whole-range model is retained for experiments only.  Its
+  // cross-shape generality has not been established well enough for the
+  // default ABI; explicit comm_ctas always overrides both policies.
+  const char* policy = std::getenv("FUSE_A2A_LHS_COMM_POLICY");
+  if (policy != nullptr && std::strcmp(policy, "experimental_model") == 0) {
+    return experimental_a2a_lhs_gemm_comm_ctas(
+        problem, route, sm_count, device);
+  }
+  return default_a2a_lhs_gemm_comm_ctas(problem, route, device);
+}
+
+int32_t recommended_a2a_lhs_gemm_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  if (device_sm_count(&sm_count, &device) != cudaSuccess) {
+    return 4;
+  }
+  return recommended_a2a_lhs_gemm_comm_ctas_impl(
+      problem, route, sm_count, device);
 }
 
 A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
@@ -2523,8 +2731,8 @@ cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t st
   }
   A2AGemmParams launch_params = params;
   if (launch_params.num_comm_ctas == 0) {
-    launch_params.num_comm_ctas =
-        recommended_a2a_lhs_gemm_comm_ctas(params.gemm);
+    launch_params.num_comm_ctas = recommended_a2a_lhs_gemm_comm_ctas_impl(
+        params.gemm, params.route, sm_count, device);
   }
   if (launch_params.num_comm_ctas <= 0 || launch_params.num_comm_ctas >= sm_count) {
     return cudaErrorInvalidValue;
@@ -2550,8 +2758,8 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
   }
   A2AGemmParams launch_params = params;
   if (launch_params.num_comm_ctas == 0) {
-    launch_params.num_comm_ctas =
-        recommended_a2a_lhs_gemm_comm_ctas(params.gemm);
+    launch_params.num_comm_ctas = recommended_a2a_lhs_gemm_comm_ctas_impl(
+        params.gemm, params.route, sm_count, device);
   }
   if (launch_params.num_comm_ctas <= 0 ||
       launch_params.num_comm_ctas >= sm_count || timeline == nullptr ||

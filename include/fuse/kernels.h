@@ -193,7 +193,9 @@ int64_t a2a_lhs_gemm_ready_elements(
     const GemmProblem& problem,
     const UlyssesRoute& route);
 
-int32_t recommended_a2a_lhs_gemm_comm_ctas(const GemmProblem& problem);
+int32_t recommended_a2a_lhs_gemm_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route);
 
 A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
     const GemmProblem& problem,

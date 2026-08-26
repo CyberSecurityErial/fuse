@@ -19,9 +19,19 @@
 - 相对调优后的 TE+NCCL/cuBLASLt+NCCL 分离实现，36 个 setting 全部加速。
 - Golden tag、源码、复现命令和结果目录一并归档。
 
-## v2.0-dev：按 cluster 对齐 GEMM 消费 frontier
+## v2.0：cluster-aware frontier 与自动通信 CTA
 
-状态：开发中，尚未发布。
+状态：已发布。
+
+### 实验性通信 CTA 模型
+
+v2 源码保留了一套覆盖短、长序列的通信 CTA 成本模型，默认关闭：
+
+```bash
+export FUSE_A2A_LHS_COMM_POLICY=experimental_model
+```
+
+启用后，运行时会枚举 `comm_ctas={2,4,6,8,10,12,14,16,20,24}`，联合估算 GEMM tile/wave、通信 task wave、peer shard 行宽、NVLink 带宽和通信 CTA 对计算资源的占用，再选择最低分。模型参数来自 CP4/CP8 的36-shape sweep；目前跨硬件和未覆盖 shape 的泛化性证据不足，因此不属于 Golden，也不作为版本性能结论。默认路径继续使用可审计的 `M` 与通信/计算比规则；显式传入 `--comm-ctas N` 时，手工值优先于两种自动策略。
 
 ### 问题
 
@@ -147,6 +157,34 @@ otherwise:
 - 完整编译、quick smoke、代表性 10+50 性能回归均通过，`exact_mismatches=0`。
 
 最新 36-case 汇总保存在 [`results/oproj_cluster_wave_bench`](results/oproj_cluster_wave_bench)。目录只保留 `fused_summary.json/csv`；失败的 M256 policy、手工 probe、逐 case JSON 和临时 A/B 文件已经删除。
+
+### 发布版自动通信 CTA
+
+Golden 入口仍为 `--comm-ctas 0 --lhs-policy auto`。默认规则只使用可审计的 shape 和硬件量：
+
+```text
+M < 32768: comm4
+M >= 32768:
+  pressure = (CP - 1) / (CP * N) * 900 / NVLink_GBps
+  pressure >= 1.65e-4: comm8
+  otherwise:             comm6
+```
+
+H100/H200 默认按 900 GB/s 双向 NVLink，H800 按 400 GB/s；其他拓扑可用 `FUSE_NVLINK_BIDIR_GBPS` 显式覆盖。该规则来自 CP4 长序列 sweep，9 个点命中 8 个 oracle comm，未命中点的延迟损失不超过 0.022%。
+
+最终 36-case（10 warmup + 50 samples，max-rank p50）：
+
+| 指标 | 结果 |
+|---|---:|
+| exact correctness | 36/36 PASS |
+| 通信 CTA 分布 | `comm4/6/8 = 21/8/7` |
+| 优于 TE+NCCL/cuBLASLt+NCCL 最强分离实现 | 36/36 |
+| 相对最强分离实现 | 1.160×–2.958×，几何平均 1.662× |
+| 优于 TE Userbuffers | 29/36 |
+| 相对 TE Userbuffers 几何平均 | 1.110× |
+| 相对上一版 comm4 Golden | CP4 1.080×，CP8 1.070×，全部 1.075× |
+
+原本已经领先 TE Userbuffers 的 case 没有因自动 comm 规则变成落后。完整逐点数据和对手调优参数见 [`BENCHMARK.md`](BENCHMARK.md)。
 
 ### 边界
 

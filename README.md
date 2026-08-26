@@ -30,6 +30,8 @@ N = hidden
 - GEMM CTA 使用 system-scope acquire 消费已到达的数据，省去独立 permutation kernel 和 kernel 间同步。
 - `auto` 策略在五个成熟 policy 中选择：`M64N128`、`M128N128`、`M128N160`、`M128N256 cluster-M2`、`M128N320 cluster-M2`；wave 以 cluster 为调度单元，并优先保证 N frontier 不被 wave 边界切开。
 
+默认通信策略对短中序列使用 `comm4`，长序列根据 CP、`N` 和设备 NVLink 带宽选择 `comm6/8`。实验性全量成本模型可通过 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 启用；它默认关闭，尚不属于 Golden。模型口径和边界见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
+
 ## 开箱运行
 
 依赖 CUDA 12.8、CMake、Ninja、CUTLASS 和 DeepGEMM headers。Golden 使用以下源码版本：
@@ -69,7 +71,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./build/fuse_bench \
 
 ```text
 comm_ctas=4 policy=m128n160 tile=128x160
-fused p50 ≈ 82.77 μs
+fused p50 ≈ 82.9 μs
 ```
 
 相同软件和硬件下，短程复跑落在 Golden 的 ±5% 可视为正常。明显偏慢时按顺序检查：
@@ -96,7 +98,7 @@ python3 benchmarks/oproj_shape_bench.py \
 
 | CP | case 数 | 相对最优分离 | 纯 GEMM 的百分比 |
 |---:|---:|---:|---:|
-| 4 | 18 | 1.17×–2.20× | 54.7%–88.5% |
-| 8 | 18 | 1.13×–2.91× | 61.5%–96.7% |
+| 4 | 18 | 1.17×–2.21× | 54.5%–100.5% |
+| 8 | 18 | 1.16×–2.96× | 61.3%–95.7% |
 
 全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级代码差异和收益见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
