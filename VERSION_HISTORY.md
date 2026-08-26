@@ -99,6 +99,8 @@ export FUSE_A2A_LHS_COMM_POLICY=experimental_model
 
 第一阶段完成了 36-case 复测；下列数据保留该阶段相对 v1 的独立结论。正式结果目录现已更新为第二阶段的最新主线结果。
 
+本节第一阶段和第二阶段的逐点数字都是开发过程快照，用于解释每步改动；v2.0 的最终发布结论只使用后文“发布版自动通信 CTA”中的正式36-case结果。
+
 | 指标 | 结果 |
 |---|---:|
 | exact correctness | 36/36 PASS |
@@ -182,7 +184,8 @@ H100/H200 默认按 900 GB/s 双向 NVLink，H800 按 400 GB/s；其他拓扑可
 | 相对最强分离实现 | 1.160×–2.958×，几何平均 1.662× |
 | 优于 TE Userbuffers | 29/36 |
 | 相对 TE Userbuffers 几何平均 | 1.110× |
-| 相对上一版 comm4 Golden | CP4 1.080×，CP8 1.070×，全部 1.075× |
+| 优于 v1.0 Golden | 25/36 |
+| 相对 v1.0 Golden | CP4 1.086×，CP8 1.092×，全部 1.089×；最大提升 1.531× |
 
 原本已经领先 TE Userbuffers 的 case 没有因自动 comm 规则变成落后。完整逐点数据和对手调优参数见 [`BENCHMARK.md`](BENCHMARK.md)。
 
@@ -190,5 +193,5 @@ H100/H200 默认按 900 GB/s 双向 NVLink，H800 按 400 GB/s；其他拓扑可
 
 - `N=7168` 在当前候选集中没有与 64 compute cluster 整除的 N tile 数；策略会在成熟 `N256` 和 partial-wave `N320` 之间按完整评分选择。
 - 尾 wave 是否满载仍由 wave efficiency 计入成本，不作为硬门禁；硬性优先级只用于避免 frontier 被 wave 边界切开。
-- 小宽度长序列仍是主要短板，不能从本次改动推断 GEMM、通信或调度中的单一瓶颈。
+- 长序列剩余短板集中在 CP8 128K：`16384×4096×4096` 和 `16384×5120×5120`；其余16个长序列点均领先 TE Userbuffers。不能仅凭总延迟把这两个点归因于 GEMM、通信或调度中的某一个环节。
 - profiling 协议和字段定义见 [`PROFILE_PROTOCOL.md`](PROFILE_PROTOCOL.md)。
