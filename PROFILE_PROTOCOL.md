@@ -43,6 +43,8 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
+当前版本：v3.0
+
 | 轨道 | 起点 | 终点 | 含义 |
 |---|---|---|---|
 | `remote A2A` | 通信 CTA 进入 kernel | 该 CTA 全部 warp 汇合并退出 | 一个 persistent 通信 CTA 的完整存活区间 |
