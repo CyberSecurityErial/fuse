@@ -1660,46 +1660,6 @@ void benchmark_qkv_gemm_a2a(
         CUDA_CHECK(fuse::launch_gemm_a2a_cutlass(params[rank], runtime[rank].stream));
       });
 
-  const bool deepgemm_fused_supported =
-      m == 512 && n == 10240 && k == 8192 &&
-      (options.comm_ctas == 8 || options.comm_ctas == 12 ||
-       options.comm_ctas == 16 || options.comm_ctas == 20 ||
-       options.comm_ctas == 24);
-  std::vector<float> deepgemm_fused;
-  std::vector<float> deepgemm_compute_only;
-  if (deepgemm_fused_supported) {
-    for (int rank = 0; rank < world; ++rank) {
-      CUDA_CHECK(cudaSetDevice(rank));
-      CUDA_CHECK(cudaMemsetAsync(
-          ready[rank], 0, ready_count * sizeof(uint32_t),
-          runtime[rank].stream));
-    }
-    synchronize(runtime);
-    uint32_t deepgemm_fused_epoch = 0;
-    deepgemm_fused = time_all_ranks(
-        runtime,
-        options.warmup,
-        options.iterations,
-        deepgemm_fused_epoch,
-        [&](int rank, uint32_t current_epoch) {
-          CUDA_CHECK(cudaSetDevice(rank));
-          params[rank].epoch = current_epoch;
-          CUDA_CHECK(fuse::launch_gemm_a2a_deepgemm(
-              params[rank], runtime[rank].stream));
-        });
-    uint32_t deepgemm_compute_only_epoch = 0;
-    deepgemm_compute_only = time_all_ranks(
-        runtime,
-        options.warmup,
-        options.iterations,
-        deepgemm_compute_only_epoch,
-        [&](int rank, uint32_t current_epoch) {
-          CUDA_CHECK(cudaSetDevice(rank));
-          params[rank].epoch = current_epoch;
-          CUDA_CHECK(fuse::launch_gemm_a2a_deepgemm_compute_only(
-              params[rank], runtime[rank].stream));
-        });
-  }
 
   auto cublaslt_plan = autotune_cublaslt_bf16(
       runtime[0], m, n, k, 1, lhs[0], rhs_nt[0], local_output[0]);
@@ -1759,37 +1719,6 @@ void benchmark_qkv_gemm_a2a(
             params[rank], runtime[rank].stream, options.comm_ctas));
       });
 
-  const bool deepgemm_supported =
-      m == 512 && n == 10240 && k == 8192 &&
-      (options.comm_ctas == 4 || options.comm_ctas == 8 ||
-       options.comm_ctas == 12 || options.comm_ctas == 16 ||
-       options.comm_ctas == 20 || options.comm_ctas == 24);
-  std::vector<float> deepgemm;
-  std::vector<float> reserved_deepgemm;
-  if (deepgemm_supported) {
-    uint32_t deepgemm_epoch = 0;
-    deepgemm = time_all_ranks(
-        runtime,
-        options.warmup,
-        options.iterations,
-        deepgemm_epoch,
-        [&](int rank, uint32_t) {
-          CUDA_CHECK(cudaSetDevice(rank));
-          CUDA_CHECK(fuse::launch_deepgemm_bf16_reference(
-              params[rank], runtime[rank].stream));
-        });
-    uint32_t reserved_deepgemm_epoch = 0;
-    reserved_deepgemm = time_all_ranks(
-        runtime,
-        options.warmup,
-        options.iterations,
-        reserved_deepgemm_epoch,
-        [&](int rank, uint32_t) {
-          CUDA_CHECK(cudaSetDevice(rank));
-          CUDA_CHECK(fuse::launch_deepgemm_bf16_reference(
-              params[rank], runtime[rank].stream, options.comm_ctas));
-        });
-  }
 
   uint32_t copy_epoch = 0;
   const auto copy = time_all_ranks(
@@ -1803,20 +1732,6 @@ void benchmark_qkv_gemm_a2a(
             params[rank], runtime[rank].stream));
       });
 
-  std::vector<float> deepgemm_copy;
-  if (deepgemm_fused_supported) {
-    uint32_t deepgemm_copy_epoch = 0;
-    deepgemm_copy = time_all_ranks(
-        runtime,
-        options.warmup,
-        options.iterations,
-        deepgemm_copy_epoch,
-        [&](int rank, uint32_t) {
-          CUDA_CHECK(cudaSetDevice(rank));
-          CUDA_CHECK(fuse::launch_gemm_a2a_deepgemm_copy_reference(
-              params[rank], runtime[rank].stream));
-        });
-  }
 
   uint32_t sequential_epoch = 0;
   const auto sequential = time_all_ranks(
@@ -1840,10 +1755,7 @@ void benchmark_qkv_gemm_a2a(
   const std::vector<float>* pure_sota = &pure_cublaslt;
   if (cublas_mean == pure_mean) pure_sota = &pure;
   if (cutlass_mean == pure_mean) pure_sota = &cutlass;
-  if (deepgemm_supported && summarize(deepgemm).mean < pure_mean) {
-    pure_mean = summarize(deepgemm).mean;
-    pure_sota = &deepgemm;
-  }
+
   const double reserved_cutlass_mean = summarize(reserved_cutlass).mean;
   const double copy_payload_bytes = static_cast<double>(m) *
       (options.q_heads +
@@ -1863,51 +1775,16 @@ void benchmark_qkv_gemm_a2a(
       world,
       pure_mean,
       cutlass_mean);
-  if (deepgemm_supported) {
-    print_result("DeepGEMM BF16", deepgemm, flops, world, pure_mean);
-    print_result(
-        "subgrid DeepGEMM",
-        reserved_deepgemm,
-        flops,
-        world,
-        pure_mean,
-        summarize(deepgemm).mean);
-  }
+
   print_copy_result(
       options.defer_v_a2a ? "Q/K A2A route" : "Q/K/V A2A route",
       copy,
       copy_payload_bytes,
       world);
-  if (deepgemm_fused_supported) {
-    print_copy_result(
-        "Q/K A2A route candidate", deepgemm_copy, copy_payload_bytes, world);
-  }
+
   print_result("GEMM+A2A sequential", sequential, flops, world, pure_mean, cutlass_mean);
   print_result("fused QKV GEMM->A2A", fused, flops, world, pure_mean, cutlass_mean);
-  if (deepgemm_fused_supported) {
-    print_result(
-        "DeepGEMM signaled compute",
-        deepgemm_compute_only,
-        flops,
-        world,
-        pure_mean,
-        summarize(reserved_deepgemm).mean);
-    print_result(
-        "DeepGEMM fused",
-        deepgemm_fused,
-        flops,
-        world,
-        pure_mean,
-        summarize(reserved_deepgemm).mean);
-    std::cout << "deepgemm_overlap_ratio=" << std::fixed
-              << std::setprecision(1)
-              << overlap_ratio(
-                     summarize(deepgemm_fused).mean,
-                     summarize(reserved_deepgemm).mean,
-                     summarize(copy).mean) *
-                     100.0
-              << "% (subgrid DeepGEMM + QKV route)\n";
-  }
+
   std::cout << "fused_vs_compute_subgrid=" << std::fixed << std::setprecision(1)
             << reserved_cutlass_mean / summarize(fused).mean * 100.0 << "%\n";
   const double overlap =
@@ -1922,21 +1799,12 @@ void benchmark_qkv_gemm_a2a(
       {"pure_sota", pure_sota},
       {"same_policy_cutlass", &cutlass},
       {"compute_subgrid_cutlass", &reserved_cutlass}};
-  if (deepgemm_supported) {
-    results.emplace_back("deepgemm", &deepgemm);
-    results.emplace_back("compute_subgrid_deepgemm", &reserved_deepgemm);
-  }
+
   results.emplace_back("qk_a2a_route", &copy);
-  if (deepgemm_fused_supported) {
-    results.emplace_back("qk_a2a_route_candidate", &deepgemm_copy);
-  }
+
   results.emplace_back("sequential", &sequential);
   results.emplace_back("fused", &fused);
-  if (deepgemm_fused_supported) {
-    results.emplace_back(
-        "deepgemm_signaled_compute", &deepgemm_compute_only);
-    results.emplace_back("deepgemm_fused", &deepgemm_fused);
-  }
+
   write_json(
       resolved,
       world,

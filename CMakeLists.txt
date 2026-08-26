@@ -10,9 +10,6 @@ set(CMAKE_CUDA_ARCHITECTURES 90a)
 set(CUTLASS_ROOT
     "/home/chen/workspace/source_code/TransformerEngine/3rdparty/cutlass"
     CACHE PATH "Local CUTLASS source root")
-set(DEEPGEMM_ROOT
-    "/home/chen/workspace/source_code/DeepGEMM"
-    CACHE PATH "Local DeepGEMM source root")
 option(
   FUSE_ENABLE_PROFILING
   "Build diagnostic %globaltimer profiling kernels"
@@ -28,7 +25,6 @@ target_include_directories(
   fuse_kernels
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${DEEPGEMM_ROOT}/deep_gemm/include
     ${CUTLASS_ROOT}/include
     ${CUTLASS_ROOT}/tools/util/include)
 target_compile_options(

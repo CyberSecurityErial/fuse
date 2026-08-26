@@ -256,12 +256,6 @@ cudaError_t launch_a2a_gemm_copy_reference(
     cudaStream_t stream);
 
 cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t stream);
-cudaError_t launch_gemm_a2a_deepgemm(
-    const GemmA2AParams& params,
-    cudaStream_t stream);
-cudaError_t launch_gemm_a2a_deepgemm_compute_only(
-    const GemmA2AParams& params,
-    cudaStream_t stream);
 
 cudaError_t launch_gemm_a2a_fp8_cutlass(
     const Fp8GemmA2AParams& params,
@@ -271,20 +265,12 @@ cudaError_t launch_batched_cutlass_reference(
     const GemmA2AParams& params,
     cudaStream_t stream,
     int32_t reserved_comm_ctas = 0);
-cudaError_t launch_deepgemm_bf16_reference(
-    const GemmA2AParams& params,
-    cudaStream_t stream,
-    int32_t reserved_comm_ctas = 0);
-
 cudaError_t launch_dense_fp8_cutlass_reference(
     const Fp8GemmA2AParams& params,
     cudaStream_t stream,
     int32_t reserved_comm_ctas = 0);
 
 cudaError_t launch_gemm_a2a_copy_reference(
-    const GemmA2AParams& params,
-    cudaStream_t stream);
-cudaError_t launch_gemm_a2a_deepgemm_copy_reference(
     const GemmA2AParams& params,
     cudaStream_t stream);
 
