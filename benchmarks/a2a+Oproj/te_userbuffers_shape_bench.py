@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PYTHON = Path("/home/chen/miniforge3/envs/mmunlearner/bin/python")
 TE_ROOT = Path("/home/chen/workspace/source_code/TransformerEngine")
 MODELS = {
@@ -104,7 +104,7 @@ def command(
 ) -> list[str]:
     result = [
         str(PYTHON), "-m", "torch.distributed.run", "--standalone",
-        f"--nproc-per-node={cp}", str(ROOT / "benchmarks" / "te_userbuffers_oproj.py"),
+        f"--nproc-per-node={cp}", str(Path(__file__).with_name("te_userbuffers_oproj.py")),
         "--global-seq", str(seq), "--hidden", str(hidden),
         "--q-heads", str(q_heads), "--head-dim", str(head_dim),
         "--batch", "1", "--warmup", str(warmup), "--iters", str(iters),

@@ -176,7 +176,7 @@ v2 自动结果固定使用生产入口：
 export FUSE_CP4_DEVICES=0,2,4,5
 export FUSE_CP8_DEVICES=0,1,2,3,4,5,6,7
 
-python3 benchmarks/oproj_shape_bench.py \
+python3 'benchmarks/a2a+Oproj/oproj_shape_bench.py' \
   --phase baseline-nccl-sweep \
   --phase baseline-mode-sweep \
   --phase baseline-formal \
@@ -189,7 +189,7 @@ python3 benchmarks/oproj_shape_bench.py \
   --results results/reproduce
 ```
 
-原始 sweep、正式结果和汇总分别保存在 `baseline_nccl_sweep`、`baseline_mode_sweep`、`baseline_formal`、`fuse_formal` 和 `baseline_summary.json`。聚合逻辑位于 `benchmarks/oproj_shape_bench.py`，可以直接审计 winner 的选择过程。
+原始 sweep、正式结果和汇总分别保存在 `baseline_nccl_sweep`、`baseline_mode_sweep`、`baseline_formal`、`fuse_formal` 和 `baseline_summary.json`。聚合逻辑位于 `benchmarks/a2a+Oproj/oproj_shape_bench.py`，可以直接审计 winner 的选择过程。
 
 ## 如何让使用者跑到 SOTA
 
@@ -479,4 +479,4 @@ v3.0 的极限性能口径额外做一次外部通信 CTA 标定。固定 `--lhs
 - CP4 `256×7168×16384` 的最新 p50 为0.1156 ms，快于 TE 的0.1202 ms；p95 为0.1258 ms，慢于 TE 的0.1217 ms，因此36/36只描述 p50。
 - TE UB 的获胜配置同时包含SM copy与Copy Engine；现有数据不把差距归因于单一搬运引擎。
 
-调优脚本为 `benchmarks/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/te_userbuffers_oproj.py`。正式汇总位于 `results/a2a-Oproj/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/a2a-Oproj/te_userbuffers_shape_bench_longseq/summary.{json,csv}`；v3通信CTA标定在 `results/a2a-Oproj/oproj_v3_manual_comm_bench/summary.{json,csv}`。原始 sweep 文件均可由脚本重建。
+调优脚本为 `benchmarks/a2a+Oproj/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/a2a+Oproj/te_userbuffers_oproj.py`。正式汇总位于 `results/a2a-Oproj/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/a2a-Oproj/te_userbuffers_shape_bench_longseq/summary.{json,csv}`；v3通信CTA标定在 `results/a2a-Oproj/oproj_v3_manual_comm_bench/summary.{json,csv}`。原始 sweep 文件均可由脚本重建。

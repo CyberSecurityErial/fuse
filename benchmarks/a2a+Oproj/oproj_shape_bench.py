@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESULTS = ROOT / "results" / "a2a-Oproj" / "oproj_shape_bench"
 DEFAULT_TORCHRUN = Path("/home/chen/miniforge3/envs/mmunlearner/bin/torchrun")
 
@@ -330,7 +330,7 @@ def external_matrix_command(
 ) -> list[str]:
     command = [
         str(args.torchrun), "--standalone", f"--nproc-per-node={cp}",
-        str(ROOT / "benchmarks" / "te_nccl_baseline.py"),
+        str(Path(__file__).with_name("te_nccl_baseline.py")),
         "--mode", "oproj_a2a_gemm",
         "--global-seq", str(seq),
         "--hidden", str(model.hidden),

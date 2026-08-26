@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cublaslt-library",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "build" / "libfuse_cublaslt_runner.so",
+        default=Path(__file__).resolve().parents[2] / "build" / "libfuse_cublaslt_runner.so",
     )
     return parser.parse_args()
 

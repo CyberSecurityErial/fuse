@@ -84,7 +84,7 @@ fused p50 ≈ 82.9 μs
 完整 shape matrix：
 
 ```bash
-python3 benchmarks/oproj_shape_bench.py \
+python3 'benchmarks/a2a+Oproj/oproj_shape_bench.py' \
   --phase fuse-formal --phase shape-table \
   --models representative_small,representative_medium,representative_large \
   --seqs 1024,4096,16384 --cps 8 \
