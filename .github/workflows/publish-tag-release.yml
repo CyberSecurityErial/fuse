@@ -13,7 +13,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v2.0
+        default: v3.0
 
 permissions:
   contents: write
@@ -31,7 +31,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v2.0");
+              : (process.env.REQUESTED_TAG || "v3.0");
 
             const releases = {
               "v1.0": {
@@ -58,6 +58,24 @@ jobs:
                   "生产入口保持 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`。实验性全量成本模型可用 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 开启，默认关闭。",
                   "",
                   "v2.0 的优化范围仍是 A2A + OProj；QKVProj + A2A 与 MegaMoE 不属于本版本已收口的性能承诺。",
+                ].join("\n"),
+              },
+              "v3.0": {
+                name: "v3.0 — A2A + O-projection",
+                body: [
+                  "第三个固化的 A2A + O-projection 版本。",
+                  "",
+                  "v3.0 固定 v2.0 的核心 kernel 与自动 tile 策略，只把外部 `comm_ctas` 作为唯一标定变量；`--lhs-policy auto --raster n --swizzle 1` 始终不变。",
+                  "",
+                  "🩵 **相对 v2.0，7 个原 TE Userbuffers 落后点全部翻转；与其余 29 个 v2 setting 合并后，36/36 个 p50 领先 TE Userbuffers，36 点几何平均为 1.154×。**",
+                  "",
+                  "这项 36/36 结论明确包含 per-shape 手工 `comm_ctas` winner，不代表默认 `--comm-ctas 0` 零调参即可取得同样结果。默认自动入口仍是通用生产配置。",
+                  "",
+                  "正式口径为 BF16、10 warmup + 50 samples、每个 sample 先取跨 rank 最大延迟再统计 p50。CP4 `256×7168×16384` 的 p50 领先 TE，但 p95 仍略慢，发布结论不扩展到尾延迟。",
+                  "",
+                  "逐点 v2→v3 数字已添加到 `BENCHMARK.md` 原36-case主表最后一列；7点机器可读归档位于 `results/oproj_v3_manual_comm_bench`。",
+                  "",
+                  "v3.0 的性能承诺仍只覆盖 A2A + OProj；QKVProj + A2A 与 MegaMoE 不在本版本收口范围。",
                 ].join("\n"),
               },
             };
