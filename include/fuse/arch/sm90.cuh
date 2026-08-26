@@ -2,14 +2,22 @@
 // System-scope barrier primitives adapted from ByteDance Flux.
 #pragma once
 
+#include "fuse/types.h"
+
 #include <cuda_runtime.h>
 #include <cstdint>
 
-#ifndef FUSE_ENABLE_PROFILING
-#define FUSE_ENABLE_PROFILING 0
-#endif
-
 namespace fuse::detail {
+
+__device__ __forceinline__ uint64_t read_global_timer() {
+  uint64_t value;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+  return value;
+}
+
+__device__ __forceinline__ void fence_system() {
+  asm volatile("fence.sc.sys;\n" ::: "memory");
+}
 
 __device__ __forceinline__ uint32_t load_acquire_gpu(const uint32_t* ptr) {
   uint32_t value;

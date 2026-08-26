@@ -1,15 +1,161 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "fuse/ready_k_iterator.cuh"
-#include "fuse/system_barrier.cuh"
-#include "fuse/kernels.h"
+#include "fuse/arch/sm90.cuh"
+#include "fuse/types.h"
+#if FUSE_ENABLE_PROFILING
+#include "fuse/profiling/timeline.cuh"
+#endif
 
 #include <cute/arch/copy_sm90.hpp>
 #include <cute/tensor.hpp>
-
 #include <cutlass/cutlass.h>
+#include <cutlass/cuda_host_adapter.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime_api.h>
+
+namespace fuse::detail {
+
+// Single-lane wait for use inside CUTLASS's elect_one_sync() producer branch.
+// Do not add a warp barrier here: the other lanes do not enter that branch.
+CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
+    const uint32_t* flag,
+    uint32_t target) {
+#pragma unroll 1
+  while (load_acquire_gpu(flag) < target) {
+    __nanosleep(64);
+  }
+}
+
+#if FUSE_ENABLE_PROFILING
+template <bool Instrumented>
+struct PeerAcquireRecorder {
+  CUTLASS_DEVICE explicit PeerAcquireRecorder(uint64_t*) {}
+  CUTLASS_DEVICE void record(int32_t) {}
+};
+
+template <>
+struct PeerAcquireRecorder<true> {
+  uint64_t* timestamps = nullptr;
+
+  CUTLASS_DEVICE explicit PeerAcquireRecorder(uint64_t* values)
+      : timestamps(values) {}
+
+  CUTLASS_DEVICE void record(int32_t group) {
+    if (timestamps) {
+      timestamps[group] = read_global_timer();
+    }
+  }
+};
+#endif
+
+// Sequential K-group adapter used by the generic A2A -> GEMM path.
+template <
+    class Iterator
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
+class ReadyKIterator
+#if FUSE_ENABLE_PROFILING
+    : private PeerAcquireRecorder<Instrumented>
+#endif
+{
+ public:
+  CUTLASS_DEVICE ReadyKIterator(
+      Iterator iterator,
+      const uint32_t* ready,
+      int32_t ready_group_stride,
+      uint32_t target,
+      int32_t tiles_per_group,
+      int32_t first_k_tile,
+      int32_t work_tile_count
+#if FUSE_ENABLE_PROFILING
+      , uint64_t* acquire_timestamps = nullptr
+#endif
+      )
+#if FUSE_ENABLE_PROFILING
+      : PeerAcquireRecorder<Instrumented>(acquire_timestamps),
+#else
+      :
+#endif
+        iterator_(iterator),
+        ready_(ready),
+        target_(target),
+        ready_group_stride_(ready_group_stride),
+        group_(first_k_tile / tiles_per_group),
+        tiles_left_in_group_(
+            tiles_per_group - first_k_tile % tiles_per_group),
+        tiles_per_group_(tiles_per_group),
+        work_tiles_left_(work_tile_count) {}
+
+  CUTLASS_DEVICE decltype(auto) operator*() const { return *iterator_; }
+
+  CUTLASS_DEVICE ReadyKIterator& operator++() {
+    ++iterator_;
+    --work_tiles_left_;
+    --tiles_left_in_group_;
+    if (tiles_left_in_group_ == 0 && work_tiles_left_ > 0) {
+      ++group_;
+      tiles_left_in_group_ = tiles_per_group_;
+      wait_acquire_gpu_single_lane(
+          ready_ + static_cast<int64_t>(group_) * ready_group_stride_,
+          target_);
+#if FUSE_ENABLE_PROFILING
+      this->record(group_);
+#endif
+    }
+    return *this;
+  }
+
+ private:
+  Iterator iterator_;
+  const uint32_t* ready_;
+  uint32_t target_;
+  int32_t ready_group_stride_;
+  int32_t group_;
+  int32_t tiles_left_in_group_;
+  int32_t tiles_per_group_;
+  int32_t work_tiles_left_;
+};
+
+template <
+#if FUSE_ENABLE_PROFILING
+    bool Instrumented = false,
+#endif
+    class Iterator>
+CUTLASS_DEVICE auto make_ready_k_iterator(
+    Iterator iterator,
+    const uint32_t* ready,
+    int32_t ready_group_stride,
+    uint32_t target,
+    int32_t tiles_per_group,
+    int32_t first_k_tile,
+    int32_t work_tile_count
+#if FUSE_ENABLE_PROFILING
+    , uint64_t* acquire_timestamps = nullptr
+#endif
+    ) {
+  return ReadyKIterator<
+      Iterator
+#if FUSE_ENABLE_PROFILING
+      , Instrumented
+#endif
+      >(
+      iterator, ready, ready_group_stride, target, tiles_per_group,
+      first_k_tile, work_tile_count
+#if FUSE_ENABLE_PROFILING
+      , acquire_timestamps
+#endif
+      );
+}
+
+}  // namespace fuse::detail
+
+
+// CUTLASS adapters for A2A readiness and GEMM tile publication.
 namespace fuse::detail {
 
 // Readiness adapter for inverse head-to-sequence A2A -> dense GEMM. Every
@@ -149,7 +295,7 @@ struct A2ALhsReadyMainloop : Base {
           tile_ready + first_peer * kReadyFlagStride, target);
 #if FUSE_ENABLE_PROFILING
       if constexpr (Instrumented) {
-        const uint64_t now = read_ready_timer();
+        const uint64_t now = read_global_timer();
         if (peer_event) {
           peer_event->m_tile = m;
           peer_event->n_tile = static_cast<int32_t>(cute::get<1>(block_coord));

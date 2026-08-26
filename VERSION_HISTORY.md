@@ -91,8 +91,8 @@ export FUSE_A2A_LHS_COMM_POLICY=experimental_model
 
 | 文件 | 改动 |
 |---|---|
-| `include/fuse/kernels.h` | 增加 N320 policy 和 cluster/frontier 诊断字段 |
-| `csrc/cutlass_kernels_sm90.cu` | 实例化 N320 collective；按 cluster 计算 wave；实现 frontier-aware 自动选择 |
+| `include/fuse/operators/a2a_gemm.h` | 增加 N320 policy 和 cluster/frontier 诊断字段 |
+| `csrc/operators/ulysses_sm90.cu` | 实例化 N320 collective；按 cluster 计算 wave；实现 frontier-aware 自动选择 |
 | `benchmarks/a2a+Oproj/fuse_smoke.cu` | 固化对齐、回退和 partial-wave 的策略回归测试 |
 | `benchmarks/a2a+Oproj/oproj_shape_bench.py` | 将 cluster/frontier 字段写入正式 JSON/CSV |
 | `BENCHMARK.md` | 更新 36-case 正式结果和 TE Userbuffers 对照 |
