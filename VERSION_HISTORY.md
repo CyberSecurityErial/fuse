@@ -166,7 +166,7 @@ otherwise:
 - 额外 `K=2048` 泛化检查中，CP4/CP8 长序列分别提升约 4.5%/27.7%。
 - 完整编译、quick smoke、代表性 10+50 性能回归均通过，`exact_mismatches=0`。
 
-最新 36-case 汇总保存在 [`results/oproj_cluster_wave_bench`](results/oproj_cluster_wave_bench)。目录只保留 `fused_summary.json/csv`；失败的 M256 policy、手工 probe、逐 case JSON 和临时 A/B 文件已经删除。
+最新 36-case 汇总保存在 [`results/a2a-Oproj/oproj_cluster_wave_bench`](results/a2a-Oproj/oproj_cluster_wave_bench)。目录只保留 `fused_summary.json/csv`；失败的 M256 policy、手工 probe、逐 case JSON 和临时 A/B 文件已经删除。
 
 ### 发布版自动通信 CTA
 
@@ -232,4 +232,4 @@ v3.0 不改 A2A + O-projection 的计算、通信或自动 tile 逻辑。它固�
 - `comm_ctas` 的 winner 属于 shape 与硬件拓扑标定值。默认 `--comm-ctas 0` 仍是通用生产入口；v3.0 没有把7个 shape 写进运行时规则。
 - profiling 字段全部由 `FUSE_ENABLE_PROFILING` 编译期开关隔离。Release 默认关闭，关闭构建不携带 timeline 参数、时间戳读取或 diagnostic atomic。
 
-完整36点的 v3.0 归档位于 [`results/oproj_v3_manual_comm_bench`](results/oproj_v3_manual_comm_bench)，每行通过 `result_source` 标明 `v2_auto_inherited` 或 `manual_comm_ctas`；上面的7点表只展示相对 v2.0 有变化的标定项。完整36点的 v2 原始结果继续保存在 `results/oproj_cluster_wave_bench`，避免把手工标定冒充自动策略结果。
+完整36点的 v3.0 归档位于 [`results/a2a-Oproj/oproj_v3_manual_comm_bench`](results/a2a-Oproj/oproj_v3_manual_comm_bench)，每行通过 `result_source` 标明 `v2_auto_inherited` 或 `manual_comm_ctas`；上面的7点表只展示相对 v2.0 有变化的标定项。完整36点的 v2 原始结果继续保存在 `results/a2a-Oproj/oproj_cluster_wave_bench`，避免把手工标定冒充自动策略结果。

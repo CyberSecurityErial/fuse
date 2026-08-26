@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS = ROOT / "results" / "oproj_shape_bench"
+DEFAULT_RESULTS = ROOT / "results" / "a2a-Oproj" / "oproj_shape_bench"
 DEFAULT_TORCHRUN = Path("/home/chen/miniforge3/envs/mmunlearner/bin/torchrun")
 
 

@@ -18,15 +18,15 @@ Measurement contract:
 
 Committed directories:
 
-- `oproj_cluster_wave_bench`: current v2 fused 36-case summary after the
+- `a2a-Oproj/oproj_cluster_wave_bench`: current v2 fused 36-case summary after the
   cluster-frontier scheduler and narrow-shard 3D TMA store optimizations;
-- `oproj_shape_bench` and `oproj_shape_bench_cp8`: selected CP4/CP8 external
+- `a2a-Oproj/oproj_shape_bench` and `a2a-Oproj/oproj_shape_bench_cp8`: selected CP4/CP8 external
   baseline configurations, fused results, and shape definitions;
-- `oproj_shape_bench_longseq_cp4` and `oproj_shape_bench_longseq_cp8`: the
+- `a2a-Oproj/oproj_shape_bench_longseq_cp4` and `a2a-Oproj/oproj_shape_bench_longseq_cp8`: the
   corresponding 128K, 256K, and 512K aggregates, plus fused-only 1M entries;
-- `te_userbuffers_shape_bench` and `te_userbuffers_shape_bench_longseq`: the
+- `a2a-Oproj/te_userbuffers_shape_bench` and `a2a-Oproj/te_userbuffers_shape_bench_longseq`: the
   selected TE Userbuffers configurations and formal results.
-- `oproj_v3_manual_comm_bench`: the complete 36-case v3 snapshot. Its
+- `a2a-Oproj/oproj_v3_manual_comm_bench`: the complete 36-case v3 snapshot. Its
   `result_source` field distinguishes 29 `v2_auto_inherited` rows from seven
   `manual_comm_ctas` rows; all options other than the external communication
   CTA count remain fixed.
