@@ -26,8 +26,9 @@ N = hidden
 
 - 单个 cooperative persistent kernel，通信 CTA 与 CUTLASS GEMM CTA 同时驻留。
 - 通信 CTA 将远端 head shard 直接写入 GEMM 的最终 A layout，并按 peer/K shard 发布 ready epoch。
+- 窄 peer shard 自动将多行写回合并为约8KiB的3D TMA store，宽 shard沿用逐行路径。
 - GEMM CTA 使用 system-scope acquire 消费已到达的数据，省去独立 permutation kernel 和 kernel 间同步。
-- `auto` 策略在四个成熟 policy 中选择：`M64N128`、`M128N128`、`M128N160`、`M128N256 cluster-M2`；通信 CTA 数也由运行时决定。
+- `auto` 策略在五个成熟 policy 中选择：`M64N128`、`M128N128`、`M128N160`、`M128N256 cluster-M2`、`M128N320 cluster-M2`；wave 以 cluster 为调度单元，并优先保证 N frontier 不被 wave 边界切开。
 
 ## 开箱运行
 
@@ -95,7 +96,7 @@ python3 benchmarks/oproj_shape_bench.py \
 
 | CP | case 数 | 相对最优分离 | 纯 GEMM 的百分比 |
 |---:|---:|---:|---:|
-| 4 | 18 | 1.17×–2.23× | 54.7%–90.2% |
-| 8 | 18 | 1.12×–2.86× | 59.8%–97.1% |
+| 4 | 18 | 1.17×–2.20× | 54.7%–88.5% |
+| 8 | 18 | 1.13×–2.91× | 61.5%–96.7% |
 
-全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)。
+全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级代码差异和收益见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。

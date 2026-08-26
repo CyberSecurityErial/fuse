@@ -17,6 +17,8 @@ Measurement contract:
 
 Committed directories:
 
+- `oproj_cluster_wave_bench`: current v2 fused 36-case summary after the
+  cluster-frontier scheduler and narrow-shard 3D TMA store optimizations;
 - `oproj_shape_bench` and `oproj_shape_bench_cp8`: selected CP4/CP8 external
   baseline configurations, fused results, and shape definitions;
 - `oproj_shape_bench_longseq_cp4` and `oproj_shape_bench_longseq_cp8`: the
@@ -28,6 +30,11 @@ Each O-projection directory keeps only `baseline_summary.*`,
 `fused_summary.*`, and `shape_matrix.*`; each Userbuffers directory keeps
 `summary.*`. The thousands of intermediate sweep and formal-run JSON files
 are intentionally omitted.
+
+The v2 fused directory intentionally keeps only `fused_summary.json` and
+`fused_summary.csv`. The superseded M256 probes, manual wide-N probes, raw
+per-case JSON, and unaligned-policy A/B files are not part of the Golden
+archive.
 
 The long-sequence SOTA comparison excludes 1M because no formal external
 TE/NCCL or cuBLASLt/NCCL rerun was requested for that length. Fused internal

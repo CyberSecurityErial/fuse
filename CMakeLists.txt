@@ -13,8 +13,17 @@ set(CUTLASS_ROOT
 set(DEEPGEMM_ROOT
     "/home/chen/workspace/source_code/DeepGEMM"
     CACHE PATH "Local DeepGEMM source root")
+option(
+  FUSE_ENABLE_PROFILING
+  "Build diagnostic %globaltimer profiling kernels"
+  OFF)
 
 add_library(fuse_kernels STATIC csrc/cutlass_kernels_sm90.cu)
+if(FUSE_ENABLE_PROFILING)
+  target_compile_definitions(fuse_kernels PUBLIC FUSE_ENABLE_PROFILING=1)
+else()
+  target_compile_definitions(fuse_kernels PUBLIC FUSE_ENABLE_PROFILING=0)
+endif()
 target_include_directories(
   fuse_kernels
   PUBLIC

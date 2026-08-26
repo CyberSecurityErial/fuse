@@ -980,15 +980,56 @@ void smoke_a2a_lhs_policy_selection() {
       {{2048, 5120, 4096, 1}, 12,
        fuse::A2ALhsGemmPolicy::kM128N256ClusterM2, 3},
       {{4096, 10240, 8192, 1}, 4,
-       fuse::A2ALhsGemmPolicy::kM128N256ClusterM2, 10},
+       fuse::A2ALhsGemmPolicy::kM128N320ClusterM2, 8},
   };
   for (const auto& test : cases) {
     const auto selected = fuse::select_a2a_lhs_gemm_policy(
         test.problem, test.comm_ctas, 132);
     if (selected.policy != test.expected ||
         selected.waves != test.expected_waves) {
-      throw std::runtime_error("A2A LHS wave-policy selection failed");
+      throw std::runtime_error(
+          "A2A LHS wave-policy selection failed: policy=" +
+          std::to_string(static_cast<int32_t>(selected.policy)) +
+          " waves=" + std::to_string(selected.waves) +
+          " clusters=" + std::to_string(selected.compute_clusters) +
+          " n_tiles=" + std::to_string(selected.n_tiles));
     }
+  }
+
+  const fuse::GemmProblem long_sequence{16384, 5120, 5120, 1};
+  const auto split_frontier = fuse::select_a2a_lhs_gemm_policy(
+      long_sequence,
+      4,
+      132,
+      fuse::A2ALhsGemmPolicy::kM128N256ClusterM2);
+  if (split_frontier.compute_clusters != 64 ||
+      split_frontier.n_tiles != 20 || split_frontier.waves != 20 ||
+      split_frontier.frontier_aligned || !split_frontier.full_last_wave) {
+    throw std::runtime_error("A2A LHS split-frontier accounting failed");
+  }
+  const auto aligned = fuse::select_a2a_lhs_gemm_policy(
+      long_sequence, 4, 132, fuse::A2ALhsGemmPolicy::kAuto);
+  if (aligned.policy != fuse::A2ALhsGemmPolicy::kM128N320ClusterM2 ||
+      aligned.compute_clusters != 64 || aligned.n_tiles != 16 ||
+      aligned.waves != 16 || !aligned.frontier_aligned ||
+      !aligned.full_last_wave) {
+    throw std::runtime_error("A2A LHS aligned-frontier selection failed");
+  }
+
+  const auto unaligned_full = fuse::select_a2a_lhs_gemm_policy(
+      {16384, 7168, 16384, 1}, 4, 132, fuse::A2ALhsGemmPolicy::kAuto);
+  if (unaligned_full.policy !=
+          fuse::A2ALhsGemmPolicy::kM128N256ClusterM2 ||
+      unaligned_full.frontier_aligned || !unaligned_full.full_last_wave) {
+    throw std::runtime_error("A2A LHS mature unaligned policy fallback failed");
+  }
+  const auto partial_wave = fuse::select_a2a_lhs_gemm_policy(
+      {2048, 7168, 16384, 1}, 4, 132, fuse::A2ALhsGemmPolicy::kAuto);
+  if (partial_wave.policy !=
+          fuse::A2ALhsGemmPolicy::kM128N320ClusterM2 ||
+      partial_wave.frontier_aligned || partial_wave.full_last_wave ||
+      partial_wave.waves != 3) {
+    throw std::runtime_error("A2A LHS partial-wave N320 selection failed");
   }
 }
 

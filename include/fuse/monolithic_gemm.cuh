@@ -29,8 +29,13 @@ template <class GemmKernel, class CommOp>
 struct MonolithicGemm {
   using ArchTag = typename GemmKernel::ArchTag;
   using ClusterShape = typename GemmKernel::ClusterShape;
-  using SharedStorage = typename GemmKernel::SharedStorage;
-  static constexpr int SharedStorageSize = GemmKernel::SharedStorageSize;
+  static constexpr int SharedStorageSize =
+      GemmKernel::SharedStorageSize > static_cast<int>(CommOp::SharedStorageBytes)
+      ? GemmKernel::SharedStorageSize
+      : static_cast<int>(CommOp::SharedStorageBytes);
+  struct alignas(128) SharedStorage {
+    char bytes[SharedStorageSize];
+  };
   static constexpr int MaxThreadsPerBlock = GemmKernel::MaxThreadsPerBlock;
   static constexpr int MinBlocksPerMultiprocessor = GemmKernel::MinBlocksPerMultiprocessor;
 

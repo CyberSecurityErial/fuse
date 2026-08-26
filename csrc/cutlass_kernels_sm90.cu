@@ -42,6 +42,7 @@ using TileShape = Shape<_128, _128, _64>;
 using M64TileShape = Shape<_64, _128, _64>;
 using N160TileShape = Shape<_128, _160, _64>;
 using ProjectionTileShape = Shape<_128, _256, _64>;
+using WideN320TileShape = Shape<_128, Int<320>, _64>;
 using Fp8TileShape = Shape<_128, _128, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
 using M64ClusterShape = Shape<_1, _1, _1>;
@@ -258,6 +259,7 @@ using N160PureGemm = cutlass::gemm::kernel::GemmUniversal<
     N160Epilogue,
     cutlass::gemm::PersistentScheduler>;
 
+#if FUSE_ENABLE_PROFILING
 using A2ALhsTelemetryMainloop =
     detail::A2ALhsReadyMainloop<BaseMainloop, 1, true>;
 using A2ALhsTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
@@ -265,6 +267,7 @@ using A2ALhsTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsTelemetryMainloop,
     BaseEpilogue,
     detail::MonolithicPersistentScheduler>;
+#endif
 // Small-M dense GEMMs need twice as many M tiles to fill H200.  Keep these
 // CTAs independent so an early-ready M64 tile is never held behind its peer.
 using M64Epilogue =
@@ -313,6 +316,7 @@ using A2ALhsM64Gemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsM64Mainloop,
     M64Epilogue,
     detail::MonolithicPersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
 using A2ALhsM64TelemetryMainloop =
     detail::A2ALhsReadyMainloop<M64Mainloop, 1, true>;
 using A2ALhsM64TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
@@ -320,6 +324,7 @@ using A2ALhsM64TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsM64TelemetryMainloop,
     M64Epilogue,
     detail::MonolithicPersistentScheduler>;
+#endif
 using OutputGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     BaseMainloop,
@@ -380,6 +385,73 @@ using A2ALhsProjectionGemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsProjectionMainloop,
     ProjectionEpilogue,
     detail::MonolithicPersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
+using A2ALhsProjectionTelemetryMainloop =
+    detail::A2ALhsReadyMainloop<ProjectionMainloop, 1, true>;
+using A2ALhsProjectionTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    A2ALhsProjectionTelemetryMainloop,
+    ProjectionEpilogue,
+    detail::MonolithicPersistentScheduler>;
+#endif
+
+// Wide-N cluster policy for frontier-aligned persistent waves.
+using WideN320Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        WideN320TileShape,
+        ProjectionClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+
+using WideN320Mainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutB,
+        kAlignment,
+        Accumulator,
+        WideN320TileShape,
+        ProjectionClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename WideN320Epilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using A2ALhsWideN320Mainloop =
+    detail::A2ALhsReadyMainloop<WideN320Mainloop>;
+using A2ALhsWideN320Gemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    A2ALhsWideN320Mainloop,
+    WideN320Epilogue,
+    detail::MonolithicPersistentScheduler>;
+using WideN320PureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    WideN320Mainloop,
+    WideN320Epilogue,
+    cutlass::gemm::PersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
+using A2ALhsWideN320TelemetryMainloop =
+    detail::A2ALhsReadyMainloop<WideN320Mainloop, 1, true>;
+using A2ALhsWideN320TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    A2ALhsWideN320TelemetryMainloop,
+    WideN320Epilogue,
+    detail::MonolithicPersistentScheduler>;
+#endif
+
 using Fp8BaseEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90,
     cutlass::arch::OpClassTensorOp,
@@ -442,14 +514,58 @@ struct A2ALhsCommTimelineArguments<true> {
   int32_t peer_timeline_capacity = 0;
 };
 
+cudaError_t make_a2a_lhs_store_tma_3d(
+    CUtensorMap* tensor_map,
+    void* pointer,
+    int32_t inner_u64,
+    int32_t total_groups,
+    int32_t rows,
+    int32_t peer_groups,
+    int32_t box_rows) {
+  const uint64_t global_dims[3] = {
+      static_cast<uint64_t>(inner_u64),
+      static_cast<uint64_t>(total_groups),
+      static_cast<uint64_t>(rows)};
+  const uint64_t global_strides[2] = {
+      static_cast<uint64_t>(inner_u64) * sizeof(uint64_t),
+      static_cast<uint64_t>(inner_u64) * total_groups * sizeof(uint64_t)};
+  const uint32_t box_dims[3] = {
+      static_cast<uint32_t>(inner_u64),
+      static_cast<uint32_t>(peer_groups),
+      static_cast<uint32_t>(box_rows)};
+  constexpr uint32_t element_strides[3] = {1, 1, 1};
+  const CUresult result =
+      CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+          tensor_map,
+          CU_TENSOR_MAP_DATA_TYPE_UINT64,
+          3,
+          pointer,
+          global_dims,
+          global_strides,
+          box_dims,
+          element_strides,
+          CU_TENSOR_MAP_INTERLEAVE_NONE,
+          CU_TENSOR_MAP_SWIZZLE_NONE,
+          CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
+}
+
 template <int32_t ReadyBlockM, bool Instrumented = false>
 struct A2ALhsInputCommT {
   static constexpr int32_t kReadyBlockM = ReadyBlockM;
+  static constexpr size_t SharedStorageBytes =
+      kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
+      kA2ALhsBulkSlots * sizeof(uint64_t);
   struct Arguments : A2ALhsCommTimelineArguments<Instrumented> {
     A2AGemmParams params{};
+    CUtensorMap store_tma_full{};
     int32_t comm_rows = kA2ALhsCommRows;
     int32_t m_window = 2;
+    int32_t store_peer_groups = 0;
+    int32_t store_rows = 0;
     bool use_bulk = false;
+    bool use_tensor_store = false;
   };
   using Params = Arguments;
 
@@ -471,7 +587,50 @@ struct A2ALhsInputCommT {
          (route.seq_local / 2) % ReadyBlockM == 0);
     if (!args.use_bulk) {
       args.comm_rows = kA2ALhsCommRows;
+      return cudaSuccess;
     }
+
+    constexpr int32_t kTensorStoreBytes = 8 * 1024;
+    if (row_bytes > 1024) {
+      return cudaSuccess;
+    }
+    args.store_rows = min(args.comm_rows, kTensorStoreBytes / row_bytes);
+    if (args.store_rows < 2) {
+      return cudaSuccess;
+    }
+
+    // Store a narrow peer shard as a small 3D tensor instead of one TMA per
+    // row. Four BF16 values form one raw 64-bit tensor element; the first two
+    // dimensions factor the contiguous K shard and the third is M.
+    const int32_t shard_u64 = row_bytes / sizeof(uint64_t);
+    int32_t inner_u64 = 0;
+    for (int32_t candidate = 256; candidate >= 2; candidate >>= 1) {
+      if (shard_u64 % candidate == 0) {
+        inner_u64 = candidate;
+        break;
+      }
+    }
+    const int32_t peer_groups = inner_u64 > 0
+        ? shard_u64 / inner_u64
+        : 0;
+    if (inner_u64 == 0 || peer_groups <= 0 || peer_groups > 256) {
+      return cudaSuccess;
+    }
+
+    const int32_t total_groups = peer_groups * route.world_size;
+    const cudaError_t status = make_a2a_lhs_store_tma_3d(
+        &args.store_tma_full,
+        p.input_staging,
+        inner_u64,
+        total_groups,
+        p.gemm.m,
+        peer_groups,
+        args.store_rows);
+    if (status != cudaSuccess) {
+      return cudaSuccess;
+    }
+    args.store_peer_groups = peer_groups;
+    args.use_tensor_store = true;
     return cudaSuccess;
   }
 
@@ -574,6 +733,9 @@ struct A2ALhsInputCommT {
       int32_t phase = 0;
       if (lane == 0) {
         cute::initialize_barrier(*barrier, 1);
+        if (args.use_tensor_store) {
+          cute::prefetch_tma_descriptor(&args.store_tma_full);
+        }
       }
       __syncwarp();
 
@@ -644,19 +806,51 @@ struct A2ALhsInputCommT {
           cute::wait_barrier(*barrier, phase);
           phase ^= 1;
           cute::tma_store_fence();
-          for (int32_t row = 0; row < copy_rows; ++row) {
-            cute::SM90_BULK_COPY_S2G::copy(
-                stage + static_cast<int64_t>(row) * shard_width,
-                p.input_staging +
-                    static_cast<int64_t>(m_begin + row) * p.gemm.k +
-                    peer_slot * shard_width,
-                shard_width * sizeof(Element));
-            if ((row & 7) == 7) {
+          if (args.use_tensor_store) {
+            int32_t row = 0;
+            for (; row + args.store_rows <= copy_rows;
+                 row += args.store_rows) {
+              cute::SM90_TMA_STORE_3D::copy(
+                  &args.store_tma_full,
+                  stage + static_cast<int64_t>(row) * shard_width,
+                  0,
+                  peer_slot * args.store_peer_groups,
+                  m_begin + row);
+            }
+            if (row > 0) {
               cute::tma_store_arrive();
             }
-          }
-          if ((copy_rows & 7) != 0) {
-            cute::tma_store_arrive();
+            int32_t residual_ops = 0;
+            for (; row < copy_rows; ++row) {
+              cute::SM90_BULK_COPY_S2G::copy(
+                  stage + static_cast<int64_t>(row) * shard_width,
+                  p.input_staging +
+                      static_cast<int64_t>(m_begin + row) * p.gemm.k +
+                      peer_slot * shard_width,
+                  shard_width * sizeof(Element));
+              if (++residual_ops == 8) {
+                cute::tma_store_arrive();
+                residual_ops = 0;
+              }
+            }
+            if (residual_ops != 0) {
+              cute::tma_store_arrive();
+            }
+          } else {
+            for (int32_t row = 0; row < copy_rows; ++row) {
+              cute::SM90_BULK_COPY_S2G::copy(
+                  stage + static_cast<int64_t>(row) * shard_width,
+                  p.input_staging +
+                      static_cast<int64_t>(m_begin + row) * p.gemm.k +
+                      peer_slot * shard_width,
+                  shard_width * sizeof(Element));
+              if ((row & 7) == 7) {
+                cute::tma_store_arrive();
+              }
+            }
+            if ((copy_rows & 7) != 0) {
+              cute::tma_store_arrive();
+            }
           }
           cute::tma_store_wait<0>();
           publish_ready(args, tile_m, peer_slot);
@@ -731,26 +925,44 @@ struct A2ALhsInputCommT {
 
 using A2ALhsInputComm = A2ALhsInputCommT<kBlockM>;
 using A2ALhsM64InputComm = A2ALhsInputCommT<64>;
+#if FUSE_ENABLE_PROFILING
 using A2ALhsTelemetryInputComm = A2ALhsInputCommT<kBlockM, true>;
 using A2ALhsM64TelemetryInputComm = A2ALhsInputCommT<64, true>;
+#endif
 
 using A2ALhsGemmKernel =
     detail::MonolithicGemm<A2ALhsInputGemm, A2ALhsInputComm>;
 using A2ALhsN160GemmKernel =
     detail::MonolithicGemm<A2ALhsN160Gemm, A2ALhsInputComm>;
+#if FUSE_ENABLE_PROFILING
 using A2ALhsTelemetryBase =
     detail::MonolithicGemm<A2ALhsTelemetryGemm, A2ALhsTelemetryInputComm>;
 using A2ALhsTelemetryKernel =
     detail::RoleTelemetryKernel<A2ALhsTelemetryBase>;
+#endif
 using A2ALhsProjectionGemmKernel =
     detail::MonolithicGemm<A2ALhsProjectionGemm, A2ALhsInputComm>;
+using A2ALhsWideN320GemmKernel =
+    detail::MonolithicGemm<A2ALhsWideN320Gemm, A2ALhsInputComm>;
+#if FUSE_ENABLE_PROFILING
+using A2ALhsProjectionTelemetryBase = detail::MonolithicGemm<
+    A2ALhsProjectionTelemetryGemm, A2ALhsTelemetryInputComm>;
+using A2ALhsProjectionTelemetryKernel =
+    detail::RoleTelemetryKernel<A2ALhsProjectionTelemetryBase>;
+using A2ALhsWideN320TelemetryBase = detail::MonolithicGemm<
+    A2ALhsWideN320TelemetryGemm, A2ALhsTelemetryInputComm>;
+using A2ALhsWideN320TelemetryKernel =
+    detail::RoleTelemetryKernel<A2ALhsWideN320TelemetryBase>;
+#endif
 using A2ALhsM64GemmKernel =
     detail::MonolithicGemm<A2ALhsM64Gemm, A2ALhsM64InputComm>;
+#if FUSE_ENABLE_PROFILING
 using A2ALhsM64TelemetryBase =
     detail::MonolithicGemm<
         A2ALhsM64TelemetryGemm, A2ALhsM64TelemetryInputComm>;
 using A2ALhsM64TelemetryKernel =
     detail::RoleTelemetryKernel<A2ALhsM64TelemetryBase>;
+#endif
 static_assert(
     sizeof(typename A2ALhsGemmKernel::SharedStorage) >=
         kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
@@ -766,6 +978,11 @@ static_assert(
         kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
             kA2ALhsBulkSlots * sizeof(uint64_t),
     "wide A2A LHS monolithic shared storage must hold every bulk slot");
+static_assert(
+    sizeof(typename A2ALhsWideN320GemmKernel::SharedStorage) >=
+        kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
+            kA2ALhsBulkSlots * sizeof(uint64_t),
+    "N320 A2A LHS monolithic shared storage must hold every bulk slot");
 static_assert(
     sizeof(typename A2ALhsM64GemmKernel::SharedStorage) >=
         kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
@@ -1623,12 +1840,16 @@ struct LhsPolicyCandidate {
   int32_t cluster_m;
 };
 
-constexpr std::array<LhsPolicyCandidate, 4> kLhsPolicyCandidates{{
+constexpr std::array<LhsPolicyCandidate, 5> kLhsPolicyCandidates{{
     {A2ALhsGemmPolicy::kM64N128, 64, 128, 1},
     {A2ALhsGemmPolicy::kM128N128, 128, 128, 1},
     {A2ALhsGemmPolicy::kM128N160, 128, 160, 1},
     {A2ALhsGemmPolicy::kM128N256ClusterM2, 128, 256, 2},
+    {A2ALhsGemmPolicy::kM128N320ClusterM2, 128, 320, 2},
 }};
+
+constexpr LhsPolicyCandidate kWideN320ManualCandidate{
+    A2ALhsGemmPolicy::kM128N320ClusterM2, 128, 320, 2};
 
 A2ALhsPolicyInfo score_a2a_lhs_policy(
     const GemmProblem& problem,
@@ -1650,15 +1871,33 @@ A2ALhsPolicyInfo score_a2a_lhs_policy(
     info.estimated_cycles = std::numeric_limits<double>::infinity();
     return info;
   }
+  info.compute_clusters = info.compute_ctas / candidate.cluster_m;
 
   const int64_t m_tiles = ceil_div(problem.m, candidate.tile_m);
   const int64_t n_tiles = ceil_div(problem.n, candidate.tile_n);
+  const int64_t m_cluster_tiles = ceil_div(m_tiles, candidate.cluster_m);
+  info.n_tiles = static_cast<int32_t>(n_tiles);
   info.tile_count = m_tiles * n_tiles * problem.l;
+  info.cluster_tile_count = m_cluster_tiles * n_tiles * problem.l;
   info.waves = static_cast<int32_t>(
-      ceil_div(info.tile_count, static_cast<int64_t>(info.compute_ctas)));
-  info.last_wave_ctas = static_cast<int32_t>(
-      info.tile_count - static_cast<int64_t>(info.waves - 1) *
-          info.compute_ctas);
+      ceil_div(
+          info.cluster_tile_count,
+          static_cast<int64_t>(info.compute_clusters)));
+  info.last_wave_clusters = static_cast<int32_t>(
+      info.cluster_tile_count - static_cast<int64_t>(info.waves - 1) *
+          info.compute_clusters);
+  info.last_wave_ctas = info.last_wave_clusters * candidate.cluster_m;
+  // A cluster is the indivisible scheduler work unit.  A wave boundary is
+  // frontier-aligned only when it contains an integer number of complete
+  // N-frontiers, or one frontier occupies an integer number of whole waves.
+  // This prevents an already-published M frontier from being split across
+  // two persistent-CTA waves merely because its N fan-out does not divide the
+  // resident cluster budget.
+  info.frontier_aligned =
+      info.waves == 1 || info.compute_clusters % n_tiles == 0 ||
+      n_tiles % info.compute_clusters == 0;
+  info.full_last_wave =
+      info.cluster_tile_count % info.compute_clusters == 0;
 
   // DeepGEMM-style SM90 wave model.  Tensor-core work and HBM bytes are
   // invariant across candidates; this compares the variable L1/L2 traffic
@@ -1682,8 +1921,9 @@ A2ALhsPolicyInfo score_a2a_lhs_policy(
           (std::max(64, candidate.tile_m) + candidate.tile_n) *
           element_bytes +
       2.0 * candidate.tile_m * candidate.tile_n * element_bytes;
-  const double wave_efficiency = static_cast<double>(info.tile_count) /
-      (static_cast<double>(info.waves) * info.compute_ctas);
+  const double wave_efficiency =
+      static_cast<double>(info.cluster_tile_count) /
+      (static_cast<double>(info.waves) * info.compute_clusters);
   const double l2_cycles =
       l2_bytes_per_tile * info.tile_count / l2_bandwidth;
   const double l1_cycles =
@@ -1700,6 +1940,10 @@ A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
     A2ALhsGemmPolicy requested) {
   A2ALhsPolicyInfo best{};
   best.estimated_cycles = std::numeric_limits<double>::infinity();
+  if (requested == A2ALhsGemmPolicy::kM128N320ClusterM2) {
+    return score_a2a_lhs_policy(
+        problem, num_comm_ctas, sm_count, kWideN320ManualCandidate);
+  }
   for (const auto& candidate : kLhsPolicyCandidates) {
     if (requested != A2ALhsGemmPolicy::kAuto &&
         requested != candidate.policy) {
@@ -1716,7 +1960,25 @@ A2ALhsPolicyInfo select_a2a_lhs_policy_impl(
     if (candidate.cluster_m > 1 && current.waves == 1) {
       continue;
     }
-    if (current.estimated_cycles < best.estimated_cycles) {
+    // N320 is admitted automatically only when it fixes a scheduling
+    // geometry problem: aligning an M frontier or improving a partial wave.
+    // If an unaligned candidate already ends on a full wave, keep the mature
+    // N256 family instead of treating larger N as a generic GEMM tuning knob.
+    if (candidate.policy == A2ALhsGemmPolicy::kM128N320ClusterM2 &&
+        !current.frontier_aligned && current.full_last_wave) {
+      continue;
+    }
+    const bool better_frontier =
+        current.frontier_aligned > best.frontier_aligned;
+    const bool equal_frontier =
+        current.frontier_aligned == best.frontier_aligned;
+    // Frontier splitting directly delays ready-data consumption and is a
+    // structural scheduling hazard.  A partial final wave is softer: its cost
+    // is already represented by wave_efficiency, so never choose an otherwise
+    // weak GEMM tile solely to make the last wave full.
+    if (better_frontier ||
+        (equal_frontier &&
+         current.estimated_cycles < best.estimated_cycles)) {
       best = current;
     }
   }
@@ -1749,6 +2011,10 @@ cudaError_t launch_a2a_lhs_gemm_impl(
     case A2ALhsGemmPolicy::kM128N256ClusterM2:
       return launch_a2a_lhs_gemm_policy<
           A2ALhsProjectionGemm, A2ALhsProjectionGemmKernel>(
+              params, stream, sm_count, device);
+    case A2ALhsGemmPolicy::kM128N320ClusterM2:
+      return launch_a2a_lhs_gemm_policy<
+          A2ALhsWideN320Gemm, A2ALhsWideN320GemmKernel>(
               params, stream, sm_count, device);
     default:
       return cudaErrorNotSupported;
@@ -2275,6 +2541,7 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     A2AGemmPeerTimeline* peer_timeline,
     int32_t peer_timeline_capacity,
     cudaStream_t stream) {
+#if FUSE_ENABLE_PROFILING
   int32_t sm_count = 0;
   int32_t device = 0;
   cudaError_t status = device_sm_count(&sm_count, &device);
@@ -2311,6 +2578,36 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
             peer_timeline,
             peer_timeline_capacity);
   }
+  if (selected.policy == A2ALhsGemmPolicy::kM128N256ClusterM2) {
+    return launch_a2a_lhs_gemm_policy<
+        A2ALhsProjectionTelemetryGemm,
+        A2ALhsProjectionTelemetryKernel,
+        A2ALhsTelemetryInputComm,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity,
+            peer_timeline,
+            peer_timeline_capacity);
+  }
+  if (selected.policy == A2ALhsGemmPolicy::kM128N320ClusterM2) {
+    return launch_a2a_lhs_gemm_policy<
+        A2ALhsWideN320TelemetryGemm,
+        A2ALhsWideN320TelemetryKernel,
+        A2ALhsTelemetryInputComm,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity,
+            peer_timeline,
+            peer_timeline_capacity);
+  }
   if (selected.policy != A2ALhsGemmPolicy::kM128N128) {
     return cudaErrorNotSupported;
   }
@@ -2327,9 +2624,19 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
           timeline_capacity,
           peer_timeline,
           peer_timeline_capacity);
+#else
+  (void)params;
+  (void)timeline;
+  (void)timeline_capacity;
+  (void)peer_timeline;
+  (void)peer_timeline_capacity;
+  (void)stream;
+  return cudaErrorNotSupported;
+#endif
 }
 
 cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources) {
+#if FUSE_ENABLE_PROFILING
   if (resources == nullptr) {
     return cudaErrorInvalidValue;
   }
@@ -2362,6 +2669,10 @@ cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources) {
           kA2ALhsBulkSlots *
           (kA2ALhsBulkStageBytes + sizeof(uint64_t)))};
   return cudaSuccess;
+#else
+  (void)resources;
+  return cudaErrorNotSupported;
+#endif
 }
 
 cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t stream) {
@@ -2574,6 +2885,13 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
         return cudaErrorInvalidValue;
       }
       return launch_a2a_lhs_reference_impl<ProjectionPureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas);
+    case A2ALhsGemmPolicy::kM128N320ClusterM2:
+      if (reserved_comm_ctas % 2 != 0 ||
+          (sm_count - reserved_comm_ctas) % 2 != 0) {
+        return cudaErrorInvalidValue;
+      }
+      return launch_a2a_lhs_reference_impl<WideN320PureGemm>(
           params, stream, sm_count, device, reserved_comm_ctas);
     default:
       return cudaErrorNotSupported;

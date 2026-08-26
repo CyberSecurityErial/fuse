@@ -91,6 +91,8 @@ const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
       return "m128n160";
     case fuse::A2ALhsGemmPolicy::kM128N256ClusterM2:
       return "m128n256_cluster_m2";
+    case fuse::A2ALhsGemmPolicy::kM128N320ClusterM2:
+      return "m128n320_cluster_m2";
     default:
       return "auto";
   }
@@ -104,9 +106,12 @@ fuse::A2ALhsGemmPolicy parse_lhs_policy(const std::string& value) {
   if (value == "m128n256c2") {
     return fuse::A2ALhsGemmPolicy::kM128N256ClusterM2;
   }
+  if (value == "m128n320c2") {
+    return fuse::A2ALhsGemmPolicy::kM128N320ClusterM2;
+  }
   throw std::runtime_error(
       "--lhs-policy must be auto, m64n128, m128n128, m128n160, or "
-      "m128n256c2");
+      "m128n256c2 or m128n320c2");
 }
 
 Options parse_options(int argc, char** argv) {
@@ -164,7 +169,12 @@ Options parse_options(int argc, char** argv) {
     } else if (argument == "--json-out") {
       options.json_out = take("--json-out");
     } else if (argument == "--trace-out") {
+#if !FUSE_ENABLE_PROFILING
+      throw std::runtime_error(
+          "--trace-out requires -DFUSE_ENABLE_PROFILING=ON");
+#endif
       options.trace_out = take("--trace-out");
+      options.role_telemetry = true;
     } else if (argument == "--role-telemetry") {
       options.role_telemetry = true;
     } else if (argument == "--defer-v-a2a") {
@@ -216,20 +226,21 @@ void report_a2a_lhs_role_trace(
         &capacities[rank], cudaDevAttrMultiProcessorCount, rank));
     device_timeline[rank] = allocate<fuse::A2AGemmCtaTimeline>(
         rank, capacities[rank]);
-    const int32_t compute_ctas = capacities[rank] - params[rank].num_comm_ctas;
-    const int32_t m128_tiles = (params[rank].gemm.m + 127) / 128;
-    const int32_t n128_tiles = (params[rank].gemm.n + 127) / 128;
-    const bool use_m64 = params[rank].gemm.n < 4096 &&
-        static_cast<int64_t>(m128_tiles) * n128_tiles * params[rank].gemm.l <
-            compute_ctas;
-    const int32_t tile_m = use_m64 ? 64 : 128;
+    const auto policy = fuse::select_a2a_lhs_gemm_policy(
+        params[rank].gemm,
+        params[rank].num_comm_ctas,
+        capacities[rank],
+        params[rank].lhs_policy);
+    const int32_t tile_m = policy.tile_m;
+    const int32_t tile_n = policy.tile_n;
     const int32_t m_tiles = (params[rank].gemm.m + tile_m - 1) / tile_m;
-    const int32_t n_tiles = params[rank].gemm.n >= 4096
-        ? (params[rank].gemm.n + 255) / 256
-        : n128_tiles;
+    const int32_t n_tiles = (params[rank].gemm.n + tile_n - 1) / tile_n;
+    const int32_t ready_block_m = tile_m;
+    const int32_t ready_m_tiles =
+        (params[rank].gemm.m + ready_block_m - 1) / ready_block_m;
     peer_capacities[rank] = std::max(
         m_tiles * n_tiles * params[rank].gemm.l,
-        m_tiles * params[rank].route.world_size);
+        ready_m_tiles * params[rank].route.world_size);
     device_peer_timeline[rank] = allocate<fuse::A2AGemmPeerTimeline>(
         rank, peer_capacities[rank]);
     CUDA_CHECK(cudaMemsetAsync(
@@ -388,13 +399,12 @@ void report_a2a_lhs_role_trace(
              event.active_start, event.end, origin);
       }
     }
-    const int32_t compute_ctas = capacities[rank] - params[rank].num_comm_ctas;
-    const int32_t m128_tiles = (params[rank].gemm.m + 127) / 128;
-    const int32_t n128_tiles = (params[rank].gemm.n + 127) / 128;
-    const bool use_m64 = params[rank].gemm.n < 4096 &&
-        static_cast<int64_t>(m128_tiles) * n128_tiles * params[rank].gemm.l <
-            compute_ctas;
-    const int32_t ready_block_m = use_m64 ? 64 : 128;
+    const auto policy = fuse::select_a2a_lhs_gemm_policy(
+        params[rank].gemm,
+        params[rank].num_comm_ctas,
+        capacities[rank],
+        params[rank].lhs_policy);
+    const int32_t ready_block_m = policy.tile_m;
     const int32_t ready_m_tiles =
         (params[rank].gemm.m + ready_block_m - 1) / ready_block_m;
     const int32_t peer_count = params[rank].route.world_size;
@@ -1106,9 +1116,19 @@ void write_json(
            << ", \"tile_k\": " << lhs_policy->tile_k
            << ", \"cluster_m\": " << lhs_policy->cluster_m
            << ", \"compute_ctas\": " << lhs_policy->compute_ctas
+           << ", \"compute_clusters\": " << lhs_policy->compute_clusters
            << ", \"tile_count\": " << lhs_policy->tile_count
+           << ", \"cluster_tile_count\": "
+           << lhs_policy->cluster_tile_count
+           << ", \"n_tiles\": " << lhs_policy->n_tiles
            << ", \"waves\": " << lhs_policy->waves
+           << ", \"last_wave_clusters\": "
+           << lhs_policy->last_wave_clusters
            << ", \"last_wave_ctas\": " << lhs_policy->last_wave_ctas
+           << ", \"frontier_aligned\": "
+           << (lhs_policy->frontier_aligned ? "true" : "false")
+           << ", \"full_last_wave\": "
+           << (lhs_policy->full_last_wave ? "true" : "false")
            << ", \"estimated_cycles\": " << lhs_policy->estimated_cycles
            << "},\n";
   }
@@ -1414,8 +1434,12 @@ void benchmark_a2a_lhs_gemm(
             << " comm_ctas=" << launch_options.comm_ctas
             << " policy=" << lhs_policy_name(policy_info.policy)
             << " tile=" << policy_info.tile_m << "x" << policy_info.tile_n
+            << " compute_clusters=" << policy_info.compute_clusters
+            << " n_tiles=" << policy_info.n_tiles
             << " waves=" << policy_info.waves
             << " last_wave=" << policy_info.last_wave_ctas
+            << " frontier_aligned=" << policy_info.frontier_aligned
+            << " full_last_wave=" << policy_info.full_last_wave
             << " exact_mismatches=" << exact_mismatches << "\n";
   print_result("cuBLAS BF16", cublas, flops, world, pure_mean);
   print_result("cuBLASLt BF16", cublaslt, flops, world, pure_mean);
