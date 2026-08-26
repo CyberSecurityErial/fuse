@@ -98,9 +98,11 @@ python3 benchmarks/oproj_shape_bench.py \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-| CP | case 数 | 相对最优分离 | 纯 GEMM 的百分比 |
-|---:|---:|---:|---:|
-| 4 | 18 | 1.17×–2.21× | 54.5%–100.5% |
-| 8 | 18 | 1.16×–2.96× | 61.3%–95.7% |
+当前版本：v3.0
+
+| CP | case 数 | 相对最优分离 | 相对 TE Userbuffers | 纯 GEMM 的百分比 |
+|---:|---:|---:|---:|---:|
+| 4 | 18 | 1.34×–2.21× | 1.01×–1.19× | 58.1%–100.5% |
+| 8 | 18 | 1.35×–2.96× | 1.04×–1.81× | 61.3%–95.7% |
 
 v3.0 标定后，36/36 个 setting 的 p50 快于 TE Userbuffers，几何平均为 1.154×；该结论明确包含7个 per-shape `comm_ctas` winner，不代表默认自动入口零调参即可得到36/36。全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级差异见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。

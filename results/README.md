@@ -10,8 +10,9 @@ Measurement contract:
 - 10 warmup iterations and 50 measured iterations;
 - every sample reports the maximum CUDA-event latency across ranks;
 - the table uses p50 latency;
-- the v2 fused implementation uses `--lhs-policy auto --comm-ctas 0`;
-- the production runtime selected `comm_ctas=4/6/8` across the 36 cases;
+- the v3 snapshot fixes the v2 kernel and keeps `--lhs-policy auto`;
+- 29 rows use the v2 automatic `comm_ctas=4/6/8` result, while seven rows
+  use a formally measured external `comm_ctas` winner;
 - the tile is selected from the maintained fixed CUTLASS candidates by the
   shared runtime cost model, with no per-shape manual tile override.
 
@@ -25,8 +26,10 @@ Committed directories:
   corresponding 128K, 256K, and 512K aggregates, plus fused-only 1M entries;
 - `te_userbuffers_shape_bench` and `te_userbuffers_shape_bench_longseq`: the
   selected TE Userbuffers configurations and formal results.
-- `oproj_v3_manual_comm_bench`: the seven v3 external `comm_ctas` overrides;
-  all other options remain fixed and the other 29 cases inherit v2 exactly.
+- `oproj_v3_manual_comm_bench`: the complete 36-case v3 snapshot. Its
+  `result_source` field distinguishes 29 `v2_auto_inherited` rows from seven
+  `manual_comm_ctas` rows; all options other than the external communication
+  CTA count remain fixed.
 
 Each O-projection directory keeps only `baseline_summary.*`,
 `fused_summary.*`, and `shape_matrix.*`; each Userbuffers directory keeps

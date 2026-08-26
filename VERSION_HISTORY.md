@@ -87,6 +87,8 @@ export FUSE_A2A_LHS_COMM_POLICY=experimental_model
 
 代码落点：
 
+当前版本：v2.0
+
 | 文件 | 改动 |
 |---|---|
 | `include/fuse/kernels.h` | 增加 N320 policy 和 cluster/frontier 诊断字段 |
@@ -101,6 +103,8 @@ export FUSE_A2A_LHS_COMM_POLICY=experimental_model
 
 本节第一阶段和第二阶段的逐点数字都是开发过程快照，用于解释每步改动；v2.0 的最终发布结论只使用后文“发布版自动通信 CTA”中的正式36-case结果。
 
+当前版本：v2.0
+
 | 指标 | 结果 |
 |---|---:|
 | exact correctness | 36/36 PASS |
@@ -111,6 +115,8 @@ export FUSE_A2A_LHS_COMM_POLICY=experimental_model
 | 相对 TE Userbuffers 几何平均 | 1.0304× |
 
 目标组 `N=K=5120`：
+
+当前版本：v2.0
 
 | CP | 全局 S | v1 p50 | v2 p50 | 提升 | v2 policy |
 |---:|---:|---:|---:|---:|---|
@@ -144,6 +150,8 @@ otherwise:
 
 正式 36-case 复测中，当前模型矩阵只有 `K=4096, CP8` 的六个 setting 命中新路径：
 
+当前版本：v2.0
+
 | 全局 S | 第一阶段 p50 | 当前 p50 | 提升 |
 |---:|---:|---:|---:|
 | 1K | 0.032096 ms | 0.031840 ms | 0.80% |
@@ -176,6 +184,8 @@ H100/H200 默认按 900 GB/s 双向 NVLink，H800 按 400 GB/s；其他拓扑可
 
 最终 36-case（10 warmup + 50 samples，max-rank p50）：
 
+当前版本：v2.0
+
 | 指标 | 结果 |
 |---|---:|
 | exact correctness | 36/36 PASS |
@@ -202,6 +212,8 @@ H100/H200 默认按 900 GB/s 双向 NVLink，H800 按 400 GB/s；其他拓扑可
 
 v3.0 不改 A2A + O-projection 的计算、通信或自动 tile 逻辑。它固定 v2.0 kernel，只把外部 `comm_ctas` 作为唯一调参量：`--lhs-policy auto --raster n --swizzle 1` 全程不变。29 个已经领先 TE Userbuffers 的 setting 原样沿用 v2 自动结果，7 个原落后点使用正式扫描得到的通信 CTA 数。
 
+当前版本：v3.0
+
 | CP | S | GEMM M×N×K | v2 自动 p50 | v3 p50 / comm | TE UB p50 | v2→v3 | v3 相对 TE |
 |---:|---:|---|---:|---:|---:|---:|---:|
 | 4 | 4K | `1024×4096×4096` | 0.0928 | 0.0736 / c10 | 0.0792 | 1.261× | 1.076× |
@@ -220,4 +232,4 @@ v3.0 不改 A2A + O-projection 的计算、通信或自动 tile 逻辑。它固�
 - `comm_ctas` 的 winner 属于 shape 与硬件拓扑标定值。默认 `--comm-ctas 0` 仍是通用生产入口；v3.0 没有把7个 shape 写进运行时规则。
 - profiling 字段全部由 `FUSE_ENABLE_PROFILING` 编译期开关隔离。Release 默认关闭，关闭构建不携带 timeline 参数、时间戳读取或 diagnostic atomic。
 
-正式7点归档位于 [`results/oproj_v3_manual_comm_bench`](results/oproj_v3_manual_comm_bench)。完整36点的 v2 原始结果继续保存在 `results/oproj_cluster_wave_bench`，避免把手工标定冒充自动策略结果。
+完整36点的 v3.0 归档位于 [`results/oproj_v3_manual_comm_bench`](results/oproj_v3_manual_comm_bench)，每行通过 `result_source` 标明 `v2_auto_inherited` 或 `manual_comm_ctas`；上面的7点表只展示相对 v2.0 有变化的标定项。完整36点的 v2 原始结果继续保存在 `results/oproj_cluster_wave_bench`，避免把手工标定冒充自动策略结果。
