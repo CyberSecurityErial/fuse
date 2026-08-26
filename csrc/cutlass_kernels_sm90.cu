@@ -4,14 +4,12 @@
 
 #include "fuse/cutlass_collectives.cuh"
 #include "fuse/cutlass_scheduler.cuh"
-#include "fuse/deepgemm_qkv_sm90.cuh"
 #include "fuse/monolithic_gemm.cuh"
 #if FUSE_ENABLE_PROFILING
 #include "fuse/role_telemetry.cuh"
 #endif
 #include "fuse/system_barrier.cuh"
 
-#include <deep_gemm/impls/sm90_bf16_gemm.cuh>
 
 #include <cuda_runtime.h>
 
@@ -1687,18 +1685,6 @@ using QkvGqaPackCommSmallInterleaved = QkvGqaPackCommT<
     static_cast<int32_t>(cute::size<1>(TileShape{})),
     4,
     true>;
-// Keep the GEMM producer on DeepGEMM's fastest wide-N policies while routing
-// Q/K in head-aligned 128-column chunks.  Producer and copy tile boundaries
-// are intentionally independent; a copy waits for every producer tile it
-// overlaps before reading the output.
-using DeepGemmQkvComm176 =
-    QkvGqaPackCommT<GemmA2AParams, false, 128, 176, 4, false, 128>;
-using DeepGemmQkvComm176Interleaved =
-    QkvGqaPackCommT<GemmA2AParams, false, 128, 176, 4, true, 128>;
-using DeepGemmQkvComm192 =
-    QkvGqaPackCommT<GemmA2AParams, false, 128, 192, 4, false, 128>;
-using DeepGemmQkvComm192Interleaved =
-    QkvGqaPackCommT<GemmA2AParams, false, 128, 192, 4, true, 128>;
 using Fp8QkvGqaPackComm = QkvGqaPackCommT<
     Fp8GemmA2AParams,
     true,
@@ -2078,7 +2064,7 @@ A2ALhsPolicyInfo score_a2a_lhs_policy(
   info.full_last_wave =
       info.cluster_tile_count % info.compute_clusters == 0;
 
-  // DeepGEMM-style SM90 wave model.  Tensor-core work and HBM bytes are
+  // SM90 wave model.  Tensor-core work and HBM bytes are
   // invariant across candidates; this compares the variable L1/L2 traffic
   // after accounting for cluster-B multicast and partial-wave occupancy.
   constexpr double kL2BytesPerCycle = 8.0e6 / 1.3e3;
@@ -2257,360 +2243,6 @@ cudaError_t launch_gemm_a2a_impl(
   return detail::launch_cooperative<Kernel>(kernel_params, stream, sm_count);
 }
 
-cudaError_t make_deepgemm_tma_2d(
-    CUtensorMap* tensor_map,
-    const void* pointer,
-    uint64_t global_inner,
-    uint64_t global_outer,
-    uint32_t box_inner,
-    uint32_t box_outer,
-    uint64_t outer_stride_elements,
-    CUtensorMapSwizzle swizzle) {
-  const uint64_t global_dims[2] = {global_inner, global_outer};
-  const uint64_t global_strides[1] = {
-      outer_stride_elements * sizeof(Element)};
-  const uint32_t box_dims[2] = {box_inner, box_outer};
-  constexpr uint32_t element_strides[2] = {1, 1};
-  const CUresult result =
-      CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-          tensor_map,
-          CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-          2,
-          const_cast<void*>(pointer),
-          global_dims,
-          global_strides,
-          box_dims,
-          element_strides,
-          CU_TENSOR_MAP_INTERLEAVE_NONE,
-          swizzle,
-          CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
-}
-
-template <
-    int32_t BlockN,
-    int32_t NumStages,
-    int32_t SwizzleD,
-    bool MulticastA,
-    int32_t NumComputeCtas>
-cudaError_t launch_deepgemm_reference_config(
-    const GemmA2AParams& params,
-    cudaStream_t stream) {
-  constexpr int32_t block_m = 128;
-  constexpr int32_t block_k = 64;
-  constexpr int32_t threads = 384;
-  constexpr size_t smem_d =
-      (block_m * BlockN * sizeof(Element) + 1023) / 1024 * 1024;
-  constexpr size_t smem_per_stage =
-      (block_m + BlockN) * block_k * sizeof(Element);
-  // DeepGEMM reserves all sixteen full/empty barriers in its host policy.
-  constexpr size_t smem_bytes = smem_d + 16 * 8 * 2 +
-      NumStages * smem_per_stage;
-  constexpr int32_t d_box_inner = SwizzleD / sizeof(Element);
-
-  CUtensorMap tensor_map_a{};
-  CUtensorMap tensor_map_b{};
-  CUtensorMap tensor_map_d{};
-  cudaError_t status = make_deepgemm_tma_2d(
-      &tensor_map_a,
-      params.lhs,
-      params.gemm.k,
-      params.gemm.m,
-      128 / sizeof(Element),
-      block_m,
-      a_row_stride(params.gemm),
-      CU_TENSOR_MAP_SWIZZLE_128B);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = make_deepgemm_tma_2d(
-      &tensor_map_b,
-      params.rhs_nt,
-      params.gemm.k,
-      params.gemm.n,
-      128 / sizeof(Element),
-      BlockN,
-      b_row_stride(params.gemm),
-      CU_TENSOR_MAP_SWIZZLE_128B);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = make_deepgemm_tma_2d(
-      &tensor_map_d,
-      params.local_output,
-      params.gemm.n,
-      params.gemm.m,
-      d_box_inner,
-      block_m,
-      d_row_stride(params.gemm),
-      SwizzleD == 128 ? CU_TENSOR_MAP_SWIZZLE_128B
-                      : (SwizzleD == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                        : CU_TENSOR_MAP_SWIZZLE_32B));
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  auto entry = deep_gemm::sm90_bf16_gemm_impl<
-      cute::UMMA::Major::K,
-      cute::UMMA::Major::K,
-      0,
-      10240,
-      8192,
-      1,
-      block_m,
-      BlockN,
-      block_k,
-      128,
-      128,
-      SwizzleD,
-      NumStages,
-      128,
-      256,
-      2,
-      MulticastA,
-      NumComputeCtas,
-      deep_gemm::GemmType::Normal,
-      false,
-      cutlass::bfloat16_t>;
-  status = cudaFuncSetAttribute(
-      entry,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  cudaLaunchAttribute cluster_attribute{};
-  cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-  cluster_attribute.val.clusterDim = {2, 1, 1};
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(NumComputeCtas, 1, 1);
-  config.blockDim = dim3(threads, 1, 1);
-  config.dynamicSmemBytes = smem_bytes;
-  config.stream = stream;
-  config.attrs = &cluster_attribute;
-  config.numAttrs = 1;
-  const uint32_t m = params.gemm.m;
-  const uint32_t n = params.gemm.n;
-  const uint32_t k = params.gemm.k;
-  return cudaLaunchKernelEx(
-      &config,
-      entry,
-      static_cast<int*>(nullptr),
-      m,
-      n,
-      k,
-      tensor_map_a,
-      tensor_map_b,
-      tensor_map_d);
-}
-
-template <
-    class CommOp,
-    int32_t BlockN,
-    int32_t NumStages,
-    int32_t SwizzleD,
-    bool MulticastA,
-    int32_t NumComputeCtas,
-    int32_t NumCommCtas>
-cudaError_t launch_deepgemm_fused_config(
-    const GemmA2AParams& params,
-    cudaStream_t stream,
-    bool enable_comm) {
-  static_assert(NumComputeCtas + NumCommCtas == 132);
-  constexpr int32_t block_m = 128;
-  constexpr int32_t block_k = 64;
-  constexpr int32_t threads = 384;
-  constexpr size_t smem_d =
-      (block_m * BlockN * sizeof(Element) + 1023) / 1024 * 1024;
-  constexpr size_t smem_per_stage =
-      (block_m + BlockN) * block_k * sizeof(Element);
-  constexpr size_t smem_bytes = smem_d + 16 * 8 * 2 +
-      NumStages * smem_per_stage;
-  constexpr int32_t d_box_inner = SwizzleD / sizeof(Element);
-
-  typename CommOp::Arguments comm_args{};
-  comm_args.params = params;
-  cudaError_t status = CommOp::initialize(comm_args);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  if (!CommOp::can_implement(comm_args)) {
-    return cudaErrorNotSupported;
-  }
-
-  CUtensorMap tensor_map_a{};
-  CUtensorMap tensor_map_b{};
-  CUtensorMap tensor_map_d{};
-  status = make_deepgemm_tma_2d(
-      &tensor_map_a,
-      params.lhs,
-      params.gemm.k,
-      params.gemm.m,
-      128 / sizeof(Element),
-      block_m,
-      a_row_stride(params.gemm),
-      CU_TENSOR_MAP_SWIZZLE_128B);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = make_deepgemm_tma_2d(
-      &tensor_map_b,
-      params.rhs_nt,
-      params.gemm.k,
-      params.gemm.n,
-      128 / sizeof(Element),
-      BlockN,
-      b_row_stride(params.gemm),
-      CU_TENSOR_MAP_SWIZZLE_128B);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = make_deepgemm_tma_2d(
-      &tensor_map_d,
-      params.local_output,
-      params.gemm.n,
-      params.gemm.m,
-      d_box_inner,
-      block_m,
-      d_row_stride(params.gemm),
-      SwizzleD == 128 ? CU_TENSOR_MAP_SWIZZLE_128B
-                      : (SwizzleD == 64 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                        : CU_TENSOR_MAP_SWIZZLE_32B));
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  auto entry = deep_gemm::sm90_bf16_gemm_fused_impl<
-      cute::UMMA::Major::K,
-      cute::UMMA::Major::K,
-      0,
-      10240,
-      8192,
-      1,
-      block_m,
-      BlockN,
-      block_k,
-      128,
-      128,
-      SwizzleD,
-      NumStages,
-      128,
-      256,
-      2,
-      MulticastA,
-      NumComputeCtas,
-      deep_gemm::GemmType::Normal,
-      false,
-      cutlass::bfloat16_t,
-      CommOp>;
-  status = cudaFuncSetAttribute(
-      entry,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  cudaLaunchAttribute cluster_attribute{};
-  cluster_attribute.id = cudaLaunchAttributeClusterDimension;
-  cluster_attribute.val.clusterDim = {2, 1, 1};
-  cudaLaunchConfig_t occupancy_config{};
-  occupancy_config.gridDim = dim3(2, 1, 1);
-  occupancy_config.blockDim = dim3(threads, 1, 1);
-  occupancy_config.dynamicSmemBytes = smem_bytes;
-  occupancy_config.stream = stream;
-  occupancy_config.attrs = &cluster_attribute;
-  occupancy_config.numAttrs = 1;
-  int32_t active_clusters = 0;
-  status = cudaOccupancyMaxActiveClusters(
-      &active_clusters, entry, &occupancy_config);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  if (active_clusters < 66) {
-    return cudaErrorCooperativeLaunchTooLarge;
-  }
-
-  cudaLaunchAttribute attributes[2]{};
-  attributes[0] = cluster_attribute;
-  attributes[1].id = cudaLaunchAttributeCooperative;
-  attributes[1].val.cooperative = 1;
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(132, 1, 1);
-  config.blockDim = dim3(threads, 1, 1);
-  config.dynamicSmemBytes = smem_bytes;
-  config.stream = stream;
-  config.attrs = attributes;
-  config.numAttrs = 2;
-  const uint32_t m = params.gemm.m;
-  const uint32_t n = params.gemm.n;
-  const uint32_t k = params.gemm.k;
-  return cudaLaunchKernelEx(
-      &config,
-      entry,
-      comm_args,
-      static_cast<uint32_t>(NumCommCtas),
-      enable_comm,
-      m,
-      n,
-      k,
-      tensor_map_a,
-      tensor_map_b,
-      tensor_map_d);
-}
-
-template <bool PeerInterleaved>
-cudaError_t launch_deepgemm_decoupled(
-    const GemmA2AParams& params,
-    cudaStream_t stream,
-    bool enable_comm) {
-  switch (params.num_comm_ctas) {
-    case 8:
-      return launch_deepgemm_fused_config<
-          std::conditional_t<
-              PeerInterleaved,
-              DeepGemmQkvComm176Interleaved,
-              DeepGemmQkvComm176>,
-          176, 4, 32, false, 124, 8>(
-              params, stream, enable_comm);
-    case 12:
-      return launch_deepgemm_fused_config<
-          std::conditional_t<
-              PeerInterleaved,
-              DeepGemmQkvComm176Interleaved,
-              DeepGemmQkvComm176>,
-          176, 4, 32, true, 120, 12>(
-              params, stream, enable_comm);
-    case 16:
-      return launch_deepgemm_fused_config<
-          std::conditional_t<
-              PeerInterleaved,
-              DeepGemmQkvComm192Interleaved,
-              DeepGemmQkvComm192>,
-          192, 4, 128, true, 116, 16>(
-              params, stream, enable_comm);
-    case 20:
-      return launch_deepgemm_fused_config<
-          std::conditional_t<
-              PeerInterleaved,
-              DeepGemmQkvComm192Interleaved,
-              DeepGemmQkvComm192>,
-          192, 4, 128, true, 112, 20>(
-              params, stream, enable_comm);
-    case 24:
-      return launch_deepgemm_fused_config<
-          std::conditional_t<
-              PeerInterleaved,
-              DeepGemmQkvComm192Interleaved,
-              DeepGemmQkvComm192>,
-          192, 4, 128, true, 108, 24>(
-              params, stream, enable_comm);
-    default:
-      return cudaErrorNotSupported;
-  }
-}
 
 }  // namespace
 
@@ -3079,38 +2711,6 @@ cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t st
   return cudaErrorNotSupported;
 }
 
-cudaError_t launch_gemm_a2a_deepgemm(
-    const GemmA2AParams& params,
-    cudaStream_t stream) {
-  int32_t sm_count = 0;
-  int32_t device = 0;
-  cudaError_t status = device_sm_count(&sm_count, &device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  const bool packed =
-      a_row_stride(params.gemm) == params.gemm.k &&
-      b_row_stride(params.gemm) == params.gemm.k &&
-      d_row_stride(params.gemm) == params.gemm.n;
-  if (sm_count != 132 || !packed || params.gemm.m != 512 ||
-      params.gemm.n != 10240 || params.gemm.k != 8192 ||
-      params.gemm.l != 1 || params.alpha != 1.0f ||
-      params.route.kind != RouteKind::kQkvGqaPack ||
-      params.route.direction != RouteDirection::kForward) {
-    return cudaErrorNotSupported;
-  }
-  return params.route.qkv_peer_interleaved
-      ? launch_deepgemm_decoupled<true>(params, stream, true)
-      : launch_deepgemm_decoupled<false>(params, stream, true);
-}
-
-cudaError_t launch_gemm_a2a_deepgemm_compute_only(
-    const GemmA2AParams& params,
-    cudaStream_t stream) {
-  return params.route.qkv_peer_interleaved
-      ? launch_deepgemm_decoupled<true>(params, stream, false)
-      : launch_deepgemm_decoupled<false>(params, stream, false);
-}
 
 cudaError_t launch_gemm_a2a_fp8_cutlass(
     const Fp8GemmA2AParams& params,
@@ -3168,56 +2768,6 @@ cudaError_t launch_batched_cutlass_reference(
       RasterOptions::AlongN);
 }
 
-cudaError_t launch_deepgemm_bf16_reference(
-    const GemmA2AParams& params,
-    cudaStream_t stream,
-    int32_t reserved_comm_ctas) {
-  int32_t sm_count = 0;
-  int32_t device = 0;
-  cudaError_t status = device_sm_count(&sm_count, &device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  const bool packed =
-      a_row_stride(params.gemm) == params.gemm.k &&
-      b_row_stride(params.gemm) == params.gemm.k &&
-      d_row_stride(params.gemm) == params.gemm.n;
-  if (!params.lhs || !params.rhs_nt || !params.local_output ||
-      params.gemm.m != 512 || params.gemm.n != 10240 ||
-      params.gemm.k != 8192 || params.gemm.l != 1 || !packed ||
-      params.alpha != 1.0f || sm_count != 132) {
-    return cudaErrorNotSupported;
-  }
-  if (reserved_comm_ctas == 0) {
-    return launch_deepgemm_reference_config<160, 5, 64, false, 132>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 4) {
-    return launch_deepgemm_reference_config<160, 5, 64, false, 128>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 8) {
-    return launch_deepgemm_reference_config<176, 4, 32, false, 124>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 12) {
-    return launch_deepgemm_reference_config<176, 4, 32, true, 120>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 16) {
-    return launch_deepgemm_reference_config<192, 4, 128, true, 116>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 20) {
-    return launch_deepgemm_reference_config<192, 4, 128, true, 112>(
-        params, stream);
-  }
-  if (reserved_comm_ctas == 24) {
-    return launch_deepgemm_reference_config<192, 4, 128, true, 108>(
-        params, stream);
-  }
-  return cudaErrorNotSupported;
-}
 
 cudaError_t launch_a2a_gemm_cutlass_reference(
     const A2AGemmParams& params,
@@ -3397,26 +2947,6 @@ cudaError_t launch_gemm_a2a_copy_reference(
       args, params.num_comm_ctas, stream);
 }
 
-cudaError_t launch_gemm_a2a_deepgemm_copy_reference(
-    const GemmA2AParams& params,
-    cudaStream_t stream) {
-  if (params.num_comm_ctas <= 0 ||
-      params.route.kind != RouteKind::kQkvGqaPack ||
-      params.route.direction != RouteDirection::kForward) {
-    return cudaErrorInvalidValue;
-  }
-  if (params.route.qkv_peer_interleaved) {
-    DeepGemmQkvComm192Interleaved::Arguments args{};
-    args.params = params;
-    return launch_qkv_gqa_copy_reference<DeepGemmQkvComm192Interleaved>(
-        args, params.num_comm_ctas, stream);
-  } else {
-    DeepGemmQkvComm192::Arguments args{};
-    args.params = params;
-    return launch_qkv_gqa_copy_reference<DeepGemmQkvComm192>(
-        args, params.num_comm_ctas, stream);
-  }
-}
 
 cudaError_t launch_gemm_a2a_fp8_copy_reference(
     const Fp8GemmA2AParams& params,

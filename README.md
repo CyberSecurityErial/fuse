@@ -34,20 +34,17 @@ N = hidden
 
 ## 开箱运行
 
-依赖 CUDA 12.8、CMake、Ninja、CUTLASS 和 DeepGEMM headers。Golden 使用以下源码版本：
+依赖 CUDA 12.8、CMake、Ninja 和 CUTLASS。Golden 使用以下源码版本：
 
 ```text
 TransformerEngine  a7aec214eb5c3969984a40c3accb6d66987d8f25
-DeepGEMM           ec757bd0ba89bc3458d7c47456e197b10179bc8c
 ```
 
 ```bash
 git clone https://github.com/CyberSecurityErial/fuse.git
 cd fuse
 
-CUTLASS_ROOT=/path/to/TransformerEngine/3rdparty/cutlass \
-DEEPGEMM_ROOT=/path/to/DeepGEMM \
-bash scripts/build.sh
+CUTLASS_ROOT=/path/to/TransformerEngine/3rdparty/cutlass bash scripts/build.sh
 
 ./build/fuse_smoke --quick
 ```
