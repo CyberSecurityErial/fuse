@@ -1198,7 +1198,7 @@ void benchmark_a2a_lhs_gemm(
   Options launch_options = options;
   if (launch_options.comm_ctas == 0) {
     launch_options.comm_ctas =
-        fuse::recommended_a2a_lhs_gemm_comm_ctas(problem);
+        fuse::recommended_a2a_lhs_gemm_comm_ctas(problem, route);
   }
   const int64_t ready_count =
       fuse::a2a_lhs_gemm_ready_elements(problem, route);
