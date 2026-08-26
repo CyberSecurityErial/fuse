@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "fuse/kernels.h"
+#include "fuse/types.h"
 
 #include <cuda_runtime_api.h>
 

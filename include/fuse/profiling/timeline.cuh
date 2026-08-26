@@ -1,20 +1,69 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "fuse/kernels.h"
+#include "fuse/types.h"
+#if defined(__CUDACC__)
+#include "fuse/arch/sm90.cuh"
+#endif
 
 #include <cuda_runtime.h>
 
 #include <cutlass/cutlass.h>
 
 #if FUSE_ENABLE_PROFILING
-namespace fuse::detail {
+namespace fuse {
 
-CUTLASS_DEVICE uint64_t read_global_timer() {
-  uint64_t value = 0;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
-  return value;
-}
+// One diagnostic sample per physical CTA. SM90 %globaltimer is shared across
+// SMs on a device, so communication and compute entries share one timeline.
+struct A2AGemmCtaTimeline {
+  uint64_t start = 0;
+  uint64_t end = 0;
+  uint64_t active_start = 0;
+};
+
+// Per-peer publication and observation timestamps for one logical GEMM tile.
+struct A2AGemmPeerTimeline {
+  uint64_t release = 0;
+  uint64_t acquire[kMaxWorldSize]{};
+  uint64_t task_begin = 0;
+  uint64_t input_ready = 0;
+  uint64_t g2s_issue = 0;
+  uint64_t g2s_done = 0;
+  uint64_t s2g_issue = 0;
+  uint64_t s2g_done = 0;
+  uint64_t publish_issue = 0;
+  int32_t m_tile = 0;
+  int32_t n_tile = 0;
+  int32_t batch = 0;
+  uint32_t valid = 0;
+  int32_t comm_cta = 0;
+  int32_t comm_slot = 0;
+  int32_t task_id = 0;
+  int32_t row_chunk = 0;
+  int32_t copy_rows = 0;
+  int32_t source_rank = 0;
+  // 0: vector GMEM copy, 1: bulk G2S + row S2G,
+  // 2: bulk G2S + tensor-store S2G.
+  int32_t copy_path = 0;
+  uint32_t comm_valid = 0;
+};
+
+struct A2AGemmRoleResources {
+  int32_t threads_per_cta = 0;
+  int32_t registers_per_thread = 0;
+  int32_t telemetry_registers_per_thread = 0;
+  int32_t static_smem_bytes = 0;
+  int32_t dynamic_smem_bytes = 0;
+  int32_t cluster_ctas = 0;
+  int32_t comm_active_warps = 0;
+  int32_t compute_active_warps = 0;
+  int32_t comm_working_smem_bytes = 0;
+};
+
+}  // namespace fuse
+
+#if defined(__CUDACC__)
+namespace fuse::detail {
 
 // Diagnostic-only wrapper. The production monolithic kernel remains
 // unchanged; this type is instantiated only by the telemetry entry point.
@@ -96,4 +145,5 @@ struct RoleTelemetryKernel {
 };
 
 }  // namespace fuse::detail
+#endif  // defined(__CUDACC__)
 #endif

@@ -15,7 +15,7 @@ option(
   "Build diagnostic %globaltimer profiling kernels"
   OFF)
 
-add_library(fuse_kernels STATIC csrc/cutlass_kernels_sm90.cu)
+add_library(fuse_kernels STATIC csrc/operators/ulysses_sm90.cu)
 if(FUSE_ENABLE_PROFILING)
   target_compile_definitions(fuse_kernels PUBLIC FUSE_ENABLE_PROFILING=1)
 else()
@@ -72,7 +72,7 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
 
-add_library(fuse_cublaslt_runner SHARED csrc/cublaslt_runner.cu)
+add_library(fuse_cublaslt_runner SHARED csrc/baselines/cublaslt_runner.cu)
 target_link_libraries(fuse_cublaslt_runner PRIVATE CUDA::cublasLt CUDA::cudart)
 target_compile_options(
   fuse_cublaslt_runner

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #define CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED 1
-#include "fuse/kernels.h"
+#include "fuse/operators/a2a_gemm.h"
+#include "fuse/operators/gemm_a2a.h"
 
-#include "fuse/cutlass_collectives.cuh"
-#include "fuse/cutlass_scheduler.cuh"
-#include "fuse/monolithic_gemm.cuh"
-#if FUSE_ENABLE_PROFILING
-#include "fuse/role_telemetry.cuh"
-#endif
-#include "fuse/system_barrier.cuh"
+#include "fuse/arch/sm90.cuh"
+#include "fuse/profiling/timeline.cuh"
+#include "fuse/schedule/cutlass_pipeline.cuh"
+#include "fuse/schedule/persistent_gemm.cuh"
 
 
 #include <cuda_runtime.h>
@@ -578,6 +576,7 @@ cudaError_t make_a2a_lhs_store_tma_3d(
   return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
+// A2A -> GEMM: remote input staging and per-peer K-shard publication.
 template <
     int32_t ReadyBlockM
 #if FUSE_ENABLE_PROFILING
@@ -1152,6 +1151,7 @@ static_assert(
             kA2ALhsBulkSlots * sizeof(uint64_t),
     "M64 A2A LHS monolithic shared storage must hold every bulk slot");
 
+// GEMM -> A2A: consume published output tiles and route Q/K/V to peers.
 template <
     class ParamsType,
     bool IsFp8,
@@ -1643,7 +1643,7 @@ struct QkvGqaPackCommT {
       return;
     }
     const auto& p = args.params;
-    asm volatile("fence.sc.sys;\n" ::: "memory");
+    detail::fence_system();
     for (int32_t destination_rank = 0;
          destination_rank < p.route.world_size;
          ++destination_rank) {
@@ -1752,6 +1752,8 @@ cudaError_t launch_qkv_gqa_copy_reference(
   return cudaGetLastError();
 }
 
+// Shared host launch helpers. Keeping both dataflow directions in one TU
+// avoids duplicate registration of the CUTLASS reference kernels they share.
 cudaError_t device_sm_count(int32_t* count, int32_t* device) {
   cudaError_t status = cudaGetDevice(device);
   if (status != cudaSuccess) {
@@ -1998,6 +2000,8 @@ cudaError_t launch_a2a_lhs_gemm_policy(
       sm_count);
 }
 
+// Runtime policy model for A2A -> GEMM; the candidate kernels stay finite and
+// precompiled above.
 struct LhsPolicyCandidate {
   A2ALhsGemmPolicy policy;
   int32_t tile_m;
@@ -2245,6 +2249,8 @@ cudaError_t launch_gemm_a2a_impl(
 
 
 }  // namespace
+
+// Public operator API.
 
 KernelTraits cutlass_kernel_traits() {
   return {

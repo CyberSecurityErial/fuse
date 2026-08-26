@@ -1,4 +1,5 @@
-#include "fuse/kernels.h"
+#include "fuse/operators/a2a_gemm.h"
+#include "fuse/operators/gemm_a2a.h"
 
 #include <cublasLt.h>
 #include <cublas_v2.h>
