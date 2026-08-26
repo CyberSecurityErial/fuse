@@ -401,7 +401,7 @@ v3.0 的极限性能口径额外做一次外部通信 CTA 标定。固定 `--lhs
 | 8 | 中 | 512K | `65536×5120×5120` | 5.3528 / 641.9 | `comm8/M128N320 C2` | Lt 7.9599 / 1.487× | 6.0045 / 1.122× | 5.3528 / 1.000× | 7.1073 / 1.328× | 92.5% |
 | 8 | 大 | 512K | `65536×7168×16384` | 23.7596 / 647.9 | `comm6/M128N320 C2` | Lt 33.4559 / 1.408× | 26.1562 / 1.101× | 23.7596 / 1.000× | 22.9492 / 0.966× | 91.2% |
 
-融合侧 v3 正式归档目录为 `results/oproj_v3_manual_comm_bench`，`summary.{json,csv}` 完整保存36个 setting，并逐行标明 `v2_auto_inherited` 或 `manual_comm_ctas`。v2 自动结果继续保存在 `results/oproj_cluster_wave_bench`，没有被覆盖。外部 winner 仍来自四个 `oproj_shape_bench*` 目录的 `baseline_summary.*`；1M 没有完整外部强基线，不进入上述 SOTA 对照表。
+融合侧 v3 正式归档目录为 `results/a2a-Oproj/oproj_v3_manual_comm_bench`，`summary.{json,csv}` 完整保存36个 setting，并逐行标明 `v2_auto_inherited` 或 `manual_comm_ctas`。v2 自动结果继续保存在 `results/a2a-Oproj/oproj_cluster_wave_bench`，没有被覆盖。外部 winner 仍来自四个 `oproj_shape_bench*` 目录的 `baseline_summary.*`；1M 没有完整外部强基线，不进入上述 SOTA 对照表。
 
 ## TE Userbuffers 强基线（独立对照）
 
@@ -411,7 +411,7 @@ v3.0 的极限性能口径额外做一次外部通信 CTA 标定。固定 `--lhs
 
 表中每次采样先取跨 rank 最大延迟，再统计 p50/p95；TFLOPS/GPU 只计算 `2MNK`，延迟覆盖 Userbuffers 通信、pack/unpack 和 GEMM。36个正式 case 的 self-pack mismatch 与 remote-recv mismatch 均为0，post-Graph 最大绝对误差为0.00195～0.00781。“相对 TE UB 加速”定义为 `TE UB p50 / 我方 p50`，大于1表示我方更快。
 
-本节“v3”列读取完整的 `results/oproj_v3_manual_comm_bench/summary.json`；TE UB列读取两份 `results/te_userbuffers_shape_bench*/summary.json`。每行同时保留 v2 p50 和 `v2→v3`，手工标定行可直接审计。
+本节“v3”列读取完整的 `results/a2a-Oproj/oproj_v3_manual_comm_bench/summary.json`；TE UB列读取两份 `results/a2a-Oproj/te_userbuffers_shape_bench*/summary.json`。每行同时保留 v2 p50 和 `v2→v3`，手工标定行可直接审计。
 
 配置缩写：
 
@@ -479,4 +479,4 @@ v3.0 的极限性能口径额外做一次外部通信 CTA 标定。固定 `--lhs
 - CP4 `256×7168×16384` 的最新 p50 为0.1156 ms，快于 TE 的0.1202 ms；p95 为0.1258 ms，慢于 TE 的0.1217 ms，因此36/36只描述 p50。
 - TE UB 的获胜配置同时包含SM copy与Copy Engine；现有数据不把差距归因于单一搬运引擎。
 
-调优脚本为 `benchmarks/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/te_userbuffers_oproj.py`。正式汇总位于 `results/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/te_userbuffers_shape_bench_longseq/summary.{json,csv}`；v3通信CTA标定在 `results/oproj_v3_manual_comm_bench/summary.{json,csv}`。原始 sweep 文件均可由脚本重建。
+调优脚本为 `benchmarks/te_userbuffers_shape_bench.py`，实现与单点入口为 `benchmarks/te_userbuffers_oproj.py`。正式汇总位于 `results/a2a-Oproj/te_userbuffers_shape_bench/summary.{json,csv}` 和 `results/a2a-Oproj/te_userbuffers_shape_bench_longseq/summary.{json,csv}`；v3通信CTA标定在 `results/a2a-Oproj/oproj_v3_manual_comm_bench/summary.{json,csv}`。原始 sweep 文件均可由脚本重建。

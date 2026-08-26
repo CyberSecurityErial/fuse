@@ -59,7 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seqs", type=csv_ints, default=(1024, 4096, 16384))
     parser.add_argument("--cps", type=csv_ints, default=(4, 8))
     parser.add_argument("--comm-sm", type=csv_ints, default=(4, 8, 12, 16, 20, 24))
-    parser.add_argument("--results", type=Path, default=ROOT / "results" / "te_userbuffers_shape_bench")
+    parser.add_argument(
+        "--results",
+        type=Path,
+        default=ROOT / "results" / "a2a-Oproj" / "te_userbuffers_shape_bench",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sweep-warmup", type=int, default=5)
     parser.add_argument("--sweep-iters", type=int, default=15)
