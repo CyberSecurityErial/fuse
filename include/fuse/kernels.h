@@ -149,9 +149,10 @@ struct KernelTraits {
   int32_t dynamic_smem_bytes;
 };
 
+#if FUSE_ENABLE_PROFILING
 // One diagnostic sample per physical CTA. SM90 %globaltimer is shared across
 // SMs on a device, so entries from communication and compute CTAs can be put
-// on one timeline. This type is unused by the production entry point.
+// on one timeline.
 struct A2AGemmCtaTimeline {
   uint64_t start = 0;
   uint64_t end = 0;
@@ -166,10 +167,30 @@ struct A2AGemmCtaTimeline {
 struct A2AGemmPeerTimeline {
   uint64_t release = 0;
   uint64_t acquire[kMaxWorldSize]{};
+  // Communication-stage timestamps for the chunk whose atomic increment
+  // completes this [ready_m, peer] publication. These fields are populated
+  // only by the diagnostic kernel; production kernels do not carry them.
+  uint64_t task_begin = 0;
+  uint64_t input_ready = 0;
+  uint64_t g2s_issue = 0;
+  uint64_t g2s_done = 0;
+  uint64_t s2g_issue = 0;
+  uint64_t s2g_done = 0;
+  uint64_t publish_issue = 0;
   int32_t m_tile = 0;
   int32_t n_tile = 0;
   int32_t batch = 0;
   uint32_t valid = 0;
+  int32_t comm_cta = 0;
+  int32_t comm_slot = 0;
+  int32_t task_id = 0;
+  int32_t row_chunk = 0;
+  int32_t copy_rows = 0;
+  int32_t source_rank = 0;
+  // 0: direct vector GMEM copy, 1: bulk G2S + row S2G,
+  // 2: bulk G2S + tensor-store S2G.
+  int32_t copy_path = 0;
+  uint32_t comm_valid = 0;
 };
 
 struct A2AGemmRoleResources {
@@ -183,6 +204,7 @@ struct A2AGemmRoleResources {
   int32_t compute_active_warps = 0;
   int32_t comm_working_smem_bytes = 0;
 };
+#endif
 
 KernelTraits cutlass_kernel_traits();
 KernelTraits projection_cutlass_kernel_traits();
@@ -211,8 +233,8 @@ cudaError_t launch_a2a_gemm_cutlass(
     const A2AGemmParams& params,
     cudaStream_t stream);
 
-// Diagnostic-only launch of the same monolithic policy. Production calls do
-// not carry timeline state or execute instrumentation branches.
+#if FUSE_ENABLE_PROFILING
+// Diagnostic-only launch of the same monolithic policy.
 cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     const A2AGemmParams& params,
     A2AGemmCtaTimeline* timeline,
@@ -222,6 +244,7 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     cudaStream_t stream);
 
 cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources);
+#endif
 
 cudaError_t launch_a2a_gemm_cutlass_reference(
     const A2AGemmParams& params,

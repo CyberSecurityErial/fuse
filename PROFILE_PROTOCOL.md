@@ -49,6 +49,15 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 | `ready wait` | 计算 CTA 进入 kernel | 第一次观察到可消费 peer shard | 计算 CTA 的首包等待 |
 | `GEMM` | 第一次 ready acquire | 计算 CTA 退出 | 该 persistent CTA 的后续区间，包含 WGMMA、后续 peer wait、epilogue 和可能的多个逻辑 tile |
 | `release->acquire` | 某 `[ready_m, source_rank]` 最后一次通信发布 | 指定 `[m_tile,n_tile]` GEMM CTA 观察该 peer | 数据已发布到消费者真正读取之间的间隔 |
+| `final publisher` | 最后完成该 `[ready_m, peer]` 的通信 chunk 开始执行 | ready atomic 完成 | 决定该 peer shard 发布时间的关键 chunk |
+| `task setup / input-ready wait` | 关键 chunk 开始执行 | task 解码完成且源 rank 输入 epoch 可见 | 地址计算与可能存在的上游输入生命周期等待 |
+| `remote G2S` | 发起 peer GMEM 到通信 CTA SMEM 的 bulk copy | mbarrier wait 返回 | 远端读取与 G2S TMA 阶段 |
+| `local S2G` | 发起通信 CTA SMEM 到 `input_staging` 的 store | `tma_store_wait<0>()` 返回 | 本地 GEMM 输入落盘阶段 |
+| `ready atomic` | 发起 ready counter 原子加 | 返回旧值并完成 diagnostic 时间戳 | 发布指令本身；正式 kernel 使用不返回值的 reduction |
+
+通信分段只记录使 `[ready_m, peer]` 计数达到目标值的最后一个 chunk。每个
+task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline；因此它用于
+区分任务排队、G2S、S2G 和发布原子，不作为正式延迟。
 
 `release->acquire` 变长不自动表示调度停顿：固定 K 顺序下，CTA 在观察后续 peer 前会先计算已经拿到的 K shard。
 

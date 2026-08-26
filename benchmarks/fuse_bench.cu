@@ -57,12 +57,16 @@ struct Options {
   int iterations = 20;
   fuse::GemmRaster raster = fuse::GemmRaster::kHeuristic;
   int swizzle = 1;
+#if FUSE_ENABLE_PROFILING
   bool role_telemetry = false;
+#endif
   bool defer_v_a2a = false;
   bool cuda_graph = false;
   fuse::A2ALhsGemmPolicy lhs_policy = fuse::A2ALhsGemmPolicy::kAuto;
   std::string json_out;
+#if FUSE_ENABLE_PROFILING
   std::string trace_out;
+#endif
 };
 
 int parse_int(const std::string& value, const char* name) {
@@ -168,15 +172,13 @@ Options parse_options(int argc, char** argv) {
       }
     } else if (argument == "--json-out") {
       options.json_out = take("--json-out");
+#if FUSE_ENABLE_PROFILING
     } else if (argument == "--trace-out") {
-#if !FUSE_ENABLE_PROFILING
-      throw std::runtime_error(
-          "--trace-out requires -DFUSE_ENABLE_PROFILING=ON");
-#endif
       options.trace_out = take("--trace-out");
       options.role_telemetry = true;
     } else if (argument == "--role-telemetry") {
       options.role_telemetry = true;
+#endif
     } else if (argument == "--defer-v-a2a") {
       options.defer_v_a2a = true;
     } else if (argument == "--cuda-graph") {
@@ -207,6 +209,7 @@ T* allocate(int device, int64_t elements) {
 
 void synchronize(const std::vector<Runtime>& runtime);
 
+#if FUSE_ENABLE_PROFILING
 void report_a2a_lhs_role_trace(
     int world,
     const std::vector<Runtime>& runtime,
@@ -408,6 +411,66 @@ void report_a2a_lhs_role_trace(
     const int32_t ready_m_tiles =
         (params[rank].gemm.m + ready_block_m - 1) / ready_block_m;
     const int32_t peer_count = params[rank].route.world_size;
+    for (int32_t ready_m = 0; ready_m < ready_m_tiles; ++ready_m) {
+      for (int32_t peer_slot = 0; peer_slot < peer_count; ++peer_slot) {
+        const int32_t release_index = ready_m * peer_count + peer_slot;
+        if (release_index >= peer_capacities[rank]) {
+          continue;
+        }
+        const auto& event = peer_timeline[rank][release_index];
+        if (!event.comm_valid || event.release <= event.task_begin) {
+          continue;
+        }
+        const std::string identity =
+            "ready_m=" + std::to_string(ready_m) +
+            " peer_slot=" + std::to_string(peer_slot) +
+            " source_rank=" + std::to_string(event.source_rank) +
+            " comm_cta=" + std::to_string(event.comm_cta) +
+            " slot=" + std::to_string(event.comm_slot) +
+            " chunk=" + std::to_string(event.row_chunk) +
+            " rows=" + std::to_string(event.copy_rows);
+        const int32_t total_tid = 200000 + release_index * 2;
+        const int32_t phase_tid = total_tid + 1;
+        emit(
+            rank, total_tid, identity + " final publisher", "comm_stage_total",
+            event.task_begin, event.release, origin);
+        if (event.comm_cta >= 0 &&
+            event.comm_cta < static_cast<int32_t>(timeline[rank].size())) {
+          emit(
+              rank, phase_tid, identity + " prior comm work", "comm_stage",
+              timeline[rank][event.comm_cta].start, event.task_begin, origin);
+        }
+        emit(
+            rank, phase_tid, identity + " task setup / input-ready wait",
+            "comm_stage",
+            event.task_begin, event.input_ready, origin);
+        if (event.copy_path == 0) {
+          emit(
+              rank, phase_tid, identity + " direct GMEM copy", "comm_stage",
+              event.g2s_issue, event.g2s_done, origin);
+        } else {
+          emit(
+              rank, phase_tid, identity + " G2S setup", "comm_stage",
+              event.input_ready, event.g2s_issue, origin);
+          emit(
+              rank, phase_tid, identity + " remote G2S", "comm_stage",
+              event.g2s_issue, event.g2s_done, origin);
+          emit(
+              rank, phase_tid, identity + " G2S-to-S2G", "comm_stage",
+              event.g2s_done, event.s2g_issue, origin);
+          emit(
+              rank, phase_tid, identity + " local S2G", "comm_stage",
+              event.s2g_issue, event.s2g_done, origin);
+        }
+        emit(
+            rank, phase_tid, identity + " pre-publish", "comm_stage",
+            event.s2g_done != 0 ? event.s2g_done : event.g2s_done,
+            event.publish_issue, origin);
+        emit(
+            rank, phase_tid, identity + " ready atomic", "comm_stage",
+            event.publish_issue, event.release, origin);
+      }
+    }
     for (int32_t tile = 0; tile < peer_capacities[rank]; ++tile) {
       const auto& event = peer_timeline[rank][tile];
       if (!event.valid) {
@@ -457,6 +520,7 @@ void report_a2a_lhs_role_trace(
     CUDA_CHECK(cudaFree(device_peer_timeline[rank]));
   }
 }
+#endif
 
 __global__ void fill_kernel(Bf16* data, int64_t elements, int seed) {
   for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x; index < elements;
@@ -1498,6 +1562,7 @@ void benchmark_a2a_lhs_gemm(
        {"cublaslt_sequential", &cublaslt_sequential},
        {"fused", &fused}},
       &policy_info);
+#if FUSE_ENABLE_PROFILING
   if (options.role_telemetry) {
     const std::string trace_path = options.trace_out.empty()
         ? "/home/chen/workspace/oproj_overlap_trace.json"
@@ -1505,6 +1570,7 @@ void benchmark_a2a_lhs_gemm(
     report_a2a_lhs_role_trace(
         world, runtime, params, ready, ready_count, trace_path);
   }
+#endif
   destroy_cublaslt_plan(cublaslt_plan);
 }
 

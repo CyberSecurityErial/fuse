@@ -5,6 +5,10 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#ifndef FUSE_ENABLE_PROFILING
+#define FUSE_ENABLE_PROFILING 0
+#endif
+
 namespace fuse::detail {
 
 __device__ __forceinline__ uint32_t load_acquire_gpu(const uint32_t* ptr) {
@@ -45,6 +49,7 @@ __device__ __forceinline__ void add_release_gpu(uint32_t* ptr, uint32_t value = 
   asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;\n" :: "l"(ptr), "r"(value) : "memory");
 }
 
+#if FUSE_ENABLE_PROFILING
 // Telemetry-only returning form. The production path uses add_release_gpu's
 // non-returning reduction instruction.
 __device__ __forceinline__ uint32_t add_release_gpu_fetch_old(
@@ -59,6 +64,7 @@ __device__ __forceinline__ uint32_t add_release_gpu_fetch_old(
       : "memory");
   return old;
 }
+#endif
 
 __device__ __forceinline__ void wait_acquire_system(
     const uint32_t* ptr,

@@ -6,7 +6,9 @@
 #include "fuse/cutlass_scheduler.cuh"
 #include "fuse/deepgemm_qkv_sm90.cuh"
 #include "fuse/monolithic_gemm.cuh"
+#if FUSE_ENABLE_PROFILING
 #include "fuse/role_telemetry.cuh"
+#endif
 #include "fuse/system_barrier.cuh"
 
 #include <deep_gemm/impls/sm90_bf16_gemm.cuh>
@@ -508,6 +510,7 @@ __host__ __device__ constexpr int32_t ceil_div(int32_t x, int32_t y) {
 // staging matrix. A peer completes one contiguous K interval for each M tile;
 // the CUTLASS producer can therefore advance peer by peer without waiting for
 // the full inverse A2A.
+#if FUSE_ENABLE_PROFILING
 template <bool Instrumented>
 struct A2ALhsCommTimelineArguments {};
 
@@ -516,6 +519,29 @@ struct A2ALhsCommTimelineArguments<true> {
   A2AGemmPeerTimeline* peer_timeline = nullptr;
   int32_t peer_timeline_capacity = 0;
 };
+#endif
+
+#if FUSE_ENABLE_PROFILING
+template <bool Instrumented>
+struct A2ALhsCommStageSample {};
+
+template <>
+struct A2ALhsCommStageSample<true> {
+  uint64_t task_begin = 0;
+  uint64_t input_ready = 0;
+  uint64_t g2s_issue = 0;
+  uint64_t g2s_done = 0;
+  uint64_t s2g_issue = 0;
+  uint64_t s2g_done = 0;
+  int32_t comm_cta = 0;
+  int32_t comm_slot = 0;
+  int32_t task_id = 0;
+  int32_t row_chunk = 0;
+  int32_t copy_rows = 0;
+  int32_t source_rank = 0;
+  int32_t copy_path = 0;
+};
+#endif
 
 cudaError_t make_a2a_lhs_store_tma_3d(
     CUtensorMap* tensor_map,
@@ -554,13 +580,22 @@ cudaError_t make_a2a_lhs_store_tma_3d(
   return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-template <int32_t ReadyBlockM, bool Instrumented = false>
+template <
+    int32_t ReadyBlockM
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
 struct A2ALhsInputCommT {
   static constexpr int32_t kReadyBlockM = ReadyBlockM;
   static constexpr size_t SharedStorageBytes =
       kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
       kA2ALhsBulkSlots * sizeof(uint64_t);
-  struct Arguments : A2ALhsCommTimelineArguments<Instrumented> {
+  struct Arguments
+#if FUSE_ENABLE_PROFILING
+      : A2ALhsCommTimelineArguments<Instrumented>
+#endif
+  {
     A2AGemmParams params{};
     CUtensorMap store_tma_full{};
     int32_t comm_rows = kA2ALhsCommRows;
@@ -675,20 +710,49 @@ struct A2ALhsInputCommT {
     auto* ready = p.ready +
         (static_cast<int64_t>(tile_m) * route.world_size + peer_slot) *
             kReadyFlagStride;
-    if constexpr (Instrumented) {
-      const auto release_issue = static_cast<unsigned long long>(
-          detail::read_global_timer());
-      const uint32_t old = detail::add_release_gpu_fetch_old(ready);
-      const uint32_t target = p.epoch * arrivals_per_peer(args);
-      const int32_t index = tile_m * route.world_size + peer_slot;
-      if (old + 1 == target && args.peer_timeline && index >= 0 &&
-          index < args.peer_timeline_capacity) {
-        args.peer_timeline[index].release = release_issue;
-      }
-    } else {
-      detail::add_release_gpu(ready);
+    detail::add_release_gpu(ready);
+  }
+
+#if FUSE_ENABLE_PROFILING
+  CUTLASS_DEVICE static void publish_ready_instrumented(
+      const Params& args,
+      int32_t tile_m,
+      int32_t peer_slot,
+      const A2ALhsCommStageSample<true>& sample) {
+    const auto& p = args.params;
+    const auto& route = p.route;
+    auto* ready = p.ready +
+        (static_cast<int64_t>(tile_m) * route.world_size + peer_slot) *
+            kReadyFlagStride;
+    const uint64_t release_issue = static_cast<unsigned long long>(
+        detail::read_global_timer());
+    const uint32_t old = detail::add_release_gpu_fetch_old(ready);
+    const uint64_t release_done = static_cast<unsigned long long>(
+        detail::read_global_timer());
+    const uint32_t target = p.epoch * arrivals_per_peer(args);
+    const int32_t index = tile_m * route.world_size + peer_slot;
+    if (old + 1 == target && args.peer_timeline && index >= 0 &&
+        index < args.peer_timeline_capacity) {
+      auto& event = args.peer_timeline[index];
+      event.release = release_done;
+      event.task_begin = sample.task_begin;
+      event.input_ready = sample.input_ready;
+      event.g2s_issue = sample.g2s_issue;
+      event.g2s_done = sample.g2s_done;
+      event.s2g_issue = sample.s2g_issue;
+      event.s2g_done = sample.s2g_done;
+      event.publish_issue = release_issue;
+      event.comm_cta = sample.comm_cta;
+      event.comm_slot = sample.comm_slot;
+      event.task_id = sample.task_id;
+      event.row_chunk = sample.row_chunk;
+      event.copy_rows = sample.copy_rows;
+      event.source_rank = sample.source_rank;
+      event.copy_path = sample.copy_path;
+      event.comm_valid = 1;
     }
   }
+#endif
 
   CUTLASS_DEVICE static int32_t global_sequence_row(
       const UlyssesRoute& route,
@@ -749,6 +813,18 @@ struct A2ALhsInputCommT {
       for (int32_t task = slot * comm_ctas + comm_id;
            task < bulk_tasks;
            task += task_stride) {
+#if FUSE_ENABLE_PROFILING
+        A2ALhsCommStageSample<Instrumented> sample{};
+        if constexpr (Instrumented) {
+          if (lane == 0) {
+            sample.task_begin = detail::read_global_timer();
+            sample.comm_cta = comm_id;
+            sample.comm_slot = slot;
+            sample.task_id = task;
+            sample.copy_path = args.use_tensor_store ? 2 : 1;
+          }
+        }
+#endif
         const int32_t m_window = args.m_window;
         const int32_t full_windows = m_tiles / m_window;
         const int32_t tasks_per_window =
@@ -786,11 +862,29 @@ struct A2ALhsInputCommT {
             min(min(args.comm_rows, ReadyBlockM - row_in_tile),
                 p.gemm.m - m_begin));
 
+#if FUSE_ENABLE_PROFILING
+        if constexpr (Instrumented) {
+          if (lane == 0) {
+            sample.row_chunk = row_chunk;
+            sample.copy_rows = copy_rows;
+            sample.source_rank = source_peer;
+          }
+        }
+#endif
+
         if (p.input_epoch != 0 && source_peer != waited_peer) {
           detail::wait_acquire_system(
               p.peer_input_ready[source_peer], p.input_epoch, lane);
           waited_peer = source_peer;
         }
+
+#if FUSE_ENABLE_PROFILING
+        if constexpr (Instrumented) {
+          if (lane == 0) {
+            sample.input_ready = detail::read_global_timer();
+          }
+        }
+#endif
 
         if (lane == 0 && copy_rows > 0) {
           const int32_t batch = m_begin / route.seq_local;
@@ -804,11 +898,26 @@ struct A2ALhsInputCommT {
           const int32_t copy_bytes =
               copy_rows * shard_width * sizeof(Element);
           cute::set_barrier_transaction_bytes(*barrier, copy_bytes);
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            sample.g2s_issue = detail::read_global_timer();
+          }
+#endif
           cute::SM90_BULK_COPY_G2S::copy(
               source, barrier, stage, copy_bytes);
           cute::wait_barrier(*barrier, phase);
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            sample.g2s_done = detail::read_global_timer();
+          }
+#endif
           phase ^= 1;
           cute::tma_store_fence();
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            sample.s2g_issue = detail::read_global_timer();
+          }
+#endif
           if (args.use_tensor_store) {
             int32_t row = 0;
             for (; row + args.store_rows <= copy_rows;
@@ -856,9 +965,24 @@ struct A2ALhsInputCommT {
             }
           }
           cute::tma_store_wait<0>();
-          publish_ready(args, tile_m, peer_slot);
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            sample.s2g_done = detail::read_global_timer();
+            publish_ready_instrumented(args, tile_m, peer_slot, sample);
+          } else
+#endif
+          {
+            publish_ready(args, tile_m, peer_slot);
+          }
         } else if (lane == 0) {
-          publish_ready(args, tile_m, peer_slot);
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            publish_ready_instrumented(args, tile_m, peer_slot, sample);
+          } else
+#endif
+          {
+            publish_ready(args, tile_m, peer_slot);
+          }
         }
         __syncwarp();
       }
@@ -869,6 +993,18 @@ struct A2ALhsInputCommT {
     }
 
     for (int32_t task = comm_id; task < tasks; task += comm_ctas) {
+#if FUSE_ENABLE_PROFILING
+      A2ALhsCommStageSample<Instrumented> sample{};
+      if constexpr (Instrumented) {
+        if (threadIdx.x == 0) {
+          sample.task_begin = detail::read_global_timer();
+          sample.comm_cta = comm_id;
+          sample.comm_slot = -1;
+          sample.task_id = task;
+          sample.copy_path = 0;
+        }
+      }
+#endif
       const int32_t tile_m = task / tasks_per_m;
       const int32_t task_in_m = task - tile_m * tasks_per_m;
       const int32_t peer_slot = task_in_m / chunks_per_tile;
@@ -881,6 +1017,16 @@ struct A2ALhsInputCommT {
       const int32_t copy_rows = max(
           0, min(args.comm_rows, p.gemm.m - m_begin));
 
+#if FUSE_ENABLE_PROFILING
+      if constexpr (Instrumented) {
+        if (threadIdx.x == 0) {
+          sample.row_chunk = row_chunk;
+          sample.copy_rows = copy_rows;
+          sample.source_rank = source_peer;
+        }
+      }
+#endif
+
       if (p.input_epoch != 0 && source_peer != waited_peer) {
         if (threadIdx.x < 32) {
           detail::wait_acquire_system(
@@ -890,6 +1036,14 @@ struct A2ALhsInputCommT {
         __syncthreads();
         waited_peer = source_peer;
       }
+#if FUSE_ENABLE_PROFILING
+      if constexpr (Instrumented) {
+        if (threadIdx.x == 0) {
+          sample.input_ready = detail::read_global_timer();
+          sample.g2s_issue = sample.input_ready;
+        }
+      }
+#endif
 
       const auto* source =
           reinterpret_cast<const uint4*>(p.peer_input[source_peer]);
@@ -919,7 +1073,15 @@ struct A2ALhsInputCommT {
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        publish_ready(args, tile_m, peer_slot);
+#if FUSE_ENABLE_PROFILING
+        if constexpr (Instrumented) {
+          sample.g2s_done = detail::read_global_timer();
+          publish_ready_instrumented(args, tile_m, peer_slot, sample);
+        } else
+#endif
+        {
+          publish_ready(args, tile_m, peer_slot);
+        }
       }
       __syncthreads();
     }
@@ -1733,17 +1895,25 @@ cudaError_t launch_a2a_lhs_reference_impl(
 template <
     class InputGemm,
     class Kernel,
-    class Comm = A2ALhsInputComm,
+    class Comm = A2ALhsInputComm
+#if FUSE_ENABLE_PROFILING
+    ,
     bool Instrumented = false>
+#else
+    >
+#endif
 cudaError_t launch_a2a_lhs_gemm_policy(
     const A2AGemmParams& params,
     cudaStream_t stream,
     int32_t sm_count,
-    int32_t device,
-    A2AGemmCtaTimeline* timeline = nullptr,
+    int32_t device
+#if FUSE_ENABLE_PROFILING
+    , A2AGemmCtaTimeline* timeline = nullptr,
     int32_t timeline_capacity = 0,
     A2AGemmPeerTimeline* peer_timeline = nullptr,
-    int32_t peer_timeline_capacity = 0) {
+    int32_t peer_timeline_capacity = 0
+#endif
+    ) {
   typename Comm::Arguments comm_args{};
   comm_args.params = params;
   cudaError_t status = Comm::initialize(comm_args);
@@ -1778,15 +1948,19 @@ cudaError_t launch_a2a_lhs_gemm_policy(
 
   typename Kernel::Arguments args{};
   args.num_comm_ctas = params.num_comm_ctas;
+#if FUSE_ENABLE_PROFILING
   if constexpr (Instrumented) {
     args.timeline = timeline;
     args.timeline_capacity = timeline_capacity;
   }
+#endif
   args.comm = comm_args;
+#if FUSE_ENABLE_PROFILING
   if constexpr (Instrumented) {
     args.comm.peer_timeline = peer_timeline;
     args.comm.peer_timeline_capacity = peer_timeline_capacity;
   }
+#endif
   args.gemm.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.gemm.problem_shape =
       make_shape(params.gemm.m, params.gemm.n, params.gemm.k, params.gemm.l);
@@ -1803,6 +1977,7 @@ cudaError_t launch_a2a_lhs_gemm_policy(
       Comm::arrivals_per_peer(comm_args);
   args.gemm.mainloop.k_tiles_per_peer = k_per_peer / tile_k;
   args.gemm.mainloop.epoch = params.epoch;
+#if FUSE_ENABLE_PROFILING
   if constexpr (Instrumented) {
     args.gemm.mainloop.timeline = timeline;
     args.gemm.mainloop.timeline_capacity = timeline_capacity;
@@ -1810,6 +1985,7 @@ cudaError_t launch_a2a_lhs_gemm_policy(
     args.gemm.mainloop.peer_timeline_capacity = peer_timeline_capacity;
     args.gemm.mainloop.n_tiles = n_tiles;
   }
+#endif
   args.gemm.epilogue.thread.alpha = params.alpha;
   args.gemm.epilogue.thread.beta = 0.0f;
   args.gemm.epilogue.ptr_C = nullptr;
@@ -2742,6 +2918,7 @@ cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t st
       launch_params, stream, sm_count, device);
 }
 
+#if FUSE_ENABLE_PROFILING
 cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     const A2AGemmParams& params,
     A2AGemmCtaTimeline* timeline,
@@ -2749,7 +2926,6 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     A2AGemmPeerTimeline* peer_timeline,
     int32_t peer_timeline_capacity,
     cudaStream_t stream) {
-#if FUSE_ENABLE_PROFILING
   int32_t sm_count = 0;
   int32_t device = 0;
   cudaError_t status = device_sm_count(&sm_count, &device);
@@ -2832,19 +3008,9 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
           timeline_capacity,
           peer_timeline,
           peer_timeline_capacity);
-#else
-  (void)params;
-  (void)timeline;
-  (void)timeline_capacity;
-  (void)peer_timeline;
-  (void)peer_timeline_capacity;
-  (void)stream;
-  return cudaErrorNotSupported;
-#endif
 }
 
 cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources) {
-#if FUSE_ENABLE_PROFILING
   if (resources == nullptr) {
     return cudaErrorInvalidValue;
   }
@@ -2877,11 +3043,8 @@ cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources) {
           kA2ALhsBulkSlots *
           (kA2ALhsBulkStageBytes + sizeof(uint64_t)))};
   return cudaSuccess;
-#else
-  (void)resources;
-  return cudaErrorNotSupported;
-#endif
 }
+#endif
 
 cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t stream) {
   int32_t sm_count = 0;

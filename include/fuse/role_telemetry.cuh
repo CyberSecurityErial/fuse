@@ -7,6 +7,7 @@
 
 #include <cutlass/cutlass.h>
 
+#if FUSE_ENABLE_PROFILING
 namespace fuse::detail {
 
 CUTLASS_DEVICE uint64_t read_global_timer() {
@@ -95,3 +96,4 @@ struct RoleTelemetryKernel {
 };
 
 }  // namespace fuse::detail
+#endif

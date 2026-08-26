@@ -52,7 +52,7 @@ bash scripts/build.sh
 ./build/fuse_smoke --quick
 ```
 
-### SOTA 复现
+### 默认入口与 SOTA 复现
 
 下面是 CP8、中型宽度、全局 S=4K 的 Golden 命令。直接照抄，不要改 tile、通信 CTA、raster 或 swizzle：
 
@@ -74,13 +74,15 @@ comm_ctas=4 policy=m128n160 tile=128x160
 fused p50 ≈ 82.9 μs
 ```
 
+这是不需要逐 shape 调参的生产入口。v3.0 的 36/36 TE Userbuffers p50 胜场采用外部 `comm_ctas` 标定：保持 `--lhs-policy auto --raster n --swizzle 1`，只扫描通信 CTA 数。29 个 setting 沿用默认自动值，7 个 setting 使用归档 winner；核心 kernel 和 tile 选择逻辑没有修改。具体映射见 [`BENCHMARK.md`](BENCHMARK.md)。
+
 相同软件和硬件下，短程复跑落在 Golden 的 ±5% 可视为正常。明显偏慢时按顺序检查：
 
 1. `bash scripts/require_idle_gpus.sh` 必须通过；
 2. `nvidia-smi topo -m` 中参与设备必须走 NVLink/P2P；
 3. 各卡 SM clock 保持稳定，结果由最慢 rank 决定；
 4. 依赖 commit 与上文一致，使用 Release/SM90a 构建；
-5. 命令保留 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`。
+5. 默认模式保留 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`；复现 v3.0 标定结果时只替换 `--comm-ctas`。
 
 完整 shape matrix：
 
@@ -101,4 +103,4 @@ python3 benchmarks/oproj_shape_bench.py \
 | 4 | 18 | 1.17×–2.21× | 54.5%–100.5% |
 | 8 | 18 | 1.16×–2.96× | 61.3%–95.7% |
 
-全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级代码差异和收益见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
+v3.0 标定后，36/36 个 setting 的 p50 快于 TE Userbuffers，几何平均为 1.154×；该结论明确包含7个 per-shape `comm_ctas` winner，不代表默认自动入口零调参即可得到36/36。全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级差异见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。

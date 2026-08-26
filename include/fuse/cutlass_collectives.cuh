@@ -16,6 +16,7 @@ namespace fuse::detail {
 // peer contributes one contiguous K shard of operand A for a given M tile.
 // The elected TMA producer waits at peer/K boundaries while the stock CUTLASS
 // load pipeline, WGMMA, and epilogue remain unchanged.
+#if FUSE_ENABLE_PROFILING
 template <bool Enabled>
 struct A2ALhsTimelineArguments {};
 
@@ -27,17 +28,27 @@ struct A2ALhsTimelineArguments<true> {
   int32_t peer_timeline_capacity = 0;
   int32_t n_tiles = 0;
 };
+#endif
 
 template <
     class Base,
-    int32_t MTilesPerReady = 1,
+    int32_t MTilesPerReady = 1
+#if FUSE_ENABLE_PROFILING
+    ,
     bool Instrumented = false>
+#else
+    >
+#endif
 struct A2ALhsReadyMainloop : Base {
   static_assert(MTilesPerReady > 0);
   using BaseArguments = typename Base::Arguments;
   using BaseParams = typename Base::Params;
 
-  struct Arguments : BaseArguments, A2ALhsTimelineArguments<Instrumented> {
+  struct Arguments : BaseArguments
+#if FUSE_ENABLE_PROFILING
+      , A2ALhsTimelineArguments<Instrumented>
+#endif
+  {
     const uint32_t* ready = nullptr;
     int32_t world_size = 0;
     int32_t m_tiles = 0;
@@ -46,7 +57,11 @@ struct A2ALhsReadyMainloop : Base {
     uint32_t epoch = 0;
   };
 
-  struct Params : BaseParams, A2ALhsTimelineArguments<Instrumented> {
+  struct Params : BaseParams
+#if FUSE_ENABLE_PROFILING
+      , A2ALhsTimelineArguments<Instrumented>
+#endif
+  {
     const uint32_t* ready = nullptr;
     int32_t world_size = 0;
     int32_t m_tiles = 0;
@@ -69,6 +84,7 @@ struct A2ALhsReadyMainloop : Base {
     params.arrivals_per_peer = args.arrivals_per_peer;
     params.k_tiles_per_peer = args.k_tiles_per_peer;
     params.epoch = args.epoch;
+#if FUSE_ENABLE_PROFILING
     if constexpr (Instrumented) {
       params.timeline = args.timeline;
       params.timeline_capacity = args.timeline_capacity;
@@ -76,6 +92,7 @@ struct A2ALhsReadyMainloop : Base {
       params.peer_timeline_capacity = args.peer_timeline_capacity;
       params.n_tiles = args.n_tiles;
     }
+#endif
     return params;
   }
 
@@ -112,6 +129,7 @@ struct A2ALhsReadyMainloop : Base {
     const uint32_t target = params.epoch * params.arrivals_per_peer;
     const int32_t first_k_tile = static_cast<int32_t>(*k_iter);
     const int32_t first_peer = first_k_tile / params.k_tiles_per_peer;
+#if FUSE_ENABLE_PROFILING
     uint64_t* acquire_timestamps = nullptr;
     A2AGemmPeerTimeline* peer_event = nullptr;
     if constexpr (Instrumented) {
@@ -125,9 +143,11 @@ struct A2ALhsReadyMainloop : Base {
         acquire_timestamps = peer_event->acquire;
       }
     }
+#endif
     if (lane == 0) {
       wait_acquire_gpu_single_lane(
           tile_ready + first_peer * kReadyFlagStride, target);
+#if FUSE_ENABLE_PROFILING
       if constexpr (Instrumented) {
         const uint64_t now = read_ready_timer();
         if (peer_event) {
@@ -144,13 +164,21 @@ struct A2ALhsReadyMainloop : Base {
                   &params.timeline[cta].active_start),
               0ull,
               static_cast<unsigned long long>(now));
-        }
+          }
       }
+#endif
     }
+#if FUSE_ENABLE_PROFILING
     auto ready_k_iter = make_ready_k_iterator<Instrumented>(
+#else
+    auto ready_k_iter = make_ready_k_iterator(
+#endif
         k_iter, tile_ready, kReadyFlagStride, target,
-        params.k_tiles_per_peer, first_k_tile, k_tiles,
-        acquire_timestamps);
+        params.k_tiles_per_peer, first_k_tile, k_tiles
+#if FUSE_ENABLE_PROFILING
+        , acquire_timestamps
+#endif
+        );
     Base::load(
         static_cast<const BaseParams&>(params), pipeline, write_state,
         inputs, block_coord, ready_k_iter, k_tiles, lane,

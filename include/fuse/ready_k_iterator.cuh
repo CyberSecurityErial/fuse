@@ -20,12 +20,15 @@ CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
   }
 }
 
+#if FUSE_ENABLE_PROFILING
 CUTLASS_DEVICE uint64_t read_ready_timer() {
   uint64_t value = 0;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
   return value;
 }
+#endif
 
+#if FUSE_ENABLE_PROFILING
 template <bool Instrumented>
 struct PeerAcquireRecorder {
   CUTLASS_DEVICE explicit PeerAcquireRecorder(uint64_t*) {}
@@ -45,10 +48,20 @@ struct PeerAcquireRecorder<true> {
     }
   }
 };
+#endif
 
 // Sequential K-group adapter used by the generic A2A -> GEMM path.
-template <class Iterator, bool Instrumented = false>
-class ReadyKIterator : private PeerAcquireRecorder<Instrumented> {
+template <
+    class Iterator
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
+class ReadyKIterator
+#if FUSE_ENABLE_PROFILING
+    : private PeerAcquireRecorder<Instrumented>
+#endif
+{
  public:
   CUTLASS_DEVICE ReadyKIterator(
       Iterator iterator,
@@ -57,9 +70,16 @@ class ReadyKIterator : private PeerAcquireRecorder<Instrumented> {
       uint32_t target,
       int32_t tiles_per_group,
       int32_t first_k_tile,
-      int32_t work_tile_count,
-      uint64_t* acquire_timestamps = nullptr)
+      int32_t work_tile_count
+#if FUSE_ENABLE_PROFILING
+      , uint64_t* acquire_timestamps = nullptr
+#endif
+      )
+#if FUSE_ENABLE_PROFILING
       : PeerAcquireRecorder<Instrumented>(acquire_timestamps),
+#else
+      :
+#endif
         iterator_(iterator),
         ready_(ready),
         target_(target),
@@ -82,7 +102,9 @@ class ReadyKIterator : private PeerAcquireRecorder<Instrumented> {
       wait_acquire_gpu_single_lane(
           ready_ + static_cast<int64_t>(group_) * ready_group_stride_,
           target_);
+#if FUSE_ENABLE_PROFILING
       this->record(group_);
+#endif
     }
     return *this;
   }
@@ -98,7 +120,11 @@ class ReadyKIterator : private PeerAcquireRecorder<Instrumented> {
   int32_t work_tiles_left_;
 };
 
-template <bool Instrumented = false, class Iterator>
+template <
+#if FUSE_ENABLE_PROFILING
+    bool Instrumented = false,
+#endif
+    class Iterator>
 CUTLASS_DEVICE auto make_ready_k_iterator(
     Iterator iterator,
     const uint32_t* ready,
@@ -106,11 +132,23 @@ CUTLASS_DEVICE auto make_ready_k_iterator(
     uint32_t target,
     int32_t tiles_per_group,
     int32_t first_k_tile,
-    int32_t work_tile_count,
-    uint64_t* acquire_timestamps = nullptr) {
-  return ReadyKIterator<Iterator, Instrumented>(
+    int32_t work_tile_count
+#if FUSE_ENABLE_PROFILING
+    , uint64_t* acquire_timestamps = nullptr
+#endif
+    ) {
+  return ReadyKIterator<
+      Iterator
+#if FUSE_ENABLE_PROFILING
+      , Instrumented
+#endif
+      >(
       iterator, ready, ready_group_stride, target, tiles_per_group,
-      first_k_tile, work_tile_count, acquire_timestamps);
+      first_k_tile, work_tile_count
+#if FUSE_ENABLE_PROFILING
+      , acquire_timestamps
+#endif
+      );
 }
 
 }  // namespace fuse::detail
