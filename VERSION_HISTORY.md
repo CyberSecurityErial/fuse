@@ -290,3 +290,43 @@ v4.0，本版本集中修正和固化以下内容：
 再统计 p50/p95。OProj 两套结果的 exact mismatch 均为0；QKV 全部 case 通过
 epoch lifecycle 检查，并按每种模型 geometry 额外完成 fused 与 separated reference
 对照。v6 从这份不再漂移的基线开始 QKVProj+A2A 专项性能优化。
+
+## v6.0：QKV wave-time tile选择
+
+状态：已发布。
+
+v6.0第一次修改QKVProj+A2A热路径。实现保留`M128N128`、`M128N160`、
+`M128N256 cluster-M2`和`M128N320 cluster-M2`四种BF16 CUTLASS policy，运行时
+使用下面的可审计评分选择tile：
+
+```text
+score(policy) = ceil(work_units / persistent_workers)
+              × calibrated_one_wave_time(K, policy, comm_ctas)
+```
+
+整波时间来自H200、132 SM上的纯CUTLASS compute-subgrid：分别标定
+`comm_ctas={24,32}`、`K={2048,3072,4096,5120,16384}`和四种policy，共40行。
+运行时M/N只计算work unit和wave数量，TE Userbuffers结果与96点逐case winner不进入
+模型。K在相邻标定点间线性插值；设备SM数、comm、K或peer-interleaved超出标定域时
+回退v5策略。原始标定表保存在
+[`benchmarks/QKVproj+a2a/qkv_wave_calibration.csv`](benchmarks/QKVproj+a2a/qkv_wave_calibration.csv)。
+
+默认路径无需环境变量；`FUSE_QKV_GEMM_POLICY=legacy`可复现v5，
+`m128n128/m128n160/m128n256/m128n320`用于固定policy消融，
+`wave_time_model`显式选择v6模型。
+
+当前版本：v6.0
+
+| QKVProj+A2A，96个setting | v5 Eager | v6 Eager | v5 Graph | v6 Graph |
+|---|---:|---:|---:|---:|
+| 对TE Userbuffers胜场 | 69/96 | 73/96 | 72/96 | 74/96 |
+| 对最强外部基线胜场 | 63/96 | 64/96 | 68/96 | 69/96 |
+| 相对v5 p50几何平均 | 1.0000× | 1.0155× | 1.0000× | 1.0164× |
+| 23个换tile setting的几何平均 | 1.0000× | 1.0649× | 1.0000× | 1.0688× |
+
+96点继续使用MPI一进程一卡、10 warmup + 50 samples、逐样本max-rank p50/p95，
+Eager与Graph分列。73个没有换tile的setting，Eager p50几何平均变化只有+0.045%，
+可作为本轮采样稳定性对照。已知取舍是CP4人工中型S=4K：Eager由111.7 μs
+变为128.2 μs，慢于TE Userbuffers的117.4 μs；v6保留这一结果，没有加入逐shape
+特判。完整数据和复现命令见
+[`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。

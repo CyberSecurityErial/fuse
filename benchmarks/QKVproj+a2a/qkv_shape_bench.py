@@ -968,9 +968,30 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
         graph = load(mpi_fuse_path(args, model, seq, cp, "graph"))
         if eager["shape"] != graph["shape"]:
             raise ValueError(f"eager/graph shape mismatch for {case_key}")
+        if eager["kernel_traits"] != graph["kernel_traits"]:
+            raise ValueError(f"eager/graph policy mismatch for {case_key}")
+        eager_policy = eager.get("qkv_policy_request", "wave_time_model")
+        graph_policy = graph.get("qkv_policy_request", "wave_time_model")
+        if eager_policy != graph_policy:
+            raise ValueError(f"eager/graph policy request mismatch for {case_key}")
+        if eager_policy == "unrecognized":
+            raise ValueError(f"unrecognized QKV policy for {case_key}")
+        default_policy_model = (
+            "calibrated_wave_time_v1"
+            if eager_policy in ("auto", "wave_time_model")
+            else "manual_override"
+        )
+        eager_policy_model = eager.get(
+            "qkv_policy_model", default_policy_model
+        )
+        graph_policy_model = graph.get(
+            "qkv_policy_model", default_policy_model
+        )
+        if eager_policy_model != graph_policy_model:
+            raise ValueError(f"eager/graph policy model mismatch for {case_key}")
         shape = eager["shape"]
+        traits = eager["kernel_traits"]
         flops = 2.0 * shape["m"] * shape["n"] * shape["k"]
-        wide_policy = shape["m"] >= 2048
         eager_ms = eager["p50_ms"]
         graph_ms = graph["p50_ms"]
         old = serial_by_key.get((model.name, seq, cp))
@@ -991,12 +1012,14 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
                 model.max_context is None or seq <= model.max_context
             ),
             "comm_ctas": config["comm_ctas"],
+            "qkv_policy_request": eager_policy,
+            "qkv_policy_model": eager_policy_model,
             "raster": config["raster"],
             "swizzle": config["swizzle"],
-            "tile_m": 128,
-            "tile_n": 256 if wide_policy else 128,
-            "tile_k": 64,
-            "cluster_m": 2 if wide_policy else 1,
+            "tile_m": traits["tile_m"],
+            "tile_n": traits["tile_n"],
+            "tile_k": traits["tile_k"],
+            "cluster_m": traits["cluster_m"],
             "warmup": args.formal_warmup,
             "iterations": args.formal_iters,
             "process_model": "one_mpi_process_per_gpu",
@@ -1153,7 +1176,8 @@ def comparison_table(args: argparse.Namespace) -> None:
                 f"{row.get('te_userbuffers_p95_ms', float('nan')):.4f} | "
                 f"{row.get('eager_speedup_over_best_external', row['eager_speedup_over_best_separated']):.3f}x | "
                 f"{row.get('graph_speedup_over_best_external', row['graph_speedup_over_best_separated']):.3f}x | "
-                f"c{row['comm_ctas']}/r{row['raster'].upper()}/s{row['swizzle']} |\n"
+                f"c{row['comm_ctas']}/r{row['raster'].upper()}/s{row['swizzle']}/"
+                f"M{row['tile_m']}N{row['tile_n']}C{row['cluster_m']} |\n"
             )
 
 

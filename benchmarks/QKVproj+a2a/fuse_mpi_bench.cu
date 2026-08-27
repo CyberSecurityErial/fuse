@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -923,6 +924,16 @@ void write_json(
   if (!output) {
     throw std::runtime_error("cannot open JSON output: " + options.json_out);
   }
+  const char* policy_override = std::getenv("FUSE_QKV_GEMM_POLICY");
+  const bool known_policy = policy_override != nullptr &&
+      (std::strcmp(policy_override, "legacy") == 0 ||
+       std::strcmp(policy_override, "wave_time_model") == 0 ||
+       std::strcmp(policy_override, "m128n128") == 0 ||
+       std::strcmp(policy_override, "m128n160") == 0 ||
+       std::strcmp(policy_override, "m128n256") == 0 ||
+       std::strcmp(policy_override, "m128n320") == 0);
+  const bool calibrated_model = policy_override == nullptr ||
+      std::strcmp(policy_override, "wave_time_model") == 0 || !known_policy;
   output << std::setprecision(10)
          << "{\n"
          << "  \"mode\": \"qkv_gemm_a2a_mpi\",\n"
@@ -944,10 +955,19 @@ void write_json(
          << "  \"iterations\": " << options.iterations << ",\n"
          << "  \"requested_comm_ctas\": " << options.comm_ctas << ",\n"
          << "  \"comm_ctas\": " << resolved_comm_ctas << ",\n"
+         << "  \"qkv_policy_request\": \""
+         << (policy_override == nullptr
+                 ? "auto"
+                 : (known_policy ? policy_override : "unrecognized"))
+         << "\",\n"
+         << "  \"qkv_policy_model\": \""
+         << (calibrated_model ? "calibrated_wave_time_v1"
+                              : "manual_override")
+         << "\",\n"
          << "  \"kernel_traits\": {\"tile_m\": " << traits.block_m
          << ", \"tile_n\": " << traits.block_n
          << ", \"tile_k\": " << traits.block_k
-         << ", \"cluster_m\": " << (traits.block_n == 256 ? 2 : 1)
+         << ", \"cluster_m\": " << (traits.block_n >= 256 ? 2 : 1)
          << ", \"threads\": " << traits.threads
          << ", \"dynamic_smem_bytes\": " << traits.dynamic_smem_bytes
          << "},\n"
@@ -1004,10 +1024,10 @@ void validate_shape(
     throw std::runtime_error(
         "Q heads and KV heads must define valid GQA and divide world size");
   }
-  if (options.m % traits.block_m != 0 || n % traits.block_n != 0 ||
+  if (options.m % traits.block_m != 0 ||
       options.k % traits.block_k != 0) {
     throw std::runtime_error(
-        "fast benchmark requires M/N/K divisible by the selected kernel tiles");
+        "fast benchmark requires M/K divisible by the selected kernel tiles");
   }
 }
 
@@ -1015,12 +1035,37 @@ int run(const Options& options, RankContext& context) {
   const int n =
       (options.q_heads + 2 * options.kv_heads) * options.head_dim;
   const fuse::GemmProblem problem{options.m, n, options.k, 1};
-  const auto traits = fuse::qkv_cutlass_kernel_traits(problem);
-  validate_shape(options, context, n, traits);
-
   Runtime runtime = initialize_runtime();
   const int seq_local = options.m / options.batch;
   const int global_seq = seq_local * context.world;
+  fuse::UlyssesRoute route{};
+  route.world_size = context.world;
+  route.rank = context.rank;
+  route.batch = options.batch;
+  route.seq_local = seq_local;
+  route.global_seq = global_seq;
+  route.q_heads = options.q_heads;
+  route.kv_heads = options.kv_heads;
+  route.head_dim = options.head_dim;
+  route.kind = fuse::RouteKind::kQkvGqaPack;
+  route.direction = fuse::RouteDirection::kForward;
+  route.defer_v_a2a = options.defer_v_a2a;
+  route.qkv_peer_interleaved =
+      options.m < 2048 && options.head_dim == 128 &&
+      options.raster == fuse::GemmRaster::kAlongM;
+  const int resolved_comm_ctas = options.comm_ctas == 0
+      ? fuse::recommended_gemm_a2a_comm_ctas(problem, route)
+      : options.comm_ctas;
+  int sm_count = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, context.device));
+  if (resolved_comm_ctas <= 0 || resolved_comm_ctas >= sm_count) {
+    throw std::runtime_error("comm CTAs must leave at least one compute CTA");
+  }
+  const auto traits = fuse::qkv_cutlass_kernel_traits(
+      problem, route, resolved_comm_ctas, sm_count);
+  validate_shape(options, context, n, traits);
+
   const int local_width =
       (options.q_heads / context.world +
        (options.defer_v_a2a ? 1 : 2) * options.kv_heads / context.world) *
@@ -1034,28 +1079,6 @@ int run(const Options& options, RankContext& context) {
           std::numeric_limits<size_t>::max() / sizeof(Bf16) ||
       ready_elements64 > std::numeric_limits<int>::max()) {
     throw std::runtime_error("shape exceeds the focused benchmark's index range");
-  }
-
-  fuse::UlyssesRoute route{};
-  route.world_size = context.world;
-  route.rank = context.rank;
-  route.batch = options.batch;
-  route.seq_local = seq_local;
-  route.global_seq = global_seq;
-  route.q_heads = options.q_heads;
-  route.kv_heads = options.kv_heads;
-  route.head_dim = options.head_dim;
-  route.kind = fuse::RouteKind::kQkvGqaPack;
-  route.direction = fuse::RouteDirection::kForward;
-  route.defer_v_a2a = options.defer_v_a2a;
-  const int resolved_comm_ctas = options.comm_ctas == 0
-      ? fuse::recommended_gemm_a2a_comm_ctas(problem, route)
-      : options.comm_ctas;
-  int sm_count = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(
-      &sm_count, cudaDevAttrMultiProcessorCount, context.device));
-  if (resolved_comm_ctas <= 0 || resolved_comm_ctas >= sm_count) {
-    throw std::runtime_error("comm CTAs must leave at least one compute CTA");
   }
 
   Buffers buffers = allocate_and_exchange_buffers(

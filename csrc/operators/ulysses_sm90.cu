@@ -163,8 +163,188 @@ bool supported_route_base(const UlyssesRoute& route) {
       route.seq_local > 0 && route.global_seq > 0;
 }
 
-bool use_wide_qkv_policy(const GemmProblem& problem) {
-  return problem.m >= 2048;
+enum class QkvGemmPolicy {
+  kM128N128,
+  kM128N160,
+  kM128N256ClusterM2,
+  kM128N320ClusterM2,
+};
+
+struct QkvPolicyGeometry {
+  QkvGemmPolicy policy;
+  int32_t tile_n;
+  int32_t cluster_m;
+};
+
+constexpr std::array<QkvPolicyGeometry, 4> kQkvPolicyGeometries{{
+    {QkvGemmPolicy::kM128N128, 128, 1},
+    {QkvGemmPolicy::kM128N160, 160, 1},
+    {QkvGemmPolicy::kM128N256ClusterM2, 256, 2},
+    {QkvGemmPolicy::kM128N320ClusterM2, 320, 2},
+}};
+
+struct QkvWaveCalibrationRow {
+  int32_t k;
+  // One full compute wave in nanoseconds, indexed like kQkvPolicyGeometries.
+  std::array<int32_t, 4> wave_ns;
+};
+
+// H200 BF16 calibration for the v6 QKV tile selector.  These are
+// pure CUTLASS compute-subgrid p50 times, not fitted coefficients:
+//   * H200 SXM, 132 SMs; CUDA events; warmup=5, iterations=20.
+//   * comm=24 leaves 108 compute CTAs; comm=32 leaves 100 compute CTAs.
+//   * Each calibration shape supplies one full (or nearest legal) wave for
+//     exactly one policy.  N128/N160 use cluster-M1; N256/N320 use cluster-M2.
+//     comm=24 uses (M,N)=(128,13824), (128,17152), (256,13824),
+//     (256,17152); comm=32 uses N=12800/15872 with the same M mapping.
+// The selector multiplies this measured one-wave latency by the number of
+// persistent waves required by the real MxN problem.  This is an
+// architecture-level calibration, not a per-shape winner table: runtime M/N
+// only determine the number of waves.  Regenerate it with
+// qkvproj_a2a_bench, forcing each m128n* policy and timing
+// compute_subgrid_cutlass on the calibration shapes documented above,
+// whenever the GPU, CUDA/CUTLASS version, or kernel policy changes.
+constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm24{{
+    {2048, {25248, 28768, 31792, 40400}},
+    {3072, {32304, 37264, 41600, 53296}},
+    {4096, {39136, 46496, 50656, 65728}},
+    {5120, {45632, 54400, 60128, 78496}},
+    {16384, {126704, 150656, 167328, 219744}},
+}};
+
+constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm32{{
+    {2048, {24288, 27680, 31456, 39440}},
+    {3072, {30880, 35840, 41056, 52304}},
+    {4096, {36768, 44496, 50256, 64896}},
+    {5120, {43920, 51504, 59392, 77152}},
+    {16384, {117696, 141040, 165456, 213024}},
+}};
+
+QkvGemmPolicy legacy_qkv_gemm_policy(const GemmProblem& problem) {
+  return problem.m >= 2048 ? QkvGemmPolicy::kM128N256ClusterM2
+                           : QkvGemmPolicy::kM128N128;
+}
+
+template <size_t NumRows>
+int64_t interpolate_qkv_wave_ns(
+    const std::array<QkvWaveCalibrationRow, NumRows>& table,
+    int32_t k,
+    size_t policy_index) {
+  if (k < table.front().k || k > table.back().k) {
+    return -1;
+  }
+  for (size_t row = 0; row < NumRows; ++row) {
+    if (k == table[row].k) {
+      return table[row].wave_ns[policy_index];
+    }
+    if (k < table[row].k) {
+      const auto& lo = table[row - 1];
+      const auto& hi = table[row];
+      const int64_t numerator =
+          static_cast<int64_t>(hi.wave_ns[policy_index] -
+                               lo.wave_ns[policy_index]) *
+          (k - lo.k);
+      const int64_t denominator = hi.k - lo.k;
+      return lo.wave_ns[policy_index] +
+          (numerator + denominator / 2) / denominator;
+    }
+  }
+  return table.back().wave_ns[policy_index];
+}
+
+QkvGemmPolicy select_qkv_wave_time_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    bool peer_interleaved) {
+  const QkvGemmPolicy fallback = legacy_qkv_gemm_policy(problem);
+  if (problem.m <= 0 || problem.n <= 0 || problem.k <= 0 || problem.l <= 0 ||
+      peer_interleaved || sm_count != 132 ||
+      (num_comm_ctas != 24 && num_comm_ctas != 32)) {
+    return fallback;
+  }
+
+  const int32_t compute_ctas = sm_count - num_comm_ctas;
+  if (compute_ctas <= 0) {
+    return fallback;
+  }
+  const auto ceil_div_i64 = [](int64_t value, int64_t divisor) {
+    return (value + divisor - 1) / divisor;
+  };
+
+  int64_t best_score_ns = std::numeric_limits<int64_t>::max();
+  int32_t best_tie_rank = std::numeric_limits<int32_t>::max();
+  QkvGemmPolicy best = fallback;
+  for (size_t index = 0; index < kQkvPolicyGeometries.size(); ++index) {
+    const auto& candidate = kQkvPolicyGeometries[index];
+    if (candidate.cluster_m == 2 &&
+        (num_comm_ctas % 2 != 0 || compute_ctas % 2 != 0)) {
+      continue;
+    }
+    const int64_t wave_ns = num_comm_ctas == 24
+        ? interpolate_qkv_wave_ns(
+              kQkvWaveCalibrationComm24, problem.k, index)
+        : interpolate_qkv_wave_ns(
+              kQkvWaveCalibrationComm32, problem.k, index);
+    if (wave_ns <= 0) {
+      return fallback;
+    }
+
+    const int64_t workers = compute_ctas / candidate.cluster_m;
+    const int64_t m_tiles = ceil_div_i64(problem.m, kBlockM);
+    const int64_t m_work_units = ceil_div_i64(
+        m_tiles, candidate.cluster_m);
+    const int64_t n_work_units = ceil_div_i64(
+        problem.n, candidate.tile_n);
+    const int64_t work_units =
+        m_work_units * n_work_units * problem.l;
+    const int64_t waves = ceil_div_i64(work_units, workers);
+    // Treat every persistent wave as one calibrated full wave.  The score is
+    // intentionally small and auditable: it does not fit per-shape winners or
+    // use TE-UB results.  Shapes outside the calibrated H200/comm/K domain use
+    // the v5 policy instead of extrapolating this model.
+    const int64_t score_ns = waves * wave_ns;
+    const int32_t tie_rank = candidate.policy == fallback
+        ? 0
+        : static_cast<int32_t>(index) + 1;
+    if (score_ns < best_score_ns ||
+        (score_ns == best_score_ns && tie_rank < best_tie_rank)) {
+      best = candidate.policy;
+      best_score_ns = score_ns;
+      best_tie_rank = tie_rank;
+    }
+  }
+  return best;
+}
+
+QkvGemmPolicy select_qkv_gemm_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    bool peer_interleaved) {
+  if (const char* value = std::getenv("FUSE_QKV_GEMM_POLICY")) {
+    if (std::strcmp(value, "legacy") == 0) {
+      return legacy_qkv_gemm_policy(problem);
+    }
+    if (std::strcmp(value, "m128n128") == 0) {
+      return QkvGemmPolicy::kM128N128;
+    }
+    if (std::strcmp(value, "m128n160") == 0) {
+      return QkvGemmPolicy::kM128N160;
+    }
+    if (std::strcmp(value, "m128n256") == 0) {
+      return QkvGemmPolicy::kM128N256ClusterM2;
+    }
+    if (std::strcmp(value, "m128n320") == 0) {
+      return QkvGemmPolicy::kM128N320ClusterM2;
+    }
+    if (std::strcmp(value, "wave_time_model") == 0) {
+      return select_qkv_wave_time_policy(
+          problem, num_comm_ctas, sm_count, peer_interleaved);
+    }
+  }
+  return select_qkv_wave_time_policy(
+      problem, num_comm_ctas, sm_count, peer_interleaved);
 }
 
 using BaseEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -247,6 +427,13 @@ using N160Mainloop =
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename N160Epilogue::SharedStorage))>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using N160ObservedEpilogue = detail::SignalingEpilogue<N160Epilogue>;
+using N160OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N160Mainloop,
+    N160ObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
 
 using A2ALhsN160Mainloop = detail::A2ALhsReadyMainloop<N160Mainloop>;
 using A2ALhsN160Gemm = cutlass::gemm::kernel::GemmUniversal<
@@ -430,6 +617,14 @@ using WideN320Mainloop =
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename WideN320Epilogue::SharedStorage))>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using WideN320ObservedEpilogue =
+    detail::SignalingEpilogue<WideN320Epilogue>;
+using WideN320OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    WideN320Mainloop,
+    WideN320ObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
 
 using A2ALhsWideN320Mainloop =
     detail::A2ALhsReadyMainloop<WideN320Mainloop>;
@@ -1709,6 +1904,17 @@ using QkvGqaPackCommWide = QkvGqaPackCommT<
     false,
     static_cast<int32_t>(cute::size<0>(ProjectionTileShape{})),
     static_cast<int32_t>(cute::size<1>(ProjectionTileShape{}))>;
+using QkvGqaPackCommN160 = QkvGqaPackCommT<
+    GemmA2AParams,
+    false,
+    static_cast<int32_t>(cute::size<0>(N160TileShape{})),
+    static_cast<int32_t>(cute::size<1>(N160TileShape{})),
+    4>;
+using QkvGqaPackCommN320 = QkvGqaPackCommT<
+    GemmA2AParams,
+    false,
+    static_cast<int32_t>(cute::size<0>(WideN320TileShape{})),
+    static_cast<int32_t>(cute::size<1>(WideN320TileShape{}))>;
 using QkvGqaPackCommSmall = QkvGqaPackCommT<
     GemmA2AParams,
     false,
@@ -1730,6 +1936,10 @@ using Fp8QkvGqaPackComm = QkvGqaPackCommT<
 
 using QkvGemmA2AKernelWide =
     detail::MonolithicGemm<ProjectionOutputGemm, QkvGqaPackCommWide>;
+using QkvGemmA2AKernelN160 =
+    detail::MonolithicGemm<N160OutputGemm, QkvGqaPackCommN160>;
+using QkvGemmA2AKernelN320 =
+    detail::MonolithicGemm<WideN320OutputGemm, QkvGqaPackCommN320>;
 using QkvGemmA2AKernelSmall =
     detail::MonolithicGemm<OutputGemm, QkvGqaPackCommSmall>;
 using Fp8GemmA2AKernel =
@@ -1839,6 +2049,12 @@ struct GemmA2ARoleTelemetryKernel
 static_assert(
     sizeof(typename QkvGemmA2AKernelWide::SharedStorage) >=
         QkvGqaPackCommWide::SharedStorageBytes);
+static_assert(
+    sizeof(typename QkvGemmA2AKernelN160::SharedStorage) >=
+        QkvGqaPackCommN160::SharedStorageBytes);
+static_assert(
+    sizeof(typename QkvGemmA2AKernelN320::SharedStorage) >=
+        QkvGqaPackCommN320::SharedStorageBytes);
 static_assert(
     sizeof(typename QkvGemmA2AKernelSmall::SharedStorage) >=
         QkvGqaPackCommSmall::SharedStorageBytes);
@@ -2434,8 +2650,61 @@ KernelTraits projection_cutlass_kernel_traits() {
 }
 
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem) {
-  if (use_wide_qkv_policy(problem)) {
-    return projection_cutlass_kernel_traits();
+  switch (legacy_qkv_gemm_policy(problem)) {
+    case QkvGemmPolicy::kM128N160:
+      return {
+          128,
+          160,
+          64,
+          static_cast<int32_t>(N160OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN160::SharedStorage))};
+    case QkvGemmPolicy::kM128N256ClusterM2:
+      return projection_cutlass_kernel_traits();
+    case QkvGemmPolicy::kM128N320ClusterM2:
+      return {
+          128,
+          320,
+          64,
+          static_cast<int32_t>(WideN320OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN320::SharedStorage))};
+    case QkvGemmPolicy::kM128N128:
+      break;
+  }
+  return cutlass_kernel_traits();
+}
+
+KernelTraits qkv_cutlass_kernel_traits(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count) {
+  switch (select_qkv_gemm_policy(
+      problem,
+      num_comm_ctas,
+      sm_count,
+      route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N160:
+      return {
+          128,
+          160,
+          64,
+          static_cast<int32_t>(N160OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN160::SharedStorage))};
+    case QkvGemmPolicy::kM128N256ClusterM2:
+      return projection_cutlass_kernel_traits();
+    case QkvGemmPolicy::kM128N320ClusterM2:
+      return {
+          128,
+          320,
+          64,
+          static_cast<int32_t>(WideN320OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN320::SharedStorage))};
+    case QkvGemmPolicy::kM128N128:
+      break;
   }
   return cutlass_kernel_traits();
 }
@@ -2865,9 +3134,22 @@ cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t st
 
   if (launch_params.route.kind == RouteKind::kQkvGqaPack &&
       launch_params.route.direction == RouteDirection::kForward) {
-    if (use_wide_qkv_policy(launch_params.gemm)) {
-      return launch_gemm_a2a_impl<ProjectionOutputGemm, QkvGqaPackCommWide>(
-          launch_params, stream, sm_count, device);
+    switch (select_qkv_gemm_policy(
+        launch_params.gemm,
+        launch_params.num_comm_ctas,
+        sm_count,
+        launch_params.route.qkv_peer_interleaved)) {
+      case QkvGemmPolicy::kM128N160:
+        return launch_gemm_a2a_impl<N160OutputGemm, QkvGqaPackCommN160>(
+            launch_params, stream, sm_count, device);
+      case QkvGemmPolicy::kM128N256ClusterM2:
+        return launch_gemm_a2a_impl<ProjectionOutputGemm, QkvGqaPackCommWide>(
+            launch_params, stream, sm_count, device);
+      case QkvGemmPolicy::kM128N320ClusterM2:
+        return launch_gemm_a2a_impl<WideN320OutputGemm, QkvGqaPackCommN320>(
+            launch_params, stream, sm_count, device);
+      case QkvGemmPolicy::kM128N128:
+        break;
     }
     if (launch_params.route.qkv_peer_interleaved) {
       return launch_gemm_a2a_impl<
@@ -2906,18 +3188,46 @@ cudaError_t launch_gemm_a2a_role_telemetry(
       launch_params.route.direction != RouteDirection::kForward) {
     return cudaErrorNotSupported;
   }
-  if (use_wide_qkv_policy(launch_params.gemm)) {
-    return launch_gemm_a2a_impl<
-        ProjectionOutputGemm,
-        QkvGqaPackCommWide,
-        GemmA2AParams,
-        true>(
-            launch_params,
-            stream,
-            sm_count,
-            device,
-            timeline,
-            timeline_capacity);
+  switch (select_qkv_gemm_policy(
+      launch_params.gemm,
+      launch_params.num_comm_ctas,
+      sm_count,
+      launch_params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N160:
+      return launch_gemm_a2a_impl<
+          N160OutputGemm, QkvGqaPackCommN160, GemmA2AParams, true>(
+              launch_params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case QkvGemmPolicy::kM128N256ClusterM2:
+      return launch_gemm_a2a_impl<
+          ProjectionOutputGemm,
+          QkvGqaPackCommWide,
+          GemmA2AParams,
+          true>(
+              launch_params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case QkvGemmPolicy::kM128N320ClusterM2:
+      return launch_gemm_a2a_impl<
+          WideN320OutputGemm,
+          QkvGqaPackCommN320,
+          GemmA2AParams,
+          true>(
+              launch_params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case QkvGemmPolicy::kM128N128:
+      break;
   }
   if (launch_params.route.qkv_peer_interleaved) {
     return launch_gemm_a2a_impl<
@@ -2993,10 +3303,28 @@ cudaError_t launch_batched_cutlass_reference(
     return cudaErrorInvalidValue;
   }
 
-  if (use_wide_qkv_policy(params.gemm)) {
-    return launch_gemm_reference_impl<ProjectionPureGemm>(
-        params, stream, sm_count, device, reserved_comm_ctas,
-        RasterOptions::AlongN);
+  const int32_t policy_comm_ctas = params.num_comm_ctas == 0
+      ? recommended_gemm_a2a_comm_ctas(params.gemm, params.route)
+      : params.num_comm_ctas;
+  switch (select_qkv_gemm_policy(
+      params.gemm,
+      policy_comm_ctas,
+      sm_count,
+      params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N160:
+      return launch_gemm_reference_impl<N160PureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas,
+          RasterOptions::AlongN);
+    case QkvGemmPolicy::kM128N256ClusterM2:
+      return launch_gemm_reference_impl<ProjectionPureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas,
+          RasterOptions::AlongN);
+    case QkvGemmPolicy::kM128N320ClusterM2:
+      return launch_gemm_reference_impl<WideN320PureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas,
+          RasterOptions::AlongN);
+    case QkvGemmPolicy::kM128N128:
+      break;
   }
   return launch_gemm_reference_impl<PureGemm>(
       params, stream, sm_count, device, reserved_comm_ctas,
@@ -3164,11 +3492,37 @@ cudaError_t launch_gemm_a2a_copy_reference(
       params.route.direction != RouteDirection::kForward) {
     return cudaErrorInvalidValue;
   }
-  if (use_wide_qkv_policy(params.gemm)) {
-    QkvGqaPackCommWide::Arguments args{};
-    args.params = params;
-    return launch_qkv_gqa_copy_reference<QkvGqaPackCommWide>(
-        args, params.num_comm_ctas, stream);
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess || params.num_comm_ctas >= sm_count) {
+    return status == cudaSuccess ? cudaErrorInvalidValue : status;
+  }
+  switch (select_qkv_gemm_policy(
+      params.gemm,
+      params.num_comm_ctas,
+      sm_count,
+      params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N160: {
+      QkvGqaPackCommN160::Arguments args{};
+      args.params = params;
+      return launch_qkv_gqa_copy_reference<QkvGqaPackCommN160>(
+          args, params.num_comm_ctas, stream);
+    }
+    case QkvGemmPolicy::kM128N256ClusterM2: {
+      QkvGqaPackCommWide::Arguments args{};
+      args.params = params;
+      return launch_qkv_gqa_copy_reference<QkvGqaPackCommWide>(
+          args, params.num_comm_ctas, stream);
+    }
+    case QkvGemmPolicy::kM128N320ClusterM2: {
+      QkvGqaPackCommN320::Arguments args{};
+      args.params = params;
+      return launch_qkv_gqa_copy_reference<QkvGqaPackCommN320>(
+          args, params.num_comm_ctas, stream);
+    }
+    case QkvGemmPolicy::kM128N128:
+      break;
   }
   if (params.route.qkv_peer_interleaved) {
     QkvGqaPackCommSmallInterleaved::Arguments args{};

@@ -1466,6 +1466,26 @@ void write_json(
          << "\",\n"
          << "  \"timing\": \"max-rank critical path\",\n"
          << "  \"overlap_ratio\": " << overlap << ",\n";
+  if (options.mode == "qkv_gemm_a2a") {
+    const char* policy_override = std::getenv("FUSE_QKV_GEMM_POLICY");
+    const std::string policy_value =
+        policy_override == nullptr ? "" : policy_override;
+    const bool known_policy =
+        policy_value == "legacy" || policy_value == "wave_time_model" ||
+        policy_value == "m128n128" || policy_value == "m128n160" ||
+        policy_value == "m128n256" || policy_value == "m128n320";
+    const bool calibrated_model = policy_override == nullptr ||
+        policy_value == "wave_time_model" || !known_policy;
+    output << "  \"qkv_policy_request\": \""
+           << (policy_override == nullptr
+                   ? "auto"
+                   : (known_policy ? policy_value : "unrecognized"))
+           << "\",\n"
+           << "  \"qkv_policy_model\": \""
+           << (calibrated_model ? "calibrated_wave_time_v1"
+                                : "manual_override")
+           << "\",\n";
+  }
   if (options.mode == "qkv_gemm_a2a" ||
       options.mode == "qkv_gemm_a2a_fp8") {
     output << "  \"qkv_route\": {\"batch\": " << options.batch
@@ -1895,9 +1915,32 @@ void benchmark_qkv_gemm_a2a(
   const int n = (options.q_heads + 2 * options.kv_heads) * options.head_dim;
   const int k = options.k;
   const fuse::GemmProblem problem{m, n, k, 1};
-  const auto traits = fuse::qkv_cutlass_kernel_traits(problem);
   const int seq_local = m / options.batch;
   const int global_seq = seq_local * world;
+  fuse::UlyssesRoute policy_route{};
+  policy_route.world_size = world;
+  policy_route.rank = 0;
+  policy_route.batch = options.batch;
+  policy_route.q_heads = options.q_heads;
+  policy_route.kv_heads = options.kv_heads;
+  policy_route.head_dim = options.head_dim;
+  policy_route.seq_local = seq_local;
+  policy_route.global_seq = global_seq;
+  policy_route.qkv_peer_interleaved =
+      m < 2048 && options.head_dim == 128 &&
+      options.raster == fuse::GemmRaster::kAlongM;
+  policy_route.kind = fuse::RouteKind::kQkvGqaPack;
+  policy_route.defer_v_a2a = options.defer_v_a2a;
+  policy_route.direction = fuse::RouteDirection::kForward;
+  const int resolved_comm_ctas = options.comm_ctas != 0
+      ? options.comm_ctas
+      : fuse::recommended_gemm_a2a_comm_ctas(problem, policy_route);
+  int sm_count = 0;
+  CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, 0));
+  const auto traits = fuse::qkv_cutlass_kernel_traits(
+      problem, policy_route, resolved_comm_ctas, sm_count);
   const int local_width =
       (options.q_heads / world +
        (options.defer_v_a2a ? 1 : 2) * options.kv_heads / world) *
@@ -1963,9 +2006,6 @@ void benchmark_qkv_gemm_a2a(
     params[rank].num_comm_ctas = options.comm_ctas;
   }
 
-  const int resolved_comm_ctas = options.comm_ctas != 0
-      ? options.comm_ctas
-      : fuse::recommended_gemm_a2a_comm_ctas(problem, params[0].route);
   for (auto& item : params) {
     item.num_comm_ctas = resolved_comm_ctas;
   }
@@ -2141,7 +2181,7 @@ void benchmark_qkv_gemm_a2a(
       nullptr,
       &traits,
       resolved_comm_ctas,
-      m >= 2048 ? 2 : 1);
+      traits.block_n >= 256 ? 2 : 1);
 #if FUSE_ENABLE_PROFILING
   if (options.role_telemetry) {
     const std::string trace_path = options.trace_out.empty()

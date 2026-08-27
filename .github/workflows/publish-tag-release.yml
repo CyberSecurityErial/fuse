@@ -2,18 +2,14 @@ name: Publish annotated tags
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-    paths:
-      - .github/workflows/publish-tag-release.yml
   workflow_dispatch:
     inputs:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v5.0
+        default: v6.0
 
 permissions:
   contents: write
@@ -31,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v5.0");
+              : (process.env.REQUESTED_TAG || "v6.0");
 
             const releases = {
               "v1.0": {
@@ -104,6 +100,22 @@ jobs:
                   "A2A + OProj 的 96-case Eager/Graph 对最强外部基线胜场分别为 95/96 与 94/96，CP8 两种口径均为 48/48。QKV 当前未专项优化实现对 TE Userbuffers 的胜场为 69/96 与 72/96，这组数据作为 v6 性能优化的固定起点。",
                   "",
                   "两个算子的 96-case 配置 manifest、TE/cuBLASLt+NCCL 与 TE Userbuffers winner、逐点 p50/p95/TFLOPS 和复现命令均已归档。",
+                ].join("\n"),
+              },
+              "v6.0": {
+                name: "v6.0 — QKV wave-time tile selection",
+                body: [
+                  "v6.0 首次优化 QKV Projection + A2A 热路径；A2A + OProj 沿用既有 Golden。",
+                  "",
+                  "QKV 运行时在 M128N128、M128N160、M128N256 cluster-M2 与 M128N320 cluster-M2 中选择。评分只使用 persistent wave 数与同 policy 的 H200 整波实测时间，不保存逐 shape winner，也不使用 TE Userbuffers 数据。",
+                  "",
+                  "整波标定覆盖 132 SM、comm_ctas=24/32 与 K=2048/3072/4096/5120/16384；超出设备、通信预算、K 或 peer-interleaved 标定域时自动回退 v5 策略。40 行原始标定、默认/手工 policy 入口与复现命令均已归档。",
+                  "",
+                  "🩵 **96 点相对 v5 的 p50 几何平均提升为 Eager 1.0155×、Graph 1.0164×；23 个实际换 tile 的 setting 分别为 1.0649× 与 1.0688×。**",
+                  "",
+                  "对 TE Userbuffers 的胜场由 69/96、72/96 增至 73/96、74/96；对最强外部基线由 63/96、68/96 增至 64/96、69/96。已知 CP4 人工中型 S=4K 会从快于 TE 变为慢于 TE，结果表明确保留该取舍，没有加入逐 shape 特判。",
+                  "",
+                  "正式口径继续使用 MPI 一进程一卡、10 warmup + 50 samples、逐样本 max-rank p50/p95，并分别报告 Eager 与 CUDA Graph。",
                 ].join("\n"),
               },
             };
