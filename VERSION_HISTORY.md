@@ -1,6 +1,6 @@
 # 版本演进手册
 
-本文记录每个版本对 A2A + O-projection 的有效改动、代码差异、测量结果和已知边界。正式数据统一使用 BF16、10 次 warmup + 50 次采样，并先取每次采样的跨 rank 最大延迟，再统计 p50。
+本文记录 A2A + O-projection 与 QKV Projection + A2A 的版本改动、测量结果和已知边界。正式数据统一使用 BF16、10 次 warmup + 50 次采样，并先取每次采样的跨 rank 最大延迟，再统计 p50。
 
 ## v1.0：可复现的 A2A + O-projection Golden
 
@@ -331,9 +331,9 @@ Eager与Graph分列。73个没有换tile的setting，Eager p50几何平均变化
 特判。完整数据和复现命令见
 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。
 
-## v7-autoroll：QKV联合流水与CTA独立前进
+## v7.0：QKV联合流水与CTA独立前进
 
-状态：开发分支已完成全量验证，尚未打发布tag。
+状态：已发布。
 
 v7把通信CTA和GEMM tile放进同一个启动前模型。候选通信CTA为`4..32`的偶数，
 候选tile为`M128N128`、`M128N160`、`M128N192`、
@@ -356,7 +356,7 @@ QKV finalize由thread0串行发布、串行等待8个source epoch，改为第一
 `comm_ctas=0/raster=n/swizzle=1`，由同一个模型解析实际通信CTA和tile；历史逐case
 manifest只保留作v5/v6复现。
 
-当前融合版本：v7-autoroll
+当前融合版本：v7.0
 
 | QKVProj+A2A，96个setting | v6 Eager | v7 Eager | v6 Graph | v7 Graph |
 |---|---:|---:|---:|---:|
@@ -364,6 +364,7 @@ manifest只保留作v5/v6复现。
 | 对TE Userbuffers几何平均 | — | 1.268× | — | 1.319× |
 | 对最强外部基线胜场 | 64/96 | 93/96 | 69/96 | 96/96 |
 | 对最强外部基线几何平均 | — | 1.201× | — | 1.250× |
+| 融合吞吐 / 经典cuBLAS吞吐，中位数 | — | 90.8% | — | 92.0% |
 | 相对v6 p50几何平均 | 1.000× | 1.147× | 1.000× | 1.156× |
 
 正式口径继续使用MPI一进程一卡、10次warmup + 50次采样，并逐样本取跨rank最大值。

@@ -69,7 +69,7 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
 `N=(Hq+2*Hkv)*D`，`M=S/CP`：
 
-v7正式路径保持两个环境变量未设置；下列变量只用于固定policy的消融或回退复现。
+v7.0正式路径保持两个环境变量未设置；下列变量只用于固定policy的消融或回退复现。
 
 ```bash
 CUDA_VISIBLE_DEVICES=<devices> \

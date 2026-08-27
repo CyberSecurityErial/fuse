@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在v7联合选择通信CTA与GEMM tile。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在v7.0联合选择通信CTA与GEMM tile。
 
 Attention 输出按 head 分片：
 
@@ -108,7 +108,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前融合版本：v7-autoroll（OProj热路径沿用v4.0；QKV使用v7联合流水策略）
+当前融合版本：v7.0（OProj热路径沿用v4.0；QKV使用v7联合流水策略）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -123,7 +123,9 @@ Eager 与 Graph 各自做10+50正式采样，不拿两列之间的差值当算�
 QKV的96点结果中，v7对TE Userbuffers的Eager/Graph胜场均为`96/96`，几何平均
 分别领先`1.268×`和`1.319×`；对最强外部基线的胜场为`93/96`和`96/96`，几何
 平均分别领先`1.201×`和`1.250×`。相对v6的全量p50几何平均提升为`1.147×`和
-`1.156×`。所有case使用同一自动入口，运行时不读取逐shape winner或TE结果。
+`1.156×`。融合GEMM-equivalent吞吐达到经典cuBLAS的全量中位数为Eager `90.8%`、
+Graph `92.0%`；CP4分别为`93.1%/93.6%`，CP8为`86.7%/88.2%`。所有case使用
+同一自动入口，运行时不读取逐shape winner或TE结果。
 
 完整数据与复现流程：
 
