@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。目前完成并优化了 A2A+O-projection；QKV Projection+A2A 已具备可运行实现与完整强基线，专项性能优化留到 v5。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。目前完成并优化了 A2A+O-projection；QKV Projection+A2A 已具备可运行实现与完整强基线。v5.0 固化 benchmark 的启动、计时与调参口径，没有修改两条算子的生产热路径。
 
 Attention 输出按 head 分片：
 
@@ -84,25 +84,35 @@ fused p50 ≈ 82.9 μs
 完整 shape matrix：
 
 ```bash
+# OProj：正式表分别运行 eager 与 CUDA Graph。
 python3 'benchmarks/a2a+Oproj/oproj_shape_bench.py' \
-  --phase fuse-formal --phase shape-table \
+  --phase fuse-launch-formal --phase fuse-launch-aggregate \
+  --phase shape-table \
   --models representative_small,representative_medium,representative_large \
   --seqs 1024,4096,16384 --cps 8 \
   --results results/reproduce_cp8
+
+# QKV：正式表必须使用 MPI 一进程一卡；eager 与 Graph 分列。
+python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
+  --phase fuse-mpi-formal --phase fuse-mpi-aggregate \
+  --phase comparison-table
 ```
 
 ## 性能
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v4.0
+当前版本：v5.0（OProj 算子热路径沿用 v4.0）
 
-| CP | case 数 | 相对最优分离 | 相对 TE Userbuffers | 纯 GEMM 的百分比 |
-|---:|---:|---:|---:|---:|
-| 4 | 18 | 1.34×–2.21× | 1.01×–1.19× | 58.1%–100.5% |
-| 8 | 18 | 1.35×–2.96× | 1.04×–1.81× | 61.3%–95.7% |
+| 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
+|---|---:|---:|---:|---:|
+| Eager | 47/48，1.110× 中位 | 48/48，1.178× 中位 | 95/96 | 86.6% / 84.9% |
+| CUDA Graph | 46/48，1.130× 中位 | 48/48，1.199× 中位 | 94/96 | 86.8% / 86.7% |
 
-v4.0 将 OProj 扩展到96个 setting，正式 p50 有95/96快于调优后的 TE Userbuffers；唯一落后点是 Llama-3.1-405B、CP4、S=1K。该结论包含 per-shape `comm_ctas` 单变量标定，不代表默认自动入口零调参即可得到95/96。
+“最强外部”逐 setting 取 `min(TE Userbuffers, 最强 TE/cuBLASLt+NCCL 分离方案)`。
+Eager 与 Graph 各自做10+50正式采样，不拿两列之间的差值当算子收益。Graph 在采样前
+完成 capture、instantiate 和显式 upload。上述极限表包含 per-shape `comm_ctas`
+单变量标定；默认自动入口不承诺零调参复现全部极限点。
 
 完整数据与复现流程：
 

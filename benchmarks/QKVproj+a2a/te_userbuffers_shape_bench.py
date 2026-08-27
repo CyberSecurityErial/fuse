@@ -342,6 +342,13 @@ def summarize_results(args: argparse.Namespace) -> None:
             "head_dim": model.head_dim, "max_context": model.max_context,
             "within_native_context": model.max_context is None or seq <= model.max_context,
             "result_source": "adapted_te_userbuffers_formal_10w50i",
+            "launch": "graph",
+            "timing": "per_sample_local_cuda_event_then_dist_max",
+            "timed_boundary": (
+                "all_qkv_slab_gemms+userbuffers_send_recv+unpack"
+            ),
+            "graph_setup_timed": False,
+            "rank_reduction": "MAX",
             **asdict(config), "math_sm": config.math_sm,
             "p50_ms": stats["p50_ms"], "p95_ms": stats["p95_ms"],
             "p50_tflops_per_gpu": 2.0 * m * n * k / stats["p50_ms"] / 1.0e9,

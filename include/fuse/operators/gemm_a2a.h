@@ -4,6 +4,9 @@
 #include "fuse/types.h"
 #include "fuse/layout/gemm.h"
 #include "fuse/layout/ulysses.h"
+#if FUSE_ENABLE_PROFILING
+#include "fuse/profiling/timeline.cuh"
+#endif
 
 #include <cuda_runtime_api.h>
 
@@ -53,6 +56,14 @@ int32_t recommended_gemm_a2a_comm_ctas(
 cudaError_t launch_gemm_a2a_cutlass(
     const GemmA2AParams& params,
     cudaStream_t stream);
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_gemm_a2a_role_telemetry(
+    const GemmA2AParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream);
+#endif
 
 cudaError_t launch_gemm_a2a_fp8_cutlass(
     const Fp8GemmA2AParams& params,

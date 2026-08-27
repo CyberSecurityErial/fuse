@@ -258,4 +258,35 @@ OProj 的融合侧只允许 `comm_ctas` 变化：先扫 `{2,4,6,8,10,12,14,16,20
 
 分离基线对每个 setting 扫描48个独立 NCCL tuple，并继续搜索 Graph/eager、stream 优先级与 pack 参数；cuBLASLt 使用64 MiB workspace做本地 heuristic 调优。TE Userbuffers 对通信 SM、streams、push/pull、CE/SM、pack 参数与方向做结构搜索，top-3 统一正式复测。不同 NCCL tuple 使用独立进程组，避免环境参数被第一个 communicator 缓存。
 
-两条算子的完整口径、逐点数据和复现命令分别见 [`benchmarks/a2a+Oproj/BENCHMARK.md`](benchmarks/a2a+Oproj/BENCHMARK.md) 与 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。v5 将以这份固定 benchmark 为基线，开始 QKVProj+A2A 的专项性能优化。
+两条算子的完整口径、逐点数据和复现命令分别见 [`benchmarks/a2a+Oproj/BENCHMARK.md`](benchmarks/a2a+Oproj/BENCHMARK.md) 与 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。v5 最终先收口正式启动与计时口径，QKVProj+A2A 的专项性能优化后移到 v6。
+
+## v5.0：Eager/Graph 双口径与可复现调参
+
+状态：已发布。
+
+v5.0 是 benchmark release。A2A+OProj 与 QKVProj+A2A 的生产热路径沿用
+v4.0，本版本集中修正和固化以下内容：
+
+- 两条算子分别给出 Eager 与 CUDA Graph 的10+50正式结果，两列独立报告；
+- Graph capture、instantiate 与显式 upload 都在采样外，结果记录 epoch 模式与启动配置；
+- QKV 正式 runner 使用 MPI 一进程一卡和 CUDA IPC，逐样本对各 rank 的 CUDA event 做 `MPI_MAX`；单进程串行多卡 runner 只保留作诊断；
+- QKV Graph 由一个预上传 graph 承载10个 warmup和50个正式 monotonic epoch kernel node，只 replay 一次；
+- 两条算子的96点配置 manifest 固化 `comm_ctas`、policy、raster 和 swizzle，TE/cuBLASLt+NCCL 与 TE Userbuffers 的 winner 参数同步归档；
+- TE Userbuffers 的计时边界完成静态审计：event 覆盖完整 pack/GEMM/通信/unpack 边界，所有通信 stream 在 stop 前回到主 stream，跨 rank 使用最大值；
+- `PROFILE_PROTOCOL.md` 升级为通算融合统一协议，补齐 GEMM→A2A finalize、正式启动和 Graph 计时规则。
+
+当前版本：v5.0
+
+| 项目 | Eager | CUDA Graph |
+|---|---:|---:|
+| A2A+OProj 正式 setting | 96 | 96 |
+| A2A+OProj 对最强外部基线胜场 | 95/96 | 94/96 |
+| A2A+OProj CP8 胜场 | 48/48 | 48/48 |
+| QKVProj+A2A 正式 setting | 96 | 96 |
+| QKVProj+A2A 对 TE Userbuffers 胜场 | 69/96 | 72/96 |
+| QKVProj+A2A 对最强外部基线胜场 | 63/96 | 68/96 |
+
+所有正式结果使用 BF16、10 warmup + 50 samples，并先逐样本取跨 rank 最大延迟，
+再统计 p50/p95。OProj 两套结果的 exact mismatch 均为0；QKV 全部 case 通过
+epoch lifecycle 检查，并按每种模型 geometry 额外完成 fused 与 separated reference
+对照。v6 从这份不再漂移的基线开始 QKVProj+A2A 专项性能优化。

@@ -1665,6 +1665,43 @@ struct QkvGqaPackCommT {
       }
     }
   }
+
+#if FUSE_ENABLE_PROFILING
+  // Diagnostic copy of finalize() with phase boundaries.  Production Params,
+  // control flow, and generated kernel remain untouched when profiling is off.
+  CUTLASS_DEVICE void finalize_profile(
+      const Params& args,
+      A2AGemmCtaTimeline* event) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || event == nullptr) {
+      return;
+    }
+    const auto& p = args.params;
+    detail::fence_system();
+    event->fence_done = detail::read_global_timer();
+    for (int32_t destination_rank = 0;
+         destination_rank < p.route.world_size;
+         ++destination_rank) {
+      detail::store_release_system(
+          p.peer_route_done_epoch[destination_rank] +
+              p.route.rank * kReadyFlagStride,
+          p.epoch);
+    }
+    event->publish_done = detail::read_global_timer();
+    const uint32_t* local_sources_done =
+        p.peer_route_done_epoch[p.route.rank];
+    for (int32_t source_rank = 0;
+         source_rank < p.route.world_size;
+         ++source_rank) {
+#pragma unroll 1
+      while (detail::load_acquire_system(
+                 local_sources_done + source_rank * kReadyFlagStride) <
+             p.epoch) {
+        __nanosleep(64);
+      }
+      event->source_ready[source_rank] = detail::read_global_timer();
+    }
+  }
+#endif
 };
 
 using QkvGqaPackCommWide = QkvGqaPackCommT<
@@ -1697,6 +1734,107 @@ using QkvGemmA2AKernelSmall =
     detail::MonolithicGemm<OutputGemm, QkvGqaPackCommSmall>;
 using Fp8GemmA2AKernel =
     detail::MonolithicGemm<Fp8OutputGemm, Fp8QkvGqaPackComm>;
+
+#if FUSE_ENABLE_PROFILING
+// Diagnostic-only GEMM->A2A wrapper. Unlike the generic outer telemetry
+// wrapper, this records the local role completion before the cooperative grid
+// barrier, which separates GEMM/route work from the cross-rank finalize tail.
+template <class GemmKernel, class CommOp>
+struct GemmA2ARoleTelemetryKernel
+    : detail::MonolithicGemm<GemmKernel, CommOp> {
+  using BaseKernel = detail::MonolithicGemm<GemmKernel, CommOp>;
+  using ArchTag = typename BaseKernel::ArchTag;
+  using ClusterShape = typename BaseKernel::ClusterShape;
+  using SharedStorage = typename BaseKernel::SharedStorage;
+  static constexpr int MaxThreadsPerBlock = BaseKernel::MaxThreadsPerBlock;
+  static constexpr int MinBlocksPerMultiprocessor =
+      BaseKernel::MinBlocksPerMultiprocessor;
+
+  struct Arguments : BaseKernel::Arguments {
+    A2AGemmCtaTimeline* timeline = nullptr;
+    int32_t timeline_capacity = 0;
+  };
+
+  struct Params : BaseKernel::Params {
+    A2AGemmCtaTimeline* timeline = nullptr;
+    int32_t timeline_capacity = 0;
+  };
+
+  static bool can_implement(const Arguments& args) {
+    return args.timeline != nullptr && args.timeline_capacity > 0 &&
+        BaseKernel::can_implement(
+            static_cast<const typename BaseKernel::Arguments&>(args));
+  }
+
+  static size_t get_workspace_size(const Arguments& args) {
+    return BaseKernel::get_workspace_size(
+        static_cast<const typename BaseKernel::Arguments&>(args));
+  }
+
+  static cutlass::Status initialize_workspace(
+      const Arguments& args,
+      void* workspace,
+      cudaStream_t stream) {
+    return BaseKernel::initialize_workspace(
+        static_cast<const typename BaseKernel::Arguments&>(args),
+        workspace,
+        stream);
+  }
+
+  static Params to_underlying_arguments(const Arguments& args, void* workspace) {
+    Params params{};
+    static_cast<typename BaseKernel::Params&>(params) =
+        BaseKernel::to_underlying_arguments(
+            static_cast<const typename BaseKernel::Arguments&>(args),
+            workspace);
+    params.timeline = args.timeline;
+    params.timeline_capacity = args.timeline_capacity;
+    return params;
+  }
+
+  static dim3 get_grid_shape(const Params& params) {
+    return BaseKernel::get_grid_shape(
+        static_cast<const typename BaseKernel::Params&>(params));
+  }
+
+  static dim3 get_block_shape() { return BaseKernel::get_block_shape(); }
+
+  CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+    const int32_t cta = static_cast<int32_t>(blockIdx.x);
+    if (threadIdx.x == 0 && cta < params.timeline_capacity) {
+      params.timeline[cta].start = detail::read_global_timer();
+    }
+
+    const bool is_comm = cta < params.num_comm_ctas;
+    if (is_comm) {
+      CommOp{}(params.comm, cta, params.num_comm_ctas);
+    } else {
+      GemmKernel{}(params.gemm, smem);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0 && cta < params.timeline_capacity) {
+      params.timeline[cta].role_done = detail::read_global_timer();
+    }
+    __syncthreads();
+
+    if constexpr (detail::NeedsGridFinalize<CommOp>::value) {
+      cooperative_groups::this_grid().sync();
+      A2AGemmCtaTimeline* event =
+          cta < params.timeline_capacity ? params.timeline + cta : nullptr;
+      if (threadIdx.x == 0 && event != nullptr) {
+        event->grid_sync_done = detail::read_global_timer();
+      }
+      CommOp{}.finalize_profile(params.comm, event);
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0 && cta < params.timeline_capacity) {
+      params.timeline[cta].end = detail::read_global_timer();
+    }
+  }
+};
+#endif
 
 static_assert(
     sizeof(typename QkvGemmA2AKernelWide::SharedStorage) >=
@@ -2190,13 +2328,32 @@ cudaError_t launch_a2a_lhs_gemm_impl(
   }
 }
 
-template <class GemmKernel, class Comm, class Params>
+template <
+    class GemmKernel,
+    class Comm,
+    class Params
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
 cudaError_t launch_gemm_a2a_impl(
     const Params& params,
     cudaStream_t stream,
     int32_t sm_count,
-    int32_t device) {
+    int32_t device
+#if FUSE_ENABLE_PROFILING
+    , A2AGemmCtaTimeline* timeline = nullptr,
+    int32_t timeline_capacity = 0
+#endif
+    ) {
+#if FUSE_ENABLE_PROFILING
+  using Kernel = std::conditional_t<
+      Instrumented,
+      GemmA2ARoleTelemetryKernel<GemmKernel, Comm>,
+      detail::MonolithicGemm<GemmKernel, Comm>>;
+#else
   using Kernel = detail::MonolithicGemm<GemmKernel, Comm>;
+#endif
   constexpr int32_t tile_m =
       static_cast<int32_t>(cute::size<0>(typename GemmKernel::TileShape{}));
   constexpr int32_t tile_n =
@@ -2204,6 +2361,12 @@ cudaError_t launch_gemm_a2a_impl(
   const int32_t m_tiles = ceil_div(params.gemm.m, tile_m);
   const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
   typename Kernel::Arguments args{};
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Instrumented) {
+    args.timeline = timeline;
+    args.timeline_capacity = timeline_capacity;
+  }
+#endif
   args.num_comm_ctas = params.num_comm_ctas;
   args.comm.params = params;
   cudaError_t status = Comm::initialize(args.comm);
@@ -2716,6 +2879,72 @@ cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t st
   }
   return cudaErrorNotSupported;
 }
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_gemm_a2a_role_telemetry(
+    const GemmA2AParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  GemmA2AParams launch_params = params;
+  if (launch_params.num_comm_ctas == 0) {
+    launch_params.num_comm_ctas =
+        recommended_gemm_a2a_comm_ctas(params.gemm, params.route);
+  }
+  if (timeline == nullptr || timeline_capacity < sm_count ||
+      launch_params.num_comm_ctas <= 0 ||
+      launch_params.num_comm_ctas >= sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  if (launch_params.route.kind != RouteKind::kQkvGqaPack ||
+      launch_params.route.direction != RouteDirection::kForward) {
+    return cudaErrorNotSupported;
+  }
+  if (use_wide_qkv_policy(launch_params.gemm)) {
+    return launch_gemm_a2a_impl<
+        ProjectionOutputGemm,
+        QkvGqaPackCommWide,
+        GemmA2AParams,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity);
+  }
+  if (launch_params.route.qkv_peer_interleaved) {
+    return launch_gemm_a2a_impl<
+        OutputGemm,
+        QkvGqaPackCommSmallInterleaved,
+        GemmA2AParams,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity);
+  }
+  return launch_gemm_a2a_impl<
+      OutputGemm,
+      QkvGqaPackCommSmall,
+      GemmA2AParams,
+      true>(
+          launch_params,
+          stream,
+          sm_count,
+          device,
+          timeline,
+          timeline_capacity);
+}
+#endif
 
 
 cudaError_t launch_gemm_a2a_fp8_cutlass(

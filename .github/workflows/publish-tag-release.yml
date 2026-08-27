@@ -13,7 +13,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v4.0
+        default: v5.0
 
 permissions:
   contents: write
@@ -31,7 +31,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v4.0");
+              : (process.env.REQUESTED_TAG || "v5.0");
 
             const releases = {
               "v1.0": {
@@ -90,6 +90,20 @@ jobs:
                   "正式口径为 BF16、10 warmup + 50 samples、每个 sample 先取跨 rank 最大延迟再统计 p50/p95。NCCL 每个环境参数组合在独立 torchrun 进程中搜索，cuBLASLt 和 TE Userbuffers 分别完成结构与运行参数标定。",
                   "",
                   "复现入口、逐 case 表格和机器可读汇总分别位于两个算子目录下的 `BENCHMARK.md` 与 `results/`。",
+                ].join("\n"),
+              },
+              "v5.0": {
+                name: "v5.0 — benchmark launch and tuning release",
+                body: [
+                  "v5.0 固化 benchmark 的启动、计时和调参口径；A2A + OProj 与 QKV Projection + A2A 的生产热路径沿用 v4.0。",
+                  "",
+                  "两条算子都新增 Eager 与 CUDA Graph 两套正式结果。Graph 的 capture、instantiate 和显式 upload 位于采样之外；两列独立报告，不把启动方式之间的差值记作算子优化收益。",
+                  "",
+                  "QKV 正式 runner 改为 MPI 一进程一卡，通过 CUDA IPC 共享目标 buffer；单进程串行多卡 launch 仅保留作诊断。正式 10+50 Graph 使用单个预上传 graph、一次 replay 和 60 个单调 epoch kernel node。",
+                  "",
+                  "A2A + OProj 的 96-case Eager/Graph 对最强外部基线胜场分别为 95/96 与 94/96，CP8 两种口径均为 48/48。QKV 当前未专项优化实现对 TE Userbuffers 的胜场为 69/96 与 72/96，这组数据作为 v6 性能优化的固定起点。",
+                  "",
+                  "两个算子的 96-case 配置 manifest、TE/cuBLASLt+NCCL 与 TE Userbuffers winner、逐点 p50/p95/TFLOPS 和复现命令均已归档。",
                 ].join("\n"),
               },
             };

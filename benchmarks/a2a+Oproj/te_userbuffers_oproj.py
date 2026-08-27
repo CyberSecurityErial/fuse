@@ -297,6 +297,11 @@ def run(
     flops = 2 * m * n * k
     result = {
         "mode": "te_userbuffers_adapted_a2a_oproj",
+        "launch": "graph" if args.cuda_graph else "eager",
+        "timing": "per_sample_local_cuda_event_then_dist_max",
+        "timed_boundary": "pack+userbuffers_send_recv+all_gemm_accumulations",
+        "graph_setup_timed": False,
+        "rank_reduction": "MAX",
         "world_size": world,
         "gemm_shape": {"m": m, "n": n, "k": k},
         "config": vars(args) | {"json_out": str(args.json_out) if args.json_out else None},

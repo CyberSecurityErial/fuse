@@ -1,6 +1,31 @@
-# A2A + GEMM Perfetto profile 协议
+# 通算融合 Perfetto profile 协议
 
-这套协议只用于定位单 kernel 内通信、ready handoff 和 GEMM CTA 的时序。正式性能数据必须使用默认构建；profile 数据只解释相对时序。
+这套协议用于定位两个方向的单 kernel 时序：
+
+- `A2A -> GEMM`：通信发布、ready handoff 和 GEMM 消费；
+- `GEMM -> A2A`：GEMM 生产、QKV route、cooperative grid barrier 和跨 rank finalize。
+
+正式性能数据必须使用默认构建；profile 数据只解释相对时序。
+
+## 正式启动与计时规则
+
+正式 benchmark 固定区分 `eager` 和 `graph`，两列独立报告，不把两者的差值
+当作算子优化收益。
+
+- `QKV Projection -> A2A` 必须使用 MPI/torchrun 一进程一卡；每个样本先在各
+  rank 记录 CUDA event，再对 elapsed time 做 `MPI_MAX`。单进程按 rank 顺序
+  launch 会把后续 GPU 的 host 提交时间计入前面 rank 的跨源 finalize，只能用于
+  diagnostic trace，不能进入正式性能表。
+- QKV Graph 使用一个预上传的 graph、一次 replay；graph 内含 10 个 warmup epoch
+  和 50 个带独立 event pair 的正式 epoch。每个 kernel node 使用不同且单调递增的
+  epoch。capture、instantiate、upload 与 MPI barrier 全部在计时外。
+- `A2A -> OProj` 也分别报告 eager/Graph。其正式 runner、shape、通信 CTA、tile、
+  raster、swizzle、warmup 与 iterations 必须写入结果表或配置 manifest。
+- TE Userbuffers 的 start/stop event 必须包住完整边界，并在 stop 前把所有通信
+  stream join 回主 stream；逐 rank elapsed time 再做 `dist.MAX`。Graph capture 与
+  额外 warmup replay 均在正式采样外。
+- 所有正式数据均为“逐样本跨 rank 最大值，再计算 p50/p95”，禁止先对每个 rank
+  求分位数后再取最大。
 
 ## 构建开关
 
@@ -22,7 +47,9 @@ cmake --build build --parallel 8
 
 1. 确认参与 GPU 空闲、P2P/NVLink 正常，记录 `CUDA_VISIBLE_DEVICES`。
 2. 固定 `M/N/K`、CP、`comm_ctas`、tile policy、raster 和 swizzle；一次只改一个待比较变量。
-3. 使用 `--trace-out`。benchmark 会在普通测量结束后清空 ready flag，以 epoch 1 单独启动一次 diagnostic kernel。
+3. 使用 `--trace-out`。benchmark 会在普通测量结束后先预热一次独立的
+   diagnostic kernel，再清空全部 ready/epoch，以 epoch 1 采集一次正式 trace；
+   这样不会把逐 GPU 的首次模块装载误记为跨 rank 等待。
 4. exact correctness 必须通过；命令退出码必须为 0。
 5. 只保留 Perfetto JSON，不把终端输出当成归档数据。
 
@@ -39,11 +66,25 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
   --trace-out /home/chen/workspace/<name>_perfetto.json
 ```
 
+QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
+`N=(Hq+2*Hkv)*D`，`M=S/CP`：
+
+```bash
+CUDA_VISIBLE_DEVICES=<devices> ./build/qkvproj_a2a_bench \
+  --mode qkv_gemm_a2a --m <M> --k <K> \
+  --batch 1 --q-heads <Hq> --kv-heads <Hkv> --head-dim <D> \
+  --comm-ctas <comm> --raster <m|n|auto> --swizzle <1|2|4|8> \
+  --warmup 1 --iterations 1 \
+  --trace-out /home/chen/workspace/<name>_perfetto.json
+```
+
 ## 事件定义
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-当前版本：v3.0
+协议版本：4
+
+### A2A -> GEMM
 
 | 轨道 | 起点 | 终点 | 含义 |
 |---|---|---|---|
@@ -63,6 +104,60 @@ task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline�
 
 `release->acquire` 变长不自动表示调度停顿：固定 K 顺序下，CTA 在观察后续 peer 前会先计算已经拿到的 K shard。
 
+### GEMM -> A2A
+
+| 轨道 | 起点 | 终点 | 含义 |
+|---|---|---|---|
+| `GEMM role` | compute CTA 进入 kernel | 该 CTA 的 CUTLASS persistent scheduler 和 epilogue 全部返回 | 本地 GEMM 生产阶段；无任务 CTA 会很短 |
+| `QKV route role` | comm CTA 进入 kernel | 该 CTA 分配到的所有 ready wait、G2S/S2G 或 vector route 完成 | 本地输出路由阶段，包含等待 GEMM tile 发布 |
+| `grid barrier / finalize` | 本 CTA 本地角色结束 | 本 CTA 退出 kernel | cooperative grid barrier；CTA0 还包含跨 rank source-complete 发布与等待 |
+| `all local roles done -> kernel complete` | 本 rank 最后一个本地角色结束 | 本 rank 最后一个 CTA 退出 | 本地计算和通信都已完成后仍暴露在关键路径上的尾部 |
+
+`GEMM role` 与 `QKV route role` 的交集是 CTA-specialized 的实际本地重叠。
+`QKV route role` 包含 ready wait，因此不能直接当作裸 NVLink 时间；裸 route 仍由默认构建的 standalone route 测量。
+
+`all local roles done -> kernel complete` 在 CTA0 的 `finalize` 轨道中进一步拆成：
+
+| 子阶段 | 含义 |
+|---|---|
+| `local roles -> grid sync` | rank 内所有 persistent CTA 到达 cooperative grid barrier 的尾差 |
+| `fence.sc.sys` | route 写入完成后的 system-scope fence |
+| `publish source-complete epochs` | 本 source rank 向所有 destination rank 发布本轮 route 完成标记 |
+| `wait source N epoch` | 按 source 0 到 `world-1` 顺序轮询时，从上一个 source 就绪到 source N 就绪的暴露等待 |
+| `kernel retire` | 最后一个 source 就绪后，到 rank 内最后一个 CTA 退出 |
+
+`wait source N epoch` 是串行扫描顺序下的增量等待，不是 source N 独立的
+release-to-acquire 网络延迟；前一个 source 仍未就绪时，后续 source 即使已经就绪也不会被提前观察。
+
+### TE Userbuffers QKV 对照
+
+TE 对照不使用 `nsys --cuda-graph-trace=node`。逐 node 的 CUPTI 回调会显著放大
+由多个短 GEMM 和 P2P kernel 组成的 Graph。本协议在显式传入 `--trace-out` 时，
+只向 diagnostic Graph 加入少量 external CUDA timing event：
+
+| 轨道 | 含义 |
+|---|---|
+| `8 QKV slab GEMMs` | 主 stream 上八个 destination slab GEMM 的总跨度 |
+| `remote sends` | Userbuffers send stream 的首个发送到全部发送完成 |
+| `remote receives` | Userbuffers recv stream 的首个接收到全部接收完成 |
+| `send + recv envelope` | send/recv 两段的并集外框，作为 `T_comm` |
+| `unpack / dependency tail` | 计算和通信依赖满足后，到输出 unpack 完成 |
+| `TE UB boundary` | 完整 Graph 边界 |
+
+`T_overlap` 是 GEMM 区间与通信外框的交集；通信掩盖比例为
+`T_overlap / T_comm`。Event 版本仍是 diagnostic Graph，绝对性能继续引用不带
+`--trace-out` 的正式 10+50 结果。
+
+```bash
+CUDA_VISIBLE_DEVICES=<devices> \
+PYTHONPATH=/home/chen/workspace/source_code/TransformerEngine \
+LD_LIBRARY_PATH=/home/chen/workspace/source_code/TransformerEngine:/usr/local/cuda/lib64 \
+/home/chen/miniforge3/envs/mmunlearner/bin/python -B -m torch.distributed.run \
+  --standalone --nproc-per-node=<CP> \
+  benchmarks/QKVproj+a2a/te_userbuffers_qkv.py \
+  <正式 winner 参数> --cuda-graph --trace-out <perfetto.json>
+```
+
 ## 完整性检查
 
 每个 rank 都必须满足：
@@ -74,9 +169,17 @@ task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline�
 - JSON 可以完整解析，所有 duration 非负；
 - 四个比较 case 使用相同通信 CTA 数和相同数据初始化。
 
+GEMM -> A2A 还必须满足：
+
+- 每个 CTA 都有 `start <= role_done <= end`；
+- CTA `[0, comm_ctas)` 是 route role，其余是 compute role；
+- `all local roles done` 取所有 CTA 的最大 `role_done`；
+- 最终 kernel 时间取所有 CTA 的最大 `end`，不能用 rank 内平均值。
+
 ## 解读边界
 
 - 不比较不同 rank 的绝对 `%globaltimer` 值；每个 rank 在 JSON 中使用自己的时间原点。
 - `GEMM` 轨道不是纯 Tensor Core 时间，不能直接拿它计算 WGMMA 吞吐。
 - profile kernel 多写 global-memory 时间戳，数值会受观测开销影响；正式延迟仍以 profiling 关闭后的 10+50 benchmark 为准。
 - Perfetto 先看同一 rank 内的通信完成、peer 发布顺序、首包等待和 CTA 长尾，再用正式 benchmark 判断这些现象是否影响端到端时间。
+- TE Userbuffers 对照使用正式 winner 配置和 CUDA Event 阶段时间线。TE 是多 stream 边界，不能用单个 Graph 外框代替计算、通信和 unpack 三段。
