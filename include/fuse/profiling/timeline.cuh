@@ -19,6 +19,16 @@ struct A2AGemmCtaTimeline {
   uint64_t start = 0;
   uint64_t end = 0;
   uint64_t active_start = 0;
+  // GEMM->A2A diagnostic kernels use this for the point immediately before
+  // the cooperative grid barrier: GEMM has finished on compute CTAs, while
+  // all locally assigned output-route tasks have finished on comm CTAs.
+  uint64_t role_done = 0;
+  // GEMM->A2A finalize breakdown. grid_sync_done is recorded by every CTA;
+  // the remaining fields are populated only by CTA0/thread0.
+  uint64_t grid_sync_done = 0;
+  uint64_t fence_done = 0;
+  uint64_t publish_done = 0;
+  uint64_t source_ready[kMaxWorldSize]{};
 };
 
 // Per-peer publication and observation timestamps for one logical GEMM tile.

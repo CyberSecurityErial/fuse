@@ -65,6 +65,24 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
+# The focused one-process-per-GPU benchmark is optional so the core library and
+# single-process tools remain buildable on systems without an MPI development
+# package. CUDA IPC supplies the peer data/control mappings; MPI is bootstrap
+# and host-side sample reduction only.
+find_package(MPI QUIET COMPONENTS CXX)
+if(MPI_CXX_FOUND)
+  add_executable(
+    qkvproj_a2a_mpi_bench "benchmarks/QKVproj+a2a/fuse_mpi_bench.cu")
+  target_link_libraries(
+    qkvproj_a2a_mpi_bench PRIVATE fuse_kernels CUDA::cudart MPI::MPI_CXX)
+  target_compile_options(
+    qkvproj_a2a_mpi_bench
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+else()
+  message(STATUS "MPI C++ not found; skipping qkvproj_a2a_mpi_bench")
+endif()
+
 add_executable(cublaslt_bench "benchmarks/GEMM/cublaslt_bench.cu")
 target_link_libraries(cublaslt_bench PRIVATE CUDA::cublasLt CUDA::cudart)
 target_compile_options(

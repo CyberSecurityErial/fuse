@@ -346,6 +346,13 @@ def summarize(args: argparse.Namespace) -> None:
                     model.max_context is not None and seq > model.max_context
                 ),
                 "result_source": "legacy_golden_10w50i",
+                "launch": "graph",
+                "timing": "per_sample_local_cuda_event_then_dist_max",
+                "timed_boundary": (
+                    "pack+userbuffers_send_recv+all_gemm_accumulations"
+                ),
+                "graph_setup_timed": False,
+                "rank_reduction": "MAX",
                 "correctness_scope": "legacy_exact",
                 "self_pack_mismatches": 0,
                 "remote_recv_mismatches": 0,
@@ -385,6 +392,13 @@ def summarize(args: argparse.Namespace) -> None:
                 model.max_context is not None and seq > model.max_context
             ),
             "result_source": "mixed_shape_formal_10w50i",
+            "launch": "graph",
+            "timing": "per_sample_local_cuda_event_then_dist_max",
+            "timed_boundary": (
+                "pack+userbuffers_send_recv+all_gemm_accumulations"
+            ),
+            "graph_setup_timed": False,
+            "rank_reduction": "MAX",
             "correctness_scope": "exact" if checked else "same_geometry_s1k",
             "self_pack_mismatches": correctness.get("self_pack_mismatches"),
             "remote_recv_mismatches": correctness.get("remote_recv_mismatches"),

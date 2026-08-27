@@ -70,6 +70,18 @@ struct Options {
 #endif
 };
 
+const char* raster_name(fuse::GemmRaster raster) {
+  switch (raster) {
+    case fuse::GemmRaster::kAlongM:
+      return "m";
+    case fuse::GemmRaster::kAlongN:
+      return "n";
+    case fuse::GemmRaster::kHeuristic:
+      return "auto";
+  }
+  return "unknown";
+}
+
 int parse_int(const std::string& value, const char* name) {
   const int parsed = std::stoi(value);
   if (parsed <= 0) {
@@ -993,7 +1005,8 @@ std::vector<float> time_all_ranks(
 
 // Pre-instantiate one single-kernel graph per monotonic ready epoch.  Replaying
 // one fixed graph would be incorrect because the fused A2A protocol accumulates
-// arrivals by epoch; graph construction and instantiation remain outside timing.
+// arrivals by epoch. Construction, instantiation, and explicit upload all remain
+// outside timing so no measured sample pays first-launch graph setup.
 std::vector<float> time_all_ranks_graph_sequence(
     const std::vector<Runtime>& runtime,
     int warmup,
@@ -1020,6 +1033,15 @@ std::vector<float> time_all_ranks_graph_sequence(
           &graph_execs[rank][step], graphs[rank][step], nullptr, nullptr, 0));
     }
   }
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    for (int step = 0; step < total; ++step) {
+      CUDA_CHECK(cudaGraphUpload(
+          graph_execs[rank][step], runtime[rank].stream));
+    }
+  }
+  synchronize(runtime);
 
   for (int step = 0; step < warmup; ++step) {
     for (int rank = 0; rank < world; ++rank) {
@@ -1144,7 +1166,8 @@ void write_json(
     const char* route_name,
     double overlap,
     const std::vector<std::pair<std::string, const std::vector<float>*>>& results,
-    const fuse::A2ALhsPolicyInfo* lhs_policy = nullptr) {
+    const fuse::A2ALhsPolicyInfo* lhs_policy = nullptr,
+    long long exact_mismatches = -1) {
   if (options.json_out.empty()) {
     return;
   }
@@ -1158,6 +1181,8 @@ void write_json(
          << ", \"k\": " << options.k << ", \"l\": " << l << "},\n"
          << "  \"world_size\": " << world << ",\n"
          << "  \"comm_ctas\": " << options.comm_ctas << ",\n"
+         << "  \"raster\": \"" << raster_name(options.raster) << "\",\n"
+         << "  \"swizzle\": " << options.swizzle << ",\n"
          << "  \"warmup\": " << options.warmup << ",\n"
          << "  \"iterations\": " << options.iterations << ",\n"
          << "  \"fused_cuda_graph\": "
@@ -1165,6 +1190,8 @@ void write_json(
          << "  \"cuda_graph_epoch_mode\": \""
          << (options.cuda_graph ? "preinstantiated_monotonic_epochs" : "eager")
          << "\",\n"
+         << "  \"cuda_graph_preuploaded\": "
+         << (options.cuda_graph ? "true" : "false") << ",\n"
          << "  \"dtype\": \""
          << (options.mode == "qkv_gemm_a2a_fp8" ||
                      options.mode == "a2a_gemm_fp8"
@@ -1196,6 +1223,10 @@ void write_json(
            << (lhs_policy->full_last_wave ? "true" : "false")
            << ", \"estimated_cycles\": " << lhs_policy->estimated_cycles
            << "},\n";
+  }
+  if (exact_mismatches >= 0) {
+    output << "  \"correctness\": {\"exact_mismatches\": "
+           << exact_mismatches << "},\n";
   }
   output << "  \"results\": {\n";
   for (size_t index = 0; index < results.size(); ++index) {
@@ -1562,7 +1593,8 @@ void benchmark_a2a_lhs_gemm(
        {"same_policy_sequential", &sequential},
        {"cublaslt_sequential", &cublaslt_sequential},
        {"fused", &fused}},
-      &policy_info);
+      &policy_info,
+      static_cast<long long>(exact_mismatches));
 #if FUSE_ENABLE_PROFILING
   if (options.role_telemetry) {
     const std::string trace_path = options.trace_out.empty()

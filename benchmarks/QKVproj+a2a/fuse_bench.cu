@@ -521,6 +521,293 @@ void report_a2a_lhs_role_trace(
     CUDA_CHECK(cudaFree(device_peer_timeline[rank]));
   }
 }
+
+void report_gemm_a2a_role_trace(
+    int world,
+    const std::vector<Runtime>& runtime,
+    std::vector<fuse::GemmA2AParams>& params,
+    const std::vector<uint32_t*>& ready,
+    int64_t ready_count,
+    const std::vector<uint32_t*>& consumed_epoch,
+    const std::string& trace_path) {
+  std::vector<int32_t> capacities(world);
+  std::vector<fuse::A2AGemmCtaTimeline*> device_timeline(world);
+  std::vector<std::vector<fuse::A2AGemmCtaTimeline>> timeline(world);
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &capacities[rank], cudaDevAttrMultiProcessorCount, rank));
+    device_timeline[rank] = allocate<fuse::A2AGemmCtaTimeline>(
+        rank, capacities[rank]);
+    CUDA_CHECK(cudaMemsetAsync(
+        device_timeline[rank],
+        0,
+        static_cast<size_t>(capacities[rank]) *
+            sizeof(fuse::A2AGemmCtaTimeline),
+        runtime[rank].stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        ready[rank],
+        0,
+        static_cast<size_t>(ready_count) * sizeof(uint32_t),
+        runtime[rank].stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        consumed_epoch[rank],
+        0,
+        static_cast<size_t>(world) * fuse::kReadyFlagStride *
+            sizeof(uint32_t),
+        runtime[rank].stream));
+    params[rank].epoch = 1;
+  }
+  synchronize(runtime);
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(fuse::launch_gemm_a2a_role_telemetry(
+        params[rank],
+        device_timeline[rank],
+        capacities[rank],
+        runtime[rank].stream));
+  }
+  synchronize(runtime);
+
+  // The instrumented kernel is a distinct template instantiation.  Warm it on
+  // every CUDA context before recording so per-device lazy module setup is not
+  // mistaken for cross-rank source waiting.  Reset the complete epoch protocol
+  // before the measured launch; production benchmarking remains untouched.
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaMemsetAsync(
+        device_timeline[rank],
+        0,
+        static_cast<size_t>(capacities[rank]) *
+            sizeof(fuse::A2AGemmCtaTimeline),
+        runtime[rank].stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        ready[rank],
+        0,
+        static_cast<size_t>(ready_count) * sizeof(uint32_t),
+        runtime[rank].stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        consumed_epoch[rank],
+        0,
+        static_cast<size_t>(world) * fuse::kReadyFlagStride *
+            sizeof(uint32_t),
+        runtime[rank].stream));
+    params[rank].epoch = 1;
+  }
+  synchronize(runtime);
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    // Match time_all_ranks(): these event-record host calls affect when the
+    // later GPU ranks are submitted, which is visible inside cross-rank waits.
+    CUDA_CHECK(cudaEventRecord(runtime[rank].start, runtime[rank].stream));
+    CUDA_CHECK(fuse::launch_gemm_a2a_role_telemetry(
+        params[rank],
+        device_timeline[rank],
+        capacities[rank],
+        runtime[rank].stream));
+    CUDA_CHECK(cudaEventRecord(runtime[rank].stop, runtime[rank].stream));
+  }
+  synchronize(runtime);
+
+  std::cout << "\nQKV GEMM->A2A CTA timeline (%globaltimer, diagnostic kernel)\n"
+            << "rank  compute_role_us  route_role_us  overlap_us  "
+               "grid_sync_us  fence_us  publish_us  source_wait_us  "
+               "retire_us  kernel_us\n";
+  for (int rank = 0; rank < world; ++rank) {
+    timeline[rank].resize(capacities[rank]);
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaMemcpy(
+        timeline[rank].data(),
+        device_timeline[rank],
+        timeline[rank].size() * sizeof(timeline[rank][0]),
+        cudaMemcpyDeviceToHost));
+
+    uint64_t first = UINT64_MAX;
+    uint64_t last = 0;
+    uint64_t compute_first = UINT64_MAX;
+    uint64_t compute_done = 0;
+    uint64_t route_first = UINT64_MAX;
+    uint64_t route_done = 0;
+    uint64_t local_roles_done = 0;
+    for (int32_t cta = 0; cta < capacities[rank]; ++cta) {
+      const auto& event = timeline[rank][cta];
+      if (event.start == 0 || event.end <= event.start ||
+          event.role_done < event.start || event.role_done > event.end) {
+        continue;
+      }
+      first = std::min(first, event.start);
+      last = std::max(last, event.end);
+      local_roles_done = std::max(local_roles_done, event.role_done);
+      if (cta < params[rank].num_comm_ctas) {
+        route_first = std::min(route_first, event.start);
+        route_done = std::max(route_done, event.role_done);
+      } else {
+        compute_first = std::min(compute_first, event.start);
+        compute_done = std::max(compute_done, event.role_done);
+      }
+    }
+    const uint64_t overlap_begin = std::max(compute_first, route_first);
+    const uint64_t overlap_end = std::min(compute_done, route_done);
+    const double compute_us = compute_done > compute_first
+        ? static_cast<double>(compute_done - compute_first) / 1000.0
+        : 0.0;
+    const double route_us = route_done > route_first
+        ? static_cast<double>(route_done - route_first) / 1000.0
+        : 0.0;
+    const double overlap_us = overlap_end > overlap_begin
+        ? static_cast<double>(overlap_end - overlap_begin) / 1000.0
+        : 0.0;
+    const auto& root = timeline[rank][0];
+    const uint64_t sources_done = root.source_ready[world - 1];
+    const double grid_sync_us = root.grid_sync_done > local_roles_done
+        ? static_cast<double>(root.grid_sync_done - local_roles_done) / 1000.0
+        : 0.0;
+    const double fence_us = root.fence_done > root.grid_sync_done
+        ? static_cast<double>(root.fence_done - root.grid_sync_done) / 1000.0
+        : 0.0;
+    const double publish_us = root.publish_done > root.fence_done
+        ? static_cast<double>(root.publish_done - root.fence_done) / 1000.0
+        : 0.0;
+    const double source_wait_us = sources_done > root.publish_done
+        ? static_cast<double>(sources_done - root.publish_done) / 1000.0
+        : 0.0;
+    const double retire_us = last > sources_done
+        ? static_cast<double>(last - sources_done) / 1000.0
+        : 0.0;
+    const double kernel_us = last > first
+        ? static_cast<double>(last - first) / 1000.0
+        : 0.0;
+    std::cout << std::setw(4) << rank << "  " << std::setw(15)
+              << std::fixed << std::setprecision(2) << compute_us << "  "
+              << std::setw(13) << route_us << "  " << std::setw(10)
+              << overlap_us << "  " << std::setw(12) << grid_sync_us << "  "
+              << std::setw(8) << fence_us << "  " << std::setw(10)
+              << publish_us << "  " << std::setw(14) << source_wait_us << "  "
+              << std::setw(9) << retire_us << "  " << std::setw(9)
+              << kernel_us << "\n";
+  }
+
+  std::ofstream trace(trace_path);
+  if (!trace) {
+    throw std::runtime_error("cannot open trace output: " + trace_path);
+  }
+  trace << "{\n  \"displayTimeUnit\": \"ns\",\n  \"traceEvents\": [\n";
+  bool first_event = true;
+  auto emit = [&](int rank, int tid, const std::string& name,
+                  const std::string& category,
+                  uint64_t begin, uint64_t end, uint64_t origin) {
+    if (begin == 0 || end <= begin) {
+      return;
+    }
+    trace << (first_event ? "" : ",\n");
+    first_event = false;
+    trace << "    {\"name\":\"" << name << "\",\"cat\":\""
+          << category << "\",\"ph\":\"X\",\"pid\":" << rank
+          << ",\"tid\":" << tid << ",\"ts\":"
+          << std::fixed << std::setprecision(3)
+          << static_cast<double>(begin - origin) / 1000.0
+          << ",\"dur\":" << static_cast<double>(end - begin) / 1000.0
+          << "}";
+  };
+  for (int rank = 0; rank < world; ++rank) {
+    uint64_t origin = UINT64_MAX;
+    uint64_t local_roles_done = 0;
+    uint64_t last = 0;
+    for (const auto& event : timeline[rank]) {
+      if (event.start != 0) {
+        origin = std::min(origin, event.start);
+        local_roles_done = std::max(local_roles_done, event.role_done);
+        last = std::max(last, event.end);
+      }
+    }
+    if (origin == UINT64_MAX) {
+      continue;
+    }
+    for (int32_t cta = 0; cta < capacities[rank]; ++cta) {
+      const auto& event = timeline[rank][cta];
+      const bool is_comm = cta < params[rank].num_comm_ctas;
+      emit(
+          rank,
+          cta,
+          is_comm ? "QKV route role" : "GEMM role",
+          is_comm ? "communication" : "compute",
+          event.start,
+          event.role_done,
+          origin);
+      emit(
+          rank,
+          cta,
+          "grid barrier / finalize",
+          "dependency",
+          event.role_done,
+          event.end,
+          origin);
+    }
+    emit(
+        rank,
+        500000,
+        "all local roles done -> kernel complete",
+        "critical_tail",
+        local_roles_done,
+        last,
+        origin);
+    const auto& root = timeline[rank][0];
+    emit(
+        rank,
+        500001,
+        "local roles -> grid sync",
+        "finalize",
+        local_roles_done,
+        root.grid_sync_done,
+        origin);
+    emit(
+        rank,
+        500001,
+        "fence.sc.sys",
+        "finalize",
+        root.grid_sync_done,
+        root.fence_done,
+        origin);
+    emit(
+        rank,
+        500001,
+        "publish source-complete epochs",
+        "finalize",
+        root.fence_done,
+        root.publish_done,
+        origin);
+    uint64_t previous = root.publish_done;
+    for (int source = 0; source < world; ++source) {
+      emit(
+          rank,
+          500001,
+          "wait source " + std::to_string(source) + " epoch",
+          "finalize_source_wait",
+          previous,
+          root.source_ready[source],
+          origin);
+      previous = root.source_ready[source];
+    }
+    emit(
+        rank,
+        500001,
+        "kernel retire",
+        "finalize",
+        previous,
+        last,
+        origin);
+  }
+  trace << "\n  ]\n}\n";
+  trace.close();
+  std::cout << "Perfetto trace: " << trace_path << "\n";
+
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaFree(device_timeline[rank]));
+  }
+}
 #endif
 
 __global__ void fill_kernel(Bf16* data, int64_t elements, int seed) {
@@ -1855,6 +2142,21 @@ void benchmark_qkv_gemm_a2a(
       &traits,
       resolved_comm_ctas,
       m >= 2048 ? 2 : 1);
+#if FUSE_ENABLE_PROFILING
+  if (options.role_telemetry) {
+    const std::string trace_path = options.trace_out.empty()
+        ? "/home/chen/workspace/qkv_gemm_a2a_overlap_trace.json"
+        : options.trace_out;
+    report_gemm_a2a_role_trace(
+        world,
+        runtime,
+        params,
+        ready,
+        ready_count,
+        consumed_epoch,
+        trace_path);
+  }
+#endif
   destroy_cublaslt_plan(cublaslt_plan);
 }
 

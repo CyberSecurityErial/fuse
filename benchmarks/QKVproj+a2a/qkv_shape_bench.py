@@ -109,6 +109,8 @@ def parse_args() -> argparse.Namespace:
             "baseline-aggregate",
             "fuse-formal",
             "fuse-aggregate",
+            "fuse-mpi-formal",
+            "fuse-mpi-aggregate",
             "comparison-table",
         ),
         required=True,
@@ -140,6 +142,22 @@ def parse_args() -> argparse.Namespace:
         "--torchrun",
         type=Path,
         default=Path(os.environ.get("FUSE_TE_TORCHRUN", DEFAULT_TORCHRUN)),
+    )
+    parser.add_argument(
+        "--mpirun",
+        type=Path,
+        default=Path(os.environ.get("FUSE_MPIRUN", "/usr/bin/mpirun")),
+    )
+    parser.add_argument(
+        "--mpi-bench",
+        type=Path,
+        default=ROOT / "build" / "qkvproj_a2a_mpi_bench",
+    )
+    parser.add_argument("--mpi-bind", default="none")
+    parser.add_argument(
+        "--mpi-config-manifest",
+        type=Path,
+        default=Path(__file__).with_name("mpi_config_manifest.csv"),
     )
     return parser.parse_args()
 
@@ -334,6 +352,116 @@ def fuse_command(
         "--iterations", str(iters),
         "--json-out", str(output),
     ]
+
+
+def mpi_config_rows(args: argparse.Namespace) -> dict[str, dict[str, object]]:
+    path = args.mpi_config_manifest
+    if not path.is_absolute():
+        path = ROOT / path
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    indexed = {}
+    for row in rows:
+        row["comm_ctas"] = int(row["comm_ctas"])
+        row["swizzle"] = int(row["swizzle"])
+        if row["case"] in indexed:
+            raise ValueError(f"duplicate MPI config: {row['case']}")
+        indexed[str(row["case"])] = row
+    expected = {key(model, seq, cp) for model, seq, cp in cases(args)}
+    missing = sorted(expected - indexed.keys())
+    if missing:
+        raise KeyError(f"MPI config manifest is missing cases: {missing[:4]}")
+    return indexed
+
+
+def mpi_fuse_path(
+    args: argparse.Namespace,
+    model: Model,
+    seq: int,
+    cp: int,
+    launch: str,
+) -> Path:
+    return args.results / "fuse_mpi_formal" / launch / (
+        f"{key(model, seq, cp)}_"
+        f"{args.formal_warmup}w{args.formal_iters}i.json"
+    )
+
+
+def mpi_fuse_command(
+    args: argparse.Namespace,
+    model: Model,
+    seq: int,
+    cp: int,
+    launch: str,
+    config: dict[str, object],
+    output: Path,
+) -> list[str]:
+    command = [
+        str(args.mpirun),
+        "-np", str(cp),
+        "--bind-to", args.mpi_bind,
+        str(args.mpi_bench),
+        "--m", str(seq // cp),
+        "--k", str(model.hidden),
+        "--batch", "1",
+        "--q-heads", str(model.q_heads),
+        "--kv-heads", str(model.kv_heads),
+        "--head-dim", str(model.head_dim),
+        "--comm-ctas", str(config["comm_ctas"]),
+        "--raster", str(config["raster"]),
+        "--swizzle", str(config["swizzle"]),
+        "--launch", launch,
+        "--warmup", str(args.formal_warmup),
+        "--iterations", str(args.formal_iters),
+        "--json-out", str(output.resolve()),
+    ]
+    # One exact check per head geometry is enough for the formal matrix; it is
+    # outside the timed region. Longer sequence cases reuse the same mapping.
+    command.append("--check" if seq == 1024 else "--no-check")
+    return command
+
+
+def mpi_result_matches(
+    path: Path,
+    *,
+    model: Model,
+    seq: int,
+    cp: int,
+    launch: str,
+    config: dict[str, object],
+    warmup: int,
+    iters: int,
+) -> bool:
+    if not path.exists():
+        return False
+    try:
+        result = load(path)
+        shape = result["shape"]
+        geometry = result.get("head_geometry", {})
+        return (
+            result["mode"] == "qkv_gemm_a2a_mpi"
+            and result["launch"] == launch
+            and result["world_size"] == cp
+            and result["warmup"] == warmup
+            and result["iterations"] == iters
+            and shape == {
+                "m": seq // cp,
+                "n": model.qkv_width,
+                "k": model.hidden,
+            }
+            and geometry == {
+                "batch": 1,
+                "q_heads": model.q_heads,
+                "kv_heads": model.kv_heads,
+                "head_dim": model.head_dim,
+            }
+            and result["comm_ctas"] == config["comm_ctas"]
+            and result["raster"] == config["raster"]
+            and result["swizzle"] == config["swizzle"]
+            and result["defer_v_a2a"] is False
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def external_command(
@@ -724,6 +852,7 @@ def baseline_aggregate(args: argparse.Namespace) -> None:
 
 
 def run_fuse_formal(args: argparse.Namespace) -> None:
+    """Legacy single-process diagnostic path; not an official QKV timing."""
     for model, seq, cp in cases(args):
         output = args.results / "fuse_formal" / (
             f"{key(model, seq, cp)}_{args.formal_warmup}w{args.formal_iters}i.json"
@@ -737,6 +866,7 @@ def run_fuse_formal(args: argparse.Namespace) -> None:
 
 
 def fuse_aggregate(args: argparse.Namespace) -> None:
+    """Aggregate legacy single-process diagnostics without promoting them."""
     rows = []
     for model, seq, cp in cases(args):
         path = args.results / "fuse_formal" / (
@@ -780,6 +910,113 @@ def fuse_aggregate(args: argparse.Namespace) -> None:
             "qkv_route_p50_ms": data["results"]["qkv_a2a_route"]["p50_ms"],
             "sequential_p50_ms": data["results"]["sequential"]["p50_ms"],
             "overlap_ratio": data["overlap_ratio"],
+        })
+    dump_rows(rows, args.results / "serial_diagnostic_summary")
+
+
+def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
+    configs = mpi_config_rows(args)
+    for model, seq, cp in cases(args):
+        config = configs[key(model, seq, cp)]
+        for launch in ("eager", "graph"):
+            output = mpi_fuse_path(args, model, seq, cp, launch)
+            if args.resume and mpi_result_matches(
+                output,
+                model=model,
+                seq=seq,
+                cp=cp,
+                launch=launch,
+                config=config,
+                warmup=args.formal_warmup,
+                iters=args.formal_iters,
+            ):
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            run(
+                mpi_fuse_command(
+                    args, model, seq, cp, launch, config, output
+                ),
+                env=gpu_env(cp),
+                output=output,
+                resume=False,
+            )
+            if not mpi_result_matches(
+                output,
+                model=model,
+                seq=seq,
+                cp=cp,
+                launch=launch,
+                config=config,
+                warmup=args.formal_warmup,
+                iters=args.formal_iters,
+            ):
+                raise RuntimeError(f"invalid MPI benchmark output: {output}")
+
+
+def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
+    configs = mpi_config_rows(args)
+    serial_path = args.results / "serial_diagnostic_summary.json"
+    serial = load(serial_path) if serial_path.exists() else []
+    serial_by_key = {
+        (row["model"], row["global_seq"], row["cp"]): row for row in serial
+    }
+    rows = []
+    for model, seq, cp in cases(args):
+        case_key = key(model, seq, cp)
+        config = configs[case_key]
+        eager = load(mpi_fuse_path(args, model, seq, cp, "eager"))
+        graph = load(mpi_fuse_path(args, model, seq, cp, "graph"))
+        if eager["shape"] != graph["shape"]:
+            raise ValueError(f"eager/graph shape mismatch for {case_key}")
+        shape = eager["shape"]
+        flops = 2.0 * shape["m"] * shape["n"] * shape["k"]
+        wide_policy = shape["m"] >= 2048
+        eager_ms = eager["p50_ms"]
+        graph_ms = graph["p50_ms"]
+        old = serial_by_key.get((model.name, seq, cp))
+        rows.append({
+            "model": model.name,
+            "suite": model.suite,
+            "aliases": model.aliases,
+            "global_seq": seq,
+            "cp": cp,
+            "m": shape["m"],
+            "n": shape["n"],
+            "k": shape["k"],
+            "q_heads": model.q_heads,
+            "kv_heads": model.kv_heads,
+            "head_dim": model.head_dim,
+            "max_context": model.max_context,
+            "within_native_context": (
+                model.max_context is None or seq <= model.max_context
+            ),
+            "comm_ctas": config["comm_ctas"],
+            "raster": config["raster"],
+            "swizzle": config["swizzle"],
+            "tile_m": 128,
+            "tile_n": 256 if wide_policy else 128,
+            "tile_k": 64,
+            "cluster_m": 2 if wide_policy else 1,
+            "warmup": args.formal_warmup,
+            "iterations": args.formal_iters,
+            "process_model": "one_mpi_process_per_gpu",
+            "timing": "per_sample_max_rank_cuda_event",
+            "eager_epoch_mode": eager["graph_epoch_mode"],
+            "graph_epoch_mode": graph["graph_epoch_mode"],
+            "graph_kernel_nodes": args.formal_warmup + args.formal_iters,
+            "correctness_scope": (
+                "epoch_lifecycle_all_cases;"
+                "fused_vs_separated_reference_at_s1024_per_geometry"
+            ),
+            "eager_p50_ms": eager_ms,
+            "eager_p95_ms": eager["p95_ms"],
+            "eager_p50_tflops_per_gpu": flops / eager_ms / 1.0e9,
+            "graph_p50_ms": graph_ms,
+            "graph_p95_ms": graph["p95_ms"],
+            "graph_p50_tflops_per_gpu": flops / graph_ms / 1.0e9,
+            "serial_diagnostic_p50_ms": (
+                old["fused_p50_ms"] if old is not None else None
+            ),
         })
     dump_rows(rows, args.results / "fused_summary")
 
@@ -860,8 +1097,11 @@ def comparison_table(args: argparse.Namespace) -> None:
         merged.update({
             "best_separated": other["best_separated"],
             "best_separated_p50_ms": other["best_separated_p50_ms"],
-            "speedup_over_best_separated": (
-                other["best_separated_p50_ms"] / row["fused_p50_ms"]
+            "eager_speedup_over_best_separated": (
+                other["best_separated_p50_ms"] / row["eager_p50_ms"]
+            ),
+            "graph_speedup_over_best_separated": (
+                other["best_separated_p50_ms"] / row["graph_p50_ms"]
             ),
             "te_boundary_p50_ms": other["te_boundary_p50_ms"],
             "cublas_boundary_p50_ms": other["cublas_boundary_p50_ms"],
@@ -873,30 +1113,47 @@ def comparison_table(args: argparse.Namespace) -> None:
             best_external_ms = min(other["best_separated_p50_ms"], ub_ms)
             merged.update({
                 "te_userbuffers_p50_ms": ub_ms,
-                "speedup_over_te_userbuffers": ub_ms / row["fused_p50_ms"],
+                "te_userbuffers_p95_ms": ub["p95_ms"],
+                "te_userbuffers_launch": ub["launch"],
+                "te_userbuffers_timing": ub["timing"],
+                "te_userbuffers_timed_boundary": ub["timed_boundary"],
+                "eager_speedup_over_te_userbuffers": (
+                    ub_ms / row["eager_p50_ms"]
+                ),
+                "graph_speedup_over_te_userbuffers": (
+                    ub_ms / row["graph_p50_ms"]
+                ),
                 "best_external_p50_ms": best_external_ms,
-                "speedup_over_best_external": (
-                    best_external_ms / row["fused_p50_ms"]
+                "eager_speedup_over_best_external": (
+                    best_external_ms / row["eager_p50_ms"]
+                ),
+                "graph_speedup_over_best_external": (
+                    best_external_ms / row["graph_p50_ms"]
                 ),
             })
         rows.append(merged)
     dump_rows(rows, args.results / "comparison_summary")
     with (args.results / "comparison_summary.md").open("w") as handle:
         handle.write(
-            "| Suite | Model | S | CP | MxNxK | Fused ms / TFLOPS | "
-            "Best separated ms | TE-UB ms | Best speedup | Pure GEMM % |\n"
-            "|---|---|---:|---:|---|---:|---:|---:|---:|---:|\n"
+            "| Suite | Model | S | CP | MxNxK | Eager p50/p95 / TFLOPS | "
+            "Graph p50/p95 / TFLOPS | Best separated ms | TE-UB p50/p95 | "
+            "Eager / external | Graph / external | Config |\n"
+            "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|\n"
         )
         for row in rows:
             handle.write(
                 f"| {row['suite']} | {row['model']} | {row['global_seq']} | "
                 f"{row['cp']} | {row['m']}x{row['n']}x{row['k']} | "
-                f"{row['fused_p50_ms']:.4f} / "
-                f"{row['fused_p50_tflops_per_gpu']:.1f} | "
+                f"{row['eager_p50_ms']:.4f}/{row['eager_p95_ms']:.4f} / "
+                f"{row['eager_p50_tflops_per_gpu']:.1f} | "
+                f"{row['graph_p50_ms']:.4f}/{row['graph_p95_ms']:.4f} / "
+                f"{row['graph_p50_tflops_per_gpu']:.1f} | "
                 f"{row['best_separated_p50_ms']:.4f} | "
-                f"{row.get('te_userbuffers_p50_ms', float('nan')):.4f} | "
-                f"{row.get('speedup_over_best_external', row['speedup_over_best_separated']):.3f}x | "
-                f"{row['fused_throughput_as_best_pure_percent']:.1f}% |\n"
+                f"{row.get('te_userbuffers_p50_ms', float('nan')):.4f}/"
+                f"{row.get('te_userbuffers_p95_ms', float('nan')):.4f} | "
+                f"{row.get('eager_speedup_over_best_external', row['eager_speedup_over_best_separated']):.3f}x | "
+                f"{row.get('graph_speedup_over_best_external', row['graph_speedup_over_best_separated']):.3f}x | "
+                f"c{row['comm_ctas']}/r{row['raster'].upper()}/s{row['swizzle']} |\n"
             )
 
 
@@ -911,6 +1168,8 @@ def main() -> None:
             "baseline-aggregate": baseline_aggregate,
             "fuse-formal": run_fuse_formal,
             "fuse-aggregate": fuse_aggregate,
+            "fuse-mpi-formal": run_fuse_mpi_formal,
+            "fuse-mpi-aggregate": fuse_mpi_aggregate,
             "comparison-table": comparison_table,
         }[phase](args)
 

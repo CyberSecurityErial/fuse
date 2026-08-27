@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math-sm", type=int, default=0)
     parser.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--trace-out", type=Path)
     parser.add_argument("--matrix-manifest", type=Path)
     parser.add_argument("--check", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -223,24 +224,51 @@ def run(
         peer_steps.reverse()
     remote_peers = [(rank + step) % world for step in peer_steps]
     gemm_order = ([rank] + remote_peers) if args.local_first else (remote_peers + [rank])
+    # Timing is enabled only for an explicit diagnostic run.  Normal tuning
+    # and formal measurements retain the original lightweight event objects.
+    trace_enabled = args.trace_out is not None
     gemm_done = [torch.cuda.Event() for _ in range(world)]
     boundary_start = torch.cuda.Event()
     recv_ready = [torch.cuda.Event() for _ in peer_steps]
     send_done = [torch.cuda.Event() for _ in send_streams]
+    trace_events = None
+    if trace_enabled:
+        trace_events = {
+            "start": torch.cuda.Event(enable_timing=True, external=True),
+            "compute_end": torch.cuda.Event(enable_timing=True, external=True),
+            "send_start": [
+                torch.cuda.Event(enable_timing=True, external=True)
+                for _ in send_streams
+            ],
+            "send_end": [
+                torch.cuda.Event(enable_timing=True, external=True)
+                for _ in send_streams
+            ],
+            "recv_start": torch.cuda.Event(enable_timing=True, external=True),
+            "recv_end": torch.cuda.Event(enable_timing=True, external=True),
+            "unpack_start": torch.cuda.Event(enable_timing=True, external=True),
+            "end": torch.cuda.Event(enable_timing=True, external=True),
+        }
 
     def boundary() -> torch.Tensor:
         main_stream = torch.cuda.current_stream(device)
         # Join TE's external receive stream to the same Graph capture, exactly
         # as the OProj adapter does with its packed-data event.
         boundary_start.record(main_stream)
+        if trace_events is not None:
+            trace_events["start"].record(main_stream)
         recv_stream.wait_event(boundary_start)
         remote_index = 0
         for destination in gemm_order:
             plan.accumulate(source, weight_slabs[destination], send[destination], beta=0.0)
             gemm_done[destination].record(main_stream)
+            if trace_events is not None and destination == gemm_order[-1]:
+                trace_events["compute_end"].record(main_stream)
             if destination != rank:
                 stream_id = remote_index % active_send_streams
                 send_streams[stream_id].wait_event(gemm_done[destination])
+                if trace_events is not None and remote_index < active_send_streams:
+                    trace_events["send_start"][stream_id].record(send_streams[stream_id])
                 ub.userbuffers_p2p_send(
                     destination * slab_bytes,
                     (world + rank) * slab_bytes,
@@ -252,6 +280,8 @@ def run(
 
         # Keep the same Userbuffers handshake as the validated OProj adapter:
         # queue every send first, then submit receives in ring-peer order.
+        if trace_events is not None:
+            trace_events["recv_start"].record(recv_stream)
         for index, step in enumerate(peer_steps):
             source_peer = (rank - step) % world
             ub.userbuffers_p2p_recv(
@@ -260,15 +290,21 @@ def run(
                 slab_bytes,
                 source_peer,
             )
+            if trace_events is not None and index == len(peer_steps) - 1:
+                trace_events["recv_end"].record(recv_stream)
             recv_ready[index].record(recv_stream)
 
         for event in recv_ready:
             main_stream.wait_event(event)
-        for stream, event in zip(send_streams, send_done):
+        for stream_id, (stream, event) in enumerate(zip(send_streams, send_done)):
+            if trace_events is not None:
+                trace_events["send_end"][stream_id].record(stream)
             event.record(stream)
             main_stream.wait_event(event)
 
         numel = output.numel()
+        if trace_events is not None:
+            trace_events["unpack_start"].record(main_stream)
         _unpack_qkv_slabs_kernel[(triton.cdiv(numel, args.pack_block),)](
             send,
             recv,
@@ -282,6 +318,8 @@ def run(
             BLOCK=args.pack_block,
             num_warps=args.pack_warps,
         )
+        if trace_events is not None:
+            trace_events["end"].record(main_stream)
         return output
 
     check: dict[str, float | int] = {}
@@ -329,6 +367,102 @@ def run(
     samples = timed_critical(
         boundary, args.warmup, args.iters, device, use_cuda_graph=args.cuda_graph
     )
+
+    trace_summary = None
+    if trace_enabled:
+        torch.cuda.synchronize(device)
+
+        assert trace_events is not None
+
+        def elapsed_us(event: torch.cuda.Event) -> float:
+            return 1000.0 * trace_events["start"].elapsed_time(event)
+
+        compute_end_us = elapsed_us(trace_events["compute_end"])
+        send_start_us = min(elapsed_us(event) for event in trace_events["send_start"])
+        send_end_us = max(elapsed_us(event) for event in trace_events["send_end"])
+        recv_start_us = elapsed_us(trace_events["recv_start"])
+        recv_end_us = elapsed_us(trace_events["recv_end"])
+        comm_end_us = max(send_end_us, recv_end_us)
+        comm_start_us = min(send_start_us, recv_start_us)
+        unpack_start_us = elapsed_us(trace_events["unpack_start"])
+        total_us = elapsed_us(trace_events["end"])
+        overlap_us = max(
+            0.0, min(compute_end_us, comm_end_us) - max(0.0, comm_start_us)
+        )
+        trace_summary = {
+            "rank": rank,
+            "compute_us": compute_end_us,
+            "send_start_us": send_start_us,
+            "send_end_us": send_end_us,
+            "recv_start_us": recv_start_us,
+            "recv_end_us": recv_end_us,
+            "communication_start_us": comm_start_us,
+            "communication_end_us": comm_end_us,
+            "communication_us": comm_end_us - comm_start_us,
+            "overlap_us": overlap_us,
+            "communication_hidden_fraction": (
+                overlap_us / (comm_end_us - comm_start_us)
+                if comm_end_us > comm_start_us else 0.0
+            ),
+            "unpack_start_us": unpack_start_us,
+            "unpack_tail_us": max(0.0, total_us - unpack_start_us),
+            "total_us": total_us,
+        }
+        rank_summaries: list[dict[str, object] | None] = [None] * world
+        dist.all_gather_object(rank_summaries, trace_summary)
+        if rank == 0:
+            perfetto_events: list[dict[str, object]] = []
+            lane_names = {
+                0: "boundary",
+                1: "QKV slab GEMMs",
+                2: "communication envelope",
+                3: "send",
+                4: "recv",
+                5: "unpack / tail",
+            }
+            for peer_rank, summary in enumerate(rank_summaries):
+                assert summary is not None
+                perfetto_events.append({
+                    "name": "process_name", "ph": "M", "pid": peer_rank,
+                    "tid": 0, "args": {"name": f"TE Userbuffers rank {peer_rank}"},
+                })
+                for tid, name in lane_names.items():
+                    perfetto_events.append({
+                        "name": "thread_name", "ph": "M", "pid": peer_rank,
+                        "tid": tid, "args": {"name": name},
+                    })
+
+                def complete(name: str, category: str, tid: int,
+                             start_us: float, end_us: float) -> None:
+                    perfetto_events.append({
+                        "name": name, "cat": category, "ph": "X",
+                        "pid": peer_rank, "tid": tid, "ts": start_us,
+                        "dur": max(0.0, end_us - start_us),
+                    })
+
+                compute_us = float(summary["compute_us"])
+                send_start = float(summary["send_start_us"])
+                send_end = float(summary["send_end_us"])
+                recv_end = float(summary["recv_end_us"])
+                recv_start = float(summary["recv_start_us"])
+                comm_start = float(summary["communication_start_us"])
+                comm_end = float(summary["communication_end_us"])
+                unpack_start = float(summary["unpack_start_us"])
+                total_us = float(summary["total_us"])
+                complete("TE UB boundary", "boundary", 0, 0.0, total_us)
+                complete("8 QKV slab GEMMs", "compute", 1, 0.0, compute_us)
+                complete("send + recv envelope", "communication", 2,
+                         comm_start, comm_end)
+                complete("remote sends", "communication", 3, send_start, send_end)
+                complete("remote receives", "communication", 4,
+                         recv_start, recv_end)
+                complete("unpack / dependency tail", "epilogue", 5,
+                         unpack_start, total_us)
+            payload = {"displayTimeUnit": "ns", "traceEvents": perfetto_events}
+            args.trace_out.parent.mkdir(parents=True, exist_ok=True)
+            temporary = args.trace_out.with_suffix(args.trace_out.suffix + ".tmp")
+            temporary.write_text(json.dumps(payload, indent=2) + "\n")
+            temporary.replace(args.trace_out)
     if args.check and args.cuda_graph:
         torch.cuda.synchronize(device)
         post_graph_max_abs = (output.float() - expected.float()).abs().max()
@@ -340,6 +474,11 @@ def run(
     flops = 2 * m * n * k
     result = {
         "mode": "te_userbuffers_adapted_qkv_a2a",
+        "launch": "graph" if args.cuda_graph else "eager",
+        "timing": "per_sample_local_cuda_event_then_dist_max",
+        "timed_boundary": "all_qkv_slab_gemms+userbuffers_send_recv+unpack",
+        "graph_setup_timed": False,
+        "rank_reduction": "MAX",
         "world_size": world,
         "gemm_shape": {"m": m, "n": n, "k": k},
         "head_geometry": {
@@ -356,6 +495,8 @@ def run(
         },
         "samples_ms": samples,
     }
+    if trace_summary is not None:
+        result["trace_summary"] = trace_summary
     dist.barrier()
     return result
 
