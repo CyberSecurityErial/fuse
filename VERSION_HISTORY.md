@@ -330,3 +330,43 @@ Eager与Graph分列。73个没有换tile的setting，Eager p50几何平均变化
 变为128.2 μs，慢于TE Userbuffers的117.4 μs；v6保留这一结果，没有加入逐shape
 特判。完整数据和复现命令见
 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。
+
+## v7-autoroll：QKV联合流水与CTA独立前进
+
+状态：开发分支已完成全量验证，尚未打发布tag。
+
+v7把通信CTA和GEMM tile放进同一个启动前模型。候选通信CTA为`4..32`的偶数，
+候选tile为`M128N128`、`M128N160`、`M128N192`、
+`M128N256 cluster-M2`和`M128N320 cluster-M2`。评分只读取M/N/K、CP、
+head geometry、SM数、远端字节数、tile/cluster几何和H200原语标定：
+
+```text
+compute = persistent_waves × calibrated_wave_time(tile, K)
+route   = max(16KiB_task_waves, remote_bytes / one_way_NVLink_rate)
+score   = compute + max(one_task_wave, route - later_compute_waves)
+```
+
+N192是本轮新增的cluster1 policy。它与cluster-M2需要相同wave数且原始GEMM速度接近时，
+可以保留两个CTA独立前进，减少通信竞争下的cluster级互相等待。运行时模型不读取模型名、
+TE Userbuffers结果、逐case winner，也没有96点shape查表。超出当前设备、K、head dim或
+布局标定域时回退成熟路径。
+
+QKV finalize由thread0串行发布、串行等待8个source epoch，改为第一warp的8个lane
+并行发布和并行等待；system fence、epoch语义与退出条件不变。benchmark默认统一传入
+`comm_ctas=0/raster=n/swizzle=1`，由同一个模型解析实际通信CTA和tile；历史逐case
+manifest只保留作v5/v6复现。
+
+当前融合版本：v7-autoroll
+
+| QKVProj+A2A，96个setting | v6 Eager | v7 Eager | v6 Graph | v7 Graph |
+|---|---:|---:|---:|---:|
+| 对TE Userbuffers胜场 | 73/96 | 96/96 | 74/96 | 96/96 |
+| 对TE Userbuffers几何平均 | — | 1.268× | — | 1.319× |
+| 对最强外部基线胜场 | 64/96 | 93/96 | 69/96 | 96/96 |
+| 对最强外部基线几何平均 | — | 1.201× | — | 1.250× |
+| 相对v6 p50几何平均 | 1.000× | 1.147× | 1.000× | 1.156× |
+
+正式口径继续使用MPI一进程一卡、10次warmup + 50次采样，并逐样本取跨rank最大值。
+Eager相对v6有3个setting回退0.3%～1.9%，三点仍分别比TE Userbuffers快26.0%～
+35.3%；Graph全96点也全部超过最强外部基线。完整逐点数据与复现命令见
+[`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。

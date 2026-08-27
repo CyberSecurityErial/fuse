@@ -1040,16 +1040,20 @@ void smoke_qkv_wave_policy_selection() {
     std::cout << "QKV wave policy selection: SKIP (manual override set)\n";
     return;
   }
+  const char* comm_policy = std::getenv("FUSE_QKV_COMM_POLICY");
+  const bool pipeline_policy = comm_policy == nullptr ||
+      std::string(comm_policy) == "pipeline" ||
+      std::string(comm_policy) == "roofline";
   fuse::UlyssesRoute route{};
   route.qkv_peer_interleaved = false;
   struct Case {
     fuse::GemmProblem problem;
     int expected_bn;
   };
-  constexpr Case cases[] = {
+  const Case cases[] = {
       {{128, 4096, 4096, 1}, 128},
       {{512, 4096, 4096, 1}, 160},
-      {{1024, 5120, 5120, 1}, 256},
+      {{1024, 5120, 5120, 1}, pipeline_policy ? 192 : 256},
       {{1024, 4096, 4096, 1}, 320},
   };
   for (const auto& item : cases) {
@@ -1057,7 +1061,7 @@ void smoke_qkv_wave_policy_selection() {
         fuse::qkv_cutlass_kernel_traits(item.problem, route, 24, 132);
     if (traits.block_m != 128 || traits.block_n != item.expected_bn ||
         traits.block_k != 64) {
-      throw std::runtime_error("QKV v6 wave policy selection failed");
+      throw std::runtime_error("QKV wave policy selection failed");
     }
   }
   const auto fallback = fuse::qkv_cutlass_kernel_traits(

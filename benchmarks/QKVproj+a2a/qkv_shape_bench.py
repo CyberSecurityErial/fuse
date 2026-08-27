@@ -79,6 +79,34 @@ VISIBLE_DEVICES = {
     4: os.environ.get("FUSE_CP4_DEVICES", "0,2,4,5"),
     8: os.environ.get("FUSE_CP8_DEVICES", "0,1,2,3,4,5,6,7"),
 }
+
+
+def expected_qkv_policy_metadata() -> tuple[str, str, str]:
+    """Return the launch-time policy fingerprint used for resumable results."""
+    gemm = os.environ.get("FUSE_QKV_GEMM_POLICY")
+    comm = os.environ.get("FUSE_QKV_COMM_POLICY")
+    known_gemm = {
+        "legacy", "wave_time_model", "m128n128", "m128n160",
+        "m128n192", "m128n256", "m128n320",
+    }
+    known_comm = {"pipeline", "roofline", "legacy"}
+    gemm_request = "auto" if gemm is None else (
+        gemm if gemm in known_gemm else "unrecognized"
+    )
+    comm_request = "auto" if comm is None else (
+        comm if comm in known_comm else "unrecognized"
+    )
+    calibrated_tile = gemm is None or gemm == "wave_time_model"
+    pipeline = comm is None or comm in {"pipeline", "roofline"}
+    if not calibrated_tile:
+        model = "manual_override" if gemm in known_gemm else "unrecognized"
+    elif pipeline:
+        model = "calibrated_pipeline_independent_progress_v2"
+    elif gemm == "wave_time_model":
+        model = "calibrated_wave_time_independent_progress_v2"
+    else:
+        model = "calibrated_wave_time_v1"
+    return gemm_request, comm_request, model
 NCCL_CHANNELS = (8, 16, 24, 32)
 NCCL_CHUNK_KIB = (128, 256, 512, 1024)
 NCCL_LL_KIB = (16, 64, 128)
@@ -136,6 +164,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweep-iters", type=int, default=12)
     parser.add_argument("--formal-warmup", type=int, default=10)
     parser.add_argument("--formal-iters", type=int, default=50)
+    parser.add_argument(
+        "--mpi-launches",
+        choices=("eager", "graph", "both"),
+        default="both",
+        help="limit the MPI fused phase; formal archives keep the default 'both'",
+    )
+    parser.add_argument(
+        "--mpi-auto-comm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pass --comm-ctas 0 so the runtime policy, not the manifest, resolves it",
+    )
     parser.add_argument("--cublaslt-tune-warmup", type=int, default=5)
     parser.add_argument("--cublaslt-tune-iters", type=int, default=30)
     parser.add_argument(
@@ -355,6 +395,19 @@ def fuse_command(
 
 
 def mpi_config_rows(args: argparse.Namespace) -> dict[str, dict[str, object]]:
+    if args.mpi_auto_comm:
+        # v7 production benchmark: one uniform launch contract.  The runtime
+        # derives comm CTAs and tile geometry from the physical model; no
+        # per-case manifest entry participates in selection.
+        return {
+            key(model, seq, cp): {
+                "case": key(model, seq, cp),
+                "comm_ctas": 0,
+                "raster": "n",
+                "swizzle": 1,
+            }
+            for model, seq, cp in cases(args)
+        }
     path = args.mpi_config_manifest
     if not path.is_absolute():
         path = ROOT / path
@@ -407,7 +460,7 @@ def mpi_fuse_command(
         "--q-heads", str(model.q_heads),
         "--kv-heads", str(model.kv_heads),
         "--head-dim", str(model.head_dim),
-        "--comm-ctas", str(config["comm_ctas"]),
+        "--comm-ctas", "0" if args.mpi_auto_comm else str(config["comm_ctas"]),
         "--raster", str(config["raster"]),
         "--swizzle", str(config["swizzle"]),
         "--launch", launch,
@@ -431,6 +484,7 @@ def mpi_result_matches(
     config: dict[str, object],
     warmup: int,
     iters: int,
+    auto_comm: bool,
 ) -> bool:
     if not path.exists():
         return False
@@ -438,6 +492,9 @@ def mpi_result_matches(
         result = load(path)
         shape = result["shape"]
         geometry = result.get("head_geometry", {})
+        gemm_request, comm_request, policy_model = (
+            expected_qkv_policy_metadata()
+        )
         return (
             result["mode"] == "qkv_gemm_a2a_mpi"
             and result["launch"] == launch
@@ -455,10 +512,17 @@ def mpi_result_matches(
                 "kv_heads": model.kv_heads,
                 "head_dim": model.head_dim,
             }
-            and result["comm_ctas"] == config["comm_ctas"]
+            and (
+                result.get("requested_comm_ctas") == 0
+                if auto_comm
+                else result["comm_ctas"] == config["comm_ctas"]
+            )
             and result["raster"] == config["raster"]
             and result["swizzle"] == config["swizzle"]
             and result["defer_v_a2a"] is False
+            and result.get("qkv_policy_request") == gemm_request
+            and result.get("qkv_comm_policy_request") == comm_request
+            and result.get("qkv_policy_model") == policy_model
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -916,9 +980,14 @@ def fuse_aggregate(args: argparse.Namespace) -> None:
 
 def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
     configs = mpi_config_rows(args)
+    launches = (
+        ("eager", "graph")
+        if args.mpi_launches == "both"
+        else (args.mpi_launches,)
+    )
     for model, seq, cp in cases(args):
         config = configs[key(model, seq, cp)]
-        for launch in ("eager", "graph"):
+        for launch in launches:
             output = mpi_fuse_path(args, model, seq, cp, launch)
             if args.resume and mpi_result_matches(
                 output,
@@ -929,6 +998,7 @@ def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
                 config=config,
                 warmup=args.formal_warmup,
                 iters=args.formal_iters,
+                auto_comm=args.mpi_auto_comm,
             ):
                 continue
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -949,6 +1019,7 @@ def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
                 config=config,
                 warmup=args.formal_warmup,
                 iters=args.formal_iters,
+                auto_comm=args.mpi_auto_comm,
             ):
                 raise RuntimeError(f"invalid MPI benchmark output: {output}")
 
@@ -970,23 +1041,20 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
             raise ValueError(f"eager/graph shape mismatch for {case_key}")
         if eager["kernel_traits"] != graph["kernel_traits"]:
             raise ValueError(f"eager/graph policy mismatch for {case_key}")
-        eager_policy = eager.get("qkv_policy_request", "wave_time_model")
-        graph_policy = graph.get("qkv_policy_request", "wave_time_model")
+        eager_policy = eager.get("qkv_policy_request")
+        graph_policy = graph.get("qkv_policy_request")
         if eager_policy != graph_policy:
             raise ValueError(f"eager/graph policy request mismatch for {case_key}")
         if eager_policy == "unrecognized":
             raise ValueError(f"unrecognized QKV policy for {case_key}")
-        default_policy_model = (
-            "calibrated_wave_time_v1"
-            if eager_policy in ("auto", "wave_time_model")
-            else "manual_override"
-        )
-        eager_policy_model = eager.get(
-            "qkv_policy_model", default_policy_model
-        )
-        graph_policy_model = graph.get(
-            "qkv_policy_model", default_policy_model
-        )
+        eager_comm_policy = eager.get("qkv_comm_policy_request")
+        graph_comm_policy = graph.get("qkv_comm_policy_request")
+        if eager_comm_policy != graph_comm_policy:
+            raise ValueError(f"eager/graph comm policy mismatch for {case_key}")
+        if eager_comm_policy == "unrecognized":
+            raise ValueError(f"unrecognized QKV comm policy for {case_key}")
+        eager_policy_model = eager.get("qkv_policy_model")
+        graph_policy_model = graph.get("qkv_policy_model")
         if eager_policy_model != graph_policy_model:
             raise ValueError(f"eager/graph policy model mismatch for {case_key}")
         shape = eager["shape"]
@@ -1011,11 +1079,12 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
             "within_native_context": (
                 model.max_context is None or seq <= model.max_context
             ),
-            "comm_ctas": config["comm_ctas"],
+            "comm_ctas": eager["comm_ctas"],
             "qkv_policy_request": eager_policy,
+            "qkv_comm_policy_request": eager_comm_policy,
             "qkv_policy_model": eager_policy_model,
-            "raster": config["raster"],
-            "swizzle": config["swizzle"],
+            "raster": eager["raster"],
+            "swizzle": eager["swizzle"],
             "tile_m": traits["tile_m"],
             "tile_n": traits["tile_n"],
             "tile_k": traits["tile_k"],

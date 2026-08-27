@@ -42,6 +42,7 @@ using Accumulator = float;
 using TileShape = Shape<_128, _128, _64>;
 using M64TileShape = Shape<_64, _128, _64>;
 using N160TileShape = Shape<_128, _160, _64>;
+using N192TileShape = Shape<_128, _192, _64>;
 using ProjectionTileShape = Shape<_128, _256, _64>;
 using WideN320TileShape = Shape<_128, Int<320>, _64>;
 using Fp8TileShape = Shape<_128, _128, _128>;
@@ -166,6 +167,7 @@ bool supported_route_base(const UlyssesRoute& route) {
 enum class QkvGemmPolicy {
   kM128N128,
   kM128N160,
+  kM128N192,
   kM128N256ClusterM2,
   kM128N320ClusterM2,
 };
@@ -176,9 +178,10 @@ struct QkvPolicyGeometry {
   int32_t cluster_m;
 };
 
-constexpr std::array<QkvPolicyGeometry, 4> kQkvPolicyGeometries{{
+constexpr std::array<QkvPolicyGeometry, 5> kQkvPolicyGeometries{{
     {QkvGemmPolicy::kM128N128, 128, 1},
     {QkvGemmPolicy::kM128N160, 160, 1},
+    {QkvGemmPolicy::kM128N192, 192, 1},
     {QkvGemmPolicy::kM128N256ClusterM2, 256, 2},
     {QkvGemmPolicy::kM128N320ClusterM2, 320, 2},
 }};
@@ -186,17 +189,22 @@ constexpr std::array<QkvPolicyGeometry, 4> kQkvPolicyGeometries{{
 struct QkvWaveCalibrationRow {
   int32_t k;
   // One full compute wave in nanoseconds, indexed like kQkvPolicyGeometries.
-  std::array<int32_t, 4> wave_ns;
+  std::array<int32_t, 5> wave_ns;
 };
 
-// H200 BF16 calibration for the v6 QKV tile selector.  These are
+// H200 BF16 primitive calibration for the QKV tile selector.  These are
 // pure CUTLASS compute-subgrid p50 times, not fitted coefficients:
 //   * H200 SXM, 132 SMs; CUDA events; warmup=5, iterations=20.
 //   * comm=24 leaves 108 compute CTAs; comm=32 leaves 100 compute CTAs.
 //   * Each calibration shape supplies one full (or nearest legal) wave for
-//     exactly one policy.  N128/N160 use cluster-M1; N256/N320 use cluster-M2.
+//     exactly one policy.  N128/N160/N192 use cluster-M1;
+//     N256/N320 use cluster-M2.
 //     comm=24 uses (M,N)=(128,13824), (128,17152), (256,13824),
 //     (256,17152); comm=32 uses N=12800/15872 with the same M mapping.
+//     N192 was measured once at comm=24 with (M,N)=(128,20736).  Its value is
+//     duplicated in the comm=32 array only to keep a uniform policy index;
+//     v7 treats tile service cost as independent of the worker split, while
+//     the mature v6 path excludes N192.
 // The selector multiplies this measured one-wave latency by the number of
 // persistent waves required by the real MxN problem.  This is an
 // architecture-level calibration, not a per-shape winner table: runtime M/N
@@ -205,20 +213,35 @@ struct QkvWaveCalibrationRow {
 // compute_subgrid_cutlass on the calibration shapes documented above,
 // whenever the GPU, CUDA/CUTLASS version, or kernel policy changes.
 constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm24{{
-    {2048, {25248, 28768, 31792, 40400}},
-    {3072, {32304, 37264, 41600, 53296}},
-    {4096, {39136, 46496, 50656, 65728}},
-    {5120, {45632, 54400, 60128, 78496}},
-    {16384, {126704, 150656, 167328, 219744}},
+    {2048, {25248, 28768, 32736, 31792, 40400}},
+    {3072, {32304, 37264, 43440, 41600, 53296}},
+    {4096, {39136, 46496, 54592, 50656, 65728}},
+    {5120, {45632, 54400, 64304, 60128, 78496}},
+    {16384, {126704, 150656, 181360, 167328, 219744}},
 }};
 
 constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm32{{
-    {2048, {24288, 27680, 31456, 39440}},
-    {3072, {30880, 35840, 41056, 52304}},
-    {4096, {36768, 44496, 50256, 64896}},
-    {5120, {43920, 51504, 59392, 77152}},
-    {16384, {117696, 141040, 165456, 213024}},
+    {2048, {24288, 27680, 32736, 31456, 39440}},
+    {3072, {30880, 35840, 43440, 41056, 52304}},
+    {4096, {36768, 44496, 54592, 50256, 64896}},
+    {5120, {43920, 51504, 64304, 59392, 77152}},
+    {16384, {117696, 141040, 181360, 165456, 213024}},
 }};
+
+// Incremental cost of one additional 16-KiB route-task wave.  The value is
+// the difference between otherwise identical 64-task and 128-task QKV route
+// calibrations (14.7 us and 19.0 us) on H200.  It is a communication-kernel
+// primitive cost, not a model-shape winner.
+constexpr int64_t kQkvRouteTaskWaveNs = 4300;
+
+bool qkv_pipeline_policy_enabled() {
+  const char* value = std::getenv("FUSE_QKV_COMM_POLICY");
+  // v7 uses the physical pipeline model by default.  Keep the mature v6
+  // selector available for reproducibility and rollback; unknown values also
+  // fall back instead of silently enabling a misspelled experimental mode.
+  return value == nullptr || std::strcmp(value, "pipeline") == 0 ||
+      std::strcmp(value, "roofline") == 0;
+}
 
 QkvGemmPolicy legacy_qkv_gemm_policy(const GemmProblem& problem) {
   return problem.m >= 2048 ? QkvGemmPolicy::kM128N256ClusterM2
@@ -252,21 +275,35 @@ int64_t interpolate_qkv_wave_ns(
   return table.back().wave_ns[policy_index];
 }
 
-QkvGemmPolicy select_qkv_wave_time_policy(
+struct QkvComputeEstimate {
+  QkvGemmPolicy policy = QkvGemmPolicy::kM128N128;
+  int32_t tile_n = 128;
+  int32_t cluster_m = 1;
+  int64_t waves = 0;
+  int64_t wave_ns = 0;
+  int64_t total_ns = 0;
+  bool valid = false;
+};
+
+QkvComputeEstimate estimate_qkv_compute(
     const GemmProblem& problem,
     int32_t num_comm_ctas,
     int32_t sm_count,
-    bool peer_interleaved) {
+    bool peer_interleaved,
+    bool allow_general_comm = false) {
   const QkvGemmPolicy fallback = legacy_qkv_gemm_policy(problem);
+  QkvComputeEstimate best{};
+  best.policy = fallback;
   if (problem.m <= 0 || problem.n <= 0 || problem.k <= 0 || problem.l <= 0 ||
       peer_interleaved || sm_count != 132 ||
-      (num_comm_ctas != 24 && num_comm_ctas != 32)) {
-    return fallback;
+      ((!allow_general_comm) &&
+       num_comm_ctas != 24 && num_comm_ctas != 32)) {
+    return best;
   }
 
   const int32_t compute_ctas = sm_count - num_comm_ctas;
   if (compute_ctas <= 0) {
-    return fallback;
+    return best;
   }
   const auto ceil_div_i64 = [](int64_t value, int64_t divisor) {
     return (value + divisor - 1) / divisor;
@@ -274,20 +311,31 @@ QkvGemmPolicy select_qkv_wave_time_policy(
 
   int64_t best_score_ns = std::numeric_limits<int64_t>::max();
   int32_t best_tie_rank = std::numeric_limits<int32_t>::max();
-  QkvGemmPolicy best = fallback;
+  QkvComputeEstimate best_independent{};
+  int64_t best_independent_ns = std::numeric_limits<int64_t>::max();
   for (size_t index = 0; index < kQkvPolicyGeometries.size(); ++index) {
     const auto& candidate = kQkvPolicyGeometries[index];
+    // N192 is the v7 independent-progress candidate.  The mature v6 selector
+    // remains bit-for-bit on its original four-policy search space.
+    if (!allow_general_comm &&
+        candidate.policy == QkvGemmPolicy::kM128N192) {
+      continue;
+    }
     if (candidate.cluster_m == 2 &&
         (num_comm_ctas % 2 != 0 || compute_ctas % 2 != 0)) {
       continue;
     }
-    const int64_t wave_ns = num_comm_ctas == 24
+    // The general comm model uses one policy latency independent of the
+    // resource split: changing comm CTAs changes the number of resident GEMM
+    // workers and therefore the wave count, not the work performed by a tile.
+    // The mature v6 path retains its exact comm24/comm32 calibration.
+    const int64_t wave_ns = allow_general_comm || num_comm_ctas == 24
         ? interpolate_qkv_wave_ns(
               kQkvWaveCalibrationComm24, problem.k, index)
         : interpolate_qkv_wave_ns(
               kQkvWaveCalibrationComm32, problem.k, index);
     if (wave_ns <= 0) {
-      return fallback;
+      return best;
     }
 
     const int64_t workers = compute_ctas / candidate.cluster_m;
@@ -304,17 +352,56 @@ QkvGemmPolicy select_qkv_wave_time_policy(
     // use TE-UB results.  Shapes outside the calibrated H200/comm/K domain use
     // the v5 policy instead of extrapolating this model.
     const int64_t score_ns = waves * wave_ns;
+    QkvComputeEstimate estimate{};
+    estimate.policy = candidate.policy;
+    estimate.tile_n = candidate.tile_n;
+    estimate.cluster_m = candidate.cluster_m;
+    estimate.waves = waves;
+    estimate.wave_ns = wave_ns;
+    estimate.total_ns = score_ns;
+    estimate.valid = true;
+    if (candidate.cluster_m == 1 && score_ns < best_independent_ns) {
+      best_independent = estimate;
+      best_independent_ns = score_ns;
+    }
     const int32_t tie_rank = candidate.policy == fallback
         ? 0
         : static_cast<int32_t>(index) + 1;
     if (score_ns < best_score_ns ||
         (score_ns == best_score_ns && tie_rank < best_tie_rank)) {
-      best = candidate.policy;
+      best = estimate;
       best_score_ns = score_ns;
       best_tie_rank = tie_rank;
     }
   }
+  // Cluster-M2 saves B traffic, but its two CTAs share one cluster progress
+  // unit.  Under concurrent route TMA, a delayed peer can hold both CTAs.  If
+  // an independent cluster-M1 policy needs the same number of persistent
+  // waves and gives up no more than two route service quanta, preserve the
+  // independent progress.  The margin is tied to the cluster width and the
+  // measured route primitive above; it is not selected from the 96 cases.
+  if (allow_general_comm && best.valid && best.cluster_m == 2 &&
+      best_independent.valid && best_independent.waves == best.waves &&
+      best_independent.total_ns <=
+          best.total_ns + best.cluster_m * kQkvRouteTaskWaveNs) {
+    return best_independent;
+  }
   return best;
+}
+
+QkvGemmPolicy select_qkv_wave_time_policy(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    bool peer_interleaved,
+    bool allow_general_comm = false) {
+  const auto estimate = estimate_qkv_compute(
+      problem,
+      num_comm_ctas,
+      sm_count,
+      peer_interleaved,
+      allow_general_comm);
+  return estimate.valid ? estimate.policy : legacy_qkv_gemm_policy(problem);
 }
 
 QkvGemmPolicy select_qkv_gemm_policy(
@@ -332,6 +419,9 @@ QkvGemmPolicy select_qkv_gemm_policy(
     if (std::strcmp(value, "m128n160") == 0) {
       return QkvGemmPolicy::kM128N160;
     }
+    if (std::strcmp(value, "m128n192") == 0) {
+      return QkvGemmPolicy::kM128N192;
+    }
     if (std::strcmp(value, "m128n256") == 0) {
       return QkvGemmPolicy::kM128N256ClusterM2;
     }
@@ -340,11 +430,16 @@ QkvGemmPolicy select_qkv_gemm_policy(
     }
     if (std::strcmp(value, "wave_time_model") == 0) {
       return select_qkv_wave_time_policy(
-          problem, num_comm_ctas, sm_count, peer_interleaved);
+          problem, num_comm_ctas, sm_count, peer_interleaved, true);
     }
   }
+  const bool pipeline_comm = qkv_pipeline_policy_enabled();
   return select_qkv_wave_time_policy(
-      problem, num_comm_ctas, sm_count, peer_interleaved);
+      problem,
+      num_comm_ctas,
+      sm_count,
+      peer_interleaved,
+      pipeline_comm);
 }
 
 using BaseEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -445,6 +540,54 @@ using N160PureGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     N160Mainloop,
     N160Epilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+// Cluster-M1 candidate between N160 and the cluster-M2 N256 policy.  It
+// fills wave-count gaps without introducing a second-CTA progress dependency.
+using N192Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        N192TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+
+using N192Mainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutB,
+        kAlignment,
+        Accumulator,
+        N192TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename N192Epilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using N192ObservedEpilogue = detail::SignalingEpilogue<N192Epilogue>;
+using N192OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N192Mainloop,
+    N192ObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using N192PureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N192Mainloop,
+    N192Epilogue,
     cutlass::gemm::PersistentScheduler>;
 
 #if FUSE_ENABLE_PROFILING
@@ -1834,31 +1977,32 @@ struct QkvGqaPackCommT {
   // destination-owned array, then hold this rank's kernel open until all
   // sources have completed its routed output.
   CUTLASS_DEVICE void finalize(const Params& args) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32) {
       return;
     }
     const auto& p = args.params;
-    detail::fence_system();
-    for (int32_t destination_rank = 0;
-         destination_rank < p.route.world_size;
-         ++destination_rank) {
+    const int32_t lane = static_cast<int32_t>(threadIdx.x);
+    if (lane == 0) {
+      detail::fence_system();
+    }
+    __syncwarp();
+    if (lane < p.route.world_size) {
       detail::store_release_system(
-          p.peer_route_done_epoch[destination_rank] +
+          p.peer_route_done_epoch[lane] +
               p.route.rank * kReadyFlagStride,
           p.epoch);
     }
+    __syncwarp();
     const uint32_t* local_sources_done =
         p.peer_route_done_epoch[p.route.rank];
-    for (int32_t source_rank = 0;
-         source_rank < p.route.world_size;
-         ++source_rank) {
-#pragma unroll 1
+    if (lane < p.route.world_size) {
       while (detail::load_acquire_system(
-                 local_sources_done + source_rank * kReadyFlagStride) <
+                 local_sources_done + lane * kReadyFlagStride) <
              p.epoch) {
         __nanosleep(64);
       }
     }
+    __syncwarp();
   }
 
 #if FUSE_ENABLE_PROFILING
@@ -1867,34 +2011,37 @@ struct QkvGqaPackCommT {
   CUTLASS_DEVICE void finalize_profile(
       const Params& args,
       A2AGemmCtaTimeline* event) {
-    if (blockIdx.x != 0 || threadIdx.x != 0 || event == nullptr) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32 || event == nullptr) {
       return;
     }
     const auto& p = args.params;
-    detail::fence_system();
-    event->fence_done = detail::read_global_timer();
-    for (int32_t destination_rank = 0;
-         destination_rank < p.route.world_size;
-         ++destination_rank) {
+    const int32_t lane = static_cast<int32_t>(threadIdx.x);
+    if (lane == 0) {
+      detail::fence_system();
+      event->fence_done = detail::read_global_timer();
+    }
+    __syncwarp();
+    if (lane < p.route.world_size) {
       detail::store_release_system(
-          p.peer_route_done_epoch[destination_rank] +
+          p.peer_route_done_epoch[lane] +
               p.route.rank * kReadyFlagStride,
           p.epoch);
     }
-    event->publish_done = detail::read_global_timer();
+    __syncwarp();
+    if (lane == 0) {
+      event->publish_done = detail::read_global_timer();
+    }
     const uint32_t* local_sources_done =
         p.peer_route_done_epoch[p.route.rank];
-    for (int32_t source_rank = 0;
-         source_rank < p.route.world_size;
-         ++source_rank) {
-#pragma unroll 1
+    if (lane < p.route.world_size) {
       while (detail::load_acquire_system(
-                 local_sources_done + source_rank * kReadyFlagStride) <
+                 local_sources_done + lane * kReadyFlagStride) <
              p.epoch) {
         __nanosleep(64);
       }
-      event->source_ready[source_rank] = detail::read_global_timer();
+      event->source_ready[lane] = detail::read_global_timer();
     }
+    __syncwarp();
   }
 #endif
 };
@@ -1909,6 +2056,12 @@ using QkvGqaPackCommN160 = QkvGqaPackCommT<
     false,
     static_cast<int32_t>(cute::size<0>(N160TileShape{})),
     static_cast<int32_t>(cute::size<1>(N160TileShape{})),
+    4>;
+using QkvGqaPackCommN192 = QkvGqaPackCommT<
+    GemmA2AParams,
+    false,
+    static_cast<int32_t>(cute::size<0>(N192TileShape{})),
+    static_cast<int32_t>(cute::size<1>(N192TileShape{})),
     4>;
 using QkvGqaPackCommN320 = QkvGqaPackCommT<
     GemmA2AParams,
@@ -1938,6 +2091,8 @@ using QkvGemmA2AKernelWide =
     detail::MonolithicGemm<ProjectionOutputGemm, QkvGqaPackCommWide>;
 using QkvGemmA2AKernelN160 =
     detail::MonolithicGemm<N160OutputGemm, QkvGqaPackCommN160>;
+using QkvGemmA2AKernelN192 =
+    detail::MonolithicGemm<N192OutputGemm, QkvGqaPackCommN192>;
 using QkvGemmA2AKernelN320 =
     detail::MonolithicGemm<WideN320OutputGemm, QkvGqaPackCommN320>;
 using QkvGemmA2AKernelSmall =
@@ -2659,6 +2814,14 @@ KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem) {
           static_cast<int32_t>(N160OutputGemm::get_block_shape().x),
           static_cast<int32_t>(
               sizeof(typename QkvGemmA2AKernelN160::SharedStorage))};
+    case QkvGemmPolicy::kM128N192:
+      return {
+          128,
+          192,
+          64,
+          static_cast<int32_t>(N192OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN192::SharedStorage))};
     case QkvGemmPolicy::kM128N256ClusterM2:
       return projection_cutlass_kernel_traits();
     case QkvGemmPolicy::kM128N320ClusterM2:
@@ -2693,6 +2856,14 @@ KernelTraits qkv_cutlass_kernel_traits(
           static_cast<int32_t>(N160OutputGemm::get_block_shape().x),
           static_cast<int32_t>(
               sizeof(typename QkvGemmA2AKernelN160::SharedStorage))};
+    case QkvGemmPolicy::kM128N192:
+      return {
+          128,
+          192,
+          64,
+          static_cast<int32_t>(N192OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN192::SharedStorage))};
     case QkvGemmPolicy::kM128N256ClusterM2:
       return projection_cutlass_kernel_traits();
     case QkvGemmPolicy::kM128N320ClusterM2:
@@ -2962,10 +3133,132 @@ int32_t recommended_gemm_a2a_comm_ctas(
       output_bytes >= 64ll * 1024 * 1024) {
     return 40;
   }
-  if (output_bytes >= 32ll * 1024 * 1024) {
-    return 32;
+  const int32_t legacy_comm_ctas =
+      output_bytes >= 32ll * 1024 * 1024
+      ? 32
+      : (problem.n >= 4096 ? 24 : 16);
+
+  const bool pipeline_policy = qkv_pipeline_policy_enabled();
+  if (!pipeline_policy ||
+      problem.input_dtype != DType::kBfloat16 || route.world_size <= 1) {
+    return legacy_comm_ctas;
   }
-  return problem.n >= 4096 ? 24 : 16;
+
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  if (device_sm_count(&sm_count, &device) != cudaSuccess || sm_count != 132) {
+    return legacy_comm_ctas;
+  }
+
+  // Jointly choose the communication split and GEMM tile from a finite
+  // two-stage pipeline model.  Every input is known before launch:
+  //
+  //   C = calibrated full-wave tile time * persistent GEMM waves
+  //   R = max(16-KiB route-task waves, remote bytes / NVLink rate)
+  //   T = C + max(one route-task wave, R - later GEMM waves)
+  //
+  // GEMM is the producer.  Route may start after the first GEMM wave, so all
+  // later GEMM waves are available to hide its total work; at least one fine
+  // 16-KiB route-task wave remains as pipeline drain.  This is the actual
+  // dependency graph, not an overlap coefficient fitted from model winners.
+  // The GEMM wave table above and the 16-KiB task cost below are reusable H200
+  // kernel primitive calibrations.  TE-UB results, model names and per-shape
+  // winner tables are deliberately absent from this policy.
+  constexpr int32_t kMinCommCtas = 4;
+  constexpr int32_t kMaxCommCtas = 32;
+  // Standalone H200 route sweeps stop gaining useful one-way fabric bandwidth
+  // beyond 16 CTAs.  This is a topology/primitive saturation point; it only
+  // scales the NVLink lower bound and does not encode a model or shape winner.
+  constexpr int32_t kFabricSaturationCommCtas = 16;
+  constexpr int32_t kRouteSlotsPerCta = kQkvBulkSlots;
+  if (route.head_dim != kQkvBulkColumns ||
+      route.q_heads <= 0 || route.kv_heads <= 0 ||
+      route.q_heads % route.world_size != 0 ||
+      route.kv_heads % route.world_size != 0) {
+    return legacy_comm_ctas;
+  }
+
+  const double one_way_nvlink_gbps =
+      0.5 * a2a_lhs_nvlink_bidirectional_gbps(device);
+  if (!(one_way_nvlink_gbps > 0.0)) {
+    return legacy_comm_ctas;
+  }
+
+  const int32_t q_local_heads = route.q_heads / route.world_size;
+  const int32_t kv_local_heads = route.kv_heads / route.world_size;
+  const int32_t routed_local_heads = q_local_heads +
+      (route.defer_v_a2a ? 1 : 2) * kv_local_heads;
+  const int64_t m_chunks = ceil_div(problem.m, kQkvBulkRows);
+  const int64_t route_tasks =
+      static_cast<int64_t>(route.world_size) * m_chunks *
+      routed_local_heads;
+  const int64_t routed_global_width =
+      static_cast<int64_t>(route.q_heads +
+          (route.defer_v_a2a ? 1 : 2) * route.kv_heads) *
+      route.head_dim;
+  const double remote_bytes =
+      static_cast<double>(problem.m) * routed_global_width * sizeof(Bf16) *
+      (route.world_size - 1) / route.world_size;
+
+  int32_t best_comm_ctas = legacy_comm_ctas;
+  double best_score_ns = std::numeric_limits<double>::infinity();
+  int32_t best_tie_rank = std::numeric_limits<int32_t>::max();
+  for (int32_t comm_ctas = kMinCommCtas;
+       comm_ctas <= kMaxCommCtas && comm_ctas < sm_count;
+       comm_ctas += 2) {
+    const auto compute = estimate_qkv_compute(
+        problem,
+        comm_ctas,
+        sm_count,
+        route.qkv_peer_interleaved,
+        true);
+    if (!compute.valid || compute.waves <= 0) {
+      continue;
+    }
+
+    const int64_t route_slots =
+        static_cast<int64_t>(comm_ctas) * kRouteSlotsPerCta;
+    const int64_t route_waves = ceil_div(route_tasks, route_slots);
+    const double route_task_ns =
+        route_waves * static_cast<double>(kQkvRouteTaskWaveNs);
+    const double comm_fraction = std::min(
+        1.0,
+        static_cast<double>(comm_ctas) / kFabricSaturationCommCtas);
+    // bytes / (GB/s) is numerically nanoseconds.
+    const double route_link_ns =
+        remote_bytes / (one_way_nvlink_gbps * comm_fraction);
+    const double route_ns = std::max(route_task_ns, route_link_ns);
+    const double compute_ns = static_cast<double>(compute.total_ns);
+    const double later_compute_ns =
+        compute_ns - static_cast<double>(compute.wave_ns);
+    const double exposed_route_ns = std::max(
+        static_cast<double>(kQkvRouteTaskWaveNs),
+        route_ns - later_compute_ns);
+    // A cluster-M2 worker exposes two CTAs to the same multicast/barrier
+    // progress dependency.  Charge one route service quantum per bound CTA;
+    // this is the same independent-progress risk used by the tile selector
+    // above, now applied across different communication splits as well.
+    const double cluster_progress_risk_ns = compute.cluster_m == 1
+        ? 0.0
+        : compute.cluster_m * static_cast<double>(kQkvRouteTaskWaveNs);
+    const double score_ns =
+        compute_ns + exposed_route_ns + cluster_progress_risk_ns;
+
+    // Exact model ties retain the mature v6 split.  This prevents a policy
+    // change when the physical model predicts no end-to-end benefit.
+    const int32_t tie_rank = comm_ctas == legacy_comm_ctas
+        ? 0
+        : std::abs(comm_ctas - legacy_comm_ctas) + 1;
+    constexpr double kTieToleranceNs = 1.0e-6;
+    if (score_ns + kTieToleranceNs < best_score_ns ||
+        (std::abs(score_ns - best_score_ns) <= kTieToleranceNs &&
+         tie_rank < best_tie_rank)) {
+      best_score_ns = score_ns;
+      best_comm_ctas = comm_ctas;
+      best_tie_rank = tie_rank;
+    }
+  }
+  return best_comm_ctas;
 }
 
 cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t stream) {
@@ -3142,6 +3435,9 @@ cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t st
       case QkvGemmPolicy::kM128N160:
         return launch_gemm_a2a_impl<N160OutputGemm, QkvGqaPackCommN160>(
             launch_params, stream, sm_count, device);
+      case QkvGemmPolicy::kM128N192:
+        return launch_gemm_a2a_impl<N192OutputGemm, QkvGqaPackCommN192>(
+            launch_params, stream, sm_count, device);
       case QkvGemmPolicy::kM128N256ClusterM2:
         return launch_gemm_a2a_impl<ProjectionOutputGemm, QkvGqaPackCommWide>(
             launch_params, stream, sm_count, device);
@@ -3196,6 +3492,15 @@ cudaError_t launch_gemm_a2a_role_telemetry(
     case QkvGemmPolicy::kM128N160:
       return launch_gemm_a2a_impl<
           N160OutputGemm, QkvGqaPackCommN160, GemmA2AParams, true>(
+              launch_params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case QkvGemmPolicy::kM128N192:
+      return launch_gemm_a2a_impl<
+          N192OutputGemm, QkvGqaPackCommN192, GemmA2AParams, true>(
               launch_params,
               stream,
               sm_count,
@@ -3313,6 +3618,10 @@ cudaError_t launch_batched_cutlass_reference(
       params.route.qkv_peer_interleaved)) {
     case QkvGemmPolicy::kM128N160:
       return launch_gemm_reference_impl<N160PureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas,
+          RasterOptions::AlongN);
+    case QkvGemmPolicy::kM128N192:
+      return launch_gemm_reference_impl<N192PureGemm>(
           params, stream, sm_count, device, reserved_comm_ctas,
           RasterOptions::AlongN);
     case QkvGemmPolicy::kM128N256ClusterM2:
@@ -3507,6 +3816,12 @@ cudaError_t launch_gemm_a2a_copy_reference(
       QkvGqaPackCommN160::Arguments args{};
       args.params = params;
       return launch_qkv_gqa_copy_reference<QkvGqaPackCommN160>(
+          args, params.num_comm_ctas, stream);
+    }
+    case QkvGemmPolicy::kM128N192: {
+      QkvGqaPackCommN192::Arguments args{};
+      args.params = params;
+      return launch_qkv_gqa_copy_reference<QkvGqaPackCommN192>(
           args, params.num_comm_ctas, stream);
     }
     case QkvGemmPolicy::kM128N256ClusterM2: {

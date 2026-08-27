@@ -925,15 +925,30 @@ void write_json(
     throw std::runtime_error("cannot open JSON output: " + options.json_out);
   }
   const char* policy_override = std::getenv("FUSE_QKV_GEMM_POLICY");
+  const char* comm_policy_override = std::getenv("FUSE_QKV_COMM_POLICY");
   const bool known_policy = policy_override != nullptr &&
       (std::strcmp(policy_override, "legacy") == 0 ||
        std::strcmp(policy_override, "wave_time_model") == 0 ||
        std::strcmp(policy_override, "m128n128") == 0 ||
        std::strcmp(policy_override, "m128n160") == 0 ||
+       std::strcmp(policy_override, "m128n192") == 0 ||
        std::strcmp(policy_override, "m128n256") == 0 ||
        std::strcmp(policy_override, "m128n320") == 0);
-  const bool calibrated_model = policy_override == nullptr ||
-      std::strcmp(policy_override, "wave_time_model") == 0 || !known_policy;
+  const bool pipeline_model = comm_policy_override == nullptr ||
+      std::strcmp(comm_policy_override, "pipeline") == 0 ||
+      std::strcmp(comm_policy_override, "roofline") == 0;
+  const bool calibrated_tile_model = policy_override == nullptr ||
+      (known_policy && std::strcmp(policy_override, "wave_time_model") == 0);
+  const char* policy_model = !calibrated_tile_model
+      ? (known_policy ? "manual_override" : "unrecognized")
+      : (pipeline_model ? "calibrated_pipeline_independent_progress_v2"
+                        : (policy_override != nullptr
+                                  ? "calibrated_wave_time_independent_progress_v2"
+                                  : "calibrated_wave_time_v1"));
+  const bool known_comm_policy = comm_policy_override == nullptr ||
+      std::strcmp(comm_policy_override, "pipeline") == 0 ||
+      std::strcmp(comm_policy_override, "roofline") == 0 ||
+      std::strcmp(comm_policy_override, "legacy") == 0;
   output << std::setprecision(10)
          << "{\n"
          << "  \"mode\": \"qkv_gemm_a2a_mpi\",\n"
@@ -960,9 +975,13 @@ void write_json(
                  ? "auto"
                  : (known_policy ? policy_override : "unrecognized"))
          << "\",\n"
+         << "  \"qkv_comm_policy_request\": \""
+         << (comm_policy_override == nullptr
+                 ? "auto"
+                 : (known_comm_policy ? comm_policy_override : "unrecognized"))
+         << "\",\n"
          << "  \"qkv_policy_model\": \""
-         << (calibrated_model ? "calibrated_wave_time_v1"
-                              : "manual_override")
+         << policy_model
          << "\",\n"
          << "  \"kernel_traits\": {\"tile_m\": " << traits.block_m
          << ", \"tile_n\": " << traits.block_n

@@ -24,7 +24,8 @@ struct A2AGemmCtaTimeline {
   // all locally assigned output-route tasks have finished on comm CTAs.
   uint64_t role_done = 0;
   // GEMM->A2A finalize breakdown. grid_sync_done is recorded by every CTA;
-  // the remaining fields are populated only by CTA0/thread0.
+  // CTA0/lane0 records the shared phase boundaries and CTA0 lane N records
+  // source_ready[N] after the parallel per-source acquire.
   uint64_t grid_sync_done = 0;
   uint64_t fence_done = 0;
   uint64_t publish_done = 0;
