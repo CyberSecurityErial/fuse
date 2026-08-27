@@ -1,8 +1,9 @@
 # Archived benchmark results
 
-The committed result set contains the v4.0 benchmark snapshots for
-`A2A -> O-projection GEMM` and `QKV projection -> A2A` on the local 132-SM
-H200-class NVLink node.
+The committed result set contains the A2A -> O-projection benchmark archive
+and the v7.0 QKV projection -> A2A fused results on the local 132-SM
+H200-class NVLink node. QKV external baselines remain the independently tuned
+v4/v5 archive; the fused Eager/Graph measurements and comparison table are v7.0.
 
 Measurement contract:
 
@@ -35,12 +36,14 @@ Committed directories:
   newly calibrated real-model rows.
 - `a2a-Oproj/te_userbuffers_mixed_shape_bench`: the matching adapted TE
   Userbuffers winners for all 96 OProj settings.
-- `QKVproj-a2a/qkv_shape_bench`: the v4.0 96-setting QKV matrix, including
-  tuned TE/cuBLAS/cuBLASLt+NCCL baselines and the current fused implementation.
+- `QKVproj-a2a/qkv_shape_bench`: the 96-setting QKV matrix. It combines the
+  independently tuned TE/cuBLAS/cuBLASLt+NCCL archive with the v7.0 fused
+  Eager/Graph results, resolved policy metadata, classic-cuBLAS throughput,
+  and the fused-throughput percentage relative to classic cuBLAS.
 - `QKVproj-a2a/te_userbuffers_shape_bench`: the matching adapted TE
   Userbuffers QKV winners.
 
-Each v4 operator directory keeps only `baseline_summary.*`, the final fused
+Each operator directory keeps only `baseline_summary.*`, the final fused
 summary, `comparison_summary.*`, and `shape_matrix.*`; each Userbuffers
 directory keeps `summary.*`. The thousands of intermediate sweep and
 formal-run JSON files are intentionally omitted.

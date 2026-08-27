@@ -1185,8 +1185,18 @@ def comparison_table(args: argparse.Namespace) -> None:
     for row in fused:
         key_value = (row["model"], row["global_seq"], row["cp"])
         other = baseline_by_key[key_value]
+        flops = 2.0 * row["m"] * row["n"] * row["k"]
+        cublas_ms = other["cublas_p50_ms"]
         merged = dict(row)
         merged.update({
+            "cublas_p50_ms": cublas_ms,
+            "cublas_p50_tflops_per_gpu": flops / cublas_ms / 1.0e9,
+            "eager_throughput_as_cublas_percent": (
+                100.0 * cublas_ms / row["eager_p50_ms"]
+            ),
+            "graph_throughput_as_cublas_percent": (
+                100.0 * cublas_ms / row["graph_p50_ms"]
+            ),
             "best_separated": other["best_separated"],
             "best_separated_p50_ms": other["best_separated_p50_ms"],
             "eager_speedup_over_best_separated": (
@@ -1228,9 +1238,10 @@ def comparison_table(args: argparse.Namespace) -> None:
     with (args.results / "comparison_summary.md").open("w") as handle:
         handle.write(
             "| Suite | Model | S | CP | MxNxK | Eager p50/p95 / TFLOPS | "
-            "Graph p50/p95 / TFLOPS | Best separated ms | TE-UB p50/p95 | "
-            "Eager / external | Graph / external | Config |\n"
-            "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|\n"
+            "Graph p50/p95 / TFLOPS | cuBLAS TFLOPS | Eager/Graph vs cuBLAS | "
+            "Best separated ms | TE-UB p50/p95 | Eager / external | "
+            "Graph / external | Config |\n"
+            "|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n"
         )
         for row in rows:
             handle.write(
@@ -1240,6 +1251,9 @@ def comparison_table(args: argparse.Namespace) -> None:
                 f"{row['eager_p50_tflops_per_gpu']:.1f} | "
                 f"{row['graph_p50_ms']:.4f}/{row['graph_p95_ms']:.4f} / "
                 f"{row['graph_p50_tflops_per_gpu']:.1f} | "
+                f"{row['cublas_p50_tflops_per_gpu']:.1f} | "
+                f"{row['eager_throughput_as_cublas_percent']:.1f}%/"
+                f"{row['graph_throughput_as_cublas_percent']:.1f}% | "
                 f"{row['best_separated_p50_ms']:.4f} | "
                 f"{row.get('te_userbuffers_p50_ms', float('nan')):.4f}/"
                 f"{row.get('te_userbuffers_p95_ms', float('nan')):.4f} | "

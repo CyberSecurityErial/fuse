@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v6.0
+        default: v7.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v6.0");
+              : (process.env.REQUESTED_TAG || "v7.0");
 
             const releases = {
               "v1.0": {
@@ -116,6 +116,22 @@ jobs:
                   "对 TE Userbuffers 的胜场由 69/96、72/96 增至 73/96、74/96；对最强外部基线由 63/96、68/96 增至 64/96、69/96。已知 CP4 人工中型 S=4K 会从快于 TE 变为慢于 TE，结果表明确保留该取舍，没有加入逐 shape 特判。",
                   "",
                   "正式口径继续使用 MPI 一进程一卡、10 warmup + 50 samples、逐样本 max-rank p50/p95，并分别报告 Eager 与 CUDA Graph。",
+                ].join("\n"),
+              },
+              "v7.0": {
+                name: "v7.0 — QKV joint pipeline policy",
+                body: [
+                  "v7.0 收口 QKV Projection + A2A 的联合流水策略；A2A + OProj 热路径沿用既有 Golden。",
+                  "",
+                  "运行时在启动前联合选择 `comm_ctas=4..32` 与 `M128N128/N160/N192/N256/N320`。评分只读取 M/N/K、CP/head geometry、SM 数、远端字节数、tile/cluster 几何和 H200 原语标定，不读取模型名、逐 shape winner 或 TE 结果。",
+                  "",
+                  "新增 `M128N192 cluster1` 保留 CTA 独立前进；跨 rank finalize 改为一个 warp 并行发布和等待 source epoch，内存序与退出语义保持不变。所有 96 个 setting 使用统一的 `comm_ctas=0/raster=n/swizzle=1` 自动入口。",
+                  "",
+                  "🩵 **相对 TE Userbuffers，Eager/Graph 均为 96/96 胜场，96 点 p50 几何平均分别领先 1.268× 与 1.319×；相对 v6 分别提升 1.147× 与 1.156×。**",
+                  "",
+                  "对 `min(TE Userbuffers, 最强 TE/cuBLASLt+NCCL 分离方案)`，Eager/Graph 胜场为 93/96 与 96/96，几何平均为 1.201× 与 1.250×。融合 GEMM-equivalent 吞吐达到经典 cuBLAS 的中位数为 Eager 90.8%、Graph 92.0%。",
+                  "",
+                  "正式口径为 BF16、MPI 一进程一卡、10 warmup + 50 samples、每个 sample 先取跨 rank 最大延迟再统计 p50/p95；Eager 与 CUDA Graph 分列。完整逐点表、纯 cuBLAS 吞吐对照和复现命令均已归档。",
                 ].join("\n"),
               },
             };
