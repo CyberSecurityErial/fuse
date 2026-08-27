@@ -1,6 +1,6 @@
-# A2A + O-projection
+# Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 fused A2A + O-projection CUDA kernel。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。目前完成并优化了 A2A+O-projection；QKV Projection+A2A 已具备可运行实现与完整强基线，专项性能优化留到 v5。
 
 Attention 输出按 head 分片：
 
@@ -71,7 +71,7 @@ comm_ctas=4 policy=m128n160 tile=128x160
 fused p50 ≈ 82.9 μs
 ```
 
-这是不需要逐 shape 调参的生产入口。v3.0 的 36/36 TE Userbuffers p50 胜场采用外部 `comm_ctas` 标定：保持 `--lhs-policy auto --raster n --swizzle 1`，只扫描通信 CTA 数。29 个 setting 沿用默认自动值，7 个 setting 使用归档 winner；核心 kernel 和 tile 选择逻辑没有修改。具体映射见 [`BENCHMARK.md`](BENCHMARK.md)。
+这是不需要逐 shape 调参的生产入口。v4.0 的极限表保持 `--lhs-policy auto --raster n --swizzle 1`，只扫描通信 CTA 数；核心 kernel 和 tile 选择逻辑没有修改。具体映射见 [`benchmarks/a2a+Oproj/BENCHMARK.md`](benchmarks/a2a+Oproj/BENCHMARK.md)。
 
 相同软件和硬件下，短程复跑落在 Golden 的 ±5% 可视为正常。明显偏慢时按顺序检查：
 
@@ -79,7 +79,7 @@ fused p50 ≈ 82.9 μs
 2. `nvidia-smi topo -m` 中参与设备必须走 NVLink/P2P；
 3. 各卡 SM clock 保持稳定，结果由最慢 rank 决定；
 4. 依赖 commit 与上文一致，使用 Release/SM90a 构建；
-5. 默认模式保留 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`；复现 v3.0 标定结果时只替换 `--comm-ctas`。
+5. 默认模式保留 `--comm-ctas 0 --lhs-policy auto --raster n --swizzle 1`；复现 v4.0 极限表时只替换 `--comm-ctas`。
 
 完整 shape matrix：
 
@@ -95,11 +95,17 @@ python3 'benchmarks/a2a+Oproj/oproj_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v3.0
+当前版本：v4.0
 
 | CP | case 数 | 相对最优分离 | 相对 TE Userbuffers | 纯 GEMM 的百分比 |
 |---:|---:|---:|---:|---:|
 | 4 | 18 | 1.34×–2.21× | 1.01×–1.19× | 58.1%–100.5% |
 | 8 | 18 | 1.35×–2.96× | 1.04×–1.81× | 61.3%–95.7% |
 
-v3.0 标定后，36/36 个 setting 的 p50 快于 TE Userbuffers，几何平均为 1.154×；该结论明确包含7个 per-shape `comm_ctas` winner，不代表默认自动入口零调参即可得到36/36。全局序列 1K 到 512K 的完整数据、调优空间和复现流程见 [`BENCHMARK.md`](BENCHMARK.md)；版本级差异见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
+v4.0 将 OProj 扩展到96个 setting，正式 p50 有95/96快于调优后的 TE Userbuffers；唯一落后点是 Llama-3.1-405B、CP4、S=1K。该结论包含 per-shape `comm_ctas` 单变量标定，不代表默认自动入口零调参即可得到95/96。
+
+完整数据与复现流程：
+
+- [A2A + O-projection benchmark](benchmarks/a2a+Oproj/BENCHMARK.md)
+- [QKV Projection + A2A benchmark](benchmarks/QKVproj+a2a/BENCHMARK.md)
+- [版本演进](VERSION_HISTORY.md)

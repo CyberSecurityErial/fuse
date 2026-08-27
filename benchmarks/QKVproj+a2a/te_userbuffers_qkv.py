@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adapted TE Userbuffers baseline for Ulysses inverse-A2A -> O projection."""
+"""Adapted TE Userbuffers baseline for QKV projection -> Ulysses A2A."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import transformer_engine  # Loads libtransformer_engine.so with global symbol visibility.
+import transformer_engine  # Loads libtransformer_engine.so with global symbols.
 import transformer_engine_torch as tex
 import triton
 import triton.language as tl
@@ -20,36 +20,54 @@ from te_nccl_baseline import CublasLtRunner, summarize, timed_critical
 
 
 @triton.jit
-def _pack_inverse_a2a_kernel(
-    source,
-    packed,
+def _unpack_qkv_slabs_kernel(
+    send,
+    recv,
+    output,
     numel: tl.constexpr,
-    seq: tl.constexpr,
-    seq_local: tl.constexpr,
-    chunk_tokens: tl.constexpr,
-    k_local: tl.constexpr,
-    world: tl.constexpr,
+    m: tl.constexpr,
+    rank: tl.constexpr,
+    q_local_width: tl.constexpr,
+    kv_local_width: tl.constexpr,
+    slab_width: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = (
+        tl.program_id(0).to(tl.int64) * BLOCK
+        + tl.arange(0, BLOCK).to(tl.int64)
+    )
     mask = offsets < numel
-    k = offsets % k_local
-    m = (offsets // k_local) % seq_local
-    target = offsets // (k_local * seq_local)
-    batch = m // (2 * chunk_tokens)
-    local_m = m % (2 * chunk_tokens)
-    first = local_m < chunk_tokens
-    chunk = tl.where(first, 2 * target, 2 * world - 2 * target - 1)
-    in_chunk = tl.where(first, local_m, local_m - chunk_tokens)
-    source_token = batch * seq + chunk * chunk_tokens + in_chunk
-    tl.store(packed + offsets, tl.load(source + source_token * k_local + k, mask=mask), mask=mask)
+    q_elements = tl.full((), (numel // slab_width) * q_local_width, tl.int64)
+    kv_elements = tl.full((), (numel // slab_width) * kv_local_width, tl.int64)
+    is_q = offsets < q_elements
+    is_k = (offsets >= q_elements) & (offsets < q_elements + kv_elements)
+    segment_element = tl.where(
+        is_q,
+        offsets,
+        tl.where(is_k, offsets - q_elements, offsets - q_elements - kv_elements),
+    )
+    segment_width = tl.where(is_q, q_local_width, kv_local_width)
+    source_rank = segment_element // (m * segment_width)
+    within_source = segment_element % (m * segment_width)
+    token = within_source // segment_width
+    channel = within_source % segment_width
+    segment_base = tl.where(
+        is_q,
+        0,
+        tl.where(is_k, q_local_width, q_local_width + kv_local_width),
+    )
+    source = source_rank * m * slab_width + token * slab_width + segment_base + channel
+    send_value = tl.load(send + source, mask=mask)
+    recv_value = tl.load(recv + source, mask=mask)
+    tl.store(output + offsets, tl.where(source_rank == rank, send_value, recv_value), mask=mask)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--global-seq", type=int, default=4096)
-    parser.add_argument("--hidden", type=int, default=5120)
-    parser.add_argument("--q-heads", type=int, default=40)
+    parser.add_argument("--hidden", type=int, default=4096)
+    parser.add_argument("--q-heads", type=int, default=32)
+    parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
@@ -60,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-ce", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--push", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reverse", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--local-first", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pack-block", type=int, default=1024)
     parser.add_argument("--pack-warps", type=int, default=4)
     parser.add_argument("--tune-warmup", type=int, default=3)
@@ -127,37 +146,52 @@ def run(
     device: torch.device,
     helper: tex.CommOverlapHelper,
 ) -> dict[str, object]:
-    if args.global_seq % world or args.q_heads % world:
-        raise ValueError("global sequence and Q heads must be divisible by CP")
-    if args.global_seq % (2 * world):
-        raise ValueError("causal Ulysses layout requires global sequence divisible by 2*CP")
 
-    seq_local = args.global_seq // world
-    m = args.batch * seq_local
-    k = args.q_heads * args.head_dim
-    k_local = k // world
-    n = args.hidden
-    chunk_tokens = args.global_seq // (2 * world)
-    chunk_bytes = m * k_local * torch.bfloat16.itemsize
+    if args.batch != 1:
+        raise ValueError("the QKV Userbuffers baseline currently requires batch=1")
+    if args.global_seq % world or args.q_heads % world or args.kv_heads % world:
+        raise ValueError("sequence, Q heads, and KV heads must be divisible by CP")
 
-    generator = torch.Generator(device=device).manual_seed(2701 + rank)
-    source = torch.empty(
-        (args.batch, args.global_seq, k_local), dtype=torch.bfloat16, device=device
-    ).uniform_(-0.125, 0.125, generator=generator)
+    m = args.global_seq // world
+    k = args.hidden
+    q_width = args.q_heads * args.head_dim
+    kv_width = args.kv_heads * args.head_dim
+    n = q_width + 2 * kv_width
+    q_local_width = q_width // world
+    kv_local_width = kv_width // world
+    slab_width = q_local_width + 2 * kv_local_width
+    slab_bytes = m * slab_width * torch.bfloat16.itemsize
+
+    generator = torch.Generator(device=device).manual_seed(3109 + rank)
+    source = torch.empty((m, k), dtype=torch.bfloat16, device=device).uniform_(
+        -0.125, 0.125, generator=generator
+    )
     weight = torch.empty((n, k), dtype=torch.bfloat16, device=device).uniform_(
         -0.02, 0.02, generator=generator
     )
     dist.broadcast(weight, src=0)
-    weight_shards = [
-        weight[:, peer * k_local : (peer + 1) * k_local].contiguous() for peer in range(world)
-    ]
-    output = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+
+    weight_slabs = []
+    for peer in range(world):
+        q0 = peer * q_local_width
+        k0 = q_width + peer * kv_local_width
+        v0 = q_width + kv_width + peer * kv_local_width
+        weight_slabs.append(torch.cat(
+            (
+                weight[q0 : q0 + q_local_width],
+                weight[k0 : k0 + kv_local_width],
+                weight[v0 : v0 + kv_local_width],
+            ),
+            dim=0,
+        ).contiguous())
 
     ub = tex.CommOverlapP2P(
-        [2 * args.batch * args.global_seq, k_local],
+        [2 * args.global_seq, slab_width],
         torch.bfloat16,
         helper,
         world,
+        # Manual P2P offsets need a flat, exactly-sized registered buffer.
+        # AG mode preserves that layout; RS mode adds TE's internal staging.
         tex.CommOverlapType.AG,
         num_max_streams=args.num_streams,
         comm_cga_size=1,
@@ -170,11 +204,11 @@ def run(
         aggregate=False,
     )
     ub.configure_userbuffers_p2p(args.num_comm_sm, args.use_ce, args.push)
-    storage = ub.get_buffer(False, [2, world, m, k_local])
+    storage = ub.get_buffer(False, [2, world, m, slab_width])
     send, recv = storage[0], storage[1]
+    output = torch.empty(world * m * slab_width, dtype=torch.bfloat16, device=device)
+
     _, recv_stream_raw = ub.get_communication_stream()
-    # TE returns generic ATen streams. Retag their external CUDA handles with
-    # the torchrun-local device ordinal (important with CUDA_VISIBLE_DEVICES).
     active_send_streams = min(args.num_streams, world - 1) if args.parallel_sends else 1
     send_streams = [
         torch.cuda.ExternalStream(ub.get_userbuffers_send_stream(i).stream_id, device=device)
@@ -182,107 +216,115 @@ def run(
     ]
     recv_stream = torch.cuda.ExternalStream(recv_stream_raw.stream_id, device=device)
 
-    plan = cached_plan(args, recv[0], weight_shards[0], output)
+    plan = cached_plan(args, source, weight_slabs[0], send[0])
 
-    pack_numel = send.numel()
     peer_steps = list(range(1, world))
     if args.reverse:
         peer_steps.reverse()
-    packed_event = torch.cuda.Event()
-    send_done_events = [torch.cuda.Event() for _ in send_streams]
-    ready_events = [torch.cuda.Event() for _ in peer_steps]
+    remote_peers = [(rank + step) % world for step in peer_steps]
+    gemm_order = ([rank] + remote_peers) if args.local_first else (remote_peers + [rank])
+    gemm_done = [torch.cuda.Event() for _ in range(world)]
+    boundary_start = torch.cuda.Event()
+    recv_ready = [torch.cuda.Event() for _ in peer_steps]
+    send_done = [torch.cuda.Event() for _ in send_streams]
 
     def boundary() -> torch.Tensor:
         main_stream = torch.cuda.current_stream(device)
-        _pack_inverse_a2a_kernel[(triton.cdiv(pack_numel, args.pack_block),)](
-            source,
+        # Join TE's external receive stream to the same Graph capture, exactly
+        # as the OProj adapter does with its packed-data event.
+        boundary_start.record(main_stream)
+        recv_stream.wait_event(boundary_start)
+        remote_index = 0
+        for destination in gemm_order:
+            plan.accumulate(source, weight_slabs[destination], send[destination], beta=0.0)
+            gemm_done[destination].record(main_stream)
+            if destination != rank:
+                stream_id = remote_index % active_send_streams
+                send_streams[stream_id].wait_event(gemm_done[destination])
+                ub.userbuffers_p2p_send(
+                    destination * slab_bytes,
+                    (world + rank) * slab_bytes,
+                    slab_bytes,
+                    destination,
+                    stream_id,
+                )
+                remote_index += 1
+
+        # Keep the same Userbuffers handshake as the validated OProj adapter:
+        # queue every send first, then submit receives in ring-peer order.
+        for index, step in enumerate(peer_steps):
+            source_peer = (rank - step) % world
+            ub.userbuffers_p2p_recv(
+                rank * slab_bytes,
+                (world + source_peer) * slab_bytes,
+                slab_bytes,
+                source_peer,
+            )
+            recv_ready[index].record(recv_stream)
+
+        for event in recv_ready:
+            main_stream.wait_event(event)
+        for stream, event in zip(send_streams, send_done):
+            event.record(stream)
+            main_stream.wait_event(event)
+
+        numel = output.numel()
+        _unpack_qkv_slabs_kernel[(triton.cdiv(numel, args.pack_block),)](
             send,
-            numel=pack_numel,
-            seq=args.global_seq,
-            seq_local=seq_local,
-            chunk_tokens=chunk_tokens,
-            k_local=k_local,
-            world=world,
+            recv,
+            output,
+            numel=numel,
+            m=m,
+            rank=rank,
+            q_local_width=q_local_width,
+            kv_local_width=kv_local_width,
+            slab_width=slab_width,
             BLOCK=args.pack_block,
             num_warps=args.pack_warps,
         )
-        packed_event.record(main_stream)
-        for send_stream in send_streams:
-            send_stream.wait_event(packed_event)
-        recv_stream.wait_event(packed_event)
-
-        for index, step in enumerate(peer_steps):
-            send_peer = (rank + step) % world
-            stream_id = index % active_send_streams
-            ub.userbuffers_p2p_send(
-                send_peer * chunk_bytes,
-                (world + rank) * chunk_bytes,
-                chunk_bytes,
-                send_peer,
-                stream_id,
-            )
-
-        plan.accumulate(send[rank], weight_shards[rank], output, beta=0.0)
-        for index, step in enumerate(peer_steps):
-            recv_peer = (rank - step) % world
-            ub.userbuffers_p2p_recv(
-                rank * chunk_bytes,
-                (world + recv_peer) * chunk_bytes,
-                chunk_bytes,
-                recv_peer,
-            )
-            ready_events[index].record(recv_stream)
-            main_stream.wait_event(ready_events[index])
-            plan.accumulate(recv[recv_peer], weight_shards[recv_peer], output, beta=1.0)
-        for send_stream, send_done_event in zip(send_streams, send_done_events):
-            send_done_event.record(send_stream)
-            main_stream.wait_event(send_done_event)
         return output
 
     check: dict[str, float | int] = {}
+    expected = None
     if args.check:
         boundary()
         torch.cuda.synchronize(device)
-        peers = [torch.empty_like(source) for _ in range(world)]
-        dist.all_gather(peers, source)
-        selected = (2 * rank, 2 * world - 2 * rank - 1)
-        # Selecting both causal chunks with one advanced-index kernel exceeds
-        # PyTorch's launch geometry at the largest benchmark shapes.  Each
-        # chunk is already contiguous, so concatenate the two views directly.
-        expected_shards = []
-        for peer in peers:
-            peer_chunks = peer.view(
-                args.batch, 2 * world, chunk_tokens, k_local
-            )
-            expected_shards.append(torch.cat(
-                (
-                    peer_chunks[:, selected[0]].reshape(-1, k_local),
-                    peer_chunks[:, selected[1]].reshape(-1, k_local),
-                ),
-                dim=0,
-            ))
-        expected_a = torch.cat(expected_shards, dim=1)
-        expected = torch.mm(expected_a, weight.t())
-        max_abs = (output.float() - expected.float()).abs().max()
-        expected_self = expected_a[:, rank * k_local : (rank + 1) * k_local]
-        mismatches = torch.count_nonzero(send[rank] != expected_self)
+
+        # Mirror the validated OProj adapter's two-layer check: first prove
+        # that Userbuffers delivered each peer slab byte-for-byte, then check
+        # the final Q/K/V segment layout against an independent projection.
+        gathered_send = [torch.empty_like(send) for _ in range(world)]
+        dist.all_gather(gathered_send, send)
         recv_mismatches_by_peer = torch.zeros(world, dtype=torch.int64, device=device)
         for peer in range(world):
             if peer != rank:
-                expected_peer = expected_a[:, peer * k_local : (peer + 1) * k_local]
-                recv_mismatches_by_peer[peer] = torch.count_nonzero(recv[peer] != expected_peer)
+                recv_mismatches_by_peer[peer] = torch.count_nonzero(
+                    recv[peer] != gathered_send[peer][rank]
+                )
+
+        source_peers = [torch.empty_like(source) for _ in range(world)]
+        dist.all_gather(source_peers, source)
+        q0 = rank * q_local_width
+        k0 = q_width + rank * kv_local_width
+        v0 = q_width + kv_width + rank * kv_local_width
+        projected = [torch.mm(peer_source, weight.t()) for peer_source in source_peers]
+        expected = torch.cat(
+            tuple(item[:, q0 : q0 + q_local_width].reshape(-1) for item in projected)
+            + tuple(item[:, k0 : k0 + kv_local_width].reshape(-1) for item in projected)
+            + tuple(item[:, v0 : v0 + kv_local_width].reshape(-1) for item in projected)
+        )
+        max_abs = (output.float() - expected.float()).abs().max()
         dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
-        dist.all_reduce(mismatches, op=dist.ReduceOp.SUM)
         dist.all_reduce(recv_mismatches_by_peer, op=dist.ReduceOp.SUM)
         recv_mismatches = recv_mismatches_by_peer.sum()
         check = {
             "max_abs": float(max_abs.item()),
-            "self_pack_mismatches": int(mismatches.item()),
             "remote_recv_mismatches": int(recv_mismatches.item()),
             "remote_recv_mismatches_by_peer": recv_mismatches_by_peer.cpu().tolist(),
         }
-        if mismatches.item() or recv_mismatches.item() or max_abs.item() > 0.01:
-            raise RuntimeError(f"Userbuffers A2A correctness failed: {check}")
+        if recv_mismatches.item() or max_abs.item() > 0.01:
+            raise RuntimeError(f"QKV Userbuffers correctness failed: {check}")
+        del gathered_send, source_peers, projected, recv_mismatches_by_peer
 
     samples = timed_critical(
         boundary, args.warmup, args.iters, device, use_cuda_graph=args.cuda_graph
@@ -293,16 +335,25 @@ def run(
         dist.all_reduce(post_graph_max_abs, op=dist.ReduceOp.MAX)
         check["post_graph_max_abs"] = float(post_graph_max_abs.item())
         if post_graph_max_abs.item() > 0.01:
-            raise RuntimeError(f"Userbuffers CUDA Graph replay correctness failed: {check}")
+            raise RuntimeError(f"QKV Userbuffers graph correctness failed: {check}")
+
     flops = 2 * m * n * k
     result = {
-        "mode": "te_userbuffers_adapted_a2a_oproj",
+        "mode": "te_userbuffers_adapted_qkv_a2a",
         "world_size": world,
         "gemm_shape": {"m": m, "n": n, "k": k},
+        "head_geometry": {
+            "q_heads": args.q_heads,
+            "kv_heads": args.kv_heads,
+            "head_dim": args.head_dim,
+        },
+        "sequence_order": "rank_major",
         "config": vars(args) | {"json_out": str(args.json_out) if args.json_out else None},
         "cublaslt_plan": plan.info,
         "correctness": check,
-        "results": {"te_userbuffers_oproj_boundary": summarize(samples, flops=flops, world=world)},
+        "results": {
+            "te_userbuffers_qkv_boundary": summarize(samples, flops=flops, world=world)
+        },
         "samples_ms": samples,
     }
     dist.barrier()

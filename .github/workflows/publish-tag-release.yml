@@ -13,7 +13,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v3.0
+        default: v4.0
 
 permissions:
   contents: write
@@ -31,7 +31,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v3.0");
+              : (process.env.REQUESTED_TAG || "v4.0");
 
             const releases = {
               "v1.0": {
@@ -76,6 +76,20 @@ jobs:
                   "`BENCHMARK.md` 已完整列出36个 v3.0 setting，并在同一行保留 v2→v3 对照；`results/a2a-Oproj/oproj_v3_manual_comm_bench` 保存完整36点机器可读归档，其中7个 `manual_comm_ctas` 行有明确标记。",
                   "",
                   "v3.0 的性能承诺仍只覆盖 A2A + OProj；QKVProj + A2A 与 MegaMoE 不在本版本收口范围。",
+                ].join("\n"),
+              },
+              "v4.0": {
+                name: "v4.0 — benchmark and tuning release",
+                body: [
+                  "v4.0 收口 benchmark、外部调参和真实模型 shape；核心算子优化仍以 A2A + O-projection 为主，QKV Projection + A2A 的性能优化留到 v5。",
+                  "",
+                  "A2A + OProj 扩展到 96 个 CP4/CP8 setting，包含代表 shape、生产 Qwen、Nanbeige4.2-3B、Llama 3、Qwen2.5 与 Llama 3.1 405B；按完整标定结果，p50 在 95/96 个 setting 领先调优后的 TE Userbuffers，Nanbeige4.2-3B 为 12/12。",
+                  "",
+                  "QKV Projection + A2A 建立同口径的 96-case benchmark、分离基线和 TE Userbuffers 对照；当前未优化实现有 38/96 个 p50 领先 TE Userbuffers，这组数据作为 v5 的优化起点，不作为 v4 的 SOTA 承诺。",
+                  "",
+                  "正式口径为 BF16、10 warmup + 50 samples、每个 sample 先取跨 rank 最大延迟再统计 p50/p95。NCCL 每个环境参数组合在独立 torchrun 进程中搜索，cuBLASLt 和 TE Userbuffers 分别完成结构与运行参数标定。",
+                  "",
+                  "复现入口、逐 case 表格和机器可读汇总分别位于两个算子目录下的 `BENCHMARK.md` 与 `results/`。",
                 ].join("\n"),
               },
             };

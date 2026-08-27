@@ -1144,7 +1144,10 @@ void write_json(
     const char* route_name,
     double overlap,
     const std::vector<std::pair<std::string, const std::vector<float>*>>& results,
-    const fuse::A2ALhsPolicyInfo* lhs_policy = nullptr) {
+    const fuse::A2ALhsPolicyInfo* lhs_policy = nullptr,
+    const fuse::KernelTraits* kernel_traits = nullptr,
+    int resolved_comm_ctas = -1,
+    int cluster_m = 1) {
   if (options.json_out.empty()) {
     return;
   }
@@ -1157,7 +1160,10 @@ void write_json(
          << "  \"shape\": {\"m\": " << options.m << ", \"n\": " << options.n
          << ", \"k\": " << options.k << ", \"l\": " << l << "},\n"
          << "  \"world_size\": " << world << ",\n"
-         << "  \"comm_ctas\": " << options.comm_ctas << ",\n"
+         << "  \"requested_comm_ctas\": " << options.comm_ctas << ",\n"
+         << "  \"comm_ctas\": "
+         << (resolved_comm_ctas >= 0 ? resolved_comm_ctas : options.comm_ctas)
+         << ",\n"
          << "  \"warmup\": " << options.warmup << ",\n"
          << "  \"iterations\": " << options.iterations << ",\n"
          << "  \"fused_cuda_graph\": "
@@ -1173,6 +1179,18 @@ void write_json(
          << "\",\n"
          << "  \"timing\": \"max-rank critical path\",\n"
          << "  \"overlap_ratio\": " << overlap << ",\n";
+  if (options.mode == "qkv_gemm_a2a" ||
+      options.mode == "qkv_gemm_a2a_fp8") {
+    output << "  \"qkv_route\": {\"batch\": " << options.batch
+           << ", \"global_seq\": " << options.m / options.batch * world
+           << ", \"seq_local\": " << options.m / options.batch
+           << ", \"q_heads\": " << options.q_heads
+           << ", \"kv_heads\": " << options.kv_heads
+           << ", \"head_dim\": " << options.head_dim
+           << ", \"defer_v_a2a\": "
+           << (options.defer_v_a2a ? "true" : "false")
+           << ", \"sequence_order\": \"rank_major\"},\n";
+  }
   if (lhs_policy != nullptr) {
     output << "  \"lhs_policy\": {\"name\": \""
            << lhs_policy_name(lhs_policy->policy)
@@ -1196,6 +1214,15 @@ void write_json(
            << (lhs_policy->full_last_wave ? "true" : "false")
            << ", \"estimated_cycles\": " << lhs_policy->estimated_cycles
            << "},\n";
+  }
+  if (kernel_traits != nullptr) {
+    output << "  \"kernel_traits\": {\"tile_m\": "
+           << kernel_traits->block_m << ", \"tile_n\": "
+           << kernel_traits->block_n << ", \"tile_k\": "
+           << kernel_traits->block_k << ", \"threads\": "
+           << kernel_traits->threads << ", \"dynamic_smem_bytes\": "
+           << kernel_traits->dynamic_smem_bytes << ", \"cluster_m\": "
+           << cluster_m << "},\n";
   }
   output << "  \"results\": {\n";
   for (size_t index = 0; index < results.size(); ++index) {
@@ -1649,6 +1676,13 @@ void benchmark_qkv_gemm_a2a(
     params[rank].num_comm_ctas = options.comm_ctas;
   }
 
+  const int resolved_comm_ctas = options.comm_ctas != 0
+      ? options.comm_ctas
+      : fuse::recommended_gemm_a2a_comm_ctas(problem, params[0].route);
+  for (auto& item : params) {
+    item.num_comm_ctas = resolved_comm_ctas;
+  }
+
   uint32_t epoch = 0;
   const auto fused = time_all_ranks(
       runtime,
@@ -1717,7 +1751,7 @@ void benchmark_qkv_gemm_a2a(
       [&](int rank, uint32_t) {
         CUDA_CHECK(cudaSetDevice(rank));
         CUDA_CHECK(fuse::launch_batched_cutlass_reference(
-            params[rank], runtime[rank].stream, options.comm_ctas));
+            params[rank], runtime[rank].stream, resolved_comm_ctas));
       });
 
 
@@ -1765,7 +1799,7 @@ void benchmark_qkv_gemm_a2a(
   std::cout << "QKV-GQA GEMM->A2A shape M=" << m << " N=" << n
             << " K=" << k << " Hq=" << options.q_heads
             << " Hkv=" << options.kv_heads << " D=" << options.head_dim
-            << " world=" << world << " comm_ctas=" << options.comm_ctas << "\n";
+            << " world=" << world << " comm_ctas=" << resolved_comm_ctas << "\n";
   print_result("cuBLAS BF16", pure, flops, world, pure_mean);
   print_result("cuBLASLt BF16", pure_cublaslt, flops, world, pure_mean);
   print_result("same-policy CUTLASS", cutlass, flops, world, pure_mean);
@@ -1801,7 +1835,9 @@ void benchmark_qkv_gemm_a2a(
       {"same_policy_cutlass", &cutlass},
       {"compute_subgrid_cutlass", &reserved_cutlass}};
 
-  results.emplace_back("qk_a2a_route", &copy);
+  const char* route_name =
+      options.defer_v_a2a ? "qk_a2a_route" : "qkv_a2a_route";
+  results.emplace_back(route_name, &copy);
 
   results.emplace_back("sequential", &sequential);
   results.emplace_back("fused", &fused);
@@ -1812,9 +1848,13 @@ void benchmark_qkv_gemm_a2a(
       1,
       flops,
       copy_payload_bytes,
-      "qk_a2a_route",
+      route_name,
       overlap,
-      results);
+      results,
+      nullptr,
+      &traits,
+      resolved_comm_ctas,
+      m >= 2048 ? 2 : 1);
   destroy_cublaslt_plan(cublaslt_plan);
 }
 
@@ -1997,7 +2037,9 @@ void benchmark_fp8_qkv_gemm_a2a(
        {"compute_subgrid_cutlass", &reserved_cutlass},
        {"qk_a2a_route", &copy},
        {"sequential", &sequential},
-       {"fused", &fused}});
+       {"fused", &fused}},
+      nullptr,
+      &traits);
 }
 
 void validate_fast_path(const Options& options, int world) {

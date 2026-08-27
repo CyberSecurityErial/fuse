@@ -233,3 +233,29 @@ v3.0 不改 A2A + O-projection 的计算、通信或自动 tile 逻辑。它固�
 - profiling 字段全部由 `FUSE_ENABLE_PROFILING` 编译期开关隔离。Release 默认关闭，关闭构建不携带 timeline 参数、时间戳读取或 diagnostic atomic。
 
 完整36点的 v3.0 归档位于 [`results/a2a-Oproj/oproj_v3_manual_comm_bench`](results/a2a-Oproj/oproj_v3_manual_comm_bench)，每行通过 `result_source` 标明 `v2_auto_inherited` 或 `manual_comm_ctas`；上面的7点表只展示相对 v2.0 有变化的标定项。完整36点的 v2 原始结果继续保存在 `results/a2a-Oproj/oproj_cluster_wave_bench`，避免把手工标定冒充自动策略结果。
+
+## v4.0：真实模型矩阵与强基线
+
+状态：已发布。
+
+v4.0 的重点是调参与 benchmark 固化，没有修改 QKVProj+A2A 的算子性能逻辑：
+
+- A2A+OProj 从36个代表 setting 扩展到96个 setting：三个人工 Golden、五组真实 GQA 模型、六档全局序列长度、CP4/CP8；
+- QKVProj+A2A 建立同样的96点正式矩阵，完成 TE、经典 cuBLAS、cuBLASLt、NCCL 和适配版 TE Userbuffers 的强基线搜索，作为 v5 优化前的固定起点。
+
+OProj 的融合侧只允许 `comm_ctas` 变化：先扫 `{2,4,6,8,10,12,14,16,20,24}`，复查短程 winner 的相邻整数，再把 top-3 固定为10+50正式复测。三组代表点逐字段复用 v3 Golden；Llama-3-8B 与 Qwen2.5 的同几何标签复用同一次物理测量；生产 Qwen、Nanbeige4.2-3B 和 Llama-3.1-405B 重新执行完整标定。
+
+当前版本：v4.0
+
+| 项目 | 结果 |
+|---|---:|
+| OProj 正式 setting | 96 |
+| OProj 相对 TE Userbuffers p50 胜场 | 95/96 |
+| Nanbeige4.2-3B OProj 胜场 | 12/12 |
+| OProj 唯一 p50 落后点 | Llama-3.1-405B，CP4，S=1K |
+| QKV 正式 setting | 96 |
+| 正式采样 | 10 warmup + 50 samples，max-rank p50/p95 |
+
+分离基线对每个 setting 扫描48个独立 NCCL tuple，并继续搜索 Graph/eager、stream 优先级与 pack 参数；cuBLASLt 使用64 MiB workspace做本地 heuristic 调优。TE Userbuffers 对通信 SM、streams、push/pull、CE/SM、pack 参数与方向做结构搜索，top-3 统一正式复测。不同 NCCL tuple 使用独立进程组，避免环境参数被第一个 communicator 缓存。
+
+两条算子的完整口径、逐点数据和复现命令分别见 [`benchmarks/a2a+Oproj/BENCHMARK.md`](benchmarks/a2a+Oproj/BENCHMARK.md) 与 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。v5 将以这份固定 benchmark 为基线，开始 QKVProj+A2A 的专项性能优化。
