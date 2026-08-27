@@ -46,7 +46,7 @@ cmake --build build --parallel 8
 ## 固定采样流程
 
 1. 确认参与 GPU 空闲、P2P/NVLink 正常，记录 `CUDA_VISIBLE_DEVICES`。
-2. 固定 `M/N/K`、CP、`comm_ctas`、tile policy、raster 和 swizzle；一次只改一个待比较变量。
+2. 固定 `M/N/K`、CP、`comm_ctas`、tile policy、raster 和 swizzle；一次只改一个待比较变量。QKV v6必须同时记录policy请求值和最终解析出的`BM/BN/cluster`，不能只写`auto`。
 3. 使用 `--trace-out`。benchmark 会在普通测量结束后先预热一次独立的
    diagnostic kernel，再清空全部 ready/epoch，以 epoch 1 采集一次正式 trace；
    这样不会把逐 GPU 的首次模块装载误记为跨 rank 等待。
@@ -70,7 +70,9 @@ QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
 `N=(Hq+2*Hkv)*D`，`M=S/CP`：
 
 ```bash
-CUDA_VISIBLE_DEVICES=<devices> ./build/qkvproj_a2a_bench \
+CUDA_VISIBLE_DEVICES=<devices> \
+FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n256|m128n320> \
+./build/qkvproj_a2a_bench \
   --mode qkv_gemm_a2a --m <M> --k <K> \
   --batch 1 --q-heads <Hq> --kv-heads <Hkv> --head-dim <D> \
   --comm-ctas <comm> --raster <m|n|auto> --swizzle <1|2|4|8> \
@@ -82,7 +84,7 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/qkvproj_a2a_bench \
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：4
+协议版本：5
 
 ### A2A -> GEMM
 
@@ -173,6 +175,7 @@ GEMM -> A2A 还必须满足：
 
 - 每个 CTA 都有 `start <= role_done <= end`；
 - CTA `[0, comm_ctas)` 是 route role，其余是 compute role；
+- QKV trace保存`FUSE_QKV_GEMM_POLICY`请求值以及实际`tile_m/tile_n/cluster_m`；
 - `all local roles done` 取所有 CTA 的最大 `role_done`；
 - 最终 kernel 时间取所有 CTA 的最大 `end`，不能用 rank 内平均值。
 

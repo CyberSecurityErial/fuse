@@ -47,6 +47,11 @@ struct Fp8GemmA2AParams {
 
 KernelTraits projection_cutlass_kernel_traits();
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem);
+KernelTraits qkv_cutlass_kernel_traits(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count);
 KernelTraits fp8_cutlass_kernel_traits();
 
 int32_t recommended_gemm_a2a_comm_ctas(

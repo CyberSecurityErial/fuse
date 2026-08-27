@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -1034,6 +1035,39 @@ void smoke_a2a_lhs_policy_selection() {
   }
 }
 
+void smoke_qkv_wave_policy_selection() {
+  if (std::getenv("FUSE_QKV_GEMM_POLICY") != nullptr) {
+    std::cout << "QKV wave policy selection: SKIP (manual override set)\n";
+    return;
+  }
+  fuse::UlyssesRoute route{};
+  route.qkv_peer_interleaved = false;
+  struct Case {
+    fuse::GemmProblem problem;
+    int expected_bn;
+  };
+  constexpr Case cases[] = {
+      {{128, 4096, 4096, 1}, 128},
+      {{512, 4096, 4096, 1}, 160},
+      {{1024, 5120, 5120, 1}, 256},
+      {{1024, 4096, 4096, 1}, 320},
+  };
+  for (const auto& item : cases) {
+    const auto traits =
+        fuse::qkv_cutlass_kernel_traits(item.problem, route, 24, 132);
+    if (traits.block_m != 128 || traits.block_n != item.expected_bn ||
+        traits.block_k != 64) {
+      throw std::runtime_error("QKV v6 wave policy selection failed");
+    }
+  }
+  const auto fallback = fuse::qkv_cutlass_kernel_traits(
+      {1024, 4096, 4096, 1}, route, 24, 120);
+  if (fallback.block_n != 128) {
+    throw std::runtime_error("QKV v6 out-of-domain fallback failed");
+  }
+  std::cout << "QKV wave policy selection: PASS\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1045,6 +1079,7 @@ int main(int argc, char** argv) {
     g_epoch_iterations = quick ? 1 : 8;
     smoke_qkv_gqa_route();
     smoke_a2a_lhs_policy_selection();
+    smoke_qkv_wave_policy_selection();
     int world = 0;
     CUDA_CHECK(cudaGetDeviceCount(&world));
     world = std::min(world, fuse::kMaxWorldSize);
