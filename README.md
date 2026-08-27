@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在v6加入基于wave数量与实测整波时间的tile选择。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在v7联合选择通信CTA与GEMM tile。
 
 Attention 输出按 head 分片：
 
@@ -30,8 +30,9 @@ N = hidden
 - GEMM CTA 使用 system-scope acquire 消费已到达的数据，省去独立 permutation kernel 和 kernel 间同步。
 - `auto` 策略在五个成熟 policy 中选择：`M64N128`、`M128N128`、`M128N160`、`M128N256 cluster-M2`、`M128N320 cluster-M2`；wave 以 cluster 为调度单元，并优先保证 N frontier 不被 wave 边界切开。
 
-QKV Projection+A2A提供`M128N128/N160/N256/N320`四种policy。H200默认按
-`wave数 × 整波实测时间`选择tile；标定范围外自动回退v5策略，完整口径见
+QKV Projection+A2A提供`M128N128/N160/N192/N256/N320`五种policy。H200默认
+用GEMM wave成本、QKV通信量、NVLink下界和cluster前进代价联合选择通信CTA与tile；
+模型名称和逐case winner不参与选择，标定范围外自动回退成熟策略。完整口径见
 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。
 
 默认通信策略对短中序列使用 `comm4`，长序列根据 CP、`N` 和设备 NVLink 带宽选择 `comm6/8`。实验性全量成本模型可通过 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 启用；它默认关闭，尚不属于 Golden。模型口径和边界见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
@@ -97,7 +98,7 @@ python3 'benchmarks/a2a+Oproj/oproj_shape_bench.py' \
   --results results/reproduce_cp8
 
 # QKV：正式表必须使用 MPI 一进程一卡；eager 与 Graph 分列。
-unset FUSE_QKV_GEMM_POLICY
+unset FUSE_QKV_COMM_POLICY FUSE_QKV_GEMM_POLICY
 python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
   --phase fuse-mpi-formal --phase fuse-mpi-aggregate \
   --phase comparison-table
@@ -107,7 +108,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v6.0（OProj热路径沿用v4.0；QKV tile选择更新于v6.0）
+当前融合版本：v7-autoroll（OProj热路径沿用v4.0；QKV使用v7联合流水策略）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -119,9 +120,10 @@ Eager 与 Graph 各自做10+50正式采样，不拿两列之间的差值当算�
 完成 capture、instantiate 和显式 upload。上述极限表包含 per-shape `comm_ctas`
 单变量标定；默认自动入口不承诺零调参复现全部极限点。
 
-QKV的96点结果中，v6对TE Userbuffers的Eager/Graph胜场为`73/96`和
-`74/96`，对最强外部基线为`64/96`和`69/96`；相对v5的全量p50几何平均提升
-分别为`1.0155×`和`1.0164×`。
+QKV的96点结果中，v7对TE Userbuffers的Eager/Graph胜场均为`96/96`，几何平均
+分别领先`1.268×`和`1.319×`；对最强外部基线的胜场为`93/96`和`96/96`，几何
+平均分别领先`1.201×`和`1.250×`。相对v6的全量p50几何平均提升为`1.147×`和
+`1.156×`。所有case使用同一自动入口，运行时不读取逐shape winner或TE结果。
 
 完整数据与复现流程：
 

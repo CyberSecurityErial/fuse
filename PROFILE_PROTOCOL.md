@@ -46,7 +46,7 @@ cmake --build build --parallel 8
 ## 固定采样流程
 
 1. 确认参与 GPU 空闲、P2P/NVLink 正常，记录 `CUDA_VISIBLE_DEVICES`。
-2. 固定 `M/N/K`、CP、`comm_ctas`、tile policy、raster 和 swizzle；一次只改一个待比较变量。QKV v6必须同时记录policy请求值和最终解析出的`BM/BN/cluster`，不能只写`auto`。
+2. 固定 `M/N/K`、CP、`comm_ctas`、tile policy、raster 和 swizzle；一次只改一个待比较变量。QKV 必须同时记录GEMM/通信policy请求值、policy模型版本和最终解析出的`BM/BN/cluster`，不能只写`auto`。
 3. 使用 `--trace-out`。benchmark 会在普通测量结束后先预热一次独立的
    diagnostic kernel，再清空全部 ready/epoch，以 epoch 1 采集一次正式 trace；
    这样不会把逐 GPU 的首次模块装载误记为跨 rank 等待。
@@ -69,9 +69,12 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
 `N=(Hq+2*Hkv)*D`，`M=S/CP`：
 
+v7正式路径保持两个环境变量未设置；下列变量只用于固定policy的消融或回退复现。
+
 ```bash
 CUDA_VISIBLE_DEVICES=<devices> \
-FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n256|m128n320> \
+FUSE_QKV_COMM_POLICY=<pipeline|legacy> \
+FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n192|m128n256|m128n320> \
 ./build/qkvproj_a2a_bench \
   --mode qkv_gemm_a2a --m <M> --k <K> \
   --batch 1 --q-heads <Hq> --kv-heads <Hkv> --head-dim <D> \
@@ -84,7 +87,7 @@ FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n256|m128n320
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：5
+协议版本：6
 
 ### A2A -> GEMM
 
@@ -124,12 +127,14 @@ task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline�
 |---|---|
 | `local roles -> grid sync` | rank 内所有 persistent CTA 到达 cooperative grid barrier 的尾差 |
 | `fence.sc.sys` | route 写入完成后的 system-scope fence |
-| `publish source-complete epochs` | 本 source rank 向所有 destination rank 发布本轮 route 完成标记 |
-| `wait source N epoch` | 按 source 0 到 `world-1` 顺序轮询时，从上一个 source 就绪到 source N 就绪的暴露等待 |
+| `publish source-complete epochs` | CTA0 第一 warp 的 lane 0..`world-1` 并行向各 destination rank 发布本轮 route 完成标记 |
+| `wait source N epoch` | CTA0 的 lane N 从并行轮询开始，到 source N 完成标记可见的独立等待；各 source 使用独立 Perfetto 轨道 |
 | `kernel retire` | 最后一个 source 就绪后，到 rank 内最后一个 CTA 退出 |
 
-`wait source N epoch` 是串行扫描顺序下的增量等待，不是 source N 独立的
-release-to-acquire 网络延迟；前一个 source 仍未就绪时，后续 source 即使已经就绪也不会被提前观察。
+`wait source N epoch` 的起点是本 rank 完成全部并行 publish 的时刻，终点是本地
+acquire 观察到 source N 的 epoch；它包含 source N 的剩余计算、路由和网络传播，不能
+单独解释为裸 NVLink 延迟。所有 source wait 会重叠，finalize 的暴露等待取其最大值，
+不能相加。
 
 ### TE Userbuffers QKV 对照
 
@@ -175,7 +180,7 @@ GEMM -> A2A 还必须满足：
 
 - 每个 CTA 都有 `start <= role_done <= end`；
 - CTA `[0, comm_ctas)` 是 route role，其余是 compute role；
-- QKV trace保存`FUSE_QKV_GEMM_POLICY`请求值以及实际`tile_m/tile_n/cluster_m`；
+- QKV trace保存`FUSE_QKV_GEMM_POLICY`、`FUSE_QKV_COMM_POLICY`请求值、模型版本以及实际`tile_m/tile_n/cluster_m`；
 - `all local roles done` 取所有 CTA 的最大 `role_done`；
 - 最终 kernel 时间取所有 CTA 的最大 `end`，不能用 rank 内平均值。
 

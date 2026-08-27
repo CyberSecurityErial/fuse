@@ -363,7 +363,8 @@ void report_a2a_lhs_role_trace(
   if (!trace) {
     throw std::runtime_error("cannot open trace output: " + trace_path);
   }
-  trace << "{\n  \"displayTimeUnit\": \"ns\",\n  \"traceEvents\": [\n";
+  trace << "{\n  \"displayTimeUnit\": \"ns\",\n"
+        << "  \"traceEvents\": [\n";
   bool first_event = true;
   auto emit = [&](int rank, int tid, const std::string& name,
                   const std::string& category,
@@ -660,7 +661,10 @@ void report_gemm_a2a_role_trace(
         ? static_cast<double>(overlap_end - overlap_begin) / 1000.0
         : 0.0;
     const auto& root = timeline[rank][0];
-    const uint64_t sources_done = root.source_ready[world - 1];
+    uint64_t sources_done = 0;
+    for (int source = 0; source < world; ++source) {
+      sources_done = std::max(sources_done, root.source_ready[source]);
+    }
     const double grid_sync_us = root.grid_sync_done > local_roles_done
         ? static_cast<double>(root.grid_sync_done - local_roles_done) / 1000.0
         : 0.0;
@@ -693,7 +697,43 @@ void report_gemm_a2a_role_trace(
   if (!trace) {
     throw std::runtime_error("cannot open trace output: " + trace_path);
   }
-  trace << "{\n  \"displayTimeUnit\": \"ns\",\n  \"traceEvents\": [\n";
+  const char* gemm_policy = std::getenv("FUSE_QKV_GEMM_POLICY");
+  const char* comm_policy = std::getenv("FUSE_QKV_COMM_POLICY");
+  const std::string gemm_request = gemm_policy == nullptr
+      ? "auto"
+      : gemm_policy;
+  const std::string comm_request = comm_policy == nullptr
+      ? "auto"
+      : comm_policy;
+  const bool pipeline_model = comm_policy == nullptr ||
+      comm_request == "pipeline" || comm_request == "roofline";
+  const bool calibrated_tile_model = gemm_policy == nullptr ||
+      gemm_request == "wave_time_model";
+  const std::string policy_model = !calibrated_tile_model
+      ? "manual_override"
+      : (pipeline_model ? "calibrated_pipeline_independent_progress_v2"
+                        : (gemm_policy != nullptr
+                                  ? "calibrated_wave_time_independent_progress_v2"
+                                  : "calibrated_wave_time_v1"));
+  const auto traits = fuse::qkv_cutlass_kernel_traits(
+      params[0].gemm,
+      params[0].route,
+      params[0].num_comm_ctas,
+      capacities[0]);
+  trace << "{\n  \"displayTimeUnit\": \"ns\",\n"
+        << "  \"metadata\": {\"world_size\":" << world
+        << ",\"m\":" << params[0].gemm.m
+        << ",\"n\":" << params[0].gemm.n
+        << ",\"k\":" << params[0].gemm.k
+        << ",\"comm_ctas\":" << params[0].num_comm_ctas
+        << ",\"qkv_policy_request\":\"" << gemm_request
+        << "\",\"qkv_comm_policy_request\":\"" << comm_request
+        << "\",\"qkv_policy_model\":\"" << policy_model
+        << "\",\"tile_m\":" << traits.block_m
+        << ",\"tile_n\":" << traits.block_n
+        << ",\"tile_k\":" << traits.block_k
+        << ",\"cluster_m\":" << (traits.block_n >= 256 ? 2 : 1)
+        << "},\n  \"traceEvents\": [\n";
   bool first_event = true;
   auto emit = [&](int rank, int tid, const std::string& name,
                   const std::string& category,
@@ -778,24 +818,26 @@ void report_gemm_a2a_role_trace(
         root.fence_done,
         root.publish_done,
         origin);
-    uint64_t previous = root.publish_done;
     for (int source = 0; source < world; ++source) {
       emit(
           rank,
-          500001,
+          500010 + source,
           "wait source " + std::to_string(source) + " epoch",
           "finalize_source_wait",
-          previous,
+          root.publish_done,
           root.source_ready[source],
           origin);
-      previous = root.source_ready[source];
+    }
+    uint64_t sources_done = 0;
+    for (int source = 0; source < world; ++source) {
+      sources_done = std::max(sources_done, root.source_ready[source]);
     }
     emit(
         rank,
         500001,
         "kernel retire",
         "finalize",
-        previous,
+        sources_done,
         last,
         origin);
   }
@@ -1468,22 +1510,41 @@ void write_json(
          << "  \"overlap_ratio\": " << overlap << ",\n";
   if (options.mode == "qkv_gemm_a2a") {
     const char* policy_override = std::getenv("FUSE_QKV_GEMM_POLICY");
+    const char* comm_policy_override = std::getenv("FUSE_QKV_COMM_POLICY");
     const std::string policy_value =
         policy_override == nullptr ? "" : policy_override;
+    const std::string comm_policy_value =
+        comm_policy_override == nullptr ? "" : comm_policy_override;
     const bool known_policy =
         policy_value == "legacy" || policy_value == "wave_time_model" ||
         policy_value == "m128n128" || policy_value == "m128n160" ||
+        policy_value == "m128n192" ||
         policy_value == "m128n256" || policy_value == "m128n320";
-    const bool calibrated_model = policy_override == nullptr ||
-        policy_value == "wave_time_model" || !known_policy;
+    const bool pipeline_model = comm_policy_override == nullptr ||
+        comm_policy_value == "pipeline" || comm_policy_value == "roofline";
+    const bool calibrated_tile_model = policy_override == nullptr ||
+        (known_policy && policy_value == "wave_time_model");
+    const std::string policy_model = !calibrated_tile_model
+        ? (known_policy ? "manual_override" : "unrecognized")
+        : (pipeline_model ? "calibrated_pipeline_independent_progress_v2"
+                          : (policy_override != nullptr
+                                    ? "calibrated_wave_time_independent_progress_v2"
+                                    : "calibrated_wave_time_v1"));
+    const bool known_comm_policy = comm_policy_override == nullptr ||
+        comm_policy_value == "pipeline" || comm_policy_value == "roofline" ||
+        comm_policy_value == "legacy";
     output << "  \"qkv_policy_request\": \""
            << (policy_override == nullptr
                    ? "auto"
                    : (known_policy ? policy_value : "unrecognized"))
            << "\",\n"
+           << "  \"qkv_comm_policy_request\": \""
+           << (comm_policy_override == nullptr
+                   ? "auto"
+                   : (known_comm_policy ? comm_policy_value : "unrecognized"))
+           << "\",\n"
            << "  \"qkv_policy_model\": \""
-           << (calibrated_model ? "calibrated_wave_time_v1"
-                                : "manual_override")
+           << policy_model
            << "\",\n";
   }
   if (options.mode == "qkv_gemm_a2a" ||
