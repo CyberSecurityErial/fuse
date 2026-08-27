@@ -246,6 +246,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nccl-high-priority", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--metric-profile",
+        choices=("route", "boundary", "full"),
+        default="full",
+        help="measure only the metrics needed by the current search phase",
+    )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument(
         "--matrix-manifest",
@@ -601,15 +607,17 @@ def run_oproj(
         dtype=torch.bfloat16,
         device=device,
     ).uniform_(-0.125, 0.125, generator=generator)
-    linear = te.Linear(
-        gemm_k,
-        gemm_n,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device=device,
-        name="ulysses_output_projection",
-    ).eval()
-    dist.broadcast(linear.weight, src=0)
+    linear = None
+    if args.metric_profile != "route":
+        linear = te.Linear(
+            gemm_k,
+            gemm_n,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            name="ulysses_output_projection",
+        ).eval()
+        dist.broadcast(linear.weight, src=0)
     cp_stream = torch.cuda.Stream(device=device)
     chunk_ids = get_seq_chunk_ids_for_reordering_before_attn(world, device)
 
@@ -632,15 +640,21 @@ def run_oproj(
     )
 
     def te_project() -> torch.Tensor:
+        assert linear is not None
         return linear(staging)
 
-    cublaslt = cached_cublaslt_runner(
-        args, staging, linear.weight, cublas_output
-    )
-    rank_cublaslt_plans: list[dict[str, object] | None] = [None] * world
-    dist.all_gather_object(rank_cublaslt_plans, cublaslt.info)
+    cublaslt = None
+    rank_cublaslt_plans: list[dict[str, object] | None] = []
+    if args.metric_profile != "route":
+        assert linear is not None
+        cublaslt = cached_cublaslt_runner(
+            args, staging, linear.weight, cublas_output
+        )
+        rank_cublaslt_plans = [None] * world
+        dist.all_gather_object(rank_cublaslt_plans, cublaslt.info)
 
     def cublaslt_project() -> torch.Tensor:
+        assert linear is not None and cublaslt is not None
         return cublaslt(staging, linear.weight, cublas_output)
 
     def te_boundary() -> torch.Tensor:
@@ -648,6 +662,7 @@ def run_oproj(
         return linear(routed)
 
     def cublaslt_boundary() -> torch.Tensor:
+        assert linear is not None and cublaslt is not None
         routed = inverse_a2a().reshape(gemm_m, gemm_k)
         return cublaslt(routed, linear.weight, cublas_output)
 
@@ -681,14 +696,16 @@ def run_oproj(
         check["inverse_a2a_reference_mismatches"] = int(mismatch.item())
         if mismatch.item():
             raise RuntimeError(f"O-projection route correctness failed: {check}")
-        cublaslt_project()
-        torch.cuda.synchronize(device)
-        reference_output = torch.mm(staging, linear.weight.t())
-        max_abs = (cublas_output.float() - reference_output.float()).abs().max()
-        dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
-        check["cublaslt_vs_torch_mm_max_abs"] = float(max_abs.item())
-        if not torch.isfinite(max_abs):
-            raise RuntimeError(f"cuBLASLt produced non-finite output: {check}")
+        if args.metric_profile != "route":
+            assert linear is not None
+            cublaslt_project()
+            torch.cuda.synchronize(device)
+            reference_output = torch.mm(staging, linear.weight.t())
+            max_abs = (cublas_output.float() - reference_output.float()).abs().max()
+            dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
+            check["cublaslt_vs_torch_mm_max_abs"] = float(max_abs.item())
+            if not torch.isfinite(max_abs):
+                raise RuntimeError(f"cuBLASLt produced non-finite output: {check}")
 
     flops = 2 * gemm_m * gemm_n * gemm_k
     payload_bytes = attention_output.numel() * attention_output.element_size()
@@ -718,19 +735,23 @@ def run_oproj(
             ),
         }
 
-    if args.include_te:
-        measure("te_oproj_gemm", te_project, metric_flops=flops)
-    measure("cublaslt_oproj_gemm", cublaslt_project, metric_flops=flops)
-    measure(
-        "te_nccl_inverse_a2a",
-        inverse_a2a,
-        metric_payload_bytes=payload_bytes,
-    )
-    if args.include_te:
-        measure("te_nccl_oproj_boundary", te_boundary, metric_flops=flops)
-    measure("cublaslt_nccl_oproj_boundary", cublaslt_boundary, metric_flops=flops)
+    if args.metric_profile == "full":
+        if args.include_te:
+            measure("te_oproj_gemm", te_project, metric_flops=flops)
+        measure("cublaslt_oproj_gemm", cublaslt_project, metric_flops=flops)
+    if args.metric_profile in ("route", "full"):
+        measure(
+            "te_nccl_inverse_a2a",
+            inverse_a2a,
+            metric_payload_bytes=payload_bytes,
+        )
+    if args.metric_profile in ("boundary", "full"):
+        if args.include_te:
+            measure("te_nccl_oproj_boundary", te_boundary, metric_flops=flops)
+        measure("cublaslt_nccl_oproj_boundary", cublaslt_boundary, metric_flops=flops)
 
     result = {
+        "benchmark_schema": "oproj_inverse_a2a_v1",
         "mode": args.mode,
         "model_shape": {
             "batch": args.batch,
@@ -748,8 +769,11 @@ def run_oproj(
         "timing": "per-sample max-rank CUDA-event critical path",
         "scope": "TE Ulysses inverse A2A (including reorder) + output projection",
         "include_te": args.include_te,
+        "metric_profile": args.metric_profile,
         "cuda_graph": args.cuda_graph,
         "nccl_high_priority": args.nccl_high_priority,
+        "pack_block": args.pack_block,
+        "pack_warps": args.pack_warps,
         "environment": {
             name: os.environ.get(name)
             for name in (
@@ -1179,10 +1203,12 @@ def print_and_write_result(
     print(f"derived={json.dumps(result['derived'], sort_keys=True)}", flush=True)
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(result, indent=2) + "\n")
+        temporary = args.json_out.with_suffix(args.json_out.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(args.json_out)
 
 
-def run_one_process_group(
+def initialize_process_group(
     args: argparse.Namespace,
     device: torch.device,
     *,
@@ -1200,16 +1226,29 @@ def run_one_process_group(
     dist.init_process_group(
         "nccl", device_id=device, pg_options=process_group_options, **init_kwargs
     )
+
+
+def run_initialized(args: argparse.Namespace, device: torch.device) -> None:
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = False
     result = run(args, rank, world, device)
     print_and_write_result(args, result, rank)
     torch.cuda.synchronize(device)
-    dist.destroy_process_group()
     del result
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def run_one_process_group(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    init_method: str | None = None,
+) -> None:
+    initialize_process_group(args, device, init_method=init_method)
+    run_initialized(args, device)
+    dist.destroy_process_group()
 
 
 def main() -> None:
@@ -1223,15 +1262,33 @@ def main() -> None:
         return
 
     entries = json.loads(args.matrix_manifest.read_text())
-    for entry in entries:
-        for name, value in entry["environment"].items():
-            os.environ[name] = str(value)
-        args.cuda_graph = bool(entry["cuda_graph"])
-        args.nccl_high_priority = bool(entry["nccl_high_priority"])
-        args.json_out = Path(entry["json_out"])
-        run_one_process_group(
-            args, device, init_method=f"file://{entry['rendezvous_file']}"
+    for high_priority in (True, False):
+        priority_entries = [
+            entry
+            for entry in entries
+            if bool(entry["nccl_high_priority"]) == high_priority
+        ]
+        if not priority_entries:
+            continue
+        args.nccl_high_priority = high_priority
+        initialize_process_group(
+            args,
+            device,
+            init_method=f"file://{priority_entries[0]['rendezvous_file']}",
         )
+        for entry in priority_entries:
+            for name, value in entry.get("arguments", {}).items():
+                setattr(args, name, value)
+            for name, value in entry["environment"].items():
+                if os.environ.get(name) != str(value):
+                    raise RuntimeError(
+                        f"matrix entry attempted to change process-static {name}: "
+                        f"{os.environ.get(name)!r} -> {value!r}"
+                    )
+            args.cuda_graph = bool(entry["cuda_graph"])
+            args.json_out = Path(entry["json_out"])
+            run_initialized(args, device)
+        dist.destroy_process_group()
     close_cublaslt_runners()
 
 

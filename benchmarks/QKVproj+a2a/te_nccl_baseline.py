@@ -238,6 +238,14 @@ def parse_args() -> argparse.Namespace:
         "--include-source", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--include-qk", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--metric-profile",
+        choices=("route", "boundary", "full"),
+        default="full",
+    )
+    parser.add_argument(
         "--cuda-graph", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--pack-backend", choices=("torch", "triton"), default="triton")
@@ -276,7 +284,10 @@ def _pack_qk_kernel(
     head_dim: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = (
+        tl.program_id(0).to(tl.int64) * BLOCK
+        + tl.arange(0, BLOCK).to(tl.int64)
+    )
     mask = offsets < numel
     local_heads = local_q_heads + local_kv_heads
     channel = offsets % head_dim
@@ -305,7 +316,10 @@ def _pack_v_kernel(
     head_dim: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = (
+        tl.program_id(0).to(tl.int64) * BLOCK
+        + tl.arange(0, BLOCK).to(tl.int64)
+    )
     mask = offsets < numel
     channel = offsets % head_dim
     logical_head = (offsets // head_dim) % local_kv_heads
@@ -314,6 +328,101 @@ def _pack_v_kernel(
     source_head = peer * local_kv_heads + logical_head
     source = token * qkv_width + v_base + source_head * head_dim + channel
     tl.store(packed + offsets, tl.load(qkv + source, mask=mask), mask=mask)
+
+
+@triton.jit
+def _pack_full_qkv_kernel(
+    qkv,
+    packed,
+    numel: tl.constexpr,
+    seq_local: tl.constexpr,
+    qkv_width: tl.constexpr,
+    q_width: tl.constexpr,
+    kv_width: tl.constexpr,
+    local_q_heads: tl.constexpr,
+    local_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = (
+        tl.program_id(0).to(tl.int64) * BLOCK
+        + tl.arange(0, BLOCK).to(tl.int64)
+    )
+    mask = offsets < numel
+    q_elements = tl.full((), seq_local * local_q_heads * head_dim, tl.int64)
+    kv_elements = tl.full((), seq_local * local_kv_heads * head_dim, tl.int64)
+    peer_elements = q_elements + 2 * kv_elements
+    peer = offsets // peer_elements
+    within = offsets % peer_elements
+    is_q = within < q_elements
+    is_k = (within >= q_elements) & (within < q_elements + kv_elements)
+    segment_element = tl.where(
+        is_q,
+        within,
+        tl.where(is_k, within - q_elements, within - q_elements - kv_elements),
+    )
+    local_heads = tl.where(is_q, local_q_heads, local_kv_heads)
+    channel = segment_element % head_dim
+    logical_head = (segment_element // head_dim) % local_heads
+    token = segment_element // (head_dim * local_heads)
+    source_head = peer * local_heads + logical_head
+    source_base = tl.where(is_q, 0, tl.where(is_k, q_width, q_width + kv_width))
+    source = token * qkv_width + source_base + source_head * head_dim + channel
+    tl.store(packed + offsets, tl.load(qkv + source, mask=mask), mask=mask)
+
+
+@triton.jit
+def _unpack_full_qkv_kernel(
+    received,
+    output,
+    numel: tl.constexpr,
+    seq_local: tl.constexpr,
+    world: tl.constexpr,
+    local_q_heads: tl.constexpr,
+    local_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = (
+        tl.program_id(0).to(tl.int64) * BLOCK
+        + tl.arange(0, BLOCK).to(tl.int64)
+    )
+    mask = offsets < numel
+    global_seq = tl.full((), seq_local * world, tl.int64)
+    q_elements = global_seq * local_q_heads * head_dim
+    kv_elements = global_seq * local_kv_heads * head_dim
+    local_q_per_peer = tl.full(
+        (), seq_local * local_q_heads * head_dim, tl.int64
+    )
+    local_kv_per_peer = tl.full(
+        (), seq_local * local_kv_heads * head_dim, tl.int64
+    )
+    peer_elements = local_q_per_peer + 2 * local_kv_per_peer
+    is_q = offsets < q_elements
+    is_k = (offsets >= q_elements) & (offsets < q_elements + kv_elements)
+    segment_element = tl.where(
+        is_q,
+        offsets,
+        tl.where(is_k, offsets - q_elements, offsets - q_elements - kv_elements),
+    )
+    local_heads = tl.where(is_q, local_q_heads, local_kv_heads)
+    channel = segment_element % head_dim
+    logical_head = (segment_element // head_dim) % local_heads
+    global_token = segment_element // (head_dim * local_heads)
+    source_rank = global_token // seq_local
+    local_token = global_token % seq_local
+    segment_base = tl.where(
+        is_q,
+        0,
+        tl.where(is_k, local_q_per_peer, local_q_per_peer + local_kv_per_peer),
+    )
+    source = (
+        source_rank * peer_elements
+        + segment_base
+        + (local_token * local_heads + logical_head) * head_dim
+        + channel
+    )
+    tl.store(output + offsets, tl.load(received + source, mask=mask), mask=mask)
 
 
 def percentile(ordered: list[float], q: float) -> float:
@@ -446,6 +555,77 @@ class UlyssesRoutes:
             dtype=torch.bfloat16,
             device=device,
         )
+        full_elements = batch * seq_local * (
+            self.local_q_heads + 2 * self.local_kv_heads
+        ) * head_dim
+        self.full_send = torch.empty(
+            (world, full_elements), dtype=torch.bfloat16, device=device
+        )
+        self.full_recv = torch.empty_like(self.full_send)
+        self.full_output = torch.empty(
+            world * full_elements, dtype=torch.bfloat16, device=device
+        )
+
+    def full(self, qkv: torch.Tensor) -> torch.Tensor:
+        if self.batch != 1:
+            raise ValueError("full QKV benchmark route currently requires batch=1")
+        qkv = qkv.view(self.seq_local, self.qkv_width)
+        if self.pack_backend == "triton":
+            output_elements = self.full_send.numel()
+            _pack_full_qkv_kernel[(triton.cdiv(output_elements, self.pack_block),)](
+                qkv,
+                self.full_send,
+                numel=output_elements,
+                seq_local=self.seq_local,
+                qkv_width=self.qkv_width,
+                q_width=self.q_width,
+                kv_width=self.kv_width,
+                local_q_heads=self.local_q_heads,
+                local_kv_heads=self.local_kv_heads,
+                head_dim=self.head_dim,
+                BLOCK=self.pack_block,
+                num_warps=self.pack_warps,
+            )
+        else:
+            q, k, v = (
+                qkv[:, : self.q_width].view(
+                    self.seq_local, self.world, self.local_q_heads, self.head_dim
+                ),
+                qkv[:, self.q_width : self.q_width + self.kv_width].view(
+                    self.seq_local, self.world, self.local_kv_heads, self.head_dim
+                ),
+                qkv[:, self.q_width + self.kv_width :].view(
+                    self.seq_local, self.world, self.local_kv_heads, self.head_dim
+                ),
+            )
+            peer_elements = self.full_send.shape[1]
+            q_elements = self.seq_local * self.local_q_heads * self.head_dim
+            kv_elements = self.seq_local * self.local_kv_heads * self.head_dim
+            flat = self.full_send.view(-1)
+            for peer in range(self.world):
+                base = peer * peer_elements
+                flat[base : base + q_elements].copy_(q[:, peer].reshape(-1))
+                flat[base + q_elements : base + q_elements + kv_elements].copy_(
+                    k[:, peer].reshape(-1)
+                )
+                flat[
+                    base + q_elements + kv_elements : base + q_elements + 2 * kv_elements
+                ].copy_(v[:, peer].reshape(-1))
+        dist.all_to_all_single(self.full_recv, self.full_send)
+        output_elements = self.full_output.numel()
+        _unpack_full_qkv_kernel[(triton.cdiv(output_elements, self.pack_block),)](
+            self.full_recv,
+            self.full_output,
+            numel=output_elements,
+            seq_local=self.seq_local,
+            world=self.world,
+            local_q_heads=self.local_q_heads,
+            local_kv_heads=self.local_kv_heads,
+            head_dim=self.head_dim,
+            BLOCK=self.pack_block,
+            num_warps=self.pack_warps,
+        )
+        return self.full_output
 
     def qk(self, qkv: torch.Tensor) -> torch.Tensor:
         qkv = qkv.view(self.batch, self.seq_local, self.qkv_width)
@@ -890,6 +1070,47 @@ def exact_te_source_route_check(
     return int(total)
 
 
+def exact_full_qkv_route_check(
+    qkv: torch.Tensor,
+    actual: torch.Tensor,
+    *,
+    batch: int,
+    seq_local: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    rank: int,
+    world: int,
+) -> int:
+    peers = [torch.empty_like(qkv) for _ in range(world)]
+    dist.all_gather(peers, qkv)
+    q_local, kv_local = q_heads // world, kv_heads // world
+    q_begin, kv_begin = rank * q_local, rank * kv_local
+    q_width, kv_width = q_heads * head_dim, kv_heads * head_dim
+    segments: list[torch.Tensor] = []
+    for segment, local_heads, begin in (
+        (0, q_local, q_begin),
+        (1, kv_local, kv_begin),
+        (2, kv_local, kv_begin),
+    ):
+        base = 0 if segment == 0 else q_width + (kv_width if segment == 2 else 0)
+        global_heads = q_heads if segment == 0 else kv_heads
+        parts = [
+            peer.view(batch, seq_local, q_width + 2 * kv_width)[
+                ..., base : base + global_heads * head_dim
+            ]
+            .view(batch, seq_local, global_heads, head_dim)[
+                ..., begin : begin + local_heads, :
+            ]
+            for peer in peers
+        ]
+        segments.append(torch.cat(parts, dim=1).contiguous().view(-1))
+    expected = torch.cat(segments)
+    mismatch = torch.count_nonzero(actual.view(-1) != expected).to(torch.int64)
+    dist.all_reduce(mismatch, op=dist.ReduceOp.SUM)
+    return int(mismatch.item())
+
+
 def overlap_summary(
     compute: dict[str, float],
     communication: dict[str, float],
@@ -934,16 +1155,27 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
     x = torch.empty(
         (qkv_m, args.hidden), dtype=torch.bfloat16, device=device
     ).uniform_(-0.125, 0.125, generator=generator)
-    linear = te.Linear(
-        args.hidden,
-        qkv_n,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device=device,
-        name="ulysses_qkv_projection",
-    ).eval()
-    dist.broadcast(linear.weight, src=0)
     qkv_cublas = torch.empty((qkv_m, qkv_n), dtype=torch.bfloat16, device=device)
+    linear = None
+    cublaslt = None
+    rank_cublaslt_plans: list[dict[str, object] | None] = []
+    if args.metric_profile != "route":
+        linear = te.Linear(
+            args.hidden,
+            qkv_n,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            name="ulysses_qkv_projection",
+        ).eval()
+        dist.broadcast(linear.weight, src=0)
+        cublaslt = cached_cublaslt_runner(
+            args, x, linear.weight, qkv_cublas
+        )
+        rank_cublaslt_plans = [None] * world
+        dist.all_gather_object(rank_cublaslt_plans, cublaslt.info)
+    else:
+        qkv_cublas.uniform_(-0.125, 0.125, generator=generator)
     routes = UlyssesRoutes(
         batch=args.batch,
         seq_local=seq_local,
@@ -974,11 +1206,11 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         )
         return q, k, v
 
-    def te_source_qkv_a2a(qkv: torch.Tensor):
+    def te_qkv_a2a(qkv: torch.Tensor, sequence_chunks: torch.Tensor):
         q, k, v = split_qkv(qkv)
         return flash_attn_a2a_communicate(
             [q, k, v],
-            chunk_ids,
+            sequence_chunks,
             1,
             world,
             dist.group.WORLD,
@@ -988,19 +1220,33 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             a2a_input_names=["q", "k", "v"],
         )
 
+    def te_source_qkv_a2a(qkv: torch.Tensor):
+        return te_qkv_a2a(qkv, chunk_ids)
+
     def cublas_project() -> torch.Tensor:
+        assert linear is not None
         return torch.mm(x, linear.weight.t(), out=qkv_cublas)
 
+    def cublaslt_project() -> torch.Tensor:
+        assert linear is not None and cublaslt is not None
+        return cublaslt(x, linear.weight, qkv_cublas)
+
     def te_project() -> torch.Tensor:
+        assert linear is not None
         return linear(x)
 
-    cublas_project()
+    if args.metric_profile != "route":
+        cublas_project()
     torch.cuda.synchronize(device)
-    check = exact_route_check(routes, qkv_cublas, rank, world) if args.check else {}
-    if args.check and args.include_source:
-        check["te_source_qkv_mismatches"] = exact_te_source_route_check(
+    check = (
+        exact_route_check(routes, qkv_cublas, rank, world)
+        if args.check and args.include_qk
+        else {}
+    )
+    if args.check:
+        check["packed_qkv_mismatches"] = exact_full_qkv_route_check(
             qkv_cublas,
-            te_source_qkv_a2a(qkv_cublas),
+            routes.full(qkv_cublas),
             batch=args.batch,
             seq_local=seq_local,
             q_heads=args.q_heads,
@@ -1008,8 +1254,20 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             head_dim=args.head_dim,
             rank=rank,
             world=world,
-            chunk_ids=chunk_ids,
         )
+        if args.include_source:
+            check["te_source_qkv_mismatches"] = exact_te_source_route_check(
+                qkv_cublas,
+                te_source_qkv_a2a(qkv_cublas),
+                batch=args.batch,
+                seq_local=seq_local,
+                q_heads=args.q_heads,
+                kv_heads=args.kv_heads,
+                head_dim=args.head_dim,
+                rank=rank,
+                world=world,
+                chunk_ids=chunk_ids,
+            )
     if any(check.values()):
         raise RuntimeError(f"route correctness failed: {check}")
 
@@ -1056,38 +1314,103 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         }
 
     if args.mode == "qkv_gemm_a2a":
-        if args.include_te:
-            measure("te_qkv_gemm", te_project, flops=qkv_flops)
-        measure("cublas_qkv_gemm", cublas_project, flops=qkv_flops)
-        measure("nccl_qk_a2a", lambda: routes.qk(qkv_cublas), payload_bytes=qk_payload)
+        if args.metric_profile == "full":
+            if args.include_te:
+                measure("te_qkv_gemm", te_project, flops=qkv_flops)
+            measure("cublas_qkv_gemm", cublas_project, flops=qkv_flops)
+            measure("cublaslt_qkv_gemm", cublaslt_project, flops=qkv_flops)
+        if args.metric_profile in ("route", "full"):
+            measure(
+                "packed_qkv_a2a",
+                lambda: routes.full(qkv_cublas),
+                payload_bytes=qk_payload + v_payload,
+            )
 
-        def te_qkv_qk() -> torch.Tensor:
-            return routes.qk(te_project())
+        if args.include_qk and args.metric_profile == "full":
+            measure(
+                "nccl_qk_a2a",
+                lambda: routes.qk(qkv_cublas),
+                payload_bytes=qk_payload,
+            )
 
-        def cublas_qkv_qk() -> torch.Tensor:
-            return routes.qk(cublas_project())
+            def te_qkv_qk() -> torch.Tensor:
+                return routes.qk(te_project())
 
-        if args.include_te:
-            measure("te_qkv_gemm_qk_a2a", te_qkv_qk, flops=qkv_flops)
-        measure("cublas_qkv_gemm_qk_a2a", cublas_qkv_qk, flops=qkv_flops)
+            def cublas_qkv_qk() -> torch.Tensor:
+                return routes.qk(cublas_project())
 
-        if args.include_source:
+            def cublaslt_qkv_qk() -> torch.Tensor:
+                return routes.qk(cublaslt_project())
+
+            if args.include_te:
+                measure("te_qkv_gemm_qk_a2a", te_qkv_qk, flops=qkv_flops)
+            measure("cublas_qkv_gemm_qk_a2a", cublas_qkv_qk, flops=qkv_flops)
+            measure(
+                "cublaslt_qkv_gemm_qk_a2a", cublaslt_qkv_qk, flops=qkv_flops
+            )
+
+        if args.include_source and args.metric_profile == "full":
             measure(
                 "te_source_qkv_a2a",
                 lambda: te_source_qkv_a2a(qkv_cublas),
                 payload_bytes=qk_payload + v_payload,
             )
 
+        def te_packed_qkv_gemm_a2a():
+            return routes.full(te_project())
+
+        def cublas_packed_qkv_gemm_a2a():
+            return routes.full(cublas_project())
+
+        def cublaslt_packed_qkv_gemm_a2a():
+            return routes.full(cublaslt_project())
+
         def te_source_qkv_gemm_a2a():
             return te_source_qkv_a2a(te_project())
 
-        if args.include_source:
+        def cublas_source_qkv_gemm_a2a():
+            return te_source_qkv_a2a(cublas_project())
+
+        def cublaslt_source_qkv_gemm_a2a():
+            return te_source_qkv_a2a(cublaslt_project())
+
+        if args.metric_profile in ("boundary", "full"):
+            measure(
+                "te_packed_qkv_gemm_a2a",
+                te_packed_qkv_gemm_a2a,
+                flops=qkv_flops,
+            )
+            measure(
+                "cublas_packed_qkv_gemm_a2a",
+                cublas_packed_qkv_gemm_a2a,
+                flops=qkv_flops,
+            )
+            measure(
+                "cublaslt_packed_qkv_gemm_a2a",
+                cublaslt_packed_qkv_gemm_a2a,
+                flops=qkv_flops,
+            )
+        if args.include_source and args.metric_profile == "full":
             measure(
                 "te_source_qkv_gemm_a2a", te_source_qkv_gemm_a2a, flops=qkv_flops
             )
+            measure(
+                "cublas_source_qkv_gemm_a2a",
+                cublas_source_qkv_gemm_a2a,
+                flops=qkv_flops,
+            )
+            measure(
+                "cublaslt_source_qkv_gemm_a2a",
+                cublaslt_source_qkv_gemm_a2a,
+                flops=qkv_flops,
+            )
 
     derived: dict[str, object] = {}
-    if args.mode == "qkv_gemm_a2a":
+    if (
+        args.mode == "qkv_gemm_a2a"
+        and args.include_qk
+        and args.metric_profile == "full"
+    ):
         if args.include_te:
             derived["te_qkv_qk_overlap"] = overlap_summary(
                 metrics["te_qkv_gemm"]["stats"],
@@ -1099,7 +1422,13 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             metrics["nccl_qk_a2a"]["stats"],
             metrics["cublas_qkv_gemm_qk_a2a"]["stats"],
         )
+        derived["cublaslt_qkv_qk_overlap"] = overlap_summary(
+            metrics["cublaslt_qkv_gemm"]["stats"],
+            metrics["nccl_qk_a2a"]["stats"],
+            metrics["cublaslt_qkv_gemm_qk_a2a"]["stats"],
+        )
     return {
+        "benchmark_schema": "qkv_full_qkv_packed_v1",
         "mode": args.mode,
         "model_shape": {
             "batch": args.batch,
@@ -1118,9 +1447,15 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         "iterations": args.iters,
         "dtype": "bfloat16",
         "timing": "per-sample max-rank CUDA-event critical path",
-        "scope": "QKV projection followed by the forward Ulysses Q/K/V A2A",
+        "scope": (
+            "QKV projection followed by full Q/K/V A2A; packed metrics "
+            "match the fused segment-major, rank-major output, te_source metrics use "
+            "TE causal-load-balanced sequence order"
+        ),
         "include_te": args.include_te,
         "include_source": args.include_source,
+        "include_qk": args.include_qk,
+        "metric_profile": args.metric_profile,
         "cuda_graph": args.cuda_graph,
         "pack_backend": args.pack_backend,
         "pack_block": args.pack_block,
@@ -1133,6 +1468,7 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
             "nccl": ".".join(str(value) for value in torch.cuda.nccl.version()),
         },
         "devices": devices,
+        "cublaslt_plans": rank_cublaslt_plans,
         "environment": {
             name: os.environ.get(name)
             for name in (
@@ -1148,7 +1484,11 @@ def run(args: argparse.Namespace, rank: int, world: int, device: torch.device):
         "implementations": {
             "te_qkv": "transformer_engine.pytorch.Linear",
             "cublas_qkv": "torch.mm(out=...), PyTorch CUDA BLAS",
-            "a2a": "torch.distributed.all_to_all_single / NCCL grouped send-recv",
+            "cublaslt_qkv": "explicit locally autotuned cuBLASLt",
+            "packed_a2a": "Triton pack + one NCCL A2A + Triton unpack",
+            "te_source_a2a": (
+                "TE flash_attn_a2a_communicate with causal load balancing"
+            ),
         },
         "correctness": check,
         "derived": derived,
@@ -1179,10 +1519,12 @@ def print_and_write_result(
     print(f"derived={json.dumps(result['derived'], sort_keys=True)}", flush=True)
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(json.dumps(result, indent=2) + "\n")
+        temporary = args.json_out.with_suffix(args.json_out.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(args.json_out)
 
 
-def run_one_process_group(
+def initialize_process_group(
     args: argparse.Namespace,
     device: torch.device,
     *,
@@ -1200,16 +1542,29 @@ def run_one_process_group(
     dist.init_process_group(
         "nccl", device_id=device, pg_options=process_group_options, **init_kwargs
     )
+
+
+def run_initialized(args: argparse.Namespace, device: torch.device) -> None:
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = False
     result = run(args, rank, world, device)
     print_and_write_result(args, result, rank)
     torch.cuda.synchronize(device)
-    dist.destroy_process_group()
     del result
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def run_one_process_group(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    init_method: str | None = None,
+) -> None:
+    initialize_process_group(args, device, init_method=init_method)
+    run_initialized(args, device)
+    dist.destroy_process_group()
 
 
 def main() -> None:
@@ -1223,15 +1578,33 @@ def main() -> None:
         return
 
     entries = json.loads(args.matrix_manifest.read_text())
-    for entry in entries:
-        for name, value in entry["environment"].items():
-            os.environ[name] = str(value)
-        args.cuda_graph = bool(entry["cuda_graph"])
-        args.nccl_high_priority = bool(entry["nccl_high_priority"])
-        args.json_out = Path(entry["json_out"])
-        run_one_process_group(
-            args, device, init_method=f"file://{entry['rendezvous_file']}"
+    for high_priority in (True, False):
+        priority_entries = [
+            entry
+            for entry in entries
+            if bool(entry["nccl_high_priority"]) == high_priority
+        ]
+        if not priority_entries:
+            continue
+        args.nccl_high_priority = high_priority
+        initialize_process_group(
+            args,
+            device,
+            init_method=f"file://{priority_entries[0]['rendezvous_file']}",
         )
+        for entry in priority_entries:
+            for name, value in entry.get("arguments", {}).items():
+                setattr(args, name, value)
+            for name, value in entry["environment"].items():
+                if os.environ.get(name) != str(value):
+                    raise RuntimeError(
+                        f"matrix entry attempted to change process-static {name}: "
+                        f"{os.environ.get(name)!r} -> {value!r}"
+                    )
+            args.cuda_graph = bool(entry["cuda_graph"])
+            args.json_out = Path(entry["json_out"])
+            run_initialized(args, device)
+        dist.destroy_process_group()
     close_cublaslt_runners()
 
 

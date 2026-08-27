@@ -1,8 +1,8 @@
 # Archived benchmark results
 
-The committed result set is the Golden dataset for the fused
-`A2A -> O-projection GEMM` operator on the local 132-SM H200-class NVLink
-node.
+The committed result set contains the v4.0 benchmark snapshots for
+`A2A -> O-projection GEMM` and `QKV projection -> A2A` on the local 132-SM
+H200-class NVLink node.
 
 Measurement contract:
 
@@ -30,11 +30,20 @@ Committed directories:
   `result_source` field distinguishes 29 `v2_auto_inherited` rows from seven
   `manual_comm_ctas` rows; all options other than the external communication
   CTA count remain fixed.
+- `a2a-Oproj/oproj_mixed_shape_bench`: the v4.0 96-setting OProj matrix. It
+  combines 36 exact v3 Golden rows, 24 same-geometry model labels, and 36
+  newly calibrated real-model rows.
+- `a2a-Oproj/te_userbuffers_mixed_shape_bench`: the matching adapted TE
+  Userbuffers winners for all 96 OProj settings.
+- `QKVproj-a2a/qkv_shape_bench`: the v4.0 96-setting QKV matrix, including
+  tuned TE/cuBLAS/cuBLASLt+NCCL baselines and the current fused implementation.
+- `QKVproj-a2a/te_userbuffers_shape_bench`: the matching adapted TE
+  Userbuffers QKV winners.
 
-Each O-projection directory keeps only `baseline_summary.*`,
-`fused_summary.*`, and `shape_matrix.*`; each Userbuffers directory keeps
-`summary.*`. The thousands of intermediate sweep and formal-run JSON files
-are intentionally omitted.
+Each v4 operator directory keeps only `baseline_summary.*`, the final fused
+summary, `comparison_summary.*`, and `shape_matrix.*`; each Userbuffers
+directory keeps `summary.*`. The thousands of intermediate sweep and
+formal-run JSON files are intentionally omitted.
 
 The v2 fused directory intentionally keeps only `fused_summary.json` and
 `fused_summary.csv`. The superseded M256 probes, manual wide-N probes, raw
@@ -53,11 +62,11 @@ exact checks passed. A small number of very large external cases use
 indexing limit is exceeded; the timed baseline path is unchanged. The scope
 and selected parameters are recorded in the aggregate JSON files.
 
-The NCCL/execution-mode search is reproducible with
-`benchmarks/a2a+Oproj/oproj_shape_bench.py`; the TE Userbuffers search is reproducible
-with `benchmarks/a2a+Oproj/te_userbuffers_shape_bench.py`. Reproduction writes raw
-search points to the caller-selected result directory without adding them to
-Git.
+The OProj searches are reproducible with
+`benchmarks/a2a+Oproj/oproj_shape_bench.py` and
+`benchmarks/a2a+Oproj/te_userbuffers_shape_bench.py`. The QKV equivalents are
+in `benchmarks/QKVproj+a2a`. Reproduction writes raw search points to the
+caller-selected result directory without adding them to Git.
 
 The original Golden measurement snapshot is tagged
 `oproj-a2a-golden-auto-20260825`.
