@@ -296,7 +296,25 @@ void smoke_qkv_gqa_pack(
   const int64_t d_row = padded ? n + 16 : n;
   const int64_t d_batch = d_row * m + (padded ? 16 : 0);
   const fuse::GemmProblem qkv_problem{m, n, k, 1};
-  const auto traits = fuse::qkv_cutlass_kernel_traits(qkv_problem);
+  fuse::UlyssesRoute qkv_route{};
+  qkv_route.world_size = world;
+  qkv_route.rank = 0;
+  qkv_route.batch = batch;
+  qkv_route.seq_local = seq_local;
+  qkv_route.global_seq = global_seq;
+  qkv_route.q_heads = q_heads;
+  qkv_route.kv_heads = kv_heads;
+  qkv_route.head_dim = head_dim;
+  qkv_route.qkv_peer_interleaved = true;
+  qkv_route.defer_v_a2a = defer_v;
+  qkv_route.kind = fuse::RouteKind::kQkvGqaPack;
+  qkv_route.direction = fuse::RouteDirection::kForward;
+  int sm_count = 0;
+  CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, 0));
+  const auto traits = fuse::qkv_cutlass_kernel_traits(
+      qkv_problem, qkv_route, num_comm_ctas, sm_count);
   const int ready_count =
       ((m + traits.block_m - 1) / traits.block_m) *
       ((n + traits.block_n - 1) / traits.block_n) * fuse::kReadyFlagStride;
@@ -413,18 +431,8 @@ void smoke_qkv_gqa_pack(
     params[rank].gemm.stride_a = {a_row, 1, a_batch};
     params[rank].gemm.stride_b = {b_row, 1, b_batch};
     params[rank].gemm.stride_d = {d_row, 1, d_batch};
-    params[rank].route.world_size = world;
+    params[rank].route = qkv_route;
     params[rank].route.rank = rank;
-    params[rank].route.batch = batch;
-    params[rank].route.seq_local = seq_local;
-    params[rank].route.global_seq = global_seq;
-    params[rank].route.q_heads = q_heads;
-    params[rank].route.kv_heads = kv_heads;
-    params[rank].route.head_dim = head_dim;
-    params[rank].route.qkv_peer_interleaved = true;
-    params[rank].route.defer_v_a2a = defer_v;
-    params[rank].route.kind = fuse::RouteKind::kQkvGqaPack;
-    params[rank].route.direction = fuse::RouteDirection::kForward;
     params[rank].num_comm_ctas = num_comm_ctas;
     params[rank].epoch = 1;
   }
@@ -1048,17 +1056,19 @@ void smoke_qkv_wave_policy_selection() {
   route.qkv_peer_interleaved = false;
   struct Case {
     fuse::GemmProblem problem;
+    int comm_ctas;
     int expected_bn;
   };
   const Case cases[] = {
-      {{128, 4096, 4096, 1}, 128},
-      {{512, 4096, 4096, 1}, 160},
-      {{1024, 5120, 5120, 1}, pipeline_policy ? 192 : 256},
-      {{1024, 4096, 4096, 1}, 320},
+      {{128, 4096, 4096, 1}, 24, pipeline_policy ? 64 : 128},
+      {{512, 4096, 4096, 1}, 24, 160},
+      {{1024, 5120, 5120, 1}, 24, pipeline_policy ? 192 : 256},
+      {{1024, 4096, 4096, 1}, 24, 320},
   };
   for (const auto& item : cases) {
     const auto traits =
-        fuse::qkv_cutlass_kernel_traits(item.problem, route, 24, 132);
+        fuse::qkv_cutlass_kernel_traits(
+            item.problem, route, item.comm_ctas, 132);
     if (traits.block_m != 128 || traits.block_n != item.expected_bn ||
         traits.block_k != 64) {
       throw std::runtime_error("QKV wave policy selection failed");

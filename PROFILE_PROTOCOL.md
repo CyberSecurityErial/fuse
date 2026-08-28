@@ -12,10 +12,16 @@
 正式 benchmark 固定区分 `eager` 和 `graph`，两列独立报告，不把两者的差值
 当作算子优化收益。
 
+- 正式 MPI benchmark 必须使用 `FUSE_ENABLE_PROFILING=OFF` 构建；profiling
+  构建产生的计时和 JSON 只能用于诊断，不能写入 Golden/BENCHMARK。
 - `QKV Projection -> A2A` 必须使用 MPI/torchrun 一进程一卡；每个样本先在各
   rank 记录 CUDA event，再对 elapsed time 做 `MPI_MAX`。单进程按 rank 顺序
   launch 会把后续 GPU 的 host 提交时间计入前面 rank 的跨源 finalize，只能用于
   diagnostic trace，不能进入正式性能表。
+- 自动配置的正式测试必须把 `comm_ctas=0` 原样传给算子。runner 可以提前查看
+  实际选择，用它计算 ready 缓冲区大小并写入 JSON，但不能把这个数替换回计时
+  参数；结果必须同时保存 `requested_comm_ctas=0`、最终 `comm_ctas` 和自动方案
+  缓存版本。这样 `--resume` 不会把修复缓存前后的结果混在一起。
 - QKV Graph 使用一个预上传的 graph、一次 replay；graph 内含 10 个 warmup epoch
   和 50 个带独立 event pair 的正式 epoch。每个 kernel node 使用不同且单调递增的
   epoch。capture、instantiate、upload 与 MPI barrier 全部在计时外。
@@ -69,12 +75,12 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
 `N=(Hq+2*Hkv)*D`，`M=S/CP`：
 
-v7.0正式路径保持两个环境变量未设置；下列变量只用于固定policy的消融或回退复现。
+v8.0 正式路径保持两个环境变量未设置；下列变量只用于固定 policy 的消融或回退复现。
 
 ```bash
 CUDA_VISIBLE_DEVICES=<devices> \
 FUSE_QKV_COMM_POLICY=<pipeline|legacy> \
-FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n192|m128n256|m128n320> \
+FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n64|m128n128|m128n160|m128n192|m128n256|m128n320> \
 ./build/qkvproj_a2a_bench \
   --mode qkv_gemm_a2a --m <M> --k <K> \
   --batch 1 --q-heads <Hq> --kv-heads <Hkv> --head-dim <D> \
@@ -83,11 +89,32 @@ FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n192|m128n256
   --trace-out /home/chen/workspace/<name>_perfetto.json
 ```
 
+### QKV MPI role summary
+
+`qkvproj_a2a_mpi_bench` 还提供轻量的 rank 级角色时间汇总。它仅在
+`FUSE_ENABLE_PROFILING=ON` 时存在，并且在普通计时与正确性检查结束后运行：先在
+每个 rank 预热一次独立 diagnostic kernel，再经 MPI barrier 启动一次使用下一单调
+epoch 的采样 kernel。预热和采样都不进入正式样本。
+
+```bash
+CUDA_VISIBLE_DEVICES=<devices> mpirun --bind-to none -np <CP> \
+  ./build/qkvproj_a2a_mpi_bench \
+  --m <M> --k <K> --batch 1 \
+  --q-heads <Hq> --kv-heads <Hkv> --head-dim <D> \
+  --comm-ctas <comm> --raster <m|n|auto> --swizzle <1|2|4|8> \
+  --launch <eager|graph> --warmup 10 --iterations 50 --check \
+  --json-out <diagnostic_measurement.json> \
+  --role-profile --role-profile-json <role_profile.json>
+```
+
+`--role-profile` 打印每个 rank 的汇总；`--role-profile-json` 同时开启采样并写入
+结构化结果。两个 JSON 路径必须不同，且都不得作为正式 benchmark 输入。
+
 ## 事件定义
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：6
+协议版本：7（对应 v8.0）
 
 ### A2A -> GEMM
 
@@ -100,8 +127,8 @@ FUSE_QKV_GEMM_POLICY=<wave_time_model|legacy|m128n128|m128n160|m128n192|m128n256
 | `final publisher` | 最后完成该 `[ready_m, peer]` 的通信 chunk 开始执行 | ready atomic 完成 | 决定该 peer shard 发布时间的关键 chunk |
 | `task setup / input-ready wait` | 关键 chunk 开始执行 | task 解码完成且源 rank 输入 epoch 可见 | 地址计算与可能存在的上游输入生命周期等待 |
 | `remote G2S` | 发起 peer GMEM 到通信 CTA SMEM 的 bulk copy | mbarrier wait 返回 | 远端读取与 G2S TMA 阶段 |
-| `local S2G` | 发起通信 CTA SMEM 到 `input_staging` 的 store | `tma_store_wait<0>()` 返回 | 本地 GEMM 输入落盘阶段 |
-| `ready atomic` | 发起 ready counter 原子加 | 返回旧值并完成 diagnostic 时间戳 | 发布指令本身；正式 kernel 使用不返回值的 reduction |
+| `local S2G` | 发起通信 CTA SMEM 到 `input_staging` 的 store | 目的端写入完成等待返回 | 本地 GEMM 输入已完整写好，随后才能发布 ready |
+| `ready atomic` | 目标显存写入完成后，发起 ready counter 原子加 | 返回旧值并完成 diagnostic 时间戳 | 发布“这一片数据可以读取”；正式 kernel 使用不返回值的 reduction |
 
 通信分段只记录使 `[ready_m, peer]` 计数达到目标值的最后一个 chunk。每个
 task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline；因此它用于
@@ -135,6 +162,21 @@ task 会读取若干次 `%globaltimer`，但只有最终 chunk 写回 timeline�
 acquire 观察到 source N 的 epoch；它包含 source N 的剩余计算、路由和网络传播，不能
 单独解释为裸 NVLink 延迟。所有 source wait 会重叠，finalize 的暴露等待取其最大值，
 不能相加。
+
+MPI role summary 将同一批 CTA 时间戳压缩成以下字段：
+
+| 字段 | 定义 |
+|---|---|
+| `compute_role_us` | 最早 compute CTA 启动，到最晚 compute CTA 完成本地角色的包络 |
+| `route_role_us` | 最早 route CTA 启动，到最晚 route CTA 完成本地角色的包络；包含 ready wait |
+| `overlap_us` | 上述 compute 与 route 两个包络的交集 |
+| `grid_sync_us` | 本 rank 最后一个本地角色完成，到 CTA0 通过 cooperative grid barrier |
+| `finalize_us` | CTA0 通过 grid barrier，到本 rank 最后一个 CTA 退出；包含 fence、跨 rank 发布与 source-complete 等待 |
+| `kernel_us` | 本 rank 最早 CTA 启动，到最后一个 CTA 退出的完整 diagnostic kernel 包络 |
+
+这些字段来自 `%globaltimer`，只能比较同一个 rank 内的起止和跨度；不同 GPU 的
+绝对时钟值不能互相相减。它们是单次 diagnostic kernel 的角色分解，不是正式 E2E
+延迟，也不能替代 profiling 关闭后的跨 rank 最大值 10+50 结果。
 
 ### TE Userbuffers QKV 对照
 

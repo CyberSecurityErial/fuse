@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在v7.0联合选择通信CTA与GEMM tile。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。
 
 Attention 输出按 head 分片：
 
@@ -30,10 +30,16 @@ N = hidden
 - GEMM CTA 使用 system-scope acquire 消费已到达的数据，省去独立 permutation kernel 和 kernel 间同步。
 - `auto` 策略在五个成熟 policy 中选择：`M64N128`、`M128N128`、`M128N160`、`M128N256 cluster-M2`、`M128N320 cluster-M2`；wave 以 cluster 为调度单元，并优先保证 N frontier 不被 wave 边界切开。
 
-QKV Projection+A2A提供`M128N128/N160/N192/N256/N320`五种policy。H200默认
+QKV Projection+A2A 提供 `M128N64/N128/N160/N192/N256/N320` 六种 policy。H200 默认
 用GEMM wave成本、QKV通信量、NVLink下界和cluster前进代价联合选择通信CTA与tile；
-模型名称和逐case winner不参与选择，标定范围外自动回退成熟策略。完整口径见
+模型名称和逐case winner不参与选择；不支持的shape或布局自动回退成熟策略。
+132-SM设备复用H200整波标定；H800的通信估算使用400 GB/s双向NVLink，
+其他设备按900 GB/s。完整口径见
 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。
+
+`comm_ctas=0` 只在首次遇到某种设备和 shape 时计算通信 CTA 与 tile；后续 Eager
+调用直接复用结果，但仍使用本次调用自己的地址和 epoch。这样避免 H800 训练中每层
+重复读取设备信息和搜索配置。QKV 与 A2A+OProj 都会等目标显存写完后再发布 ready。
 
 默认通信策略对短中序列使用 `comm4`，长序列根据 CP、`N` 和设备 NVLink 带宽选择 `comm6/8`。实验性全量成本模型可通过 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 启用；它默认关闭，尚不属于 Golden。模型口径和边界见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
 
@@ -108,7 +114,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前融合版本：v7.0（OProj热路径沿用v4.0；QKV使用v7联合流水策略）
+当前融合版本：v8.0（OProj 性能策略沿用 v4.0；QKV 使用 v8 自动流水策略）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -120,12 +126,12 @@ Eager 与 Graph 各自做10+50正式采样，不拿两列之间的差值当算�
 完成 capture、instantiate 和显式 upload。上述极限表包含 per-shape `comm_ctas`
 单变量标定；默认自动入口不承诺零调参复现全部极限点。
 
-QKV的96点结果中，v7对TE Userbuffers的Eager/Graph胜场均为`96/96`，几何平均
-分别领先`1.268×`和`1.319×`；对最强外部基线的胜场为`93/96`和`96/96`，几何
-平均分别领先`1.201×`和`1.250×`。相对v6的全量p50几何平均提升为`1.147×`和
-`1.156×`。融合GEMM-equivalent吞吐达到经典cuBLAS的全量中位数为Eager `90.8%`、
-Graph `92.0%`；CP4分别为`93.1%/93.6%`，CP8为`86.7%/88.2%`。所有case使用
-同一自动入口，运行时不读取逐shape winner或TE结果。
+QKV的96点v8结果中，Eager/Graph对TE Userbuffers均为`96/96`胜场，几何平均
+分别领先`1.282×`和`1.337×`；对最强外部基线也均为`96/96`，几何平均分别领先
+`1.215×`和`1.267×`。相对v7的全量p50几何平均提升为`1.0116×`和`1.0135×`。
+融合吞吐达到经典cuBLAS的全量中位数为Eager `91.0%`、Graph `92.2%`；CP4分别为
+`92.6%/93.4%`，CP8为`88.8%/90.0%`。所有case使用同一自动入口，运行时不读取
+逐shape winner或TE结果。
 
 完整数据与复现流程：
 

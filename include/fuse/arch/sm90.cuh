@@ -19,6 +19,14 @@ __device__ __forceinline__ void fence_system() {
   asm volatile("fence.sc.sys;\n" ::: "memory");
 }
 
+// CUTLASS' cute::tma_store_wait<0>() uses the `.read` form, which only waits
+// until the async engine has finished reading the source SMEM.  Publication
+// of a consumer-visible flag needs the destination-global writes to be
+// complete as well, so use the full wait-group form at that boundary.
+__device__ __forceinline__ void tma_store_wait_all() {
+  asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+}
+
 __device__ __forceinline__ uint32_t load_acquire_gpu(const uint32_t* ptr) {
   uint32_t value;
   asm volatile(

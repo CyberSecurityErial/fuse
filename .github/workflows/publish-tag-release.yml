@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v7.0
+        default: v8.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v7.0");
+              : (process.env.REQUESTED_TAG || "v8.0");
 
             const releases = {
               "v1.0": {
@@ -132,6 +132,30 @@ jobs:
                   "对 `min(TE Userbuffers, 最强 TE/cuBLASLt+NCCL 分离方案)`，Eager/Graph 胜场为 93/96 与 96/96，几何平均为 1.201× 与 1.250×。融合 GEMM-equivalent 吞吐达到经典 cuBLAS 的中位数为 Eager 90.8%、Graph 92.0%。",
                   "",
                   "正式口径为 BF16、MPI 一进程一卡、10 warmup + 50 samples、每个 sample 先取跨 rank 最大延迟再统计 p50/p95；Eager 与 CUDA Graph 分列。完整逐点表、纯 cuBLAS 吞吐对照和复现命令均已归档。",
+                ].join("\n"),
+              },
+              "v8.0": {
+                name: "v8.0 — QKV N64 与稳定自动启动",
+                body: [
+                  "v8.0 继续优化 QKV Projection + A2A，并修正自动启动和数据发布中的两个问题。A2A + OProj 的性能策略不变。",
+                  "",
+                  "新增 `M128N64 cluster1`。运行时把它和原有五种 tile 放进同一套计算中，比较每种组合需要多少轮计算以及每轮耗时，再选择预计总时间最短的一种。N64 没有模型名、benchmark shape 或 `comm_ctas` 阈值特判；尤其不存在“通信 CTA 至少为 16 才能选择 N64”的条件。",
+                  "",
+                  "修复 H800 Eager 模式下 `comm_ctas=0` 反复变慢的问题。旧实现每次调用都会重新读取 GPU 信息，并重新遍历通信 CTA 和 GEMM tile 组合；H800 上读取设备信息可能等待前面的 GPU 工作，所以训练中的每一层都会重复付出这段时间。现在相同设备、shape、route 和环境配置只在第一次调用时计算一次，后续直接复用通信 CTA 与 tile；NVLink 带宽信息也只读取一次。直接传 0 和上层先调用公开 CTA 推荐接口都会命中缓存。CUDA Graph 原本只在 capture 时做这一步，因此本修复主要改善 Eager 和真实训练中的逐层调用。",
+                  "",
+                  "修复 ready 可能过早发布的问题。旧等待只保证 TMA 已经读完源共享内存，不能保证目标显存已经写完；v8 必须等目标显存中的整块数据完整可见，才发布“数据可读”标记。该规则同时用于 QKV 输出和 A2A + OProj 输入。",
+                  "A2A + OProj 随后按原口径重跑 96 个 setting 的 Eager/Graph：全部零误差，几何平均延迟相对旧结果分别变化 +0.11% / -0.06%，没有系统性退化。唯一绝对时间波动超过 5% 的长序列点，同次纯 GEMM 也慢了约 8%。",
+                  "",
+                  "smoke test 现在根据真实 route、通信 CTA、SM 数和实际自动 tile 分配 ready 缓冲区。自动选择 N64 时，不再按旧 N128 大小分配测试内存。",
+                  "",
+                  "🩵 **v8 相对 v7 的 Eager/Graph 96 点 p50 几何平均为 1.0116× / 1.0135×；对 TE Userbuffers 均为 96/96 胜场，几何平均领先 1.282× / 1.337×。**",
+                  "",
+                  "H800 同一训练 case 中，修复前的自动入口训练 step 为 855～1250 ms，显式配置约 662.6 ms，legacy auto 约 668.3 ms。当前机器没有 H800，修复后的 H800 训练 step 仍需在对应环境复验；H200 同 shape 三次复测中，自动入口与等价显式配置的 p50 中位数为 43.440 μs 与 43.248 μs，只差 0.44%。",
+                  "",
+                  "H200 正式验证包含 192 份 raw、96 个唯一 setting；N64 命中 9 点，其中 6 点提升、3 点回退，N64 子集相对 v7 的 Eager/Graph 几何平均提升为 1.1368× / 1.1503×。3 个回退点仍全部领先 TE Userbuffers。8 卡完整 smoke 覆盖 CP2/4/8、BF16/FP8、完整 QKV/defer-V 和 padding，均通过。",
+                  "融合端到端吞吐达到经典 cuBLAS 纯 GEMM 吞吐的中位数为 Eager 91.0%、Graph 92.2%。",
+                  "",
+                  "正式口径仍为 BF16、MPI 一进程一卡、10 warmup + 50 samples、逐样本 max-rank p50/p95，并分别报告 Eager 与 CUDA Graph。H200 的性能数字与 H800 的 Eager 启动修复分开报告。",
                 ].join("\n"),
               },
             };
