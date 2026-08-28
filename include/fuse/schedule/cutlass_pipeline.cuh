@@ -432,18 +432,21 @@ struct SignalingEpilogue : Base {
         subtile_idx);
 
     if (thread_idx == 0 && params_->ready) {
-      cute::tma_store_wait<0>();
-        const int32_t m = static_cast<int32_t>(cute::get<0>(tile_coord));
-        const int32_t n = static_cast<int32_t>(cute::get<1>(tile_coord));
-        const int32_t l = static_cast<int32_t>(cute::get<3>(tile_coord));
-        const bool valid_tile =
-            m >= 0 && m < params_->m_tiles && n >= 0 && n < params_->n_tiles;
-        const int32_t tile =
-            (l * params_->m_tiles + m) * params_->n_tiles + n;
-        if (valid_tile) {
-          store_release_system(
-              params_->ready + tile * kReadyFlagStride, params_->epoch);
-        }
+      // ready is consumed by a different CTA.  The `.read` TMA wait used by
+      // CUTE is sufficient for SMEM reuse, but it does not guarantee that D
+      // is visible in global memory.  Fully drain this tile before release.
+      tma_store_wait_all();
+      const int32_t m = static_cast<int32_t>(cute::get<0>(tile_coord));
+      const int32_t n = static_cast<int32_t>(cute::get<1>(tile_coord));
+      const int32_t l = static_cast<int32_t>(cute::get<3>(tile_coord));
+      const bool valid_tile =
+          m >= 0 && m < params_->m_tiles && n >= 0 && n < params_->n_tiles;
+      const int32_t tile =
+          (l * params_->m_tiles + m) * params_->n_tiles + n;
+      if (valid_tile) {
+        store_release_system(
+            params_->ready + tile * kReadyFlagStride, params_->epoch);
+      }
     }
     return states;
   }

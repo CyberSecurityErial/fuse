@@ -1,9 +1,16 @@
 # Archived benchmark results
 
-The committed result set contains the A2A -> O-projection benchmark archive
-and the v7.0 QKV projection -> A2A fused results on the local 132-SM
-H200-class NVLink node. QKV external baselines remain the independently tuned
-v4/v5 archive; the fused Eager/Graph measurements and comparison table are v7.0.
+当前归档包含A2A -> O-projection历史Golden，以及132-SM H200 NVLink节点上的
+QKV projection -> A2A结果。QKV外部基线继续使用独立调优的v4/v5归档；融合侧
+Eager/Graph结果和对比表为v8.0正式96点采样。
+
+v8归档需要同时保存用户请求的`comm_ctas=0`、实际解析出的通信CTA、实际tile和
+policy模型版本。正式runner会把0原样传给launcher，第一次prime完成自动选择，后续
+Eager样本复用该结果；不能在计时前把0替换成实际CTA，否则测不到真实自动入口。
+
+v8还包含两项正确性修复：发布ready之前先等TMA目标显存完整写完；smoke按真实自动
+tile分配ready缓冲区，覆盖N64。正式结果必须来自profiling关闭的构建，diagnostic
+role profile不得混入Golden。
 
 Measurement contract:
 
@@ -36,10 +43,9 @@ Committed directories:
   newly calibrated real-model rows.
 - `a2a-Oproj/te_userbuffers_mixed_shape_bench`: the matching adapted TE
   Userbuffers winners for all 96 OProj settings.
-- `QKVproj-a2a/qkv_shape_bench`: the 96-setting QKV matrix. It combines the
-  independently tuned TE/cuBLAS/cuBLASLt+NCCL archive with the v7.0 fused
-  Eager/Graph results, resolved policy metadata, classic-cuBLAS throughput,
-  and the fused-throughput percentage relative to classic cuBLAS.
+- `QKVproj-a2a/qkv_shape_bench`: 96个QKV setting。它保留独立调优的
+  TE/cuBLAS/cuBLASLt+NCCL归档，并保存v8 Eager/Graph结果、N64在内的实际policy
+  信息、自动方案缓存版本、经典cuBLAS吞吐和融合吞吐占比。
 - `QKVproj-a2a/te_userbuffers_shape_bench`: the matching adapted TE
   Userbuffers QKV winners.
 

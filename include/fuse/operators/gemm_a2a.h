@@ -46,6 +46,11 @@ struct Fp8GemmA2AParams {
 };
 
 KernelTraits projection_cutlass_kernel_traits();
+// Without route/communication information, return the finest supported QKV
+// geometry so callers can size ready/workspace buffers safely. This does not
+// report the kernel selected by auto. To query the actual selected geometry,
+// use the overload below and pass its resolved, positive communication-CTA
+// count rather than the auto sentinel 0.
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem);
 KernelTraits qkv_cutlass_kernel_traits(
     const GemmProblem& problem,

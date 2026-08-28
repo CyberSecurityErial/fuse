@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass
@@ -86,7 +87,7 @@ def expected_qkv_policy_metadata() -> tuple[str, str, str]:
     gemm = os.environ.get("FUSE_QKV_GEMM_POLICY")
     comm = os.environ.get("FUSE_QKV_COMM_POLICY")
     known_gemm = {
-        "legacy", "wave_time_model", "m128n128", "m128n160",
+        "legacy", "wave_time_model", "m128n64", "m128n128", "m128n160",
         "m128n192", "m128n256", "m128n320",
     }
     known_comm = {"pipeline", "roofline", "legacy"}
@@ -101,9 +102,9 @@ def expected_qkv_policy_metadata() -> tuple[str, str, str]:
     if not calibrated_tile:
         model = "manual_override" if gemm in known_gemm else "unrecognized"
     elif pipeline:
-        model = "calibrated_pipeline_independent_progress_v2"
+        model = "calibrated_pipeline_independent_progress_v3"
     elif gemm == "wave_time_model":
-        model = "calibrated_wave_time_independent_progress_v2"
+        model = "calibrated_wave_time_independent_progress_v3"
     else:
         model = "calibrated_wave_time_v1"
     return gemm_request, comm_request, model
@@ -223,17 +224,22 @@ def run(command: list[str], *, env: dict[str, str], output: Path, resume: bool) 
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     print("RUN", " ".join(command), flush=True)
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
     if completed.returncode != 0:
         print(completed.stdout, end="")
         print(completed.stderr, end="")
+        output.unlink(missing_ok=True)
         completed.check_returncode()
 
 
@@ -396,7 +402,7 @@ def fuse_command(
 
 def mpi_config_rows(args: argparse.Namespace) -> dict[str, dict[str, object]]:
     if args.mpi_auto_comm:
-        # v7 production benchmark: one uniform launch contract.  The runtime
+        # Production benchmark: one uniform launch contract.  The runtime
         # derives comm CTAs and tile geometry from the physical model; no
         # per-case manifest entry participates in selection.
         return {
@@ -492,6 +498,7 @@ def mpi_result_matches(
         result = load(path)
         shape = result["shape"]
         geometry = result.get("head_geometry", {})
+        samples = result.get("samples_ms")
         gemm_request, comm_request, policy_model = (
             expected_qkv_policy_metadata()
         )
@@ -501,6 +508,23 @@ def mpi_result_matches(
             and result["world_size"] == cp
             and result["warmup"] == warmup
             and result["iterations"] == iters
+            and result.get("profiling_build") is False
+            and result.get("role_profile_requested") is False
+            and isinstance(samples, list)
+            and len(samples) == iters
+            and all(
+                isinstance(sample, (int, float))
+                and not isinstance(sample, bool)
+                and math.isfinite(sample)
+                for sample in samples
+            )
+            and (
+                result.get("correctness") == "fused_vs_separated_reference"
+                if seq == 1024
+                else result.get("correctness") in {
+                    "not_run", "fused_vs_separated_reference"
+                }
+            )
             and shape == {
                 "m": seq // cp,
                 "n": model.qkv_width,
@@ -523,6 +547,7 @@ def mpi_result_matches(
             and result.get("qkv_policy_request") == gemm_request
             and result.get("qkv_comm_policy_request") == comm_request
             and result.get("qkv_policy_model") == policy_model
+            and result.get("launch_plan_cache") == "per_process_v1"
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -1021,6 +1046,7 @@ def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
                 iters=args.formal_iters,
                 auto_comm=args.mpi_auto_comm,
             ):
+                output.unlink(missing_ok=True)
                 raise RuntimeError(f"invalid MPI benchmark output: {output}")
 
 
@@ -1057,6 +1083,20 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
         graph_policy_model = graph.get("qkv_policy_model")
         if eager_policy_model != graph_policy_model:
             raise ValueError(f"eager/graph policy model mismatch for {case_key}")
+        eager_plan_cache = eager.get("launch_plan_cache")
+        graph_plan_cache = graph.get("launch_plan_cache")
+        if eager_plan_cache != graph_plan_cache:
+            raise ValueError(f"eager/graph launch-plan cache mismatch for {case_key}")
+        if eager_plan_cache != "per_process_v1":
+            raise ValueError(f"unknown launch-plan cache for {case_key}")
+        eager_requested_comm = eager.get("requested_comm_ctas")
+        graph_requested_comm = graph.get("requested_comm_ctas")
+        if eager_requested_comm != graph_requested_comm:
+            raise ValueError(
+                f"eager/graph requested comm CTA mismatch for {case_key}"
+            )
+        if args.mpi_auto_comm and eager_requested_comm != 0:
+            raise ValueError(f"auto comm request was not preserved for {case_key}")
         shape = eager["shape"]
         traits = eager["kernel_traits"]
         flops = 2.0 * shape["m"] * shape["n"] * shape["k"]
@@ -1079,10 +1119,12 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
             "within_native_context": (
                 model.max_context is None or seq <= model.max_context
             ),
+            "requested_comm_ctas": eager_requested_comm,
             "comm_ctas": eager["comm_ctas"],
             "qkv_policy_request": eager_policy,
             "qkv_comm_policy_request": eager_comm_policy,
             "qkv_policy_model": eager_policy_model,
+            "launch_plan_cache": eager_plan_cache,
             "raster": eager["raster"],
             "swizzle": eager["swizzle"],
             "tile_m": traits["tile_m"],

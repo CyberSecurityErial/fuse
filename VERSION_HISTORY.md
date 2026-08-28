@@ -371,3 +371,78 @@ manifest只保留作v5/v6复现。
 Eager相对v6有3个setting回退0.3%～1.9%，三点仍分别比TE Userbuffers快26.0%～
 35.3%；Graph全96点也全部超过最强外部基线。完整逐点数据与复现命令见
 [`benchmarks/QKVproj+a2a/BENCHMARK.md`](benchmarks/QKVproj+a2a/BENCHMARK.md)。
+
+## v8.0：QKV N64 与稳定自动启动
+
+状态：已发布。
+
+### N64进入统一选择
+
+v8新增`M128N64 cluster-M1`。它与`M128N128`、`M128N160`、`M128N192`、
+`M128N256 cluster-M2`和`M128N320 cluster-M2`使用同一套启动前计算：先根据
+真实M/N/K算出每种tile需要多少个计算wave，再结合独立测得的整波时间和通信时间，
+选择预计总时间最短的组合。
+
+N64没有模型名、benchmark shape或`comm_ctas`阈值特判；尤其不存在“通信CTA至少
+为16才能使用N64”的条件。H200整波测量保存在
+[`qkv_wave_calibration.csv`](benchmarks/QKVproj+a2a/qkv_wave_calibration.csv)，
+TE Userbuffers结果和96点逐case winner不参与选择。
+
+### 修复H800 Eager每层重复选择
+
+旧实现收到`comm_ctas=0`时，每次Eager调用都会重新读取GPU信息，并重新遍历通信CTA
+和GEMM tile组合。H800上读取设备信息可能等待前面的GPU工作，所以训练中的每一层都
+可能重复付出这段时间；显式写死通信CTA时不会走这条路径。CUDA Graph只在capture时
+执行一次主机侧选择，因此这个问题在Graph replay里不明显。
+
+v8在第一次调用时生成完整启动配置，记住实际通信CTA、tile、SM数和设备。之后遇到
+相同设备、shape、route和环境配置时直接复用，不再逐层读取设备属性或重新搜索。
+NVLink带宽信息也按设备读取一次。数据指针、epoch和alpha仍使用每次调用的新值，
+不会被缓存。
+上层无论是直接把`comm_ctas=0`交给launcher，还是先调用公开的CTA推荐接口，
+都会复用同一类已解析结果，不会从另一个入口重复付这段开销。
+
+H800原问题已经用同一训练case稳定复现；当前机器没有H800，因此修复后的H800
+训练step仍需在对应环境复验。H200上使用同一shape连续三次测试，自动入口与等价
+显式配置的p50中位数分别为43.440 μs和43.248 μs，只差0.44%，说明后续调用已走
+复用路径。
+
+| 启动方式 | 修复前 | 修复后 | 显式通信CTA对照 |
+|---|---:|---:|---:|
+| Eager训练step | 855～1250 ms | 待H800环境复验 | 约662.6 ms；legacy auto约668.3 ms |
+
+### 数据写完以后再发布ready
+
+TMA store原有等待只保证异步引擎已经读完源共享内存，不能保证目标显存已经写完。
+旧代码随后立即发布ready，消费者理论上可能先看到“数据可读”，再遇到尚未完成的
+目标写入。v8改为完整等待目标显存中的整块数据写完，再发布ready。该规则同时覆盖
+QKV GEMM输出和A2A+OProj输入；epoch与system-scope内存顺序保持不变。
+
+为确认这项修复没有拖慢A2A+OProj，v8又按原口径重跑了96个setting的Eager和
+CUDA Graph：所有结果均为零误差，几何平均延迟相对旧结果分别变化`+0.11%`和
+`-0.06%`，没有系统性退化。唯一绝对时间波动超过5%的长序列点，同一次运行中的
+纯GEMM也慢了约8%，因此判断为测试环境波动，而不是融合路径效率下降。
+
+### smoke按真实tile分配ready缓冲区
+
+旧smoke按默认tile大小计算ready数组。自动策略选择N64后，N方向tile数量会增加，
+继续按N128分配会使测试缓冲区偏小。v8先用真实route、通信CTA、SM数和自动选择结果
+取得实际BM/BN，再据此分配ready数组。这是测试脚手架的正确性修复，不改变生产接口。
+
+### 正式结果
+
+当前融合版本：v8.0
+
+| QKVProj+A2A，96个setting | v7 Eager | v8 Eager | v7 Graph | v8 Graph |
+|---|---:|---:|---:|---:|
+| 对TE Userbuffers胜场 | 96/96 | 96/96 | 96/96 | 96/96 |
+| 对最强外部基线胜场 | 93/96 | 96/96 | 96/96 | 96/96 |
+| 相对v7 p50几何平均 | 1.000× | 1.0116× | 1.000× | 1.0135× |
+| 融合吞吐 / 经典cuBLAS吞吐，中位数 | 90.8% | 91.0% | 92.0% | 92.2% |
+| N64实际命中 | — | 9/96 | — | 9/96 |
+
+H200正式结果包含192份raw、96个唯一setting；Eager和Graph均为96/96领先
+TE Userbuffers。N64命中9点，6点提升、3点回退，子集相对v7几何平均提升
+1.1368×/1.1503×；3个回退点仍全部领先TE Userbuffers。8卡完整smoke覆盖
+CP2/4/8、BF16/FP8、完整QKV/defer-V和padding，均通过。H200的性能数字与H800的
+Eager启动问题分开报告，不把H200吞吐数字直接当作H800性能承诺。

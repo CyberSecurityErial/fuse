@@ -711,9 +711,9 @@ void report_gemm_a2a_role_trace(
       gemm_request == "wave_time_model";
   const std::string policy_model = !calibrated_tile_model
       ? "manual_override"
-      : (pipeline_model ? "calibrated_pipeline_independent_progress_v2"
+      : (pipeline_model ? "calibrated_pipeline_independent_progress_v3"
                         : (gemm_policy != nullptr
-                                  ? "calibrated_wave_time_independent_progress_v2"
+                                  ? "calibrated_wave_time_independent_progress_v3"
                                   : "calibrated_wave_time_v1"));
   const auto traits = fuse::qkv_cutlass_kernel_traits(
       params[0].gemm,
@@ -729,6 +729,7 @@ void report_gemm_a2a_role_trace(
         << ",\"qkv_policy_request\":\"" << gemm_request
         << "\",\"qkv_comm_policy_request\":\"" << comm_request
         << "\",\"qkv_policy_model\":\"" << policy_model
+        << "\",\"launch_plan_cache\":\"per_process_v1"
         << "\",\"tile_m\":" << traits.block_m
         << ",\"tile_n\":" << traits.block_n
         << ",\"tile_k\":" << traits.block_k
@@ -1517,7 +1518,8 @@ void write_json(
         comm_policy_override == nullptr ? "" : comm_policy_override;
     const bool known_policy =
         policy_value == "legacy" || policy_value == "wave_time_model" ||
-        policy_value == "m128n128" || policy_value == "m128n160" ||
+        policy_value == "m128n64" || policy_value == "m128n128" ||
+        policy_value == "m128n160" ||
         policy_value == "m128n192" ||
         policy_value == "m128n256" || policy_value == "m128n320";
     const bool pipeline_model = comm_policy_override == nullptr ||
@@ -1526,9 +1528,9 @@ void write_json(
         (known_policy && policy_value == "wave_time_model");
     const std::string policy_model = !calibrated_tile_model
         ? (known_policy ? "manual_override" : "unrecognized")
-        : (pipeline_model ? "calibrated_pipeline_independent_progress_v2"
+        : (pipeline_model ? "calibrated_pipeline_independent_progress_v3"
                           : (policy_override != nullptr
-                                    ? "calibrated_wave_time_independent_progress_v2"
+                                    ? "calibrated_wave_time_independent_progress_v3"
                                     : "calibrated_wave_time_v1"));
     const bool known_comm_policy = comm_policy_override == nullptr ||
         comm_policy_value == "pipeline" || comm_policy_value == "roofline" ||
@@ -1545,7 +1547,8 @@ void write_json(
            << "\",\n"
            << "  \"qkv_policy_model\": \""
            << policy_model
-           << "\",\n";
+           << "\",\n"
+           << "  \"launch_plan_cache\": \"per_process_v1\",\n";
   }
   if (options.mode == "qkv_gemm_a2a" ||
       options.mode == "qkv_gemm_a2a_fp8") {

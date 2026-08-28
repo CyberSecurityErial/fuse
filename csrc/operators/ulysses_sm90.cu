@@ -29,7 +29,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace fuse {
 namespace {
@@ -39,6 +41,7 @@ using namespace cute;
 using Element = Bf16;
 using Fp8Element = Fp8E4m3;
 using Accumulator = float;
+using N64TileShape = Shape<_128, _64, _64>;
 using TileShape = Shape<_128, _128, _64>;
 using M64TileShape = Shape<_64, _128, _64>;
 using N160TileShape = Shape<_128, _160, _64>;
@@ -165,6 +168,7 @@ bool supported_route_base(const UlyssesRoute& route) {
 }
 
 enum class QkvGemmPolicy {
+  kM128N64,
   kM128N128,
   kM128N160,
   kM128N192,
@@ -178,7 +182,8 @@ struct QkvPolicyGeometry {
   int32_t cluster_m;
 };
 
-constexpr std::array<QkvPolicyGeometry, 5> kQkvPolicyGeometries{{
+constexpr std::array<QkvPolicyGeometry, 6> kQkvPolicyGeometries{{
+    {QkvGemmPolicy::kM128N64, 64, 1},
     {QkvGemmPolicy::kM128N128, 128, 1},
     {QkvGemmPolicy::kM128N160, 160, 1},
     {QkvGemmPolicy::kM128N192, 192, 1},
@@ -189,7 +194,7 @@ constexpr std::array<QkvPolicyGeometry, 5> kQkvPolicyGeometries{{
 struct QkvWaveCalibrationRow {
   int32_t k;
   // One full compute wave in nanoseconds, indexed like kQkvPolicyGeometries.
-  std::array<int32_t, 5> wave_ns;
+  std::array<int32_t, 6> wave_ns;
 };
 
 // H200 BF16 primitive calibration for the QKV tile selector.  These are
@@ -197,14 +202,15 @@ struct QkvWaveCalibrationRow {
 //   * H200 SXM, 132 SMs; CUDA events; warmup=5, iterations=20.
 //   * comm=24 leaves 108 compute CTAs; comm=32 leaves 100 compute CTAs.
 //   * Each calibration shape supplies one full (or nearest legal) wave for
-//     exactly one policy.  N128/N160/N192 use cluster-M1;
+//     exactly one policy.  N64/N128/N160/N192 use cluster-M1;
 //     N256/N320 use cluster-M2.
+//     N64 uses (M,N)=(128,6912), exactly 108 N64 tiles at comm=24.
 //     comm=24 uses (M,N)=(128,13824), (128,17152), (256,13824),
 //     (256,17152); comm=32 uses N=12800/15872 with the same M mapping.
-//     N192 was measured once at comm=24 with (M,N)=(128,20736).  Its value is
-//     duplicated in the comm=32 array only to keep a uniform policy index;
-//     v7 treats tile service cost as independent of the worker split, while
-//     the mature v6 path excludes N192.
+//     N64 and N192 were measured once at comm=24.  Their values are duplicated
+//     in the comm=32 array only to keep a uniform policy index; the general
+//     model treats tile service cost as independent of the worker split, while
+//     the mature v6 path excludes both experimental geometries.
 // The selector multiplies this measured one-wave latency by the number of
 // persistent waves required by the real MxN problem.  This is an
 // architecture-level calibration, not a per-shape winner table: runtime M/N
@@ -213,19 +219,19 @@ struct QkvWaveCalibrationRow {
 // compute_subgrid_cutlass on the calibration shapes documented above,
 // whenever the GPU, CUDA/CUTLASS version, or kernel policy changes.
 constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm24{{
-    {2048, {25248, 28768, 32736, 31792, 40400}},
-    {3072, {32304, 37264, 43440, 41600, 53296}},
-    {4096, {39136, 46496, 54592, 50656, 65728}},
-    {5120, {45632, 54400, 64304, 60128, 78496}},
-    {16384, {126704, 150656, 181360, 167328, 219744}},
+    {2048, {15312, 25248, 28768, 32736, 31792, 40400}},
+    {3072, {18816, 32304, 37264, 43440, 41600, 53296}},
+    {4096, {25520, 39136, 46496, 54592, 50656, 65728}},
+    {5120, {28752, 45632, 54400, 64304, 60128, 78496}},
+    {16384, {78352, 126704, 150656, 181360, 167328, 219744}},
 }};
 
 constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm32{{
-    {2048, {24288, 27680, 32736, 31456, 39440}},
-    {3072, {30880, 35840, 43440, 41056, 52304}},
-    {4096, {36768, 44496, 54592, 50256, 64896}},
-    {5120, {43920, 51504, 64304, 59392, 77152}},
-    {16384, {117696, 141040, 181360, 165456, 213024}},
+    {2048, {15312, 24288, 27680, 32736, 31456, 39440}},
+    {3072, {18816, 30880, 35840, 43440, 41056, 52304}},
+    {4096, {25520, 36768, 44496, 54592, 50256, 64896}},
+    {5120, {28752, 43920, 51504, 64304, 59392, 77152}},
+    {16384, {78352, 117696, 141040, 181360, 165456, 213024}},
 }};
 
 // Incremental cost of one additional 16-KiB route-task wave.  The value is
@@ -234,10 +240,16 @@ constexpr std::array<QkvWaveCalibrationRow, 5> kQkvWaveCalibrationComm32{{
 // primitive cost, not a model-shape winner.
 constexpr int64_t kQkvRouteTaskWaveNs = 4300;
 
+// Standalone H200 route sweeps reach their useful one-way fabric bandwidth at
+// 16 communication CTAs.  The joint model uses this architecture-level
+// saturation point to cap its NVLink bandwidth estimate; it is not a tile
+// eligibility threshold.
+constexpr int32_t kQkvFabricSaturationCommCtas = 16;
+
 bool qkv_pipeline_policy_enabled() {
   const char* value = std::getenv("FUSE_QKV_COMM_POLICY");
-  // v7 uses the physical pipeline model by default.  Keep the mature v6
-  // selector available for reproducibility and rollback; unknown values also
+  // The physical pipeline model is the production default.  Keep the mature
+  // legacy selector available for reproducibility and rollback; unknown values also
   // fall back instead of silently enabling a misspelled experimental mode.
   return value == nullptr || std::strcmp(value, "pipeline") == 0 ||
       std::strcmp(value, "roofline") == 0;
@@ -315,10 +327,11 @@ QkvComputeEstimate estimate_qkv_compute(
   int64_t best_independent_ns = std::numeric_limits<int64_t>::max();
   for (size_t index = 0; index < kQkvPolicyGeometries.size(); ++index) {
     const auto& candidate = kQkvPolicyGeometries[index];
-    // N192 is the v7 independent-progress candidate.  The mature v6 selector
+    // N64 and N192 are general-model candidates.  The mature v6 selector
     // remains bit-for-bit on its original four-policy search space.
     if (!allow_general_comm &&
-        candidate.policy == QkvGemmPolicy::kM128N192) {
+        (candidate.policy == QkvGemmPolicy::kM128N64 ||
+         candidate.policy == QkvGemmPolicy::kM128N192)) {
       continue;
     }
     if (candidate.cluster_m == 2 &&
@@ -413,6 +426,9 @@ QkvGemmPolicy select_qkv_gemm_policy(
     if (std::strcmp(value, "legacy") == 0) {
       return legacy_qkv_gemm_policy(problem);
     }
+    if (std::strcmp(value, "m128n64") == 0) {
+      return QkvGemmPolicy::kM128N64;
+    }
     if (std::strcmp(value, "m128n128") == 0) {
       return QkvGemmPolicy::kM128N128;
     }
@@ -441,6 +457,55 @@ QkvGemmPolicy select_qkv_gemm_policy(
       peer_interleaved,
       pipeline_comm);
 }
+
+// Narrow-N latency geometry for short, under-filled QKV projections.  The
+// production selector evaluates it with the same calibrated compute/route
+// cost model as every other geometry, without a shape- or comm-specific gate.
+using N64Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        N64TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+
+using N64Mainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutB,
+        kAlignment,
+        Accumulator,
+        N64TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename N64Epilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
+
+using N64ObservedEpilogue = detail::SignalingEpilogue<N64Epilogue>;
+using N64OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N64Mainloop,
+    N64ObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using N64PureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    N64Mainloop,
+    N64Epilogue,
+    cutlass::gemm::PersistentScheduler>;
 
 using BaseEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90,
@@ -1299,7 +1364,10 @@ struct A2ALhsInputCommT {
               cute::tma_store_arrive();
             }
           }
-          cute::tma_store_wait<0>();
+          // The ready flag is consumed by another CTA.  Waiting only for the
+          // source-SMEM read would allow that consumer to observe ready before
+          // the destination-global writes have completed.
+          detail::tma_store_wait_all();
 #if FUSE_ENABLE_PROFILING
           if constexpr (Instrumented) {
             sample.s2g_done = detail::read_global_timer();
@@ -1816,6 +1884,10 @@ struct QkvGqaPackCommT {
           __syncwarp();
         }
         if (lane == 0) {
+          // Per-task `.read` waits above make each stage reusable.  Before
+          // this CTA publishes completion, also wait for every destination
+          // global write issued by this lane to finish.
+          detail::tma_store_wait_all();
           cutlass::arch::ClusterBarrier::invalidate(barrier);
         }
       }
@@ -2051,6 +2123,14 @@ using QkvGqaPackCommWide = QkvGqaPackCommT<
     false,
     static_cast<int32_t>(cute::size<0>(ProjectionTileShape{})),
     static_cast<int32_t>(cute::size<1>(ProjectionTileShape{}))>;
+using QkvGqaPackCommN64 = QkvGqaPackCommT<
+    GemmA2AParams,
+    false,
+    static_cast<int32_t>(cute::size<0>(N64TileShape{})),
+    static_cast<int32_t>(cute::size<1>(N64TileShape{})),
+    4,
+    false,
+    kQkvBulkColumns>;
 using QkvGqaPackCommN160 = QkvGqaPackCommT<
     GemmA2AParams,
     false,
@@ -2089,6 +2169,8 @@ using Fp8QkvGqaPackComm = QkvGqaPackCommT<
 
 using QkvGemmA2AKernelWide =
     detail::MonolithicGemm<ProjectionOutputGemm, QkvGqaPackCommWide>;
+using QkvGemmA2AKernelN64 =
+    detail::MonolithicGemm<N64OutputGemm, QkvGqaPackCommN64>;
 using QkvGemmA2AKernelN160 =
     detail::MonolithicGemm<N160OutputGemm, QkvGqaPackCommN160>;
 using QkvGemmA2AKernelN192 =
@@ -2204,6 +2286,10 @@ struct GemmA2ARoleTelemetryKernel
 static_assert(
     sizeof(typename QkvGemmA2AKernelWide::SharedStorage) >=
         QkvGqaPackCommWide::SharedStorageBytes);
+static_assert(
+    sizeof(typename QkvGemmA2AKernelN64::SharedStorage) >=
+        QkvGqaPackCommN64::SharedStorageBytes);
+static_assert(N64OutputGemm::MaxThreadsPerBlock == 384);
 static_assert(
     sizeof(typename QkvGemmA2AKernelN160::SharedStorage) >=
         QkvGqaPackCommN160::SharedStorageBytes);
@@ -2781,7 +2867,6 @@ cudaError_t launch_gemm_a2a_impl(
   return detail::launch_cooperative<Kernel>(kernel_params, stream, sm_count);
 }
 
-
 }  // namespace
 
 // Public operator API.
@@ -2805,37 +2890,18 @@ KernelTraits projection_cutlass_kernel_traits() {
 }
 
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem) {
-  switch (legacy_qkv_gemm_policy(problem)) {
-    case QkvGemmPolicy::kM128N160:
-      return {
-          128,
-          160,
-          64,
-          static_cast<int32_t>(N160OutputGemm::get_block_shape().x),
-          static_cast<int32_t>(
-              sizeof(typename QkvGemmA2AKernelN160::SharedStorage))};
-    case QkvGemmPolicy::kM128N192:
-      return {
-          128,
-          192,
-          64,
-          static_cast<int32_t>(N192OutputGemm::get_block_shape().x),
-          static_cast<int32_t>(
-              sizeof(typename QkvGemmA2AKernelN192::SharedStorage))};
-    case QkvGemmPolicy::kM128N256ClusterM2:
-      return projection_cutlass_kernel_traits();
-    case QkvGemmPolicy::kM128N320ClusterM2:
-      return {
-          128,
-          320,
-          64,
-          static_cast<int32_t>(WideN320OutputGemm::get_block_shape().x),
-          static_cast<int32_t>(
-              sizeof(typename QkvGemmA2AKernelN320::SharedStorage))};
-    case QkvGemmPolicy::kM128N128:
-      break;
-  }
-  return cutlass_kernel_traits();
+  (void)problem;
+  // This overload has no route, communication split or SM count, so it
+  // cannot know the auto-selected kernel. Return the finest real geometry as
+  // a conservative ready/workspace sizing contract. The route-aware overload
+  // below reports the actual selected kernel.
+  return {
+      128,
+      64,
+      64,
+      static_cast<int32_t>(N64OutputGemm::get_block_shape().x),
+      static_cast<int32_t>(
+          sizeof(typename QkvGemmA2AKernelN64::SharedStorage))};
 }
 
 KernelTraits qkv_cutlass_kernel_traits(
@@ -2848,6 +2914,14 @@ KernelTraits qkv_cutlass_kernel_traits(
       num_comm_ctas,
       sm_count,
       route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N64:
+      return {
+          128,
+          64,
+          64,
+          static_cast<int32_t>(N64OutputGemm::get_block_shape().x),
+          static_cast<int32_t>(
+              sizeof(typename QkvGemmA2AKernelN64::SharedStorage))};
     case QkvGemmPolicy::kM128N160:
       return {
           128,
@@ -2903,20 +2977,92 @@ int64_t a2a_lhs_gemm_ready_elements(
       route.world_size * kReadyFlagStride;
 }
 
+namespace {
+
+enum class QkvCommPolicyRequest : uint64_t {
+  kLegacy,
+  kPipeline,
+};
+
+QkvCommPolicyRequest normalized_qkv_comm_policy_request() {
+  const char* value = std::getenv("FUSE_QKV_COMM_POLICY");
+  return value == nullptr || std::strcmp(value, "pipeline") == 0 ||
+          std::strcmp(value, "roofline") == 0
+      ? QkvCommPolicyRequest::kPipeline
+      : QkvCommPolicyRequest::kLegacy;
+}
+
+struct QkvNvlinkOverride {
+  bool present = false;
+  uint64_t bits = 0;
+};
+
+QkvNvlinkOverride normalized_qkv_nvlink_override() {
+  QkvNvlinkOverride result{};
+  const char* value = std::getenv("FUSE_NVLINK_BIDIR_GBPS");
+  if (value == nullptr) {
+    return result;
+  }
+  char* end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  if (end != value && parsed > 0.0) {
+    result.present = true;
+    static_assert(sizeof(result.bits) == sizeof(parsed));
+    std::memcpy(&result.bits, &parsed, sizeof(parsed));
+  }
+  return result;
+}
+
+}  // namespace
+
 double a2a_lhs_nvlink_bidirectional_gbps(int32_t device) {
-  if (const char* value = std::getenv("FUSE_NVLINK_BIDIR_GBPS")) {
-    char* end = nullptr;
-    const double parsed = std::strtod(value, &end);
-    if (end != value && parsed > 0.0) {
-      return parsed;
-    }
+  const auto override = normalized_qkv_nvlink_override();
+  if (override.present) {
+    double parsed = 0.0;
+    std::memcpy(&parsed, &override.bits, sizeof(parsed));
+    return parsed;
   }
+
+  // Device identity is immutable for a process.  In particular, do not put
+  // cudaGetDeviceProperties on every eager-launch policy path: on H800 it can
+  // synchronize with outstanding CUDA work.  The environment override above
+  // intentionally remains dynamic and therefore bypasses this cache.
+  struct DeviceBandwidthCache {
+    std::mutex mutex;
+    std::unordered_map<int32_t, double> values;
+  };
+  static DeviceBandwidthCache cache;
+  thread_local bool has_last_device = false;
+  thread_local int32_t last_device = -1;
+  thread_local double last_value = 0.0;
+  if (has_last_device && last_device == device) {
+    return last_value;
+  }
+
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  const auto cached = cache.values.find(device);
+  if (cached != cache.values.end()) {
+    has_last_device = true;
+    last_device = device;
+    last_value = cached->second;
+    return last_value;
+  }
+
   cudaDeviceProp properties{};
-  if (cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
-      std::strstr(properties.name, "H800") != nullptr) {
-    return 400.0;
+  const cudaError_t status = cudaGetDeviceProperties(&properties, device);
+  if (status != cudaSuccess) {
+    // Preserve the previous conservative fallback, but do not cache a
+    // transient runtime failure.
+    return 900.0;
   }
-  return 900.0;
+  const double bandwidth = std::strstr(properties.name, "H800") != nullptr
+      ? 400.0
+      : 900.0;
+  cache.values.emplace(device, bandwidth);
+  has_last_device = true;
+  last_device = device;
+  last_value = bandwidth;
+  return bandwidth;
 }
 
 double a2a_lhs_compute_time_us(
@@ -3121,6 +3267,149 @@ A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
       problem, num_comm_ctas, sm_count, requested);
 }
 
+namespace {
+
+struct QkvCommRecommendationKey {
+  // Keep every scalar problem/route input so future policy changes cannot
+  // accidentally reuse an older result. Device pointers are deliberately
+  // excluded: they do not affect the communication split.
+  std::array<uint64_t, 41> words{};
+
+  bool operator==(const QkvCommRecommendationKey& other) const {
+    return words == other.words;
+  }
+};
+
+struct QkvCommRecommendationKeyHash {
+  size_t operator()(const QkvCommRecommendationKey& key) const {
+    size_t result = 0xcbf29ce484222325ull;
+    for (uint64_t word : key.words) {
+      result ^= std::hash<uint64_t>{}(word) + 0x9e3779b97f4a7c15ull +
+          (result << 6) + (result >> 2);
+    }
+    return result;
+  }
+};
+
+QkvCommRecommendationKey make_qkv_comm_recommendation_key(
+    const GemmProblem& p,
+    const UlyssesRoute& r,
+    int32_t device) {
+  const auto comm_policy = normalized_qkv_comm_policy_request();
+  const auto nvlink_override = normalized_qkv_nvlink_override();
+  return {{
+      static_cast<uint64_t>(device),
+      static_cast<uint64_t>(p.m),
+      static_cast<uint64_t>(p.n),
+      static_cast<uint64_t>(p.k),
+      static_cast<uint64_t>(p.l),
+      static_cast<uint64_t>(p.stride_a.row),
+      static_cast<uint64_t>(p.stride_a.column),
+      static_cast<uint64_t>(p.stride_a.batch),
+      static_cast<uint64_t>(p.stride_b.row),
+      static_cast<uint64_t>(p.stride_b.column),
+      static_cast<uint64_t>(p.stride_b.batch),
+      static_cast<uint64_t>(p.stride_d.row),
+      static_cast<uint64_t>(p.stride_d.column),
+      static_cast<uint64_t>(p.stride_d.batch),
+      static_cast<uint64_t>(p.input_dtype),
+      static_cast<uint64_t>(p.weight_dtype),
+      static_cast<uint64_t>(p.output_dtype),
+      static_cast<uint64_t>(p.transpose_a),
+      static_cast<uint64_t>(p.transpose_b),
+      static_cast<uint64_t>(p.raster),
+      static_cast<uint64_t>(p.max_swizzle_size),
+      static_cast<uint64_t>(r.world_size),
+      static_cast<uint64_t>(r.rank),
+      static_cast<uint64_t>(r.batch),
+      static_cast<uint64_t>(r.global_seq),
+      static_cast<uint64_t>(r.seq_local),
+      static_cast<uint64_t>(r.q_heads),
+      static_cast<uint64_t>(r.kv_heads),
+      static_cast<uint64_t>(r.local_heads),
+      static_cast<uint64_t>(r.head_dim),
+      static_cast<uint64_t>(r.channel_count),
+      static_cast<uint64_t>(r.kind),
+      static_cast<uint64_t>(r.direction),
+      static_cast<uint64_t>(r.qkv_peer_interleaved),
+      static_cast<uint64_t>(r.defer_v_a2a),
+      static_cast<uint64_t>(r.causal_load_balanced),
+      static_cast<uint64_t>(r.cyclic_peer_order),
+      static_cast<uint64_t>(r.packed_row_granularity),
+      static_cast<uint64_t>(comm_policy),
+      static_cast<uint64_t>(nvlink_override.present),
+      nvlink_override.bits,
+  }};
+}
+
+struct QkvCommRecommendationCache {
+  std::mutex mutex;
+  std::unordered_map<
+      QkvCommRecommendationKey,
+      int32_t,
+      QkvCommRecommendationKeyHash> entries;
+};
+
+struct QkvLastCommRecommendation {
+  bool valid = false;
+  QkvCommRecommendationKey key{};
+  int32_t comm_ctas = 0;
+};
+
+QkvCommRecommendationCache& qkv_comm_recommendation_cache() {
+  static QkvCommRecommendationCache cache;
+  return cache;
+}
+
+QkvLastCommRecommendation& qkv_last_comm_recommendation() {
+  thread_local QkvLastCommRecommendation last;
+  return last;
+}
+
+bool find_qkv_comm_recommendation(
+    const QkvCommRecommendationKey& key,
+    int32_t* comm_ctas) {
+  auto& last = qkv_last_comm_recommendation();
+  if (last.valid && last.key == key) {
+    *comm_ctas = last.comm_ctas;
+    return true;
+  }
+  auto& cache = qkv_comm_recommendation_cache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  const auto found = cache.entries.find(key);
+  if (found == cache.entries.end()) {
+    return false;
+  }
+  last = {true, key, found->second};
+  *comm_ctas = found->second;
+  return true;
+}
+
+void store_qkv_comm_recommendation(
+    const QkvCommRecommendationKey& key,
+    int32_t comm_ctas) {
+  if (comm_ctas <= 0) {
+    return;
+  }
+  auto& cache = qkv_comm_recommendation_cache();
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const auto found = cache.entries.find(key);
+    if (found == cache.entries.end()) {
+      constexpr size_t kMaxEntries = 256;
+      if (cache.entries.size() >= kMaxEntries) {
+        cache.entries.erase(cache.entries.begin());
+      }
+      cache.entries.emplace(key, comm_ctas);
+    } else {
+      comm_ctas = found->second;
+    }
+  }
+  qkv_last_comm_recommendation() = {true, key, comm_ctas};
+}
+
+}  // namespace
+
 int32_t recommended_gemm_a2a_comm_ctas(
   const GemmProblem& problem,
   const UlyssesRoute& route) {
@@ -3144,9 +3433,28 @@ int32_t recommended_gemm_a2a_comm_ctas(
     return legacy_comm_ctas;
   }
 
-  int32_t sm_count = 0;
   int32_t device = 0;
-  if (device_sm_count(&sm_count, &device) != cudaSuccess || sm_count != 132) {
+  // The current CUDA device is thread-local and may change between calls, so
+  // keep this cheap lookup outside the cache.  The cache removes the device
+  // property/SM queries and the comm-by-tile search that caused the eager
+  // host stall.
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    return legacy_comm_ctas;
+  }
+  const auto cache_key = make_qkv_comm_recommendation_key(
+      problem, route, device);
+  int32_t cached_comm_ctas = 0;
+  if (find_qkv_comm_recommendation(cache_key, &cached_comm_ctas)) {
+    return cached_comm_ctas;
+  }
+
+  int32_t sm_count = 0;
+  if (cudaDeviceGetAttribute(
+          &sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+    return legacy_comm_ctas;
+  }
+  if (sm_count != 132) {
+    store_qkv_comm_recommendation(cache_key, legacy_comm_ctas);
     return legacy_comm_ctas;
   }
 
@@ -3169,18 +3477,19 @@ int32_t recommended_gemm_a2a_comm_ctas(
   // Standalone H200 route sweeps stop gaining useful one-way fabric bandwidth
   // beyond 16 CTAs.  This is a topology/primitive saturation point; it only
   // scales the NVLink lower bound and does not encode a model or shape winner.
-  constexpr int32_t kFabricSaturationCommCtas = 16;
   constexpr int32_t kRouteSlotsPerCta = kQkvBulkSlots;
   if (route.head_dim != kQkvBulkColumns ||
       route.q_heads <= 0 || route.kv_heads <= 0 ||
       route.q_heads % route.world_size != 0 ||
       route.kv_heads % route.world_size != 0) {
+    store_qkv_comm_recommendation(cache_key, legacy_comm_ctas);
     return legacy_comm_ctas;
   }
 
   const double one_way_nvlink_gbps =
       0.5 * a2a_lhs_nvlink_bidirectional_gbps(device);
   if (!(one_way_nvlink_gbps > 0.0)) {
+    store_qkv_comm_recommendation(cache_key, legacy_comm_ctas);
     return legacy_comm_ctas;
   }
 
@@ -3223,7 +3532,8 @@ int32_t recommended_gemm_a2a_comm_ctas(
         route_waves * static_cast<double>(kQkvRouteTaskWaveNs);
     const double comm_fraction = std::min(
         1.0,
-        static_cast<double>(comm_ctas) / kFabricSaturationCommCtas);
+        static_cast<double>(comm_ctas) /
+            kQkvFabricSaturationCommCtas);
     // bytes / (GB/s) is numerically nanoseconds.
     const double route_link_ns =
         remote_bytes / (one_way_nvlink_gbps * comm_fraction);
@@ -3258,6 +3568,7 @@ int32_t recommended_gemm_a2a_comm_ctas(
       best_tie_rank = tie_rank;
     }
   }
+  store_qkv_comm_recommendation(cache_key, best_comm_ctas);
   return best_comm_ctas;
 }
 
@@ -3409,51 +3720,242 @@ cudaError_t query_a2a_gemm_role_resources(A2AGemmRoleResources* resources) {
 }
 #endif
 
-cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t stream) {
-  int32_t sm_count = 0;
+namespace {
+
+enum class QkvGemmPolicyRequest : uint64_t {
+  kAuto,
+  kLegacy,
+  kM128N64,
+  kM128N128,
+  kM128N160,
+  kM128N192,
+  kM128N256,
+  kM128N320,
+  kWaveTimeModel,
+};
+
+QkvGemmPolicyRequest normalized_qkv_gemm_policy_request() {
+  const char* value = std::getenv("FUSE_QKV_GEMM_POLICY");
+  if (value == nullptr) {
+    return QkvGemmPolicyRequest::kAuto;
+  }
+  if (std::strcmp(value, "legacy") == 0) {
+    return QkvGemmPolicyRequest::kLegacy;
+  }
+  if (std::strcmp(value, "m128n64") == 0) {
+    return QkvGemmPolicyRequest::kM128N64;
+  }
+  if (std::strcmp(value, "m128n128") == 0) {
+    return QkvGemmPolicyRequest::kM128N128;
+  }
+  if (std::strcmp(value, "m128n160") == 0) {
+    return QkvGemmPolicyRequest::kM128N160;
+  }
+  if (std::strcmp(value, "m128n192") == 0) {
+    return QkvGemmPolicyRequest::kM128N192;
+  }
+  if (std::strcmp(value, "m128n256") == 0) {
+    return QkvGemmPolicyRequest::kM128N256;
+  }
+  if (std::strcmp(value, "m128n320") == 0) {
+    return QkvGemmPolicyRequest::kM128N320;
+  }
+  if (std::strcmp(value, "wave_time_model") == 0) {
+    return QkvGemmPolicyRequest::kWaveTimeModel;
+  }
+  // Unknown values have always fallen through to the normal automatic path.
+  return QkvGemmPolicyRequest::kAuto;
+}
+
+struct QkvLaunchPlanKey {
+  // Only immutable policy inputs belong here.  Device pointers, epoch and
+  // alpha remain per-launch values in GemmA2AParams.
+  std::array<uint64_t, 34> words{};
+
+  bool operator==(const QkvLaunchPlanKey& other) const {
+    return words == other.words;
+  }
+};
+
+struct QkvLaunchPlanKeyHash {
+  size_t operator()(const QkvLaunchPlanKey& key) const {
+    size_t result = 0xcbf29ce484222325ull;
+    for (uint64_t word : key.words) {
+      result ^= std::hash<uint64_t>{}(word) + 0x9e3779b97f4a7c15ull +
+          (result << 6) + (result >> 2);
+    }
+    return result;
+  }
+};
+
+QkvLaunchPlanKey make_qkv_launch_plan_key(
+    const GemmA2AParams& params,
+    int32_t device) {
+  const GemmProblem& p = params.gemm;
+  const UlyssesRoute& r = params.route;
+  const auto comm_policy = normalized_qkv_comm_policy_request();
+  const auto gemm_policy = normalized_qkv_gemm_policy_request();
+  const auto nvlink_override = normalized_qkv_nvlink_override();
+  return {{
+      static_cast<uint64_t>(device),
+      static_cast<uint64_t>(params.num_comm_ctas),
+      static_cast<uint64_t>(p.m),
+      static_cast<uint64_t>(p.n),
+      static_cast<uint64_t>(p.k),
+      static_cast<uint64_t>(p.l),
+      static_cast<uint64_t>(p.input_dtype),
+      static_cast<uint64_t>(p.weight_dtype),
+      static_cast<uint64_t>(p.output_dtype),
+      static_cast<uint64_t>(p.transpose_a),
+      static_cast<uint64_t>(p.transpose_b),
+      static_cast<uint64_t>(p.raster),
+      static_cast<uint64_t>(p.max_swizzle_size),
+      static_cast<uint64_t>(r.world_size),
+      static_cast<uint64_t>(r.rank),
+      static_cast<uint64_t>(r.batch),
+      static_cast<uint64_t>(r.global_seq),
+      static_cast<uint64_t>(r.seq_local),
+      static_cast<uint64_t>(r.q_heads),
+      static_cast<uint64_t>(r.kv_heads),
+      static_cast<uint64_t>(r.local_heads),
+      static_cast<uint64_t>(r.head_dim),
+      static_cast<uint64_t>(r.channel_count),
+      static_cast<uint64_t>(r.kind),
+      static_cast<uint64_t>(r.direction),
+      static_cast<uint64_t>(r.qkv_peer_interleaved),
+      static_cast<uint64_t>(r.defer_v_a2a),
+      static_cast<uint64_t>(r.causal_load_balanced),
+      static_cast<uint64_t>(r.cyclic_peer_order),
+      static_cast<uint64_t>(r.packed_row_granularity),
+      static_cast<uint64_t>(comm_policy),
+      static_cast<uint64_t>(gemm_policy),
+      static_cast<uint64_t>(nvlink_override.present),
+      nvlink_override.bits,
+  }};
+}
+
+struct QkvLaunchPlan {
   int32_t device = 0;
-  cudaError_t status = device_sm_count(&sm_count, &device);
+  int32_t sm_count = 0;
+  int32_t num_comm_ctas = 0;
+  QkvGemmPolicy policy = QkvGemmPolicy::kM128N128;
+};
+
+struct QkvLaunchPlanCache {
+  std::mutex mutex;
+  std::unordered_map<
+      QkvLaunchPlanKey,
+      QkvLaunchPlan,
+      QkvLaunchPlanKeyHash> entries;
+};
+
+cudaError_t cached_qkv_launch_plan(
+    const GemmA2AParams& params,
+    QkvLaunchPlan* result) {
+  if (result == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+
+  int32_t device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const QkvLaunchPlanKey key = make_qkv_launch_plan_key(params, device);
+
+  struct LastPlan {
+    bool valid = false;
+    QkvLaunchPlanKey key{};
+    QkvLaunchPlan plan{};
+  };
+  thread_local LastPlan last;
+  if (last.valid && last.key == key) {
+    *result = last.plan;
+    return cudaSuccess;
+  }
+
+  static QkvLaunchPlanCache cache;
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  const auto cached = cache.entries.find(key);
+  if (cached != cache.entries.end()) {
+    last = {true, key, cached->second};
+    *result = cached->second;
+    return cudaSuccess;
+  }
+
+  // Cold path: resolve the device, communication split and GEMM kernel as one
+  // immutable plan.  All subsequent eager launches for this key bypass both
+  // cudaGetDeviceProperties and the comm/tile candidate search.
+  QkvLaunchPlan plan{};
+  plan.device = device;
+  status = cudaDeviceGetAttribute(
+      &plan.sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  plan.num_comm_ctas = params.num_comm_ctas == 0
+      ? recommended_gemm_a2a_comm_ctas(params.gemm, params.route)
+      : params.num_comm_ctas;
+  if (plan.num_comm_ctas <= 0 || plan.num_comm_ctas >= plan.sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  plan.policy = select_qkv_gemm_policy(
+      params.gemm,
+      plan.num_comm_ctas,
+      plan.sm_count,
+      params.route.qkv_peer_interleaved);
+
+  constexpr size_t kMaxEntries = 256;
+  if (cache.entries.size() >= kMaxEntries) {
+    cache.entries.erase(cache.entries.begin());
+  }
+  cache.entries.emplace(key, plan);
+  last = {true, key, plan};
+  *result = plan;
+  return cudaSuccess;
+}
+
+}  // namespace
+
+cudaError_t launch_gemm_a2a_cutlass(
+    const GemmA2AParams& params,
+    cudaStream_t stream) {
+  QkvLaunchPlan plan{};
+  cudaError_t status = cached_qkv_launch_plan(params, &plan);
   if (status != cudaSuccess) {
     return status;
   }
   GemmA2AParams launch_params = params;
-  if (launch_params.num_comm_ctas == 0) {
-    launch_params.num_comm_ctas =
-        recommended_gemm_a2a_comm_ctas(params.gemm, params.route);
-  }
-  if (launch_params.num_comm_ctas <= 0 || launch_params.num_comm_ctas >= sm_count) {
-    return cudaErrorInvalidValue;
-  }
+  launch_params.num_comm_ctas = plan.num_comm_ctas;
 
   if (launch_params.route.kind == RouteKind::kQkvGqaPack &&
       launch_params.route.direction == RouteDirection::kForward) {
-    switch (select_qkv_gemm_policy(
-        launch_params.gemm,
-        launch_params.num_comm_ctas,
-        sm_count,
-        launch_params.route.qkv_peer_interleaved)) {
+    switch (plan.policy) {
+      case QkvGemmPolicy::kM128N64:
+        return launch_gemm_a2a_impl<N64OutputGemm, QkvGqaPackCommN64>(
+            launch_params, stream, plan.sm_count, plan.device);
       case QkvGemmPolicy::kM128N160:
         return launch_gemm_a2a_impl<N160OutputGemm, QkvGqaPackCommN160>(
-            launch_params, stream, sm_count, device);
+            launch_params, stream, plan.sm_count, plan.device);
       case QkvGemmPolicy::kM128N192:
         return launch_gemm_a2a_impl<N192OutputGemm, QkvGqaPackCommN192>(
-            launch_params, stream, sm_count, device);
+            launch_params, stream, plan.sm_count, plan.device);
       case QkvGemmPolicy::kM128N256ClusterM2:
         return launch_gemm_a2a_impl<ProjectionOutputGemm, QkvGqaPackCommWide>(
-            launch_params, stream, sm_count, device);
+            launch_params, stream, plan.sm_count, plan.device);
       case QkvGemmPolicy::kM128N320ClusterM2:
         return launch_gemm_a2a_impl<WideN320OutputGemm, QkvGqaPackCommN320>(
-            launch_params, stream, sm_count, device);
+            launch_params, stream, plan.sm_count, plan.device);
       case QkvGemmPolicy::kM128N128:
         break;
     }
     if (launch_params.route.qkv_peer_interleaved) {
       return launch_gemm_a2a_impl<
           OutputGemm, QkvGqaPackCommSmallInterleaved>(
-              launch_params, stream, sm_count, device);
+              launch_params, stream, plan.sm_count, plan.device);
     }
     return launch_gemm_a2a_impl<OutputGemm, QkvGqaPackCommSmall>(
-        launch_params, stream, sm_count, device);
+        launch_params, stream, plan.sm_count, plan.device);
   }
   return cudaErrorNotSupported;
 }
@@ -3489,6 +3991,15 @@ cudaError_t launch_gemm_a2a_role_telemetry(
       launch_params.num_comm_ctas,
       sm_count,
       launch_params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N64:
+      return launch_gemm_a2a_impl<
+          N64OutputGemm, QkvGqaPackCommN64, GemmA2AParams, true>(
+              launch_params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
     case QkvGemmPolicy::kM128N160:
       return launch_gemm_a2a_impl<
           N160OutputGemm, QkvGqaPackCommN160, GemmA2AParams, true>(
@@ -3616,6 +4127,10 @@ cudaError_t launch_batched_cutlass_reference(
       policy_comm_ctas,
       sm_count,
       params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N64:
+      return launch_gemm_reference_impl<N64PureGemm>(
+          params, stream, sm_count, device, reserved_comm_ctas,
+          RasterOptions::AlongN);
     case QkvGemmPolicy::kM128N160:
       return launch_gemm_reference_impl<N160PureGemm>(
           params, stream, sm_count, device, reserved_comm_ctas,
@@ -3812,6 +4327,12 @@ cudaError_t launch_gemm_a2a_copy_reference(
       params.num_comm_ctas,
       sm_count,
       params.route.qkv_peer_interleaved)) {
+    case QkvGemmPolicy::kM128N64: {
+      QkvGqaPackCommN64::Arguments args{};
+      args.params = params;
+      return launch_qkv_gqa_copy_reference<QkvGqaPackCommN64>(
+          args, params.num_comm_ctas, stream);
+    }
     case QkvGemmPolicy::kM128N160: {
       QkvGqaPackCommN160::Arguments args{};
       args.params = params;
