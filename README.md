@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子，并为功耗受限 shape 增加安全回退；原有均匀 CP 热路径不变。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；原有前向热路径不变。
 
 Attention 输出按 head 分片：
 
@@ -50,6 +50,29 @@ v9.0 新增独立的 weighted QKV Projection+A2A 与 weighted A2A+OProj；v9.1 �
 这不是跨 GPU 动态偷任务：每个 rank 仍只执行一个连续区间和一个 persistent kernel。全局数学结果不变，但每张卡的 local sequence length 可以不同，因此框架必须让同一分区贯穿依赖该序列布局的后续计算。QKV 默认只在全局 `S≤16K` 时允许重分；更长 QKV 回退原均匀算子。OProj 不使用固定的序列长度限制。
 
 v9.1 的 shape 复核确认：把 MNK 按 H200 的 989 TFLOPS 理论峰值换算后，当单 rank 纯 GEMM 最低时间接近 1 ms 时，1980 MHz 参考卡本身也会撞 700 W 功耗墙并降到约 1500 MHz，此时标称频率比已经失效。v9.1 默认只在实测的 0.75 ms 功耗安全域内重分配，超出后 QKV 和 OProj 都会回退 uniform；若调用方提供同一负载下的有效吞吐比，可显式放开。完整约束、18 点补充结果和复现命令见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
+
+### 反向融合（v10.0）
+
+v10 把两个前向融合边界按反向依赖倒过来实现：
+
+```text
+QKV B:   Head→Sequence A2A(dQ,dK,dV) -> dX GEMM
+QKV W:   dWqkv = dQKVᵀ × X
+
+OProj B: dA GEMM -> Sequence→Head A2A
+OProj W: dWo = dYᵀ × saved_A
+```
+
+通信直接读写最终布局，接口不要求框架先做 `cat`、`index_select`、`permute` 或
+`contiguous`。普通模式在同一 stream 中严格执行 B→W，并用 `beta=0` 写权重梯度；
+ZeroBubble 模式把 B 和 W 拆成两个入口，W 用 `beta=1` 累加 BF16 `main_grad`。分离
+期间调用方必须保留 W 真正需要的两个输入；能延长原 buffer 寿命时无需额外复制，
+不能保留时才需要显式 stash。
+
+两条反向算子的参数结构、自动策略和生产入口互相独立，只共用采样脚手架。完整
+MNK、生命周期约束、96 行逐点结果和复现命令见
+[`QKV backward`](benchmarks/QKVproj-backward/BENCHMARK.md) 与
+[`OProj backward`](benchmarks/Oproj-backward/BENCHMARK.md)。
 
 ## 开箱运行
 
@@ -122,7 +145,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v9.1（原有均匀 OProj 性能策略沿用 v4.0，均匀 QKV 使用 v8 自动流水策略；v9.1 收口独立锁频异构 CP 路径的跨 shape 安全回退）
+当前版本：v10.0（原有前向策略沿用 v9.1；新增两条 BF16 反向融合算子与普通/ZeroBubble 两种调度语义）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -143,9 +166,28 @@ QKV的96点v8结果中，Eager/Graph对TE Userbuffers均为`96/96`胜场，几�
 
 v9 锁频异构矩阵使用三张 1500 MHz 卡与 1980 MHz 参考卡，HBM 均为 3201 MHz。CP2/4/6/8 共 22 个 setting 使用 5 次 warmup + 30 次正式采样并逐样本取 max-rank p50。短 QKV 实际启用的 7 点全部提升 `1.0619×～1.0901×`；长 QKV 全部回退为 `1.0000×`。OProj 启用的 13 点全部提升 `1.1593×～1.4216×`。所有启用点均通过 BF16 逐元素完全一致检查。
 
+v10 反向矩阵每个算子覆盖 96 个 setting，并分别测 Eager/Graph 与普通/ZeroBubble，
+共 768 份融合结果。下表的“前向占比”是 B+W 总 FLOPs 吞吐除以同 shape 已发布
+前向融合吞吐；“cuBLAS 中位”使用本轮同卡组、同 MNK、匹配 `beta` 的两次经典
+cuBLAS 纯 GEMM。
+
+| 反向算子 | 调度 | Eager 前向占比几何平均 | Graph 前向占比几何平均 | Eager / Graph cuBLAS 中位 | Eager / Graph 989T MFU中位 |
+|---|---|---:|---:|---:|---:|
+| QKV | ZeroBubble B/W分离，`beta=1` | 100.5% | 98.0% | 91.0% / 90.4% | 63.7% / 64.0% |
+| QKV | 普通同流 B→W，`beta=0` | 104.3% | 102.3% | 88.8% / 89.6% | 64.7% / 64.6% |
+| OProj | ZeroBubble B/W分离，`beta=1` | 99.6% | 100.1% | 89.7% / 90.3% | 62.4% / 62.4% |
+| OProj | 普通同流 B→W，`beta=0` | 104.0% | 104.6% | 89.5% / 90.1% | 63.1% / 63.4% |
+
+所有四组几何平均都达到同 shape 前向吞吐的 98.0% 以上。小矩阵 exact smoke
+覆盖 CP4/CP8、rank-major/causal、batch=2、同流/分离和 `beta=1`；正式 S=1K
+再检查跨 rank route、epoch 与完整写入。v9 的 43 个旧前向 device-kernel 指令体
+在 v10 Release 构建中保持一致。
+
 完整数据与复现流程：
 
 - [A2A + O-projection benchmark](benchmarks/a2a+Oproj/BENCHMARK.md)
 - [QKV Projection + A2A benchmark](benchmarks/QKVproj+a2a/BENCHMARK.md)
 - [锁频异构 CP benchmark](benchmarks/heterogeneous_cp/BENCHMARK.md)
+- [QKV Projection backward benchmark](benchmarks/QKVproj-backward/BENCHMARK.md)
+- [Output Projection backward benchmark](benchmarks/Oproj-backward/BENCHMARK.md)
 - [版本演进](VERSION_HISTORY.md)

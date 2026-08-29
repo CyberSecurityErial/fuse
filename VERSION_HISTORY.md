@@ -474,3 +474,51 @@ v9.1 保留 v9.0 的两个 weighted 算子、连续 token 分区和冷路径规�
 补充矩阵覆盖 production Qwen、Llama-3 8B、Nanbeige 4.2-3B、Qwen2.5 14B/32B、Llama-3.1 405B 和原 v9 控制 shape，共 18 个 setting、36 个算子点，包含 CP4/CP8 与本地 `M=2048/16384`。19 个实际启用 weighted 的点全部提升并通过 BF16 逐元素完全一致检查，另外 17 个点安全回退；QKV 和 OProj 启用点的加速比几何平均分别为 `1.1101×` 和 `1.3915×`，没有退化点。
 
 这组验证用于说明所选模型宽度内的安全泛化，不是所有 MNK、功耗上限或动态 DVFS 状态的全量保证。SM 锁频仍是唯一完成正式性能验收的异构来源；HBM/NVLink 降频接口继续保留为实验能力。完整口径和逐点结果见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
+
+## v10.0：QKV 与 OProj 反向融合
+
+状态：已发布。
+
+v10 新增两条 BF16 反向算子，不改变 v9.1 的四条前向/weighted 接口。
+
+QKV 反向 B 先把各 source rank 的平面 `dQ/dK/dV` 直接写成 destination rank 的
+`[M,QKV]`，再计算 `dX[M,H]`；W 计算
+`dWqkv[QKV,H]=dQKVᵀ[QKV,M]×X[M,H]`。OProj 反向 B 先计算
+`dA[M,A]=dY[M,H]×stored_Wo[H,A]`，再把最终 head shard 直接写到各 peer；W
+计算 `dWo[H,A]=dYᵀ[H,M]×saved_A[M,A]`。两条 B 路径的通信与 GEMM 顺序分别
+是前向的自然逆序，接口不要求框架插入 `cat/index_select/permute/contiguous`。
+
+普通入口在同一 stream 内严格执行 B→W，使用 `beta=0` 写权重梯度。ZeroBubble
+入口把 B 和 W 拆开，W 用 `beta=1` 直接累加 BF16 `main_grad`；B 与 W 之间，
+调用方必须保留 W 真正读取的两个 buffer，并为每个未完成区间提供独立 slot。
+如果框架能延长原 buffer 寿命，就不需要为了接口再复制一份；不能保留时，stash
+是调度延迟本身带来的存储成本。多个 W 不能并发写同一个梯度地址。
+
+反向自动策略只读取 M/N/K、CP、head geometry、route task、SM 数和合法 tile，
+不读取模型名、前向/TE 结果或逐 case winner。QKV 与 OProj 使用各自的参数和计划
+缓存；共享 CUTLASS ready adapter 新增的 system-scope 路径是默认关闭的编译期分支，
+只由 QKV 反向的跨 GPU producer 显式启用。v9 的 43 个旧 device-kernel 指令体在
+v10 Release 构建中保持一致。
+
+旧前向还用 CP8 Nanbeige、全局 S=16K 做了两轮同机 10+50 A/B：QKV 的 v9/v10
+p50 中位为 `0.2402/0.2408 ms`，OProj 为 `0.2643/0.2657 ms`，变化分别为
+`+0.25%/+0.53%`，落在短程复测波动内；两边逐元素检查均为零误差。
+
+正式矩阵对每条算子覆盖 3 个人工 shape、5 组真实模型、6 档全局序列长度和
+CP4/CP8，共 96 个 setting。Eager/Graph 与普通/ZeroBubble 分别做 10 warmup +
+50 samples，逐样本先取 max-rank；两条算子合计 768 份融合 raw。另用同一卡组、
+真实 B/W MNK 和匹配 `beta` 完成 192 份经典 cuBLAS 纯 GEMM测量。
+
+| 算子 | 调度 | Eager 相对前向几何平均 | Graph 相对前向几何平均 | Eager / Graph 经典cuBLAS中位 |
+|---|---|---:|---:|---:|
+| QKV backward | ZeroBubble，`beta=1` | 100.5% | 98.0% | 91.0% / 90.4% |
+| QKV backward | 普通 B→W，`beta=0` | 104.3% | 102.3% | 88.8% / 89.6% |
+| OProj backward | ZeroBubble，`beta=1` | 99.6% | 100.1% | 89.7% / 90.3% |
+| OProj backward | 普通 B→W，`beta=0` | 104.0% | 104.6% | 89.5% / 90.1% |
+
+这里的“相对前向”是 B+W 总 FLOPs 吞吐除以同 shape 已发布前向融合吞吐；四种
+几何平均均高于 98%。小矩阵 exact smoke 覆盖 CP4/CP8、rank-major/causal、
+batch=2、普通/分离和 `beta=1`；正式 S=1K 还检查跨 rank route、epoch 和完整写入。
+完整 96 行 ZeroBubble/普通表、TFLOPS、989T MFU、经典 cuBLAS 对照与复现命令见
+[`QKV backward`](benchmarks/QKVproj-backward/BENCHMARK.md) 和
+[`OProj backward`](benchmarks/Oproj-backward/BENCHMARK.md)。

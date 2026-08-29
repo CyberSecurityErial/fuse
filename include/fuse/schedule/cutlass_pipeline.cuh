@@ -29,6 +29,18 @@ CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
   }
 }
 
+// Source-push backward routes publish readiness from a peer GPU. The elected
+// TMA producer therefore needs a system-scope acquire; forward pull routes
+// keep the cheaper GPU-scope path.
+CUTLASS_DEVICE void wait_acquire_system_single_lane(
+    const uint32_t* flag,
+    uint32_t target) {
+#pragma unroll 1
+  while (load_acquire_system(flag) < target) {
+    __nanosleep(64);
+  }
+}
+
 #if FUSE_ENABLE_PROFILING
 template <bool Instrumented>
 struct PeerAcquireRecorder {
@@ -53,7 +65,8 @@ struct PeerAcquireRecorder<true> {
 
 // Sequential K-group adapter used by the generic A2A -> GEMM path.
 template <
-    class Iterator
+    class Iterator,
+    bool SystemScope = false
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
@@ -100,9 +113,15 @@ class ReadyKIterator
     if (tiles_left_in_group_ == 0 && work_tiles_left_ > 0) {
       ++group_;
       tiles_left_in_group_ = tiles_per_group_;
-      wait_acquire_gpu_single_lane(
-          ready_ + static_cast<int64_t>(group_) * ready_group_stride_,
-          target_);
+      if constexpr (SystemScope) {
+        wait_acquire_system_single_lane(
+            ready_ + static_cast<int64_t>(group_) * ready_group_stride_,
+            target_);
+      } else {
+        wait_acquire_gpu_single_lane(
+            ready_ + static_cast<int64_t>(group_) * ready_group_stride_,
+            target_);
+      }
 #if FUSE_ENABLE_PROFILING
       this->record(group_);
 #endif
@@ -125,6 +144,7 @@ template <
 #if FUSE_ENABLE_PROFILING
     bool Instrumented = false,
 #endif
+    bool SystemScope = false,
     class Iterator>
 CUTLASS_DEVICE auto make_ready_k_iterator(
     Iterator iterator,
@@ -139,7 +159,8 @@ CUTLASS_DEVICE auto make_ready_k_iterator(
 #endif
     ) {
   return ReadyKIterator<
-      Iterator
+      Iterator,
+      SystemScope
 #if FUSE_ENABLE_PROFILING
       , Instrumented
 #endif
@@ -178,7 +199,8 @@ struct A2ALhsTimelineArguments<true> {
 
 template <
     class Base,
-    int32_t MTilesPerReady = 1
+    int32_t MTilesPerReady = 1,
+    bool SystemScope = false
 #if FUSE_ENABLE_PROFILING
     ,
     bool Instrumented = false>
@@ -291,8 +313,13 @@ struct A2ALhsReadyMainloop : Base {
     }
 #endif
     if (lane == 0) {
-      wait_acquire_gpu_single_lane(
-          tile_ready + first_peer * kReadyFlagStride, target);
+      if constexpr (SystemScope) {
+        wait_acquire_system_single_lane(
+            tile_ready + first_peer * kReadyFlagStride, target);
+      } else {
+        wait_acquire_gpu_single_lane(
+            tile_ready + first_peer * kReadyFlagStride, target);
+      }
 #if FUSE_ENABLE_PROFILING
       if constexpr (Instrumented) {
         const uint64_t now = read_global_timer();
@@ -315,9 +342,9 @@ struct A2ALhsReadyMainloop : Base {
 #endif
     }
 #if FUSE_ENABLE_PROFILING
-    auto ready_k_iter = make_ready_k_iterator<Instrumented>(
+    auto ready_k_iter = make_ready_k_iterator<Instrumented, SystemScope>(
 #else
-    auto ready_k_iter = make_ready_k_iterator(
+    auto ready_k_iter = make_ready_k_iterator<SystemScope>(
 #endif
         k_iter, tile_ready, kReadyFlagStride, target,
         params.k_tiles_per_peer, first_k_tile, k_tiles
