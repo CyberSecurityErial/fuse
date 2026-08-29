@@ -15,7 +15,12 @@ option(
   "Build diagnostic %globaltimer profiling kernels"
   OFF)
 
-add_library(fuse_kernels STATIC csrc/operators/ulysses_sm90.cu)
+find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(
+  fuse_kernels STATIC
+  csrc/operators/ulysses_sm90.cu)
 if(FUSE_ENABLE_PROFILING)
   target_compile_definitions(fuse_kernels PUBLIC FUSE_ENABLE_PROFILING=1)
 else()
@@ -27,13 +32,13 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CUTLASS_ROOT}/include
     ${CUTLASS_ROOT}/tools/util/include)
+target_link_libraries(fuse_kernels PUBLIC CUDA::cudart)
 target_compile_options(
   fuse_kernels
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 set_target_properties(fuse_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
-find_package(CUDAToolkit REQUIRED)
 add_executable(fuse_smoke "benchmarks/a2a+Oproj/fuse_smoke.cu")
 target_link_libraries(fuse_smoke PRIVATE fuse_kernels CUDA::cublas CUDA::cudart)
 target_compile_options(
@@ -96,3 +101,19 @@ target_compile_options(
   fuse_cublaslt_runner
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
+
+add_executable(
+  heterogeneous_cp_plan_test
+  "benchmarks/heterogeneous_cp/plan_test.cpp")
+target_link_libraries(heterogeneous_cp_plan_test PRIVATE fuse_kernels)
+
+add_executable(
+  heterogeneous_cp_weighted_bench
+  "benchmarks/heterogeneous_cp/weighted_bench.cu")
+target_link_libraries(
+  heterogeneous_cp_weighted_bench
+  PRIVATE fuse_kernels CUDA::cudart Threads::Threads)
+target_compile_options(
+  heterogeneous_cp_weighted_bench
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
