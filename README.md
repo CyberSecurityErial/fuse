@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.0 另外提供两个面向已知锁频差异的 BF16 加权序列算子，不改变原有均匀 CP 热路径。
 
 Attention 输出按 head 分片：
 
@@ -42,6 +42,12 @@ QKV Projection+A2A 提供 `M128N64/N128/N160/N192/N256/N320` 六种 policy。H20
 重复读取设备信息和搜索配置。QKV 与 A2A+OProj 都会等目标显存写完后再发布 ready。
 
 默认通信策略对短中序列使用 `comm4`，长序列根据 CP、`N` 和设备 NVLink 带宽选择 `comm6/8`。实验性全量成本模型可通过 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 启用；它默认关闭，尚不属于 Golden。模型口径和边界见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
+
+### 锁频异构 CP（v9.0）
+
+v9.0 新增独立的 weighted QKV Projection+A2A 与 weighted A2A+OProj。调用方在启动前为每个 rank 提供相对 SM、HBM 和 NVLink 能力；规划器以 256-row 对齐的连续 token 区间为单位，联合选择每张卡的行数、通信 CTA 和既有 GEMM tile，使预测最慢 rank 的完成时间最短。它不读取实时频率、模型名、逐 case winner 或外部基线，也不需要调用方提供 alpha。
+
+这不是跨 GPU 动态偷任务：每个 rank 仍只执行一个连续区间和一个 persistent kernel。全局数学结果不变，但每张卡的 local sequence length 可以不同，因此框架必须让同一分区贯穿依赖该序列布局的后续计算。QKV 默认只在全局 `S≤16K` 时允许重分；更长 QKV 回退原均匀算子。OProj 在本轮长序列实测中仍稳定受益，不使用该长度限制。完整约束、结果和复现命令见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
 
 ## 开箱运行
 
@@ -114,7 +120,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前融合版本：v8.0（OProj 性能策略沿用 v4.0；QKV 使用 v8 自动流水策略）
+当前版本：v9.0（原有均匀 OProj 性能策略沿用 v4.0，均匀 QKV 使用 v8 自动流水策略；v9 新增独立锁频异构 CP 路径）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -133,8 +139,11 @@ QKV的96点v8结果中，Eager/Graph对TE Userbuffers均为`96/96`胜场，几�
 `92.6%/93.4%`，CP8为`88.8%/90.0%`。所有case使用同一自动入口，运行时不读取
 逐shape winner或TE结果。
 
+v9 锁频异构矩阵使用三张 1500 MHz 卡与 1980 MHz 参考卡，HBM 均为 3201 MHz。CP2/4/6/8 共 22 个 setting 使用 5 次 warmup + 30 次正式采样并逐样本取 max-rank p50。短 QKV 实际启用的 7 点全部提升 `1.0619×～1.0901×`；长 QKV 全部回退为 `1.0000×`。OProj 启用的 13 点全部提升 `1.1593×～1.4216×`。所有启用点均通过 BF16 逐元素完全一致检查。
+
 完整数据与复现流程：
 
 - [A2A + O-projection benchmark](benchmarks/a2a+Oproj/BENCHMARK.md)
 - [QKV Projection + A2A benchmark](benchmarks/QKVproj+a2a/BENCHMARK.md)
+- [锁频异构 CP benchmark](benchmarks/heterogeneous_cp/BENCHMARK.md)
 - [版本演进](VERSION_HISTORY.md)

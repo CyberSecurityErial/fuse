@@ -6,3 +6,4 @@
 #include "fuse/layout/ulysses.h"
 #include "fuse/operators/a2a_gemm.h"
 #include "fuse/operators/gemm_a2a.h"
+#include "fuse/operators/heterogeneous_cp.h"

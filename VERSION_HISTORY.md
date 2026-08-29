@@ -446,3 +446,19 @@ TE Userbuffers。N64命中9点，6点提升、3点回退，子集相对v7几何�
 1.1368×/1.1503×；3个回退点仍全部领先TE Userbuffers。8卡完整smoke覆盖
 CP2/4/8、BF16/FP8、完整QKV/defer-V和padding，均通过。H200的性能数字与H800的
 Eager启动问题分开报告，不把H200吞吐数字直接当作H800性能承诺。
+
+## v9.0：锁频异构 CP
+
+状态：已发布。
+
+v9.0 新增两个独立的 BF16 算子：weighted QKV Projection+A2A 和 weighted A2A+OProj。原有均匀 QKV/OProj 的接口、tile策略和热路径不变。
+
+调用方为每个 CP rank 提供相对 SM、HBM 和 NVLink 能力。规划器不读取频率、设备名、模型名、外部基线或逐 case winner；它在冷路径枚举256-row对齐的连续序列分区，并结合现有通信CTA和GEMM tile的物理模型，使预测最慢rank的完成时间最短。正式自动入口不需要alpha；结果中的`equivalent_alpha`仅用于解释最终分区距离均分和纯SM比例端点有多远。
+
+每个rank仍只拥有一个连续token区间并启动一个persistent kernel，不做跨GPU动态偷任务。QKV根据`global_sequence_begin`把本地生成的Q/K/V直接写到全局正确位置；OProj直接从所有peer读取本rank新token区间对应的head shard。全局数学结果不变，但local sequence length可不同，因此框架必须让相同分区贯穿依赖该序列布局的后续计算。
+
+长时间运行的QKV会让原本较快的卡撞到功耗墙，固定频率比例不再能代表真实算力。因此默认只在全局`S≤16K`时允许QKV重分；更长QKV直接使用原均匀算子。调用方只有在已经测得稳定的长QKV有效能力时，才可显式开启实验覆盖。OProj长序列在本轮仍稳定受益，所以不使用该长度限制。任何候选只要模型没有预测到严格收益，就不启动weighted kernel而直接回退uniform。
+
+正式矩阵使用三张1500 MHz卡和1980 MHz参考卡，HBM均为3201 MHz；覆盖CP2/4/6/8、不同慢卡数量、本地M=2048/16384，使用BF16、5次warmup + 30次采样，并逐样本先取max-rank再统计p50。短QKV实际启用的7点全部提升`1.0619×～1.0901×`，长QKV全部回退`1.0000×`；OProj启用的13点全部提升`1.1593×～1.4216×`。其余点主动回退，所有启用点均通过逐元素完全一致检查。
+
+SM锁频是本版本唯一完成性能验收的异构来源。HBM/NVLink比例已进入API和成本模型，但尚无对应降频硬件数据；自动DVFS、温度、功耗墙和动态争用不属于v9.0保证范围。完整口径见[`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。

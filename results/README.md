@@ -1,8 +1,7 @@
 # Archived benchmark results
 
 当前归档包含A2A -> O-projection历史Golden，以及132-SM H200 NVLink节点上的
-QKV projection -> A2A结果。QKV外部基线继续使用独立调优的v4/v5归档；融合侧
-Eager/Graph结果和对比表为v8.0正式96点采样。
+QKV projection -> A2A结果，以及v9.0锁频异构CP的精简正式矩阵。QKV外部基线继续使用独立调优的v4/v5归档；均匀融合侧Eager/Graph结果和对比表为v8.0正式96点采样。
 
 v8归档需要同时保存用户请求的`comm_ctas=0`、实际解析出的通信CTA、实际tile和
 policy模型版本。正式runner会把0原样传给launcher，第一次prime完成自动选择，后续
@@ -48,6 +47,7 @@ Committed directories:
   信息、自动方案缓存版本、经典cuBLAS吞吐和融合吞吐占比。
 - `QKVproj-a2a/te_userbuffers_shape_bench`: the matching adapted TE
   Userbuffers QKV winners.
+- `heterogeneous-cp/locked_frequency_summary.csv`: v9.0 两个独立 weighted 算子的22点锁频矩阵。它覆盖CP2/4/6/8、不同慢卡数量和本地M=2048/16384，保存实际设备组合、连续行分区、通信CTA、uniform/weighted p50及加速比。该矩阵为BF16、5次warmup + 30次采样、逐样本max-rank，并启用逐元素完全一致检查；它不覆盖自动DVFS或未经实测的HBM/NVLink降频。
 
 Each operator directory keeps only `baseline_summary.*`, the final fused
 summary, `comparison_summary.*`, and `shape_matrix.*`; each Userbuffers
