@@ -76,6 +76,56 @@ fuse::UlyssesRoute oproj_route(int32_t world_size, int32_t local_rows) {
   return route;
 }
 
+fuse::GemmProblem power_limited_qkv_problem(int32_t local_rows) {
+  fuse::GemmProblem problem{};
+  problem.m = local_rows;
+  problem.n = (128 + 2 * 8) * 128;
+  problem.k = 16384;
+  problem.raster = fuse::GemmRaster::kAlongN;
+  return problem;
+}
+
+fuse::UlyssesRoute power_limited_qkv_route(
+    int32_t world_size,
+    int32_t local_rows) {
+  fuse::UlyssesRoute route{};
+  route.world_size = world_size;
+  route.batch = 1;
+  route.global_seq = world_size * local_rows;
+  route.seq_local = local_rows;
+  route.q_heads = 128;
+  route.kv_heads = 8;
+  route.head_dim = 128;
+  route.kind = fuse::RouteKind::kQkvGqaPack;
+  route.direction = fuse::RouteDirection::kForward;
+  return route;
+}
+
+fuse::GemmProblem power_limited_oproj_problem(int32_t local_rows) {
+  fuse::GemmProblem problem{};
+  problem.m = local_rows;
+  problem.n = 16384;
+  problem.k = 128 * 128;
+  problem.raster = fuse::GemmRaster::kAlongN;
+  return problem;
+}
+
+fuse::UlyssesRoute power_limited_oproj_route(
+    int32_t world_size,
+    int32_t local_rows) {
+  fuse::UlyssesRoute route{};
+  route.world_size = world_size;
+  route.batch = 1;
+  route.global_seq = world_size * local_rows;
+  route.seq_local = local_rows;
+  route.q_heads = 128;
+  route.local_heads = 128 / world_size;
+  route.head_dim = 128;
+  route.kind = fuse::RouteKind::kHeadToSequence;
+  route.direction = fuse::RouteDirection::kInverse;
+  return route;
+}
+
 void check_plan_shape(
     const fuse::WeightedCpPlan& plan,
     int32_t world_size,
@@ -165,6 +215,7 @@ int main() {
   // caller has measured a stable long-QKV capacity ratio under the workload.
   auto override_options = planner_options(8, 16384, 3);
   override_options.allow_long_qkv_redistribution = true;
+  override_options.allow_power_limited_redistribution = true;
   fuse::WeightedCpPlan override_plan{};
   check(
       fuse::plan_weighted_gemm_a2a(
@@ -175,6 +226,54 @@ int main() {
       "explicit long-QKV planning override");
   check_plan_shape(override_plan, 8, 16384);
 
-  std::printf("weighted CP planner PASS: CP2/4/6/8 fixed-clock matrix\n");
+  // A nominal clock ratio is not useful when the reference ranks themselves
+  // hit the sustained power limit.  The measured H200 work envelope must make
+  // both projections fall back unless the caller supplies workload-level
+  // effective capacities and opts in explicitly.
+  auto power_options = planner_options(8, 2048, 3);
+  fuse::WeightedCpPlan power_qkv{};
+  check(
+      fuse::plan_weighted_gemm_a2a(
+          power_limited_qkv_problem(2048),
+          power_limited_qkv_route(8, 2048),
+          power_options,
+          &power_qkv) == cudaSuccess,
+      "power-limited QKV planning");
+  check(!power_qkv.weighted && power_qkv.redistributed_rows == 0,
+        "power-limited QKV must default to equal ownership");
+
+  fuse::WeightedCpPlan power_oproj{};
+  check(
+      fuse::plan_weighted_a2a_gemm(
+          power_limited_oproj_problem(2048),
+          power_limited_oproj_route(8, 2048),
+          power_options,
+          &power_oproj) == cudaSuccess,
+      "power-limited OProj planning");
+  check(!power_oproj.weighted && power_oproj.redistributed_rows == 0,
+        "power-limited OProj must default to equal ownership");
+
+  power_options.allow_power_limited_redistribution = true;
+  check(
+      fuse::plan_weighted_gemm_a2a(
+          power_limited_qkv_problem(2048),
+          power_limited_qkv_route(8, 2048),
+          power_options,
+          &power_qkv) == cudaSuccess,
+      "explicit power-limited QKV override");
+  check(power_qkv.weighted,
+        "power-limited override must expose the weighted QKV plan");
+  check(
+      fuse::plan_weighted_a2a_gemm(
+          power_limited_oproj_problem(2048),
+          power_limited_oproj_route(8, 2048),
+          power_options,
+          &power_oproj) == cudaSuccess,
+      "explicit power-limited OProj override");
+  check(power_oproj.weighted,
+        "power-limited override must expose the weighted OProj plan");
+
+  std::printf(
+      "weighted CP planner PASS: CP2/4/6/8 fixed-clock and power envelope\n");
   return 0;
 }

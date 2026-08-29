@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.0 另外提供两个面向已知锁频差异的 BF16 加权序列算子，不改变原有均匀 CP 热路径。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子，并为功耗受限 shape 增加安全回退；原有均匀 CP 热路径不变。
 
 Attention 输出按 head 分片：
 
@@ -43,11 +43,13 @@ QKV Projection+A2A 提供 `M128N64/N128/N160/N192/N256/N320` 六种 policy。H20
 
 默认通信策略对短中序列使用 `comm4`，长序列根据 CP、`N` 和设备 NVLink 带宽选择 `comm6/8`。实验性全量成本模型可通过 `FUSE_A2A_LHS_COMM_POLICY=experimental_model` 启用；它默认关闭，尚不属于 Golden。模型口径和边界见 [`VERSION_HISTORY.md`](VERSION_HISTORY.md)。
 
-### 锁频异构 CP（v9.0）
+### 锁频异构 CP（v9.1）
 
-v9.0 新增独立的 weighted QKV Projection+A2A 与 weighted A2A+OProj。调用方在启动前为每个 rank 提供相对 SM、HBM 和 NVLink 能力；规划器以 256-row 对齐的连续 token 区间为单位，联合选择每张卡的行数、通信 CTA 和既有 GEMM tile，使预测最慢 rank 的完成时间最短。它不读取实时频率、模型名、逐 case winner 或外部基线，也不需要调用方提供 alpha。
+v9.0 新增独立的 weighted QKV Projection+A2A 与 weighted A2A+OProj；v9.1 保留这套接口和调度模型，并补上跨 shape 的功耗安全边界。调用方在启动前为每个 rank 提供相对 SM、HBM 和 NVLink 能力；规划器以 256-row 对齐的连续 token 区间为单位，联合选择每张卡的行数、通信 CTA 和既有 GEMM tile，使预测最慢 rank 的完成时间最短。它不读取实时频率、模型名、逐 case winner 或外部基线，也不需要调用方提供 alpha。
 
-这不是跨 GPU 动态偷任务：每个 rank 仍只执行一个连续区间和一个 persistent kernel。全局数学结果不变，但每张卡的 local sequence length 可以不同，因此框架必须让同一分区贯穿依赖该序列布局的后续计算。QKV 默认只在全局 `S≤16K` 时允许重分；更长 QKV 回退原均匀算子。OProj 在本轮长序列实测中仍稳定受益，不使用该长度限制。完整约束、结果和复现命令见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
+这不是跨 GPU 动态偷任务：每个 rank 仍只执行一个连续区间和一个 persistent kernel。全局数学结果不变，但每张卡的 local sequence length 可以不同，因此框架必须让同一分区贯穿依赖该序列布局的后续计算。QKV 默认只在全局 `S≤16K` 时允许重分；更长 QKV 回退原均匀算子。OProj 不使用固定的序列长度限制。
+
+v9.1 的 shape 复核确认：把 MNK 按 H200 的 989 TFLOPS 理论峰值换算后，当单 rank 纯 GEMM 最低时间接近 1 ms 时，1980 MHz 参考卡本身也会撞 700 W 功耗墙并降到约 1500 MHz，此时标称频率比已经失效。v9.1 默认只在实测的 0.75 ms 功耗安全域内重分配，超出后 QKV 和 OProj 都会回退 uniform；若调用方提供同一负载下的有效吞吐比，可显式放开。完整约束、18 点补充结果和复现命令见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
 
 ## 开箱运行
 
@@ -120,7 +122,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v9.0（原有均匀 OProj 性能策略沿用 v4.0，均匀 QKV 使用 v8 自动流水策略；v9 新增独立锁频异构 CP 路径）
+当前版本：v9.1（原有均匀 OProj 性能策略沿用 v4.0，均匀 QKV 使用 v8 自动流水策略；v9.1 收口独立锁频异构 CP 路径的跨 shape 安全回退）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|

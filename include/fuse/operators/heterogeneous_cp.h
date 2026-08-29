@@ -82,6 +82,12 @@ struct WeightedCpPlannerOptions {
   // redistributes QKV rows only through S=16K.  Callers may opt in for longer
   // sequences only when they have a stable workload-level capacity ratio.
   bool allow_long_qkv_redistribution = false;
+  // A nominal SM-clock ratio stops describing effective capacity once the
+  // reference ranks hit their sustained power limit.  By default the H200
+  // planner redistributes only inside its measured power-safe work envelope.
+  // Set this only when rank[].sm already contains a workload-level effective
+  // throughput ratio rather than a nominal locked-clock ratio.
+  bool allow_power_limited_redistribution = false;
   HeterogeneousCpRankResources rank[kMaxWorldSize]{};
 };
 

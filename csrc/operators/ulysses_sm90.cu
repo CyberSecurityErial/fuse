@@ -3915,6 +3915,17 @@ struct WeightedRankModel {
 
 constexpr double kH200DenseBf16FlopsPerUs = 989.0e6;
 constexpr double kH200HbmBytesPerUs = 4.8e6;
+// Sustained locked-frequency validation on the 700-W H200 system brackets
+// the reference-rank power transition between about 0.49 ms (1980 MHz held)
+// and 0.97 ms (reference ranks collapsed to roughly 1500--1650 MHz).  Stay on
+// the conservative side when the caller supplies nominal clock ratios.  This
+// is an architecture/workload envelope, not a model-name or shape winner.
+constexpr double kH200WeightedPowerSafeDenseComputeUs = 750.0;
+
+double dense_bf16_compute_floor_us(const GemmProblem& problem) {
+  return 2.0 * problem.m * problem.n * problem.k * problem.l /
+      kH200DenseBf16FlopsPerUs;
+}
 
 bool valid_rank_resources(const HeterogeneousCpRankResources& resources) {
   return std::isfinite(resources.sm) && resources.sm > 0.0 &&
@@ -4474,8 +4485,11 @@ cudaError_t plan_weighted_gemm_a2a(
         uniform_comm_ctas);
   };
   const bool permit_redistribution =
-      options.allow_long_qkv_redistribution ||
-      uniform_route.global_seq <= kDefaultWeightedQkvMaxGlobalSequence;
+      (options.allow_long_qkv_redistribution ||
+       uniform_route.global_seq <= kDefaultWeightedQkvMaxGlobalSequence) &&
+      (options.allow_power_limited_redistribution ||
+       dense_bf16_compute_floor_us(uniform_problem) <=
+           kH200WeightedPowerSafeDenseComputeUs);
   return solve_weighted_cp_plan(
       options, score_rank, score_uniform, permit_redistribution, plan);
 }
@@ -4517,8 +4531,16 @@ cudaError_t plan_weighted_a2a_gemm(
         options.rank[rank],
         uniform_comm_ctas);
   };
+  const bool permit_redistribution =
+      options.allow_power_limited_redistribution ||
+      dense_bf16_compute_floor_us(uniform_problem) <=
+          kH200WeightedPowerSafeDenseComputeUs;
   return solve_weighted_cp_plan(
-      options, score_rank, score_uniform, true, plan);
+      options,
+      score_rank,
+      score_uniform,
+      permit_redistribution,
+      plan);
 }
 
 cudaError_t launch_weighted_gemm_a2a_cutlass(

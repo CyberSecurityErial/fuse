@@ -120,8 +120,14 @@ def main() -> None:
     parser.add_argument("--slow-hbm-ratio", type=float, default=1.0)
     parser.add_argument("--slow-nvlink-ratio", type=float, default=1.0)
     parser.add_argument("--nvlink-bidir-gbps", type=float, default=900.0)
+    parser.add_argument("--q-heads", type=int, default=24)
+    parser.add_argument("--kv-heads", type=int, default=24)
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--hidden", type=int, default=4096)
+    parser.add_argument("--row-quantum", type=int, default=256)
     parser.add_argument("--auto-plan", action="store_true")
     parser.add_argument("--allow-long-qkv", action="store_true")
+    parser.add_argument("--allow-power-limited", action="store_true")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--oproj-fast-comm", type=int, default=8)
@@ -165,6 +171,11 @@ def main() -> None:
                     "--slow-hbm-ratio", str(args.slow_hbm_ratio),
                     "--slow-nvlink-ratio", str(args.slow_nvlink_ratio),
                     "--nvlink-bidir-gbps", str(args.nvlink_bidir_gbps),
+                    "--q-heads", str(args.q_heads),
+                    "--kv-heads", str(args.kv_heads),
+                    "--head-dim", str(args.head_dim),
+                    "--hidden", str(args.hidden),
+                    "--row-quantum", str(args.row_quantum),
                     "--warmup", str(args.warmup),
                     "--iterations", str(args.iterations),
                     "--oproj-fast-comm", str(args.oproj_fast_comm),
@@ -176,6 +187,8 @@ def main() -> None:
                     command.extend(["--alpha", str(alpha)])
                 if args.allow_long_qkv:
                     command.append("--allow-long-qkv")
+                if args.allow_power_limited:
+                    command.append("--allow-power-limited")
                 if not args.check:
                     command.append("--no-check")
                 environment = os.environ.copy()
@@ -207,10 +220,19 @@ def main() -> None:
                     "slow_nvlink_ratio": args.slow_nvlink_ratio,
                     "baseline_nvlink_bidirectional_gbps":
                         args.nvlink_bidir_gbps,
+                    "q_heads": args.q_heads,
+                    "kv_heads": args.kv_heads,
+                    "head_dim": args.head_dim,
+                    "hidden": args.hidden,
+                    "qkv_n": (args.q_heads + 2 * args.kv_heads)
+                        * args.head_dim,
+                    "oproj_k": args.q_heads * args.head_dim,
                     "local_rows": local_rows,
+                    "row_quantum": args.row_quantum,
                     "alpha": alpha,
                     "auto_plan": args.auto_plan,
                     "allow_long_qkv": args.allow_long_qkv,
+                    "allow_power_limited": args.allow_power_limited,
                     "correctness": (
                         "exact_bf16_output" if args.check else "not_run"
                     ),
