@@ -36,6 +36,10 @@ struct Options {
   int warmup = 5;
   int iterations = 20;
   int row_quantum = 256;
+  int q_heads = 24;
+  int kv_heads = 24;
+  int head_dim = 128;
+  int hidden = 4096;
   double slow_ratio = 1500.0 / 1980.0;
   double slow_hbm_ratio = 1.0;
   double slow_nvlink_ratio = 1.0;
@@ -51,6 +55,7 @@ struct Options {
   bool calibrate = false;
   bool auto_plan = false;
   bool allow_long_qkv = false;
+  bool allow_power_limited = false;
 };
 
 bool parse_int(const char* text, int* value) {
@@ -99,10 +104,13 @@ void usage(const char* program) {
       "usage: %s --world P --m LOCAL_ROWS --slow-ranks LIST "
       "[--slow-ratio R] [--slow-hbm-ratio R] "
       "[--slow-nvlink-ratio R] [--nvlink-bidir-gbps G] "
+      "[--q-heads H] [--kv-heads H] [--head-dim D] [--hidden K] "
+      "[--row-quantum ROWS] "
       "[--alpha A | --auto-plan] [--warmup N] [--iterations N] "
       "[--operation both|qkv|oproj] [--qkv-fast-comm N] "
       "[--qkv-slow-comm N] [--oproj-fast-comm N] "
-      "[--oproj-slow-comm N] [--allow-long-qkv] [--no-check]\n",
+      "[--oproj-slow-comm N] [--allow-long-qkv] "
+      "[--allow-power-limited] [--no-check]\n",
       program);
 }
 
@@ -121,6 +129,8 @@ Options parse_options(int argc, char** argv) {
       if (!parse_int(take(), &options.world)) std::exit(2);
     } else if (arg == "--m") {
       if (!parse_int(take(), &options.local_rows)) std::exit(2);
+    } else if (arg == "--row-quantum") {
+      if (!parse_int(take(), &options.row_quantum)) std::exit(2);
     } else if (arg == "--slow-ranks") {
       options.slow_ranks = parse_rank_list(take());
     } else if (arg == "--slow-ratio") {
@@ -134,6 +144,14 @@ Options parse_options(int argc, char** argv) {
               take(), &options.baseline_nvlink_bidirectional_gbps)) {
         std::exit(2);
       }
+    } else if (arg == "--q-heads") {
+      if (!parse_int(take(), &options.q_heads)) std::exit(2);
+    } else if (arg == "--kv-heads") {
+      if (!parse_int(take(), &options.kv_heads)) std::exit(2);
+    } else if (arg == "--head-dim") {
+      if (!parse_int(take(), &options.head_dim)) std::exit(2);
+    } else if (arg == "--hidden") {
+      if (!parse_int(take(), &options.hidden)) std::exit(2);
     } else if (arg == "--alpha") {
       if (!parse_double(take(), &options.alpha)) std::exit(2);
     } else if (arg == "--warmup") {
@@ -158,6 +176,8 @@ Options parse_options(int argc, char** argv) {
       options.auto_plan = true;
     } else if (arg == "--allow-long-qkv") {
       options.allow_long_qkv = true;
+    } else if (arg == "--allow-power-limited") {
+      options.allow_power_limited = true;
     } else {
       usage(argv[0]);
       std::exit(2);
@@ -166,6 +186,11 @@ Options parse_options(int argc, char** argv) {
   if (options.world < 2 || options.world > fuse::kMaxWorldSize ||
       options.local_rows <= 0 || options.local_rows % options.row_quantum != 0 ||
       options.warmup < 0 || options.iterations <= 0 ||
+      options.q_heads <= 0 || options.kv_heads <= 0 ||
+      options.head_dim != 128 || options.hidden <= 0 ||
+      options.q_heads % options.kv_heads != 0 ||
+      options.q_heads % options.world != 0 ||
+      options.kv_heads % options.world != 0 ||
       !(options.slow_ratio > 0.0 && options.slow_ratio <= 1.0) ||
       !(options.slow_hbm_ratio > 0.0 && options.slow_hbm_ratio <= 1.0) ||
       !(options.slow_nvlink_ratio > 0.0 &&
@@ -257,6 +282,7 @@ fuse::WeightedCpPlannerOptions make_planner_options(const Options& options) {
   planner.baseline_nvlink_bidirectional_gbps =
       options.baseline_nvlink_bidirectional_gbps;
   planner.allow_long_qkv_redistribution = options.allow_long_qkv;
+  planner.allow_power_limited_redistribution = options.allow_power_limited;
   for (int rank = 0; rank < options.world; ++rank) {
     if (is_slow(options, rank)) {
       planner.rank[rank].sm = options.slow_ratio;
@@ -315,22 +341,20 @@ void print_plan(const char* operation, const fuse::WeightedCpPlan& plan) {
 }
 
 fuse::WeightedCpPlan make_qkv_plan(const Options& options) {
-  constexpr int q_heads = 24;
-  constexpr int kv_heads = 24;
-  constexpr int head_dim = 128;
   fuse::GemmProblem problem{};
   problem.m = options.local_rows;
-  problem.n = (q_heads + 2 * kv_heads) * head_dim;
-  problem.k = 4096;
+  problem.n =
+      (options.q_heads + 2 * options.kv_heads) * options.head_dim;
+  problem.k = options.hidden;
   problem.raster = fuse::GemmRaster::kAlongN;
   fuse::UlyssesRoute route{};
   route.world_size = options.world;
   route.batch = 1;
   route.global_seq = options.world * options.local_rows;
   route.seq_local = options.local_rows;
-  route.q_heads = q_heads;
-  route.kv_heads = kv_heads;
-  route.head_dim = head_dim;
+  route.q_heads = options.q_heads;
+  route.kv_heads = options.kv_heads;
+  route.head_dim = options.head_dim;
   route.kind = fuse::RouteKind::kQkvGqaPack;
   route.direction = fuse::RouteDirection::kForward;
   fuse::WeightedCpPlan plan{};
@@ -340,21 +364,19 @@ fuse::WeightedCpPlan make_qkv_plan(const Options& options) {
 }
 
 fuse::WeightedCpPlan make_oproj_plan(const Options& options) {
-  constexpr int heads = 24;
-  constexpr int head_dim = 128;
   fuse::GemmProblem problem{};
   problem.m = options.local_rows;
-  problem.n = 4096;
-  problem.k = heads * head_dim;
+  problem.n = options.hidden;
+  problem.k = options.q_heads * options.head_dim;
   problem.raster = fuse::GemmRaster::kAlongN;
   fuse::UlyssesRoute route{};
   route.world_size = options.world;
   route.batch = 1;
   route.global_seq = options.world * options.local_rows;
   route.seq_local = options.local_rows;
-  route.q_heads = heads;
-  route.local_heads = heads / options.world;
-  route.head_dim = head_dim;
+  route.q_heads = options.q_heads;
+  route.local_heads = options.q_heads / options.world;
+  route.head_dim = options.head_dim;
   route.kind = fuse::RouteKind::kHeadToSequence;
   route.direction = fuse::RouteDirection::kInverse;
   fuse::WeightedCpPlan plan{};
@@ -619,13 +641,11 @@ void run_qkv(
     const std::vector<cudaStream_t>& streams,
     const fuse::WeightedCpPlan* planner = nullptr) {
   const bool fallback_uniform = planner != nullptr && !planner->weighted;
-  // This artificial geometry is deliberately divisible by CP2/4/6/8 so the
-  // same mathematical problem can isolate CP degree and slow-rank count.
-  constexpr int q_heads = 24;
-  constexpr int kv_heads = 24;
-  constexpr int head_dim = 128;
-  constexpr int k = 4096;
-  constexpr int n = (q_heads + 2 * kv_heads) * head_dim;
+  const int q_heads = options.q_heads;
+  const int kv_heads = options.kv_heads;
+  const int head_dim = options.head_dim;
+  const int k = options.hidden;
+  const int n = (q_heads + 2 * kv_heads) * head_dim;
   const int global_rows = options.world * options.local_rows;
   const int local_width =
       (q_heads / options.world + 2 * (kv_heads / options.world)) * head_dim;
@@ -866,10 +886,10 @@ void run_oproj(
     const std::vector<cudaStream_t>& streams,
     const fuse::WeightedCpPlan* planner = nullptr) {
   const bool fallback_uniform = planner != nullptr && !planner->weighted;
-  constexpr int heads = 24;
-  constexpr int head_dim = 128;
-  constexpr int k = heads * head_dim;
-  constexpr int n = 4096;
+  const int heads = options.q_heads;
+  const int head_dim = options.head_dim;
+  const int k = heads * head_dim;
+  const int n = options.hidden;
   const int global_rows = options.world * options.local_rows;
   const int shard_width = k / options.world;
   const int64_t input_elements =
@@ -1123,17 +1143,18 @@ int main(int argc, char** argv) {
         stderr, "need %d visible GPUs, found %d\n", options.world, device_count);
     return 2;
   }
-  if (24 % options.world != 0) {
-    std::fprintf(stderr, "the common 24-head geometry does not divide CP%d\n", options.world);
-    return 2;
-  }
   const Partition diagnostic_partition = make_partition(options);
   std::printf(
       "CONFIG world=%d slow=%zu sm_ratio=%.6f hbm_ratio=%.6f "
-      "nvlink_ratio=%.6f alpha=%.3f auto_plan=%d m=%d rows=",
+      "nvlink_ratio=%.6f alpha=%.3f auto_plan=%d m=%d "
+      "q_heads=%d kv_heads=%d head_dim=%d hidden=%d "
+      "qkv_n=%d oproj_k=%d rows=",
       options.world, options.slow_ranks.size(), options.slow_ratio,
       options.slow_hbm_ratio, options.slow_nvlink_ratio, options.alpha,
-      options.auto_plan ? 1 : 0, options.local_rows);
+      options.auto_plan ? 1 : 0, options.local_rows, options.q_heads,
+      options.kv_heads, options.head_dim, options.hidden,
+      (options.q_heads + 2 * options.kv_heads) * options.head_dim,
+      options.q_heads * options.head_dim);
   for (int rank = 0; rank < options.world; ++rank) {
     std::printf(
         "%s%d", rank ? "," : "", diagnostic_partition.rows[rank]);

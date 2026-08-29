@@ -462,3 +462,15 @@ v9.0 新增两个独立的 BF16 算子：weighted QKV Projection+A2A 和 weighte
 正式矩阵使用三张1500 MHz卡和1980 MHz参考卡，HBM均为3201 MHz；覆盖CP2/4/6/8、不同慢卡数量、本地M=2048/16384，使用BF16、5次warmup + 30次采样，并逐样本先取max-rank再统计p50。短QKV实际启用的7点全部提升`1.0619×～1.0901×`，长QKV全部回退`1.0000×`；OProj启用的13点全部提升`1.1593×～1.4216×`。其余点主动回退，所有启用点均通过逐元素完全一致检查。
 
 SM锁频是本版本唯一完成性能验收的异构来源。HBM/NVLink比例已进入API和成本模型，但尚无对应降频硬件数据；自动DVFS、温度、功耗墙和动态争用不属于v9.0保证范围。完整口径见[`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。
+
+## v9.1：异构 shape 功耗安全回退
+
+状态：已发布。
+
+v9.1 保留 v9.0 的两个 weighted 算子、连续 token 分区和冷路径规划模型，不改原有均匀 QKV/OProj 热路径。补充真实模型宽度后发现：当单 rank GEMM 足够重时，原本 1980 MHz 的参考卡也会撞到约 700 W 功耗墙并降至约 1500～1650 MHz。此时 1500/1980 的标称频率比不再代表实际吞吐，继续按它搬工作反而可能变慢。
+
+规划器现在用 `2MNKL / 989 TFLOPS` 计算 H200 BF16 纯 GEMM 的理论最低时间。默认只在该值不超过 `0.75 ms` 时使用标称锁频比例；超过后 QKV 和 OProj 都直接复用 uniform 路径。这个边界不读取模型名或逐 case winner。若调用方提供的是同一 workload 下测得的有效吞吐比，而非标称频率比，可显式设置 `allow_power_limited_redistribution` 放开。
+
+补充矩阵覆盖 production Qwen、Llama-3 8B、Nanbeige 4.2-3B、Qwen2.5 14B/32B、Llama-3.1 405B 和原 v9 控制 shape，共 18 个 setting、36 个算子点，包含 CP4/CP8 与本地 `M=2048/16384`。19 个实际启用 weighted 的点全部提升并通过 BF16 逐元素完全一致检查，另外 17 个点安全回退；QKV 和 OProj 启用点的加速比几何平均分别为 `1.1101×` 和 `1.3915×`，没有退化点。
+
+这组验证用于说明所选模型宽度内的安全泛化，不是所有 MNK、功耗上限或动态 DVFS 状态的全量保证。SM 锁频仍是唯一完成正式性能验收的异构来源；HBM/NVLink 降频接口继续保留为实验能力。完整口径和逐点结果见 [`benchmarks/heterogeneous_cp/BENCHMARK.md`](benchmarks/heterogeneous_cp/BENCHMARK.md)。

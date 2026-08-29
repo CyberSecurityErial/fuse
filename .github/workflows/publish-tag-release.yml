@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v9.0
+        default: v9.1
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v9.0");
+              : (process.env.REQUESTED_TAG || "v9.1");
 
             const releases = {
               "v1.0": {
@@ -172,6 +172,20 @@ jobs:
                   "🩵 **锁频矩阵覆盖 CP2/4/6/8、三张 1500 MHz 卡与 1980 MHz 参考卡。短 QKV 启用的 7 点全部提升 1.0619×～1.0901×；OProj 启用的 13 点全部提升 1.1593×～1.4216×；长 QKV 全部回退为 1.0000×。**",
                   "",
                   "正式口径为 BF16、5 warmup + 30 samples、逐样本 max-rank p50，并启用逐元素完全一致检查。SM 锁频是本版本完成性能验收的异构来源；HBM/NVLink比例接口仍属实验，自动DVFS、温度、功耗墙和动态争用不在v9.0保证范围。",
+                ].join("\n"),
+              },
+              "v9.1": {
+                name: "v9.1 — 异构 shape 功耗安全回退",
+                body: [
+                  "v9.1 保留 v9.0 的 weighted QKV Projection + A2A 与 weighted A2A + OProj，并为不同模型宽度补上功耗安全回退。原有均匀 QKV/OProj 接口、tile 策略和热路径保持不变；v9.0 tag 也保持不动。",
+                  "",
+                  "补充测试发现，宽 QKV/OProj 会让原本 1980 MHz 的 H200 参考卡撞到约 700 W 功耗墙并降至约 1500～1650 MHz。此时 1500/1980 的标称频率比已经不能代表实际吞吐，继续按它重新分配工作可能变慢。",
+                  "",
+                  "规划器现在用 `2MNKL / 989 TFLOPS` 估算 H200 BF16 纯 GEMM 的理论最低时间。默认只在不超过 0.75 ms 的实测安全域内使用标称锁频比例；更重的 QKV/OProj 直接复用 uniform 路径。该规则不读取模型名或逐 case winner。调用方若提供同一 workload 下实测的有效吞吐比，可显式放开限制。",
+                  "",
+                  "🩵 **补充矩阵覆盖五种真实模型宽度和原 v9 控制 shape，共 18 个 setting、36 个算子点。19 个实际启用 weighted 的点全部提升，17 个点安全回退；QKV/OProj 启用点的加速比几何平均分别为 1.1101× / 1.3915×，没有退化点。**",
+                  "",
+                  "正式口径为 BF16、CP4/CP8、5 warmup + 30 samples、逐样本 max-rank p50。所有实际启用 weighted 的点都通过逐元素完全一致检查。SM 锁频仍是完成性能验收的异构来源；HBM/NVLink 降频与动态 DVFS 不属于本版本的全量保证。",
                 ].join("\n"),
               },
             };

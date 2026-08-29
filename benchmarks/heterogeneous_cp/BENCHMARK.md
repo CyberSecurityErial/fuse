@@ -1,12 +1,13 @@
 # Locked-frequency heterogeneous CP benchmark
 
-当前版本：v9.0。状态：已发布的实验特性；原有均匀 QKV/OProj 算子保持 v8.0 行为。
+当前已发布版本：v9.1。原有均匀 QKV/OProj 算子保持 v8.0 行为；v9.1 在 v9.0 的 weighted 路径上加入跨 shape 功耗安全回退。
 
 ## 口径
 
 - BF16，测试两个独立算子：QKV Projection + Ulysses A2A，以及 Ulysses A2A + OProj；
 - 只处理调用方已经知道、并且在负载期间保持稳定的锁频差异；算子不读取频率，也不预测 GPU 自动降频；
-- QKV 使用 `M×9216×4096`、`Hq/Hkv/D=24/24/128`，OProj 使用 `M×4096×3072`；
+- 原 v9.0 锁频矩阵使用 QKV `M×9216×4096`、`Hq/Hkv/D=24/24/128`，OProj `M×4096×3072`；
+- 发布后又选取 production Qwen、Llama-3 8B、Nanbeige 4.2-3B、Qwen2.5 14B/32B、Llama-3.1 405B 五种宽度，并保留原 v9 shape 作控制，共补测18点；
 - CP2/4/6/8，覆盖当前八卡能够组成的不同慢卡数量；
 - 每个结果使用 5 次 warmup + 30 次采样，每个样本先取所有 rank 的最大延迟，再报告 p50；
 - uniform 与 weighted 使用相同输入、权重和最终布局；执行后的 BF16 输出逐元素完全相同；
@@ -20,7 +21,9 @@
 
 QKV 的默认适用范围为全局 `S≤16K`。更长的 QKV 会持续压满 Tensor Core，未锁定的参考卡可能撞到功耗上限，使标称频率不再代表实际算力；因此 `S>16K` 默认直接使用原来的 uniform 算子。只有调用方已经测得稳定的长 QKV 能力比时，才可显式使用 `--allow-long-qkv` 做实验。
 
-OProj 在本轮长序列中仍有稳定收益，因此不使用这个长度限制。任何算子只要物理模型没有预测到严格收益，都会直接回退 uniform；回退时不会启动 weighted kernel。
+shape 复核还发现，序列不长并不等于功耗一定安全。把MNK工作量按H200的989 TFLOPS理论峰值换算成纯GEMM最低时间后，约 `0.49 ms` 的点仍能让参考卡保持 `1.8～1.95 GHz`；约 `0.97 ms` 时，参考卡已降到 `1.5～1.65 GHz`，与锁在1500 MHz的慢卡几乎同速。因此默认把 `0.75 ms` 作为这台700 W H200的保守有效边界：QKV和OProj只要超过它就回退 uniform。这个判断只使用MNK工作量，不读取模型名。调用方若传入的是同一负载下实测的有效吞吐比，而不是标称频率比，可使用 `--allow-power-limited` 显式放开。
+
+OProj 不使用固定的序列长度限制；Nanbeige 长 OProj 按同一方法换算约 `0.63 ms`，仍在有效域并保留了收益。任何算子只要超出功耗安全域，或物理模型没有预测到严格收益，都会直接回退 uniform；回退时不会启动 weighted kernel。
 
 ## 复现
 
@@ -40,6 +43,12 @@ python3 benchmarks/heterogeneous_cp/weighted_sweep.py \
 ```
 
 `--alpha` 只保留给人工消融；正式自动规划使用 `--auto-plan`，不读取 alpha。
+
+例如复现 Nanbeige 4.2-3B 的 shape，可在上面的命令中增加：
+
+```bash
+--q-heads 48 --kv-heads 8 --head-dim 128 --hidden 3072
+```
 
 ## 完整结果
 
@@ -72,8 +81,35 @@ python3 benchmarks/heterogeneous_cp/weighted_sweep.py \
 
 混合频率组合中，短 QKV 启用的 7 个 setting 全部提升，范围为 `1.0619×～1.0901×`；长 QKV 全部回退为 `1.0000×`。OProj 启用的 13 个 setting 全部提升，范围为 `1.1593×～1.4216×`。其余 setting 均由规划器主动回退，没有性能退化。
 
+## 补充 shape 复核
+
+精简结果保存在 [`shape_generalization_summary.csv`](../../results/heterogeneous-cp/shape_generalization_summary.csv)。这18点仍使用5次warmup、30次采样和max-rank p50；所有实际启用weighted的点都通过逐元素完全一致检查。`fallback`不是测到刚好没有提升，而是规划器直接调用原来的均匀算子，所以不产生新的数值路径并严格为`1.0000×`。
+
+| Shape | CP | 本地 M | QKV 结果 | OProj 结果 |
+|---|---:|---:|---:|---:|
+| production Qwen | 4 | 2048 | weighted `1.1058×` | weighted `1.3278×` |
+| production Qwen | 8 | 2048 | weighted `1.0789×` | weighted `1.5454×` |
+| Llama-3 8B | 4 | 2048 | weighted `1.1586×` | fallback `1.0000×` |
+| Llama-3 8B | 8 | 2048 | weighted `1.1397×` | weighted `1.2582×` |
+| Nanbeige 4.2-3B | 4 | 2048 | weighted `1.1326×` | weighted `1.3539×` |
+| Nanbeige 4.2-3B | 8 | 2048 | weighted `1.1298×` | weighted `1.3355×` |
+| Nanbeige 4.2-3B | 4 | 16384 | fallback `1.0000×` | weighted `1.7319×` |
+| Nanbeige 4.2-3B | 8 | 16384 | fallback `1.0000×` | weighted `1.7268×` |
+| Qwen2.5 14B/32B | 4 | 2048 | fallback `1.0000×` | fallback `1.0000×` |
+| Qwen2.5 14B/32B | 8 | 2048 | fallback `1.0000×` | fallback `1.0000×` |
+| Llama-3.1 405B | 4 | 2048 | fallback `1.0000×` | fallback `1.0000×` |
+| Llama-3.1 405B | 8 | 2048 | fallback `1.0000×` | fallback `1.0000×` |
+| Llama-3.1 405B | 4 | 16384 | fallback `1.0000×` | fallback `1.0000×` |
+| Llama-3.1 405B | 8 | 16384 | fallback `1.0000×` | fallback `1.0000×` |
+| v9 原 shape | 4 | 2048 | weighted `1.0638×` | weighted `1.2029×` |
+| v9 原 shape | 8 | 2048 | weighted `1.0756×` | weighted `1.2146×` |
+| v9 原 shape | 4 | 16384 | fallback `1.0000×` | weighted `1.3088×` |
+| v9 原 shape | 8 | 16384 | fallback `1.0000×` | weighted `1.4185×` |
+
+补充矩阵覆盖QKV的`K=2K/3K/4K/5K/16K`、`N=4K～18K`，以及OProj的`N=2K～16K`。启用weighted的19个算子点全部提升，另外17个算子点安全回退；没有退化点。这证明的是所选宽度内的安全泛化，不等价于所有可能MNK的全量保证。
+
 ## 限制
 
 - 当前正式数据只验证了 SM 锁频；HBM/NVLink 能力比已经进入模型和 API，但没有对应的降频硬件可做性能验收，因此仍属于实验接口；
 - weighted ownership 会改变每个 CP rank 的本地序列长度，框架必须让相同分区贯穿依赖该序列布局的后续计算；
-- 自动 DVFS、温度变化、功耗墙和共享机器上的动态争用不属于本版本保证范围。
+- 规划器不会在线预测自动DVFS、温度或共享机器争用。默认功耗边界只负责避免把标称频率比误用于已经撞功耗墙的shape；如果运行环境或功耗上限改变，应重新测定这个边界，或直接传入同一workload下的有效吞吐比。
