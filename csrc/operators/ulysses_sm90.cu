@@ -3,6 +3,8 @@
 #include "fuse/operators/a2a_gemm.h"
 #include "fuse/operators/gemm_a2a.h"
 #include "fuse/operators/heterogeneous_cp.h"
+#include "fuse/operators/oproj_backward.h"
+#include "fuse/operators/qkv_backward.h"
 
 #include "fuse/arch/sm90.cuh"
 #include "fuse/profiling/timeline.cuh"
@@ -55,7 +57,9 @@ using ClusterShape = Shape<_1, _1, _1>;
 using M64ClusterShape = Shape<_1, _1, _1>;
 using ProjectionClusterShape = Shape<_2, _1, _1>;
 using LayoutA = cutlass::layout::RowMajor;
+using LayoutAColumn = cutlass::layout::ColumnMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
+using LayoutBRow = cutlass::layout::RowMajor;
 using LayoutD = cutlass::layout::RowMajor;
 
 constexpr int kBlockM = 128;
@@ -138,6 +142,25 @@ bool supported_problem(const GemmProblem& p) {
        p.max_swizzle_size == 4 || p.max_swizzle_size == 8);
 }
 
+bool supported_transpose_b_problem(const GemmProblem& p) {
+  const bool unit_strides =
+      (p.stride_a.column < 0 || p.stride_a.column == 1) &&
+      (p.stride_b.column < 0 || p.stride_b.column == 1) &&
+      (p.stride_d.column < 0 || p.stride_d.column == 1);
+  const bool leading_dimensions =
+      a_row_stride(p) >= p.k && b_row_stride(p) >= p.n &&
+      d_row_stride(p) >= p.n && a_row_stride(p) % kAlignment == 0 &&
+      b_row_stride(p) % kAlignment == 0 &&
+      d_row_stride(p) % kAlignment == 0;
+  return p.m > 0 && p.n > 0 && p.k > 0 && p.l == 1 && unit_strides &&
+      leading_dimensions && !p.transpose_a && p.transpose_b &&
+      p.input_dtype == DType::kBfloat16 &&
+      p.weight_dtype == DType::kBfloat16 &&
+      p.output_dtype == DType::kBfloat16 &&
+      (p.max_swizzle_size == 1 || p.max_swizzle_size == 2 ||
+       p.max_swizzle_size == 4 || p.max_swizzle_size == 8);
+}
+
 bool supported_fp8_problem(const GemmProblem& p) {
   const bool unit_strides =
       (p.stride_a.column < 0 || p.stride_a.column == 1) &&
@@ -211,6 +234,45 @@ struct WeightedA2AGemmKernelParams {
   int32_t source_row_begin = 0;
   int32_t global_sequence_begin = 0;
   bool weighted_partition = false;
+};
+
+// Private launch form for QKV backward. The public API is expressed in model
+// semantics; this normalized form carries the exact dgrad GEMM and route used
+// by the cooperative kernel.
+struct QkvBackwardKernelParams {
+  const Bf16* local_q = nullptr;
+  const Bf16* local_k = nullptr;
+  const Bf16* local_v = nullptr;
+  Bf16* peer_staging[kMaxWorldSize]{};
+  uint32_t* peer_ready[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  const Bf16* weight = nullptr;
+  Bf16* grad_input = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  float alpha = 1.0f;
+};
+
+// Private normalized form for OProj backward. Keeping it distinct from the
+// public forward GemmA2AParams lets the shared route template select its
+// q-head-only semantics without adding a new template argument to every
+// existing forward kernel instantiation.
+struct OprojBackwardKernelParams {
+  const Bf16* lhs = nullptr;
+  const Bf16* rhs_nt = nullptr;
+  Bf16* local_output = nullptr;
+  Bf16* peer_output[kMaxWorldSize]{};
+  uint32_t* peer_route_done_epoch[kMaxWorldSize]{};
+  uint32_t* ready = nullptr;
+  uint32_t* completion_epoch = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  uint32_t epoch = 0;
+  float alpha = 1.0f;
 };
 
 enum class QkvGemmPolicy {
@@ -703,7 +765,7 @@ using N192PureGemm = cutlass::gemm::kernel::GemmUniversal<
 
 #if FUSE_ENABLE_PROFILING
 using A2ALhsTelemetryMainloop =
-    detail::A2ALhsReadyMainloop<BaseMainloop, 1, true>;
+    detail::A2ALhsReadyMainloop<BaseMainloop, 1, false, true>;
 using A2ALhsTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     A2ALhsTelemetryMainloop,
@@ -760,7 +822,7 @@ using A2ALhsM64Gemm = cutlass::gemm::kernel::GemmUniversal<
     detail::MonolithicPersistentScheduler>;
 #if FUSE_ENABLE_PROFILING
 using A2ALhsM64TelemetryMainloop =
-    detail::A2ALhsReadyMainloop<M64Mainloop, 1, true>;
+    detail::A2ALhsReadyMainloop<M64Mainloop, 1, false, true>;
 using A2ALhsM64TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     A2ALhsM64TelemetryMainloop,
@@ -820,6 +882,183 @@ using ProjectionPureGemm = cutlass::gemm::kernel::GemmUniversal<
     ProjectionEpilogue,
     cutlass::gemm::PersistentScheduler>;
 
+// Backward dgrad consumes the original row-major forward weight. CUTLASS sees
+// it as logical B[K,N], so the physical [K,N] rows are used directly and no
+// online weight transpose is needed.
+using BackwardProjectionMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutBRow,
+        kAlignment,
+        Accumulator,
+        ProjectionTileShape,
+        ProjectionClusterShape,
+        cutlass::gemm::collective::StageCount<4>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
+using BackwardProjectionObservedEpilogue =
+    detail::SignalingEpilogue<ProjectionEpilogue>;
+using BackwardProjectionOutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    BackwardProjectionMainloop,
+    BackwardProjectionObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+
+template <
+    class TileShapeType,
+    class ClusterShapeType,
+    class EpilogueType,
+    class KernelScheduleType>
+using BackwardRowBMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutA,
+        kAlignment,
+        Element,
+        LayoutBRow,
+        kAlignment,
+        Accumulator,
+        TileShapeType,
+        ClusterShapeType,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename EpilogueType::SharedStorage))>,
+        KernelScheduleType>::CollectiveOp;
+
+using BackwardN64Mainloop = BackwardRowBMainloop<
+    N64TileShape,
+    ClusterShape,
+    N64Epilogue,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using BackwardN128Mainloop = BackwardRowBMainloop<
+    TileShape,
+    ClusterShape,
+    BaseEpilogue,
+    cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using BackwardN160Mainloop = BackwardRowBMainloop<
+    N160TileShape,
+    ClusterShape,
+    N160Epilogue,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative>;
+using BackwardN192Mainloop = BackwardRowBMainloop<
+    N192TileShape,
+    ClusterShape,
+    N192Epilogue,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative>;
+using BackwardN64ClusterM2Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        N64TileShape,
+        ProjectionClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+using BackwardN64ClusterM2Mainloop = BackwardRowBMainloop<
+    N64TileShape,
+    ProjectionClusterShape,
+    BackwardN64ClusterM2Epilogue,
+    cutlass::gemm::KernelTmaWarpSpecializedCooperative>;
+template <class Mainloop, class Epilogue>
+using BackwardReadyGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    detail::A2ALhsReadyMainloop<Mainloop, 1, true>,
+    Epilogue,
+    detail::MonolithicPersistentScheduler>;
+
+using BackwardN64ReadyGemm =
+    BackwardReadyGemm<BackwardN64Mainloop, N64Epilogue>;
+using BackwardN128ReadyGemm =
+    BackwardReadyGemm<BackwardN128Mainloop, BaseEpilogue>;
+using BackwardN160ReadyGemm =
+    BackwardReadyGemm<BackwardN160Mainloop, N160Epilogue>;
+using BackwardN192ReadyGemm =
+    BackwardReadyGemm<BackwardN192Mainloop, N192Epilogue>;
+using BackwardN64ClusterM2ReadyGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    detail::A2ALhsReadyMainloop<BackwardN64ClusterM2Mainloop, 1, true>,
+    BackwardN64ClusterM2Epilogue,
+    detail::MonolithicPersistentScheduler>;
+
+template <class Mainloop, class Epilogue>
+using BackwardSignalingGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Mainloop,
+    detail::SignalingEpilogue<Epilogue>,
+    detail::MonolithicPersistentScheduler>;
+
+using BackwardN64SignalingGemm =
+    BackwardSignalingGemm<BackwardN64Mainloop, N64Epilogue>;
+using BackwardN128SignalingGemm =
+    BackwardSignalingGemm<BackwardN128Mainloop, BaseEpilogue>;
+using BackwardN160SignalingGemm =
+    BackwardSignalingGemm<BackwardN160Mainloop, N160Epilogue>;
+using BackwardN192SignalingGemm =
+    BackwardSignalingGemm<BackwardN192Mainloop, N192Epilogue>;
+
+// QKV dgrad consumes peer-published [M,QKV] staging. Each logical head is one
+// ready group, and the source rank publishes the flag with system scope.
+using BackwardA2ALhsMainloop =
+    detail::A2ALhsReadyMainloop<BackwardProjectionMainloop, 1, true>;
+using BackwardA2ALhsGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    BackwardA2ALhsMainloop,
+    ProjectionEpilogue,
+    detail::MonolithicPersistentScheduler>;
+
+// Shared QKV/OProj wgrad geometry. Logical A is the transpose view of the
+// row-major output gradient, logical B is the saved row-major forward input:
+// [weight_rows,M] * [M,weight_columns] -> [weight_rows,weight_columns].
+using BackwardWgradEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        ProjectionTileShape,
+        ProjectionClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        Element,
+        LayoutD,
+        kAlignment,
+        Element,
+        LayoutD,
+        kAlignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+using BackwardWgradMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Element,
+        LayoutAColumn,
+        kAlignment,
+        Element,
+        LayoutBRow,
+        kAlignment,
+        Accumulator,
+        ProjectionTileShape,
+        ProjectionClusterShape,
+        cutlass::gemm::collective::StageCount<4>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+using BackwardWgradGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    BackwardWgradMainloop,
+    BackwardWgradEpilogue,
+    cutlass::gemm::PersistentScheduler>;
+
 using A2ALhsProjectionMainloop =
     detail::A2ALhsReadyMainloop<ProjectionMainloop>;
 using A2ALhsProjectionGemm = cutlass::gemm::kernel::GemmUniversal<
@@ -829,7 +1068,7 @@ using A2ALhsProjectionGemm = cutlass::gemm::kernel::GemmUniversal<
     detail::MonolithicPersistentScheduler>;
 #if FUSE_ENABLE_PROFILING
 using A2ALhsProjectionTelemetryMainloop =
-    detail::A2ALhsReadyMainloop<ProjectionMainloop, 1, true>;
+    detail::A2ALhsReadyMainloop<ProjectionMainloop, 1, false, true>;
 using A2ALhsProjectionTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     A2ALhsProjectionTelemetryMainloop,
@@ -892,9 +1131,10 @@ using WideN320PureGemm = cutlass::gemm::kernel::GemmUniversal<
     WideN320Mainloop,
     WideN320Epilogue,
     cutlass::gemm::PersistentScheduler>;
+
 #if FUSE_ENABLE_PROFILING
 using A2ALhsWideN320TelemetryMainloop =
-    detail::A2ALhsReadyMainloop<WideN320Mainloop, 1, true>;
+    detail::A2ALhsReadyMainloop<WideN320Mainloop, 1, false, true>;
 using A2ALhsWideN320TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     A2ALhsWideN320TelemetryMainloop,
@@ -1639,8 +1879,395 @@ struct A2ALhsInputCommT {
   }
 };
 
+// QKV backward source-push route. Each rank reads its planar local-head
+// dQ/dK/dV tensors and writes every destination's [M,QKV] staging matrix in
+// the exact forward projection order [all Q][all K][all V].
+template <int32_t ReadyBlockM>
+struct QkvBackwardPushCommT {
+  static constexpr size_t SharedStorageBytes =
+      kQkvBulkSlots * kQkvBulkStageBytes +
+      kQkvBulkSlots * sizeof(uint64_t);
+  static constexpr bool kNeedsGridFinalize = true;
+
+  struct Arguments {
+    QkvBackwardKernelParams params{};
+    cute::TmaDescriptor source_tma[3]{};
+    cute::TmaDescriptor peer_staging_tma[kMaxWorldSize]{};
+    bool use_tma = false;
+  };
+  using Params = Arguments;
+
+  static cudaError_t initialize(Arguments& args) {
+    const auto& p = args.params;
+    const auto& route = p.route;
+    args.use_tma = false;
+    if (ReadyBlockM != 2 * kQkvBulkRows ||
+        route.head_dim != kQkvBulkColumns ||
+        route.world_size <= 0 || route.world_size > kMaxWorldSize ||
+        route.seq_local <= 0 || route.seq_local % ReadyBlockM != 0 ||
+        p.gemm.m <= 0 || p.gemm.m % ReadyBlockM != 0) {
+      return cudaSuccess;
+    }
+
+    constexpr uint32_t box_dims[2] = {
+        kQkvBulkColumns, kQkvBulkRows};
+    constexpr uint32_t element_strides[2] = {1, 1};
+    auto encode = [&](cute::TmaDescriptor* descriptor,
+                      Bf16* pointer,
+                      int32_t columns,
+                      int32_t rows) {
+      const uint64_t global_dims[2] = {
+          static_cast<uint64_t>(columns),
+          static_cast<uint64_t>(rows)};
+      const uint64_t global_strides[1] = {
+          static_cast<uint64_t>(columns) * sizeof(Bf16)};
+      return CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+          descriptor,
+          CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+          2,
+          pointer,
+          global_dims,
+          global_strides,
+          box_dims,
+          element_strides,
+          CU_TENSOR_MAP_INTERLEAVE_NONE,
+          CU_TENSOR_MAP_SWIZZLE_NONE,
+          CU_TENSOR_MAP_L2_PROMOTION_NONE,
+          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+    };
+
+    const int32_t q_local_width =
+        route.q_heads / route.world_size * route.head_dim;
+    const int32_t kv_local_width =
+        route.kv_heads / route.world_size * route.head_dim;
+    const int32_t global_rows = route.batch * route.global_seq;
+    if (!encode(
+            &args.source_tma[0],
+            const_cast<Bf16*>(p.local_q),
+            q_local_width,
+            global_rows) ||
+        !encode(
+            &args.source_tma[1],
+            const_cast<Bf16*>(p.local_k),
+            kv_local_width,
+            global_rows) ||
+        !encode(
+            &args.source_tma[2],
+            const_cast<Bf16*>(p.local_v),
+            kv_local_width,
+            global_rows)) {
+      return cudaSuccess;
+    }
+    for (int32_t peer = 0; peer < route.world_size; ++peer) {
+      if (!encode(
+              &args.peer_staging_tma[peer],
+              p.peer_staging[peer],
+              p.gemm.k,
+              p.gemm.m)) {
+        return cudaSuccess;
+      }
+    }
+    args.use_tma = true;
+    return cudaSuccess;
+  }
+
+  static bool can_implement(const Arguments& args) {
+    const auto& p = args.params;
+    const auto& route = p.route;
+    bool pointers = p.local_q && p.local_k && p.local_v && p.weight &&
+        p.grad_input && p.peer_staging[route.rank] &&
+        p.peer_ready[route.rank];
+    for (int32_t peer = 0; peer < route.world_size && pointers; ++peer) {
+      pointers = p.peer_staging[peer] && p.peer_ready[peer] &&
+          p.peer_done_epoch[peer];
+    }
+    const int32_t packed_heads = route.q_heads + 2 * route.kv_heads;
+    return pointers && p.epoch > 0 && supported_route_base(route) &&
+        route.kind == RouteKind::kQkvGqaPack &&
+        route.direction == RouteDirection::kInverse &&
+        route.q_heads > 0 && route.kv_heads > 0 &&
+        route.q_heads % route.kv_heads == 0 &&
+        route.q_heads % route.world_size == 0 &&
+        route.kv_heads % route.world_size == 0 &&
+        route.head_dim > 0 && route.head_dim % kAlignment == 0 &&
+        route.global_seq == route.seq_local * route.world_size &&
+        (!route.causal_load_balanced || route.seq_local % 2 == 0) &&
+        p.gemm.l == 1 && p.gemm.m == route.batch * route.seq_local &&
+        p.gemm.k == packed_heads * route.head_dim && p.gemm.n > 0 &&
+        p.gemm.transpose_b;
+  }
+
+  static Params to_underlying_arguments(const Arguments& args) { return args; }
+
+  __host__ __device__ static int32_t arrivals_per_peer(const Params&) {
+    return 1;
+  }
+
+  CUTLASS_DEVICE static int32_t global_sequence_row(
+      const UlyssesRoute& route,
+      int32_t destination_rank,
+      int32_t local_sequence) {
+    if (!route.causal_load_balanced) {
+      return destination_rank * route.seq_local + local_sequence;
+    }
+    const int32_t chunk_rows = route.seq_local / 2;
+    const int32_t chunk = local_sequence < chunk_rows
+        ? destination_rank
+        : 2 * route.world_size - destination_rank - 1;
+    const int32_t row_in_chunk = local_sequence < chunk_rows
+        ? local_sequence
+        : local_sequence - chunk_rows;
+    return chunk * chunk_rows + row_in_chunk;
+  }
+
+  CUTLASS_DEVICE void operator()(
+      const Params& args,
+      int32_t comm_id,
+      int32_t comm_ctas) {
+    const auto& p = args.params;
+    const auto& route = p.route;
+    const int32_t q_local_heads = route.q_heads / route.world_size;
+    const int32_t kv_local_heads = route.kv_heads / route.world_size;
+    const int32_t local_packed_heads =
+        q_local_heads + 2 * kv_local_heads;
+    const int32_t packed_heads = route.q_heads + 2 * route.kv_heads;
+    const int32_t m_tiles = ceil_div(p.gemm.m, ReadyBlockM);
+    const int32_t tasks =
+        m_tiles * route.world_size * local_packed_heads;
+    constexpr int32_t elements_per_vector = kAlignment;
+    const int32_t vectors_per_head = route.head_dim / elements_per_vector;
+
+    if (args.use_tma) {
+      extern __shared__ char dynamic_smem[];
+      auto* stages = reinterpret_cast<Bf16*>(dynamic_smem);
+      auto* barriers = reinterpret_cast<uint64_t*>(
+          dynamic_smem + kQkvBulkSlots * kQkvBulkStageBytes);
+      const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31;
+      const int32_t slot = static_cast<int32_t>(threadIdx.x) >> 5;
+      if (slot < kQkvBulkSlots) {
+        auto* stage = stages +
+            static_cast<int64_t>(slot) *
+                kQkvBulkRows * kQkvBulkColumns;
+        uint64_t* barrier = barriers + slot;
+        int32_t phase = 0;
+        if (lane == 0) {
+          cute::initialize_barrier(*barrier, 1);
+        }
+        __syncwarp();
+
+        const int32_t task_stride = comm_ctas * kQkvBulkSlots;
+        for (int32_t task = slot * comm_ctas + comm_id;
+             task < tasks;
+             task += task_stride) {
+          const int32_t local_head = task % local_packed_heads;
+          const int32_t destination_work = task / local_packed_heads;
+          const int32_t destination_rank =
+              destination_work % route.world_size;
+          const int32_t tile_m = destination_work / route.world_size;
+
+          int32_t segment = 0;
+          int32_t segment_head = local_head;
+          int32_t global_head = 0;
+          if (local_head >= q_local_heads + kv_local_heads) {
+            segment = 2;
+            segment_head =
+                local_head - q_local_heads - kv_local_heads;
+            global_head = route.q_heads + route.kv_heads +
+                route.rank * kv_local_heads + segment_head;
+          } else if (local_head >= q_local_heads) {
+            segment = 1;
+            segment_head = local_head - q_local_heads;
+            global_head = route.q_heads +
+                route.rank * kv_local_heads + segment_head;
+          } else {
+            global_head =
+                route.rank * q_local_heads + segment_head;
+          }
+
+          if (lane == 0) {
+            for (int32_t chunk = 0; chunk < 2; ++chunk) {
+              const int32_t destination_row =
+                  tile_m * ReadyBlockM + chunk * kQkvBulkRows;
+              const int32_t batch = destination_row / route.seq_local;
+              const int32_t local_sequence =
+                  destination_row - batch * route.seq_local;
+              const int32_t source_row = batch * route.global_seq +
+                  global_sequence_row(
+                      route, destination_rank, local_sequence);
+              cute::set_barrier_transaction_bytes(
+                  *barrier, kQkvBulkStageBytes);
+              cute::SM90_TMA_LOAD_2D::copy(
+                  &args.source_tma[segment],
+                  barrier,
+                  0x12f0000000000000ull,
+                  stage,
+                  segment_head * route.head_dim,
+                  source_row);
+              cute::wait_barrier(*barrier, phase);
+              phase ^= 1;
+              cute::tma_store_fence();
+              cute::SM90_TMA_STORE_2D::copy(
+                  &args.peer_staging_tma[destination_rank],
+                  stage,
+                  global_head * route.head_dim,
+                  destination_row);
+              cute::tma_store_arrive();
+              // The stage can be reused once the async engine has consumed
+              // it; final destination completion is enforced below before
+              // publishing the ready epoch.
+              cute::tma_store_wait<0>();
+            }
+            detail::tma_store_wait_all();
+            detail::store_release_system(
+                p.peer_ready[destination_rank] +
+                    (static_cast<int64_t>(tile_m) * packed_heads +
+                     global_head) * kReadyFlagStride,
+                p.epoch);
+          }
+          __syncwarp();
+        }
+        if (lane == 0) {
+          cutlass::arch::ClusterBarrier::invalidate(barrier);
+        }
+      }
+      return;
+    }
+
+    for (int32_t task = comm_id; task < tasks; task += comm_ctas) {
+      const int32_t local_head = task % local_packed_heads;
+      const int32_t destination_work = task / local_packed_heads;
+      const int32_t destination_rank =
+          destination_work % route.world_size;
+      const int32_t tile_m = destination_work / route.world_size;
+
+      int32_t segment_head = local_head;
+      int32_t global_head = 0;
+      int32_t segment_width = q_local_heads * route.head_dim;
+      const Bf16* segment = p.local_q;
+      if (local_head >= q_local_heads + kv_local_heads) {
+        segment_head = local_head - q_local_heads - kv_local_heads;
+        global_head = route.q_heads + route.kv_heads +
+            route.rank * kv_local_heads + segment_head;
+        segment_width = kv_local_heads * route.head_dim;
+        segment = p.local_v;
+      } else if (local_head >= q_local_heads) {
+        segment_head = local_head - q_local_heads;
+        global_head = route.q_heads +
+            route.rank * kv_local_heads + segment_head;
+        segment_width = kv_local_heads * route.head_dim;
+        segment = p.local_k;
+      } else {
+        global_head = route.rank * q_local_heads + segment_head;
+      }
+
+      const int32_t m_begin = tile_m * ReadyBlockM;
+      const int32_t copy_rows =
+          max(0, min(ReadyBlockM, p.gemm.m - m_begin));
+      const auto* source = reinterpret_cast<const uint4*>(segment);
+      auto* destination = reinterpret_cast<uint4*>(
+          p.peer_staging[destination_rank]);
+      const int32_t vector_count = copy_rows * vectors_per_head;
+      for (int32_t index = static_cast<int32_t>(threadIdx.x);
+           index < vector_count;
+           index += static_cast<int32_t>(blockDim.x)) {
+        const int32_t row = index / vectors_per_head;
+        const int32_t vector_n = index - row * vectors_per_head;
+        const int32_t destination_row = m_begin + row;
+        const int32_t batch = destination_row / route.seq_local;
+        const int32_t local_sequence =
+            destination_row - batch * route.seq_local;
+        const int32_t source_sequence = global_sequence_row(
+            route, destination_rank, local_sequence);
+        const int64_t source_element =
+            (static_cast<int64_t>(batch) * route.global_seq +
+             source_sequence) * segment_width +
+            segment_head * route.head_dim;
+        const int64_t destination_element =
+            static_cast<int64_t>(destination_row) * p.gemm.k +
+            global_head * route.head_dim;
+        destination[destination_element / elements_per_vector + vector_n] =
+            source[source_element / elements_per_vector + vector_n];
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        // The destination GEMM runs on another GPU and may consume this tile
+        // immediately after observing the flag.
+        detail::fence_system();
+        detail::store_release_system(
+            p.peer_ready[destination_rank] +
+                (static_cast<int64_t>(tile_m) * packed_heads + global_head) *
+                    kReadyFlagStride,
+            p.epoch);
+      }
+      __syncthreads();
+    }
+  }
+
+  CUTLASS_DEVICE void finalize(const Params& args) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32) {
+      return;
+    }
+    const auto& p = args.params;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x);
+    if (lane == 0) {
+      detail::fence_system();
+    }
+    __syncwarp();
+    if (lane < p.route.world_size) {
+      detail::store_release_system(
+          p.peer_done_epoch[lane] + p.route.rank * kReadyFlagStride,
+          p.epoch);
+    }
+    __syncwarp();
+    const uint32_t* local_done = p.peer_done_epoch[p.route.rank];
+    if (lane < p.route.world_size) {
+      while (detail::load_acquire_system(
+                 local_done + lane * kReadyFlagStride) < p.epoch) {
+        __nanosleep(64);
+      }
+    }
+    __syncwarp();
+  }
+
+#if FUSE_ENABLE_PROFILING
+  CUTLASS_DEVICE void finalize_profile(
+      const Params& args,
+      A2AGemmCtaTimeline* event) {
+    if (blockIdx.x != 0 || threadIdx.x >= 32 || event == nullptr) {
+      return;
+    }
+    const auto& p = args.params;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x);
+    if (lane == 0) {
+      detail::fence_system();
+      event->fence_done = detail::read_global_timer();
+    }
+    __syncwarp();
+    if (lane < p.route.world_size) {
+      detail::store_release_system(
+          p.peer_done_epoch[lane] + p.route.rank * kReadyFlagStride,
+          p.epoch);
+    }
+    __syncwarp();
+    if (lane == 0) {
+      event->publish_done = detail::read_global_timer();
+    }
+    const uint32_t* local_done = p.peer_done_epoch[p.route.rank];
+    if (lane < p.route.world_size) {
+      while (detail::load_acquire_system(
+                 local_done + lane * kReadyFlagStride) < p.epoch) {
+        __nanosleep(64);
+      }
+      event->source_ready[lane] = detail::read_global_timer();
+    }
+    __syncwarp();
+  }
+#endif
+};
+
 using A2ALhsInputComm = A2ALhsInputCommT<kBlockM>;
 using A2ALhsM64InputComm = A2ALhsInputCommT<64>;
+using QkvBackwardPushComm = QkvBackwardPushCommT<kBlockM>;
 template <int32_t ReadyBlockM, bool Finalize>
 using WeightedA2ALhsInputComm = A2ALhsInputCommT<
     ReadyBlockM,
@@ -1668,6 +2295,22 @@ using A2ALhsProjectionGemmKernel =
     detail::MonolithicGemm<A2ALhsProjectionGemm, A2ALhsInputComm>;
 using A2ALhsWideN320GemmKernel =
     detail::MonolithicGemm<A2ALhsWideN320Gemm, A2ALhsInputComm>;
+
+template <class Gemm>
+using QkvBackwardDataKernelT =
+    detail::MonolithicGemm<Gemm, QkvBackwardPushComm>;
+using QkvBackwardDataKernelN64 =
+    QkvBackwardDataKernelT<BackwardN64ReadyGemm>;
+using QkvBackwardDataKernelN128 =
+    QkvBackwardDataKernelT<BackwardN128ReadyGemm>;
+using QkvBackwardDataKernelN160 =
+    QkvBackwardDataKernelT<BackwardN160ReadyGemm>;
+using QkvBackwardDataKernelN192 =
+    QkvBackwardDataKernelT<BackwardN192ReadyGemm>;
+using QkvBackwardDataKernelN256 =
+    QkvBackwardDataKernelT<BackwardA2ALhsGemm>;
+using QkvBackwardDataKernelN64ClusterM2 =
+    QkvBackwardDataKernelT<BackwardN64ClusterM2ReadyGemm>;
 #if FUSE_ENABLE_PROFILING
 using A2ALhsProjectionTelemetryBase = detail::MonolithicGemm<
     A2ALhsProjectionTelemetryGemm, A2ALhsTelemetryInputComm>;
@@ -1737,6 +2380,8 @@ struct QkvGqaPackCommT {
       kQkvBulkSlots * kQkvBulkStageBytes +
       kQkvBulkSlots * sizeof(uint64_t);
   static constexpr bool kNeedsGridFinalize = FinalizeAcrossRanks;
+  static constexpr bool kUniformHeads =
+      std::is_same_v<ParamsType, OprojBackwardKernelParams>;
 
   CUTLASS_HOST_DEVICE static int32_t logical_source_rank(
       const ParamsType& p) {
@@ -1769,6 +2414,20 @@ struct QkvGqaPackCommT {
     const int32_t local_sequence =
         logical_row - batch * p.route.seq_local;
     int32_t sequence_begin = logical_source_rank(p) * p.route.seq_local;
+    if constexpr (kUniformHeads) {
+      if (p.route.causal_load_balanced) {
+        const int32_t chunk_rows = p.route.seq_local / 2;
+        const int32_t source_rank = logical_source_rank(p);
+        const int32_t chunk = local_sequence < chunk_rows
+            ? source_rank
+            : 2 * p.route.world_size - source_rank - 1;
+        const int32_t row_in_chunk = local_sequence < chunk_rows
+            ? local_sequence
+            : local_sequence - chunk_rows;
+        return static_cast<int64_t>(batch) * p.route.global_seq +
+            chunk * chunk_rows + row_in_chunk;
+      }
+    }
     if constexpr (Heterogeneous) {
       if (p.weighted_partition) {
         sequence_begin = p.global_sequence_begin;
@@ -1822,15 +2481,20 @@ struct QkvGqaPackCommT {
         p.route.q_heads / p.route.world_size * p.route.head_dim;
     const int32_t kv_local_width =
         p.route.kv_heads / p.route.world_size * p.route.head_dim;
+    constexpr bool uniform_heads = kUniformHeads;
     const uint64_t output_rows =
         static_cast<uint64_t>(p.route.batch) * p.route.global_seq;
     for (int32_t peer = 0; peer < p.route.world_size; ++peer) {
-      const int32_t descriptor_count = p.route.defer_v_a2a ? 1 : 3;
+      const int32_t descriptor_count =
+          uniform_heads || p.route.defer_v_a2a ? 1 : 3;
       for (int32_t segment = 0; segment < descriptor_count; ++segment) {
-        const int32_t segment_width = p.route.defer_v_a2a
+        const int32_t segment_width = uniform_heads
+            ? q_local_width
+            : p.route.defer_v_a2a
             ? q_local_width + kv_local_width
             : (segment == 0 ? q_local_width : kv_local_width);
-        const int64_t segment_offset = p.route.defer_v_a2a || segment == 0
+        const int64_t segment_offset =
+            uniform_heads || p.route.defer_v_a2a || segment == 0
             ? 0
             : static_cast<int64_t>(output_rows) * q_local_width +
                 (segment == 2
@@ -1868,10 +2532,12 @@ struct QkvGqaPackCommT {
     for (int32_t peer = 0; peer < p.route.world_size && pointers; ++peer) {
       pointers = p.peer_output[peer] && p.peer_route_done_epoch[peer];
     }
-    const int32_t packed_heads = p.route.q_heads + 2 * p.route.kv_heads;
+    const int32_t packed_heads = p.route.q_heads +
+        (kUniformHeads ? 0 : 2 * p.route.kv_heads);
     const bool problem_supported = IsFp8
         ? supported_fp8_problem(p.gemm)
-        : supported_problem(p.gemm);
+        : (kUniformHeads ? supported_transpose_b_problem(p.gemm)
+                        : supported_problem(p.gemm));
     bool rows_supported =
         p.gemm.m == p.route.batch * p.route.seq_local;
     bool sequence_supported =
@@ -1895,18 +2561,25 @@ struct QkvGqaPackCommT {
                 p.route.batch * p.route.seq_local;
       }
     }
-    return pointers && p.epoch > 0 && problem_supported &&
-        p.route.kind == RouteKind::kQkvGqaPack &&
-        p.route.direction == RouteDirection::kForward && p.gemm.l == 1 &&
-        p.route.q_heads > 0 && p.route.kv_heads > 0 &&
-        p.route.q_heads % p.route.kv_heads == 0 &&
+    const bool route_supported = kUniformHeads
+        ? p.route.kind == RouteKind::kHeadToSequence &&
+              p.route.direction == RouteDirection::kForward
+        : p.route.kind == RouteKind::kQkvGqaPack &&
+              p.route.direction == RouteDirection::kForward;
+    return pointers && p.epoch > 0 && problem_supported && route_supported &&
+        p.gemm.l == 1 && p.route.q_heads > 0 &&
+        (kUniformHeads ||
+         (p.route.kv_heads > 0 &&
+          p.route.q_heads % p.route.kv_heads == 0)) &&
         p.route.q_heads % p.route.world_size == 0 &&
-        p.route.kv_heads % p.route.world_size == 0 &&
+        (kUniformHeads || p.route.kv_heads % p.route.world_size == 0) &&
         p.route.head_dim > 0 && p.route.head_dim % kAlignment == 0 &&
         rows_supported &&
         sequence_supported &&
         p.gemm.n == packed_heads * p.route.head_dim &&
         p.gemm.n % kAlignment == 0 &&
+        (!kUniformHeads ||
+         (!p.route.defer_v_a2a && !p.route.qkv_peer_interleaved)) &&
         p.route.qkv_peer_interleaved == PeerInterleaved &&
         (!PeerInterleaved || p.gemm.raster != GemmRaster::kAlongN);
   }
@@ -1944,8 +2617,10 @@ struct QkvGqaPackCommT {
     const int32_t output_n_tiles = ceil_div(p.gemm.n, BlockN);
     const int32_t q_local_heads = p.route.q_heads / p.route.world_size;
     const int32_t kv_local_heads = p.route.kv_heads / p.route.world_size;
-    const int32_t route_heads =
-        q_local_heads + (p.route.defer_v_a2a ? 1 : 2) * kv_local_heads;
+    const int32_t route_heads = kUniformHeads
+        ? q_local_heads
+        : q_local_heads +
+            (p.route.defer_v_a2a ? 1 : 2) * kv_local_heads;
     const int32_t chunks_per_head = ceil_div(p.route.head_dim, CopyBlockN);
     const int32_t head_chunks = route_heads * chunks_per_head;
     const int32_t tasks =
@@ -2388,6 +3063,26 @@ using Fp8QkvGqaPackComm = QkvGqaPackCommT<
     true,
     static_cast<int32_t>(cute::size<0>(Fp8TileShape{})),
     static_cast<int32_t>(cute::size<1>(Fp8TileShape{}))>;
+template <
+    int32_t BlockM,
+    int32_t BlockN,
+    int32_t MTilesPerTask,
+    int32_t CopyBlockN>
+using OprojBackwardHeadCommT = QkvGqaPackCommT<
+    OprojBackwardKernelParams,
+    false,
+    BlockM,
+    BlockN,
+    MTilesPerTask,
+    false,
+    CopyBlockN,
+    true,
+    false>;
+using OprojBackwardHeadCommN64 = OprojBackwardHeadCommT<128, 64, 4, 128>;
+using OprojBackwardHeadCommN128 = OprojBackwardHeadCommT<128, 128, 4, 128>;
+using OprojBackwardHeadCommN160 = OprojBackwardHeadCommT<128, 160, 4, 160>;
+using OprojBackwardHeadCommN192 = OprojBackwardHeadCommT<128, 192, 4, 192>;
+using OprojBackwardHeadCommN256 = OprojBackwardHeadCommT<128, 256, 1, 256>;
 
 template <bool Finalize>
 using WeightedQkvGqaPackCommN64 = QkvGqaPackCommT<
@@ -2481,6 +3176,18 @@ using QkvGemmA2AKernelSmall =
     detail::MonolithicGemm<OutputGemm, QkvGqaPackCommSmall>;
 using Fp8GemmA2AKernel =
     detail::MonolithicGemm<Fp8OutputGemm, Fp8QkvGqaPackComm>;
+template <class Gemm, class Comm>
+using OprojBackwardDataKernelT = detail::MonolithicGemm<Gemm, Comm>;
+using OprojBackwardDataKernelN64 = OprojBackwardDataKernelT<
+    BackwardN64SignalingGemm, OprojBackwardHeadCommN64>;
+using OprojBackwardDataKernelN128 = OprojBackwardDataKernelT<
+    BackwardN128SignalingGemm, OprojBackwardHeadCommN128>;
+using OprojBackwardDataKernelN160 = OprojBackwardDataKernelT<
+    BackwardN160SignalingGemm, OprojBackwardHeadCommN160>;
+using OprojBackwardDataKernelN192 = OprojBackwardDataKernelT<
+    BackwardN192SignalingGemm, OprojBackwardHeadCommN192>;
+using OprojBackwardDataKernelN256 = OprojBackwardDataKernelT<
+    BackwardProjectionOutputGemm, OprojBackwardHeadCommN256>;
 
 #if FUSE_ENABLE_PROFILING
 // Diagnostic-only GEMM->A2A wrapper. Unlike the generic outer telemetry
@@ -3167,6 +3874,514 @@ cudaError_t launch_gemm_a2a_impl(
   return detail::launch_cooperative<Kernel>(kernel_params, stream, sm_count);
 }
 
+template <
+    class Gemm,
+    class BaseKernel
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
+cudaError_t launch_qkv_backward_data_policy(
+    const QkvBackwardKernelParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device
+#if FUSE_ENABLE_PROFILING
+    , A2AGemmCtaTimeline* timeline = nullptr,
+    int32_t timeline_capacity = 0
+#endif
+    ) {
+  using Comm = QkvBackwardPushComm;
+#if FUSE_ENABLE_PROFILING
+  using Kernel = std::conditional_t<
+      Instrumented,
+      GemmA2ARoleTelemetryKernel<Gemm, Comm>,
+      BaseKernel>;
+#else
+  using Kernel = BaseKernel;
+#endif
+  typename Comm::Arguments comm_args{};
+  comm_args.params = params;
+  cudaError_t status = Comm::initialize(comm_args);
+  if (status != cudaSuccess || !Comm::can_implement(comm_args)) {
+    return status != cudaSuccess ? status : cudaErrorNotSupported;
+  }
+
+  constexpr int32_t tile_m = static_cast<int32_t>(
+      cute::size<0>(typename Gemm::TileShape{}));
+  constexpr int32_t tile_k = static_cast<int32_t>(
+      cute::size<2>(typename Gemm::TileShape{}));
+  const int32_t packed_heads =
+      params.route.q_heads + 2 * params.route.kv_heads;
+  if (params.route.head_dim % tile_k != 0) {
+    return cudaErrorNotSupported;
+  }
+
+  typename Kernel::Arguments args{};
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Instrumented) {
+    args.timeline = timeline;
+    args.timeline_capacity = timeline_capacity;
+  }
+#endif
+  args.num_comm_ctas = params.num_comm_ctas;
+  args.comm = comm_args;
+  args.gemm.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.gemm.problem_shape = make_shape(
+      params.gemm.m, params.gemm.n, params.gemm.k, 1);
+  args.gemm.mainloop.ptr_A = params.peer_staging[params.route.rank];
+  args.gemm.mainloop.dA = make_stride(
+      static_cast<int64_t>(params.gemm.k),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.k);
+  args.gemm.mainloop.ptr_B = params.weight;
+  // CUTLASS B coordinates are [N,K]. The stored forward weight is row-major
+  // [K,N], hence address(n,k) = n + k*N.
+  args.gemm.mainloop.dB = make_stride(
+      _1{},
+      static_cast<int64_t>(params.gemm.n),
+      static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  args.gemm.mainloop.ready = params.peer_ready[params.route.rank];
+  args.gemm.mainloop.world_size = packed_heads;
+  args.gemm.mainloop.m_tiles = ceil_div(params.gemm.m, tile_m);
+  args.gemm.mainloop.arrivals_per_peer = 1;
+  args.gemm.mainloop.k_tiles_per_peer = params.route.head_dim / tile_k;
+  args.gemm.mainloop.epoch = params.epoch;
+  args.gemm.epilogue.thread.alpha = params.alpha;
+  args.gemm.epilogue.thread.beta = 0.0f;
+  args.gemm.epilogue.ptr_C = nullptr;
+  args.gemm.epilogue.dC = make_stride(
+      static_cast<int64_t>(params.gemm.n),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
+  args.gemm.epilogue.ptr_D = params.grad_input;
+  args.gemm.epilogue.dD = make_stride(
+      static_cast<int64_t>(params.gemm.n),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
+  args.gemm.hw_info.device_id = device;
+  args.gemm.hw_info.sm_count = sm_count - params.num_comm_ctas;
+  args.gemm.scheduler.max_swizzle_size = 1;
+  args.gemm.scheduler.block_offset = params.num_comm_ctas;
+  args.gemm.scheduler.raster_order = RasterOptions::AlongN;
+  if (!Kernel::can_implement(args) || Kernel::get_workspace_size(args) != 0) {
+    return cudaErrorNotSupported;
+  }
+  if (Kernel::initialize_workspace(args, nullptr, stream) !=
+      cutlass::Status::kSuccess) {
+    return cudaErrorInitializationError;
+  }
+  return detail::launch_cooperative<Kernel>(
+      Kernel::to_underlying_arguments(args, nullptr), stream, sm_count);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_qkv_backward_data_telemetry_impl(
+    const QkvBackwardKernelParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (timeline == nullptr || timeline_capacity < sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  switch (params.gemm_policy) {
+    case BackwardGemmPolicy::kM128N64ClusterM2:
+      return launch_qkv_backward_data_policy<
+          BackwardN64ClusterM2ReadyGemm,
+          QkvBackwardDataKernelN64ClusterM2>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N64:
+      return launch_qkv_backward_data_policy<
+          BackwardN64ReadyGemm, QkvBackwardDataKernelN64, true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
+    default:
+      // The diagnostic is intentionally narrow so profiling builds do not
+      // instantiate five extra copies of the already-large backward kernel.
+      return cudaErrorNotSupported;
+  }
+}
+#endif
+
+cudaError_t launch_qkv_backward_data_impl(
+    const QkvBackwardKernelParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  switch (params.gemm_policy) {
+    case BackwardGemmPolicy::kM128N64ClusterM2:
+      return launch_qkv_backward_data_policy<
+          BackwardN64ClusterM2ReadyGemm,
+          QkvBackwardDataKernelN64ClusterM2>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N64:
+      return launch_qkv_backward_data_policy<
+          BackwardN64ReadyGemm, QkvBackwardDataKernelN64>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N128:
+      return launch_qkv_backward_data_policy<
+          BackwardN128ReadyGemm, QkvBackwardDataKernelN128>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N160:
+      return launch_qkv_backward_data_policy<
+          BackwardN160ReadyGemm, QkvBackwardDataKernelN160>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N192:
+      return launch_qkv_backward_data_policy<
+          BackwardN192ReadyGemm, QkvBackwardDataKernelN192>(
+              params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N256:
+      return launch_qkv_backward_data_policy<
+          BackwardA2ALhsGemm, QkvBackwardDataKernelN256>(
+              params, stream, sm_count, device);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
+template <class Gemm, class Comm, class Kernel>
+cudaError_t launch_oproj_backward_data_policy(
+    const OprojBackwardKernelParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  constexpr int32_t tile_m = static_cast<int32_t>(
+      cute::size<0>(typename Gemm::TileShape{}));
+  constexpr int32_t tile_n = static_cast<int32_t>(
+      cute::size<1>(typename Gemm::TileShape{}));
+  const int32_t m_tiles = ceil_div(params.gemm.m, tile_m);
+  const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
+
+  typename Kernel::Arguments args{};
+  args.num_comm_ctas = params.num_comm_ctas;
+  args.comm.params = params;
+  cudaError_t status = Comm::initialize(args.comm);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  args.gemm.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.gemm.problem_shape = make_shape(
+      params.gemm.m, params.gemm.n, params.gemm.k, 1);
+  args.gemm.mainloop.ptr_A = params.lhs;
+  args.gemm.mainloop.dA = make_stride(
+      static_cast<int64_t>(params.gemm.k),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.k);
+  args.gemm.mainloop.ptr_B = params.rhs_nt;
+  args.gemm.mainloop.dB = make_stride(
+      _1{},
+      static_cast<int64_t>(params.gemm.n),
+      static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  args.gemm.epilogue.thread.alpha = params.alpha;
+  args.gemm.epilogue.thread.beta = 0.0f;
+  args.gemm.epilogue.ptr_C = nullptr;
+  args.gemm.epilogue.dC = make_stride(
+      static_cast<int64_t>(params.gemm.n),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
+  args.gemm.epilogue.ptr_D = params.local_output;
+  args.gemm.epilogue.dD = make_stride(
+      static_cast<int64_t>(params.gemm.n),
+      _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
+  args.gemm.epilogue.ready = params.ready;
+  args.gemm.epilogue.m_tiles = m_tiles;
+  args.gemm.epilogue.n_tiles = n_tiles;
+  args.gemm.epilogue.epoch = params.epoch;
+  args.gemm.hw_info.device_id = device;
+  args.gemm.hw_info.sm_count = sm_count - params.num_comm_ctas;
+  args.gemm.scheduler.max_swizzle_size = 1;
+  args.gemm.scheduler.block_offset = params.num_comm_ctas;
+  args.gemm.scheduler.raster_order = RasterOptions::AlongN;
+  if (!Kernel::can_implement(args) || Kernel::get_workspace_size(args) != 0) {
+    return cudaErrorNotSupported;
+  }
+  if (Kernel::initialize_workspace(args, nullptr, stream) !=
+      cutlass::Status::kSuccess) {
+    return cudaErrorInitializationError;
+  }
+  return detail::launch_cooperative<Kernel>(
+      Kernel::to_underlying_arguments(args, nullptr), stream, sm_count);
+}
+
+cudaError_t launch_oproj_backward_data_impl(
+    const OprojBackwardKernelParams& params,
+    BackwardGemmPolicy policy,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  switch (policy) {
+    case BackwardGemmPolicy::kM128N64:
+      return launch_oproj_backward_data_policy<
+          BackwardN64SignalingGemm,
+          OprojBackwardHeadCommN64,
+          OprojBackwardDataKernelN64>(params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N128:
+      return launch_oproj_backward_data_policy<
+          BackwardN128SignalingGemm,
+          OprojBackwardHeadCommN128,
+          OprojBackwardDataKernelN128>(params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N160:
+      return launch_oproj_backward_data_policy<
+          BackwardN160SignalingGemm,
+          OprojBackwardHeadCommN160,
+          OprojBackwardDataKernelN160>(params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N192:
+      return launch_oproj_backward_data_policy<
+          BackwardN192SignalingGemm,
+          OprojBackwardHeadCommN192,
+          OprojBackwardDataKernelN192>(params, stream, sm_count, device);
+    case BackwardGemmPolicy::kM128N256:
+      return launch_oproj_backward_data_policy<
+          BackwardProjectionOutputGemm,
+          OprojBackwardHeadCommN256,
+          OprojBackwardDataKernelN256>(params, stream, sm_count, device);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
+cudaError_t launch_backward_wgrad_impl(
+    const Bf16* output_gradient,
+    const Bf16* saved_input,
+    Bf16* grad_weight,
+    int32_t weight_rows,
+    int32_t weight_columns,
+    int32_t tokens,
+    float alpha,
+    float beta,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (!output_gradient || !saved_input || !grad_weight ||
+      weight_rows <= 0 || weight_columns <= 0 || tokens <= 0 ||
+      weight_rows % kAlignment != 0 ||
+      weight_columns % kAlignment != 0 || tokens % kAlignment != 0) {
+    return cudaErrorInvalidValue;
+  }
+  typename BackwardWgradGemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.problem_shape = make_shape(
+      weight_rows, weight_columns, tokens, 1);
+  args.mainloop.ptr_A = output_gradient;
+  // output_gradient is [tokens,weight_rows] row-major and is consumed as its
+  // zero-copy column-major transpose [weight_rows,tokens].
+  args.mainloop.dA = make_stride(
+      _1{},
+      static_cast<int64_t>(weight_rows),
+      static_cast<int64_t>(tokens) * weight_rows);
+  args.mainloop.ptr_B = saved_input;
+  // CUTLASS B coordinates are [N,K]; saved_input is [K,N] row-major.
+  args.mainloop.dB = make_stride(
+      _1{},
+      static_cast<int64_t>(weight_columns),
+      static_cast<int64_t>(tokens) * weight_columns);
+  args.epilogue.thread.alpha = alpha;
+  args.epilogue.thread.beta = beta;
+  args.epilogue.ptr_C = beta == 0.0f ? nullptr : grad_weight;
+  args.epilogue.dC = make_stride(
+      static_cast<int64_t>(weight_columns),
+      _1{},
+      static_cast<int64_t>(weight_rows) * weight_columns);
+  args.epilogue.ptr_D = grad_weight;
+  args.epilogue.dD = make_stride(
+      static_cast<int64_t>(weight_columns),
+      _1{},
+      static_cast<int64_t>(weight_rows) * weight_columns);
+  args.hw_info.device_id = device;
+  args.hw_info.sm_count = sm_count;
+  args.scheduler.max_swizzle_size = 1;
+  args.scheduler.raster_order = RasterOptions::AlongN;
+  if (!BackwardWgradGemm::can_implement(args) ||
+      BackwardWgradGemm::get_workspace_size(args) != 0) {
+    return cudaErrorNotSupported;
+  }
+  if (BackwardWgradGemm::initialize_workspace(args, nullptr, stream) !=
+      cutlass::Status::kSuccess) {
+    return cudaErrorInitializationError;
+  }
+  return launch_regular<BackwardWgradGemm>(
+      BackwardWgradGemm::to_underlying_arguments(args, nullptr), stream);
+}
+
+BackwardGemmPolicy backward_policy_from_qkv_policy(QkvGemmPolicy policy) {
+  switch (policy) {
+    case QkvGemmPolicy::kM128N64:
+      return BackwardGemmPolicy::kM128N64;
+    case QkvGemmPolicy::kM128N128:
+      return BackwardGemmPolicy::kM128N128;
+    case QkvGemmPolicy::kM128N160:
+      return BackwardGemmPolicy::kM128N160;
+    case QkvGemmPolicy::kM128N192:
+      return BackwardGemmPolicy::kM128N192;
+    case QkvGemmPolicy::kM128N256ClusterM2:
+      return BackwardGemmPolicy::kM128N256;
+    case QkvGemmPolicy::kM128N320ClusterM2:
+      return BackwardGemmPolicy::kM128N256;
+    default:
+      return BackwardGemmPolicy::kM128N128;
+  }
+}
+
+QkvComputeEstimate estimate_backward_compute(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count) {
+  QkvComputeEstimate best{};
+  if (problem.m <= 0 || problem.n <= 0 || problem.k <= 0 ||
+      problem.l <= 0 || num_comm_ctas <= 0 ||
+      num_comm_ctas >= sm_count) {
+    return best;
+  }
+  const int32_t compute_ctas = sm_count - num_comm_ctas;
+  int64_t best_score = std::numeric_limits<int64_t>::max();
+  int32_t best_tie_rank = std::numeric_limits<int32_t>::max();
+  QkvComputeEstimate best_independent{};
+  int64_t best_independent_score = std::numeric_limits<int64_t>::max();
+
+  // N320 is deliberately absent: SM90's row-major-B dgrad mainloop cannot
+  // legally instantiate that GMMA geometry without first transposing the
+  // stored forward weight. The first five entries are all zero-copy layouts.
+  for (size_t index = 0; index < 5; ++index) {
+    const auto& candidate = kQkvPolicyGeometries[index];
+    if (candidate.cluster_m == 2 &&
+        (num_comm_ctas % 2 != 0 || compute_ctas % 2 != 0)) {
+      continue;
+    }
+    int64_t wave_ns = interpolate_qkv_wave_ns(
+        kQkvWaveCalibrationComm24,
+        max(
+            kQkvWaveCalibrationComm24.front().k,
+            min(problem.k, kQkvWaveCalibrationComm24.back().k)),
+        index);
+    if (wave_ns <= 0) {
+      continue;
+    }
+    if (problem.k > kQkvWaveCalibrationComm24.back().k) {
+      // Above the last calibrated K, tensor-core service is dominated by the
+      // K loop. Scale every legal tile by the same physical work ratio rather
+      // than falling back to an unrelated legacy tile.
+      wave_ns =
+          (wave_ns * problem.k +
+           kQkvWaveCalibrationComm24.back().k / 2) /
+          kQkvWaveCalibrationComm24.back().k;
+    }
+    const int64_t workers = compute_ctas / candidate.cluster_m;
+    if (workers <= 0) {
+      continue;
+    }
+    const int64_t m_tiles = ceil_div(problem.m, kBlockM);
+    const int64_t work_units =
+        ceil_div(m_tiles, candidate.cluster_m) *
+        ceil_div(problem.n, candidate.tile_n) * problem.l;
+    const int64_t waves = ceil_div(work_units, workers);
+    const int64_t score = waves * wave_ns;
+    QkvComputeEstimate estimate{};
+    estimate.policy = candidate.policy;
+    estimate.tile_n = candidate.tile_n;
+    estimate.cluster_m = candidate.cluster_m;
+    estimate.waves = waves;
+    estimate.wave_ns = wave_ns;
+    estimate.total_ns = score;
+    estimate.valid = true;
+    if (candidate.cluster_m == 1 && score < best_independent_score) {
+      best_independent = estimate;
+      best_independent_score = score;
+    }
+    const int32_t tie_rank = static_cast<int32_t>(index);
+    if (score < best_score ||
+        (score == best_score && tie_rank < best_tie_rank)) {
+      best = estimate;
+      best_score = score;
+      best_tie_rank = tie_rank;
+    }
+  }
+  if (best.valid && best.cluster_m == 2 && best_independent.valid &&
+      best_independent.waves == best.waves &&
+      best_independent.total_ns <=
+          best.total_ns + best.cluster_m * kQkvRouteTaskWaveNs) {
+    return best_independent;
+  }
+  return best;
+}
+
+BackwardGemmPolicy select_backward_gemm_policy(
+    BackwardGemmPolicy request,
+    int32_t m,
+    int32_t n,
+    int32_t k,
+    int32_t comm_ctas,
+    int32_t sm_count) {
+  if (request != BackwardGemmPolicy::kAuto) {
+    return request;
+  }
+  GemmProblem problem{m, n, k, 1};
+  problem.raster = GemmRaster::kAlongN;
+  const auto estimate = estimate_backward_compute(
+      problem, comm_ctas, sm_count);
+  return backward_policy_from_qkv_policy(
+      estimate.valid ? estimate.policy : legacy_qkv_gemm_policy(problem));
+}
+
+template <class Kernel, class Gemm>
+KernelTraits backward_traits() {
+  return {
+      static_cast<int32_t>(cute::size<0>(typename Gemm::TileShape{})),
+      static_cast<int32_t>(cute::size<1>(typename Gemm::TileShape{})),
+      static_cast<int32_t>(cute::size<2>(typename Gemm::TileShape{})),
+      static_cast<int32_t>(Kernel::get_block_shape().x),
+      static_cast<int32_t>(sizeof(typename Kernel::SharedStorage))};
+}
+
+KernelTraits qkv_backward_traits_for_policy(BackwardGemmPolicy policy) {
+  switch (policy) {
+    case BackwardGemmPolicy::kM128N64ClusterM2:
+      return backward_traits<
+          QkvBackwardDataKernelN64ClusterM2,
+          BackwardN64ClusterM2ReadyGemm>();
+    case BackwardGemmPolicy::kM128N64:
+      return backward_traits<
+          QkvBackwardDataKernelN64, BackwardN64ReadyGemm>();
+    case BackwardGemmPolicy::kM128N128:
+      return backward_traits<
+          QkvBackwardDataKernelN128, BackwardN128ReadyGemm>();
+    case BackwardGemmPolicy::kM128N160:
+      return backward_traits<
+          QkvBackwardDataKernelN160, BackwardN160ReadyGemm>();
+    case BackwardGemmPolicy::kM128N192:
+      return backward_traits<
+          QkvBackwardDataKernelN192, BackwardN192ReadyGemm>();
+    case BackwardGemmPolicy::kM128N256:
+      return backward_traits<
+          QkvBackwardDataKernelN256, BackwardA2ALhsGemm>();
+    default:
+      return {};
+  }
+}
+
+KernelTraits oproj_backward_traits_for_policy(BackwardGemmPolicy policy) {
+  switch (policy) {
+    case BackwardGemmPolicy::kM128N64:
+      return backward_traits<
+          OprojBackwardDataKernelN64, BackwardN64SignalingGemm>();
+    case BackwardGemmPolicy::kM128N128:
+      return backward_traits<
+          OprojBackwardDataKernelN128, BackwardN128SignalingGemm>();
+    case BackwardGemmPolicy::kM128N160:
+      return backward_traits<
+          OprojBackwardDataKernelN160, BackwardN160SignalingGemm>();
+    case BackwardGemmPolicy::kM128N192:
+      return backward_traits<
+          OprojBackwardDataKernelN192, BackwardN192SignalingGemm>();
+    case BackwardGemmPolicy::kM128N256:
+      return backward_traits<
+          OprojBackwardDataKernelN256, BackwardProjectionOutputGemm>();
+    default:
+      return {};
+  }
+}
+
 template <class InputGemm, int32_t ReadyBlockM>
 cudaError_t launch_weighted_a2a_policy(
     const WeightedA2AGemmKernelParams& segment,
@@ -3213,6 +4428,803 @@ KernelTraits projection_cutlass_kernel_traits() {
       static_cast<int32_t>(cute::size<2>(ProjectionTileShape{})),
       static_cast<int32_t>(ProjectionOutputGemm::get_block_shape().x),
       static_cast<int32_t>(sizeof(typename QkvGemmA2AKernelWide::SharedStorage))};
+}
+
+int64_t qkv_backward_ready_elements(const QkvBackwardDataParams& params) {
+  if (params.local_tokens <= 0 || params.q_heads <= 0 ||
+      params.kv_heads <= 0) {
+    return 0;
+  }
+  const int64_t m_tiles = ceil_div(params.local_tokens, kBlockM);
+  return m_tiles * (params.q_heads + 2LL * params.kv_heads) *
+      kReadyFlagStride;
+}
+
+BackwardGemmPolicy recommended_qkv_backward_gemm_policy(
+    const QkvBackwardDataParams& params,
+    int32_t resolved_comm_ctas,
+    int32_t sm_count) {
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  const BackwardGemmPolicy selected = select_backward_gemm_policy(
+      params.gemm_policy,
+      params.local_tokens,
+      params.hidden,
+      packed_width,
+      resolved_comm_ctas,
+      sm_count);
+  // For a long-K dgrad with an even number of M128 tiles, cluster-M2 lets
+  // each CTA pair multicast the same weight tile.  The output tile count is
+  // unchanged, so this avoids the extra wave that made M64 tiles unattractive.
+  // Explicit requests remain exact benchmark knobs; only kAuto upgrades the
+  // independently selected N64 policy.
+  const int32_t m_tiles = ceil_div(params.local_tokens, kBlockM);
+  if (params.gemm_policy == BackwardGemmPolicy::kAuto &&
+      selected == BackwardGemmPolicy::kM128N64 &&
+      packed_width >= 4096 && m_tiles >= 2 && m_tiles % 2 == 0) {
+    return BackwardGemmPolicy::kM128N64ClusterM2;
+  }
+  return selected;
+}
+
+KernelTraits qkv_backward_kernel_traits(
+    const QkvBackwardDataParams& params,
+    int32_t resolved_comm_ctas,
+    int32_t sm_count) {
+  return qkv_backward_traits_for_policy(
+      recommended_qkv_backward_gemm_policy(
+          params, resolved_comm_ctas, sm_count));
+}
+
+namespace {
+
+struct BackwardDeviceInfo {
+  int32_t device = 0;
+  int32_t sm_count = 0;
+};
+
+cudaError_t cached_backward_device_info(BackwardDeviceInfo* result) {
+  if (result == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  int32_t device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  struct Cache {
+    std::mutex mutex;
+    std::unordered_map<int32_t, int32_t> sm_counts;
+  };
+  static Cache cache;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    const auto found = cache.sm_counts.find(device);
+    if (found != cache.sm_counts.end()) {
+      *result = {device, found->second};
+      return cudaSuccess;
+    }
+  }
+  int32_t sm_count = 0;
+  status = cudaDeviceGetAttribute(
+      &sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.sm_counts.emplace(device, sm_count);
+  }
+  *result = {device, sm_count};
+  return cudaSuccess;
+}
+
+int32_t recommended_qkv_backward_comm_ctas_impl(
+    const QkvBackwardDataParams& params,
+    int32_t sm_count) {
+  if (params.local_tokens <= 0 || params.hidden <= 0 || params.batch <= 0 ||
+      params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.world_size <= 1 ||
+      params.world_size > kMaxWorldSize ||
+      params.q_heads % params.world_size != 0 ||
+      params.kv_heads % params.world_size != 0 || sm_count <= 2) {
+    return 0;
+  }
+
+  // One QKV push task moves one M128 x head_dim tile.  A communication CTA
+  // owns twelve independent warp/TMA issue slots.  H200 measurements show
+  // that ten CTAs are enough to reach the useful issuer bandwidth; beyond
+  // that point extra CTAs are useful only when they remove long task waves
+  // without forcing the GEMM out of a single persistent wave.
+  constexpr int32_t kRouteSlotsPerCta = 12;
+  constexpr int32_t kTargetRouteWaves = 2;
+  constexpr int32_t kRouteIssuerSaturation = 10;
+  constexpr int32_t kMultiComputeWaveCap = 12;
+  constexpr int32_t kMaxCommCtas = 32;
+  const int64_t m_tiles = ceil_div(params.local_tokens, kBlockM);
+  const int64_t packed_heads = params.q_heads + 2LL * params.kv_heads;
+  const int64_t route_tasks = m_tiles * packed_heads;
+  const int32_t issuer_floor = static_cast<int32_t>(
+      min<int64_t>(kRouteIssuerSaturation, route_tasks));
+  const int32_t two_wave_target = static_cast<int32_t>(ceil_div(
+      route_tasks,
+      static_cast<int64_t>(kRouteSlotsPerCta) * kTargetRouteWaves));
+  int32_t desired = max(issuer_floor, two_wave_target);
+  desired = (desired + 1) & ~1;
+  const int32_t max_comm = min(kMaxCommCtas, (sm_count - 2) & ~1);
+  desired = min(desired, max_comm);
+  if (desired <= 0) {
+    return 0;
+  }
+
+  // A larger route subgrid is effectively free only while every GEMM tile
+  // can still reside in one physical compute wave.  Once compute needs more
+  // than one wave, cap the route side near its measured saturation point so
+  // it cannot steal additional GEMM workers.  This rule uses only physical
+  // task counts and the selected tile geometry; it has no model/shape table.
+  if (desired > kMultiComputeWaveCap) {
+    const BackwardGemmPolicy policy =
+        recommended_qkv_backward_gemm_policy(params, desired, sm_count);
+    const KernelTraits traits = qkv_backward_traits_for_policy(policy);
+    if (traits.block_m <= 0 || traits.block_n <= 0) {
+      return 0;
+    }
+    int64_t physical_m_tiles = ceil_div(params.local_tokens, traits.block_m);
+    if (policy == BackwardGemmPolicy::kM128N64ClusterM2) {
+      physical_m_tiles = ceil_div(physical_m_tiles, int64_t{2}) * 2;
+    }
+    const int64_t compute_ctas =
+        physical_m_tiles * ceil_div(params.hidden, traits.block_n);
+    if (compute_ctas > sm_count - desired) {
+      desired = min(max_comm, kMultiComputeWaveCap);
+    }
+  }
+  return desired;
+}
+
+struct QkvBackwardLaunchPlanKey {
+  std::array<uint64_t, 12> words{};
+
+  bool operator==(const QkvBackwardLaunchPlanKey& other) const {
+    return words == other.words;
+  }
+};
+
+struct QkvBackwardLaunchPlanKeyHash {
+  size_t operator()(const QkvBackwardLaunchPlanKey& key) const {
+    size_t result = 0xcbf29ce484222325ull;
+    for (uint64_t word : key.words) {
+      result ^= std::hash<uint64_t>{}(word) + 0x9e3779b97f4a7c15ull +
+          (result << 6) + (result >> 2);
+    }
+    return result;
+  }
+};
+
+QkvBackwardLaunchPlanKey make_qkv_backward_launch_plan_key(
+    const QkvBackwardDataParams& params,
+    int32_t device) {
+  return {{
+      static_cast<uint64_t>(device),
+      static_cast<uint64_t>(params.num_comm_ctas),
+      static_cast<uint64_t>(params.gemm_policy),
+      static_cast<uint64_t>(params.local_tokens),
+      static_cast<uint64_t>(params.hidden),
+      static_cast<uint64_t>(params.batch),
+      static_cast<uint64_t>(params.q_heads),
+      static_cast<uint64_t>(params.kv_heads),
+      static_cast<uint64_t>(params.head_dim),
+      static_cast<uint64_t>(params.world_size),
+      static_cast<uint64_t>(params.rank),
+      static_cast<uint64_t>(params.causal_load_balanced),
+  }};
+}
+
+struct QkvBackwardLaunchPlan {
+  int32_t device = 0;
+  int32_t sm_count = 0;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy policy = BackwardGemmPolicy::kM128N128;
+};
+
+cudaError_t cached_qkv_backward_launch_plan(
+    const QkvBackwardDataParams& params,
+    QkvBackwardLaunchPlan* result) {
+  if (result == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const QkvBackwardLaunchPlanKey key =
+      make_qkv_backward_launch_plan_key(params, device_info.device);
+  struct LastPlan {
+    bool valid = false;
+    QkvBackwardLaunchPlanKey key{};
+    QkvBackwardLaunchPlan plan{};
+  };
+  thread_local LastPlan last;
+  if (last.valid && last.key == key) {
+    *result = last.plan;
+    return cudaSuccess;
+  }
+  struct Cache {
+    std::mutex mutex;
+    std::unordered_map<
+        QkvBackwardLaunchPlanKey,
+        QkvBackwardLaunchPlan,
+        QkvBackwardLaunchPlanKeyHash> entries;
+  };
+  static Cache cache;
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  const auto found = cache.entries.find(key);
+  if (found != cache.entries.end()) {
+    last = {true, key, found->second};
+    *result = found->second;
+    return cudaSuccess;
+  }
+
+  QkvBackwardLaunchPlan plan{};
+  plan.device = device_info.device;
+  plan.sm_count = device_info.sm_count;
+  plan.num_comm_ctas = params.num_comm_ctas == 0
+      ? recommended_qkv_backward_comm_ctas_impl(params, plan.sm_count)
+      : params.num_comm_ctas;
+  if (plan.num_comm_ctas <= 0 || plan.num_comm_ctas >= plan.sm_count) {
+    return cudaErrorInvalidConfiguration;
+  }
+  plan.policy = recommended_qkv_backward_gemm_policy(
+      params, plan.num_comm_ctas, plan.sm_count);
+  constexpr size_t kMaxEntries = 256;
+  if (cache.entries.size() >= kMaxEntries) {
+    cache.entries.erase(cache.entries.begin());
+  }
+  cache.entries.emplace(key, plan);
+  last = {true, key, plan};
+  *result = plan;
+  return cudaSuccess;
+}
+
+}  // namespace
+
+int32_t recommended_qkv_backward_comm_ctas(
+    const QkvBackwardDataParams& params) {
+  QkvBackwardDataParams automatic = params;
+  automatic.num_comm_ctas = 0;
+  QkvBackwardLaunchPlan plan{};
+  if (cached_qkv_backward_launch_plan(automatic, &plan) != cudaSuccess) {
+    return 0;
+  }
+  return plan.num_comm_ctas;
+}
+
+static cudaError_t prepare_qkv_backward_data_launch(
+    const QkvBackwardDataParams& params,
+    QkvBackwardKernelParams* launch,
+    int32_t* sm_count,
+    int32_t* device) {
+  if (launch == nullptr || sm_count == nullptr || device == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (!params.grad_q || !params.grad_k || !params.grad_v || !params.weight ||
+      !params.grad_input || params.local_tokens <= 0 || params.hidden <= 0 ||
+      params.batch <= 0 || params.local_tokens % params.batch != 0 ||
+      params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.head_dim % kAlignment != 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.rank < 0 || params.rank >= params.world_size ||
+      params.q_heads % params.kv_heads != 0 ||
+      params.q_heads % params.world_size != 0 ||
+      params.kv_heads % params.world_size != 0 || params.epoch == 0 ||
+      (params.causal_load_balanced &&
+       (params.local_tokens / params.batch) % 2 != 0)) {
+    return cudaErrorInvalidValue;
+  }
+  *launch = {};
+  QkvBackwardLaunchPlan plan{};
+  cudaError_t status = cached_qkv_backward_launch_plan(params, &plan);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  *sm_count = plan.sm_count;
+  *device = plan.device;
+  launch->local_q = params.grad_q;
+  launch->local_k = params.grad_k;
+  launch->local_v = params.grad_v;
+  for (int32_t peer = 0; peer < params.world_size; ++peer) {
+    launch->peer_staging[peer] = params.peer_dqkv_staging[peer];
+    launch->peer_ready[peer] = params.peer_ready[peer];
+    launch->peer_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  launch->weight = params.weight;
+  launch->grad_input = params.grad_input;
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  launch->gemm = {
+      params.local_tokens, params.hidden, packed_width, 1};
+  launch->gemm.transpose_b = true;
+  launch->gemm.stride_b.row = params.hidden;
+  launch->gemm.raster = GemmRaster::kAlongN;
+  launch->gemm.max_swizzle_size = 1;
+  launch->route.world_size = params.world_size;
+  launch->route.rank = params.rank;
+  launch->route.batch = params.batch;
+  launch->route.seq_local = params.local_tokens / params.batch;
+  launch->route.global_seq =
+      launch->route.seq_local * params.world_size;
+  launch->route.q_heads = params.q_heads;
+  launch->route.kv_heads = params.kv_heads;
+  launch->route.local_heads = params.q_heads / params.world_size;
+  launch->route.head_dim = params.head_dim;
+  launch->route.causal_load_balanced = params.causal_load_balanced;
+  launch->route.kind = RouteKind::kQkvGqaPack;
+  launch->route.direction = RouteDirection::kInverse;
+  launch->num_comm_ctas = plan.num_comm_ctas;
+  launch->epoch = params.epoch;
+  launch->alpha = params.alpha;
+
+  if (launch->num_comm_ctas <= 0 || launch->num_comm_ctas >= *sm_count ||
+      launch->num_comm_ctas % 2 != 0) {
+    return cudaErrorInvalidConfiguration;
+  }
+  launch->gemm_policy = plan.policy;
+  return cudaSuccess;
+}
+
+cudaError_t launch_qkv_backward_data(
+    const QkvBackwardDataParams& params,
+    cudaStream_t stream) {
+  QkvBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_qkv_backward_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_data_impl(
+      launch, stream, sm_count, device);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_qkv_backward_data_role_telemetry(
+    const QkvBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  QkvBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_qkv_backward_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_data_telemetry_impl(
+      launch, timeline, timeline_capacity, stream, sm_count, device);
+}
+#endif
+
+cudaError_t launch_qkv_backward_weight(
+    const QkvBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.q_heads % params.kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  return launch_backward_wgrad_impl(
+      params.dqkv_staging,
+      params.saved_input,
+      params.grad_weight,
+      packed_width,
+      params.hidden,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_qkv_backward(
+    const QkvBackwardParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = launch_qkv_backward_data(params.data, stream);
+  if (status != cudaSuccess ||
+      params.weight_mode == WeightGradientMode::kDeferred) {
+    return status;
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate) {
+    return cudaErrorInvalidValue;
+  }
+  QkvBackwardWeightParams weight = params.weight;
+  if (!weight.dqkv_staging) {
+    weight.dqkv_staging =
+        params.data.peer_dqkv_staging[params.data.rank];
+  }
+  if (weight.local_tokens == 0) {
+    weight.local_tokens = params.data.local_tokens;
+  }
+  if (weight.hidden == 0) {
+    weight.hidden = params.data.hidden;
+  }
+  if (weight.q_heads == 0) {
+    weight.q_heads = params.data.q_heads;
+  }
+  if (weight.kv_heads == 0) {
+    weight.kv_heads = params.data.kv_heads;
+  }
+  if (weight.head_dim == 0) {
+    weight.head_dim = params.data.head_dim;
+  }
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.kv_heads != params.data.kv_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_qkv_backward_weight(weight, stream);
+}
+
+int64_t oproj_backward_ready_elements(
+    const OprojBackwardDataParams& params) {
+  if (params.local_tokens <= 0 || params.q_heads <= 0 ||
+      params.head_dim <= 0) {
+    return 0;
+  }
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  BackwardDeviceInfo device_info{};
+  if (cached_backward_device_info(&device_info) != cudaSuccess) {
+    return 0;
+  }
+  const int32_t comm_ctas = params.num_comm_ctas == 0
+      ? recommended_oproj_backward_comm_ctas(params)
+      : params.num_comm_ctas;
+  const KernelTraits traits = oproj_backward_kernel_traits(
+      params, comm_ctas, device_info.sm_count);
+  if (traits.block_m <= 0 || traits.block_n <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(
+      ceil_div(params.local_tokens, traits.block_m)) *
+      ceil_div(attention_width, traits.block_n) * kReadyFlagStride;
+}
+
+namespace {
+
+int32_t recommended_oproj_backward_comm_ctas_impl(
+    const OprojBackwardDataParams& params,
+    int32_t sm_count) {
+  if (params.local_tokens <= 0 || params.hidden <= 0 || params.batch <= 0 ||
+      params.q_heads <= 0 || params.head_dim <= 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.q_heads % params.world_size != 0 || sm_count <= 2) {
+    return 0;
+  }
+
+  // OProj backward publishes one 64-row x head_dim route task per logical
+  // head.  Ten route CTAs reach the useful H200 issuer bandwidth.  A short
+  // GEMM may spend otherwise-idle SMs to make the whole route a single wave;
+  // a multi-wave GEMM keeps only the saturation floor so communication does
+  // not take workers away from sustained matrix math.
+  constexpr int32_t kRouteRows = 64;
+  constexpr int32_t kRouteSlotsPerCta = 12;
+  constexpr int32_t kRouteIssuerSaturation = 10;
+  constexpr int32_t kMaxCommCtas = 32;
+  const int64_t route_tasks =
+      ceil_div(params.local_tokens, kRouteRows) *
+      static_cast<int64_t>(params.q_heads) *
+      ceil_div(params.head_dim, kQkvBulkColumns);
+  const int32_t issuer_floor = static_cast<int32_t>(
+      min<int64_t>(kRouteIssuerSaturation, route_tasks));
+  int32_t desired = max(
+      issuer_floor,
+      static_cast<int32_t>(ceil_div(route_tasks, kRouteSlotsPerCta)));
+  desired = (desired + 1) & ~1;
+  const int32_t max_comm = min(kMaxCommCtas, (sm_count - 2) & ~1);
+  desired = min(desired, max_comm);
+  if (desired <= 0) {
+    return 0;
+  }
+
+  if (desired > kRouteIssuerSaturation) {
+    const BackwardGemmPolicy policy =
+        recommended_oproj_backward_gemm_policy(params, desired, sm_count);
+    const KernelTraits traits = oproj_backward_traits_for_policy(policy);
+    if (traits.block_m <= 0 || traits.block_n <= 0) {
+      return 0;
+    }
+    int64_t physical_m_tiles = ceil_div(params.local_tokens, traits.block_m);
+    if (policy == BackwardGemmPolicy::kM128N256) {
+      physical_m_tiles = ceil_div(physical_m_tiles, int64_t{2}) * 2;
+    }
+    const int64_t attention_width =
+        static_cast<int64_t>(params.q_heads) * params.head_dim;
+    const int64_t compute_ctas =
+        physical_m_tiles * ceil_div(attention_width, traits.block_n);
+    if (compute_ctas > sm_count - desired) {
+      desired = min(max_comm, kRouteIssuerSaturation);
+    }
+  }
+  return desired;
+}
+
+struct OprojBackwardLaunchPlanKey {
+  std::array<uint64_t, 11> words{};
+
+  bool operator==(const OprojBackwardLaunchPlanKey& other) const {
+    return words == other.words;
+  }
+};
+
+struct OprojBackwardLaunchPlanKeyHash {
+  size_t operator()(const OprojBackwardLaunchPlanKey& key) const {
+    size_t result = 0xcbf29ce484222325ull;
+    for (uint64_t word : key.words) {
+      result ^= std::hash<uint64_t>{}(word) + 0x9e3779b97f4a7c15ull +
+          (result << 6) + (result >> 2);
+    }
+    return result;
+  }
+};
+
+OprojBackwardLaunchPlanKey make_oproj_backward_launch_plan_key(
+    const OprojBackwardDataParams& params,
+    int32_t device) {
+  return {{
+      static_cast<uint64_t>(device),
+      static_cast<uint64_t>(params.num_comm_ctas),
+      static_cast<uint64_t>(params.gemm_policy),
+      static_cast<uint64_t>(params.local_tokens),
+      static_cast<uint64_t>(params.hidden),
+      static_cast<uint64_t>(params.batch),
+      static_cast<uint64_t>(params.q_heads),
+      static_cast<uint64_t>(params.head_dim),
+      static_cast<uint64_t>(params.world_size),
+      static_cast<uint64_t>(params.rank),
+      static_cast<uint64_t>(params.causal_load_balanced),
+  }};
+}
+
+struct OprojBackwardLaunchPlan {
+  int32_t device = 0;
+  int32_t sm_count = 0;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy policy = BackwardGemmPolicy::kM128N128;
+};
+
+cudaError_t cached_oproj_backward_launch_plan(
+    const OprojBackwardDataParams& params,
+    OprojBackwardLaunchPlan* result) {
+  if (result == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const OprojBackwardLaunchPlanKey key =
+      make_oproj_backward_launch_plan_key(params, device_info.device);
+  struct LastPlan {
+    bool valid = false;
+    OprojBackwardLaunchPlanKey key{};
+    OprojBackwardLaunchPlan plan{};
+  };
+  thread_local LastPlan last;
+  if (last.valid && last.key == key) {
+    *result = last.plan;
+    return cudaSuccess;
+  }
+  struct Cache {
+    std::mutex mutex;
+    std::unordered_map<
+        OprojBackwardLaunchPlanKey,
+        OprojBackwardLaunchPlan,
+        OprojBackwardLaunchPlanKeyHash> entries;
+  };
+  static Cache cache;
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  const auto found = cache.entries.find(key);
+  if (found != cache.entries.end()) {
+    last = {true, key, found->second};
+    *result = found->second;
+    return cudaSuccess;
+  }
+
+  OprojBackwardLaunchPlan plan{};
+  plan.device = device_info.device;
+  plan.sm_count = device_info.sm_count;
+  plan.num_comm_ctas = params.num_comm_ctas == 0
+      ? recommended_oproj_backward_comm_ctas_impl(params, plan.sm_count)
+      : params.num_comm_ctas;
+  if (plan.num_comm_ctas <= 0 || plan.num_comm_ctas >= plan.sm_count) {
+    return cudaErrorInvalidConfiguration;
+  }
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  plan.policy = select_backward_gemm_policy(
+      params.gemm_policy,
+      params.local_tokens,
+      attention_width,
+      params.hidden,
+      plan.num_comm_ctas,
+      plan.sm_count);
+  constexpr size_t kMaxEntries = 256;
+  if (cache.entries.size() >= kMaxEntries) {
+    cache.entries.erase(cache.entries.begin());
+  }
+  cache.entries.emplace(key, plan);
+  last = {true, key, plan};
+  *result = plan;
+  return cudaSuccess;
+}
+
+}  // namespace
+
+int32_t recommended_oproj_backward_comm_ctas(
+    const OprojBackwardDataParams& params) {
+  OprojBackwardDataParams automatic = params;
+  automatic.num_comm_ctas = 0;
+  OprojBackwardLaunchPlan plan{};
+  if (cached_oproj_backward_launch_plan(automatic, &plan) != cudaSuccess) {
+    return 0;
+  }
+  return plan.num_comm_ctas;
+}
+
+BackwardGemmPolicy recommended_oproj_backward_gemm_policy(
+    const OprojBackwardDataParams& params,
+    int32_t resolved_comm_ctas,
+    int32_t sm_count) {
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  return select_backward_gemm_policy(
+      params.gemm_policy,
+      params.local_tokens,
+      attention_width,
+      params.hidden,
+      resolved_comm_ctas,
+      sm_count);
+}
+
+KernelTraits oproj_backward_kernel_traits(
+    const OprojBackwardDataParams& params,
+    int32_t resolved_comm_ctas,
+    int32_t sm_count) {
+  return oproj_backward_traits_for_policy(
+      recommended_oproj_backward_gemm_policy(
+          params, resolved_comm_ctas, sm_count));
+}
+
+cudaError_t launch_oproj_backward_data(
+    const OprojBackwardDataParams& params,
+    cudaStream_t stream) {
+  if (!params.grad_output || !params.weight ||
+      !params.local_grad_attention || !params.ready ||
+      params.local_tokens <= 0 || params.hidden <= 0 || params.batch <= 0 ||
+      params.local_tokens % params.batch != 0 || params.q_heads <= 0 ||
+      params.head_dim <= 0 || params.head_dim % kAlignment != 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.rank < 0 || params.rank >= params.world_size ||
+      params.q_heads % params.world_size != 0 || params.epoch == 0 ||
+      (params.causal_load_balanced &&
+       (params.local_tokens / params.batch) % 2 != 0)) {
+    return cudaErrorInvalidValue;
+  }
+  OprojBackwardLaunchPlan plan{};
+  cudaError_t status = cached_oproj_backward_launch_plan(params, &plan);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  OprojBackwardKernelParams launch{};
+  launch.lhs = params.grad_output;
+  launch.rhs_nt = params.weight;
+  launch.local_output = params.local_grad_attention;
+  for (int32_t peer = 0; peer < params.world_size; ++peer) {
+    launch.peer_output[peer] = params.peer_grad_attention[peer];
+    launch.peer_route_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  launch.ready = params.ready;
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  launch.gemm = {
+      params.local_tokens, attention_width, params.hidden, 1};
+  launch.gemm.transpose_b = true;
+  launch.gemm.stride_b.row = attention_width;
+  launch.gemm.raster = GemmRaster::kAlongN;
+  launch.gemm.max_swizzle_size = 1;
+  launch.route.world_size = params.world_size;
+  launch.route.rank = params.rank;
+  launch.route.batch = params.batch;
+  launch.route.seq_local = params.local_tokens / params.batch;
+  launch.route.global_seq =
+      launch.route.seq_local * params.world_size;
+  launch.route.q_heads = params.q_heads;
+  launch.route.kv_heads = 0;
+  launch.route.local_heads = params.q_heads / params.world_size;
+  launch.route.head_dim = params.head_dim;
+  launch.route.causal_load_balanced = params.causal_load_balanced;
+  launch.route.kind = RouteKind::kHeadToSequence;
+  launch.route.direction = RouteDirection::kForward;
+  launch.num_comm_ctas = plan.num_comm_ctas;
+  launch.epoch = params.epoch;
+  launch.alpha = params.alpha;
+
+  if (launch.num_comm_ctas <= 0 || launch.num_comm_ctas >= plan.sm_count ||
+      launch.num_comm_ctas % 2 != 0) {
+    return cudaErrorInvalidConfiguration;
+  }
+  return launch_oproj_backward_data_impl(
+      launch, plan.policy, stream, plan.sm_count, plan.device);
+}
+
+cudaError_t launch_oproj_backward_weight(
+    const OprojBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_backward_wgrad_impl(
+      params.grad_output,
+      params.saved_attention,
+      params.grad_weight,
+      params.hidden,
+      params.q_heads * params.head_dim,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_oproj_backward(
+    const OprojBackwardParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = launch_oproj_backward_data(params.data, stream);
+  if (status != cudaSuccess ||
+      params.weight_mode == WeightGradientMode::kDeferred) {
+    return status;
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate) {
+    return cudaErrorInvalidValue;
+  }
+  OprojBackwardWeightParams weight = params.weight;
+  if (!weight.grad_output) {
+    weight.grad_output = params.data.grad_output;
+  }
+  if (weight.local_tokens == 0) {
+    weight.local_tokens = params.data.local_tokens;
+  }
+  if (weight.hidden == 0) {
+    weight.hidden = params.data.hidden;
+  }
+  if (weight.q_heads == 0) {
+    weight.q_heads = params.data.q_heads;
+  }
+  if (weight.head_dim == 0) {
+    weight.head_dim = params.data.head_dim;
+  }
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_oproj_backward_weight(weight, stream);
 }
 
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem) {

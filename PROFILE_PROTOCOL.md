@@ -5,6 +5,10 @@
 - `A2A -> GEMM`：通信发布、ready handoff 和 GEMM 消费；
 - `GEMM -> A2A`：GEMM 生产、QKV route、cooperative grid barrier 和跨 rank finalize。
 
+v10 的两条反向算子沿用这两个物理方向，但不沿用前向 shape：QKV 反向 B 是
+`Head→Sequence A2A -> dX GEMM`，OProj 反向 B 是 `dA GEMM -> Sequence→Head A2A`。
+权重梯度 W 是单独的纯 GEMM，不应混进 B 阶段的通信轨道。
+
 正式性能数据必须使用默认构建；profile 数据只解释相对时序。
 
 ## 正式启动与计时规则
@@ -32,6 +36,16 @@
   额外 warmup replay 均在正式采样外。
 - 所有正式数据均为“逐样本跨 rank 最大值，再计算 p50/p95”，禁止先对每个 rank
   求分位数后再取最大。
+- v10 反向正式表必须同时保存 B 与 W 的真实 MNK。普通模式在同一 stream 内记录
+  完整 `B→W`；ZeroBubble 模式分别记录 B 和 W，再报告两者之和。ZeroBubble 的 W
+  使用 `beta=1` 累加 BF16 `main_grad`，普通模式使用 `beta=0`。
+- 反向 Graph 与前向 QKV 一样，把 10 个预热 epoch 和 50 个正式 epoch 放进一个
+  预上传 graph，并只 replay 一次。框架若要重复 replay，必须统一重置跨卡状态，或
+  更新 graph 中的 epoch；旧 ready/done 不能直接复用。
+- 反向正式结果还要测同一卡组、同 B/W MNK 的经典 cuBLAS 纯 GEMM。普通模式的
+  W 对照用 `beta=0`，ZeroBubble 的 W 对照用 `beta=1`；cuBLAS 不含通信，只用来
+  回答融合总吞吐达到同语义纯计算上限的百分之多少。总时间按相同样本编号，把
+  B 与匹配 beta 的 W 两个独立 max-rank 时间相加，不能误写成同一个组合 kernel。
 
 ## 构建开关
 
@@ -75,7 +89,7 @@ CUDA_VISIBLE_DEVICES=<devices> ./build/fuse_bench \
 QKV Projection -> A2A 同样使用独立 diagnostic launch。下面命令中的
 `N=(Hq+2*Hkv)*D`，`M=S/CP`：
 
-v8.0 正式路径保持两个环境变量未设置；下列变量只用于固定 policy 的消融或回退复现。
+前向 QKV 正式路径保持两个环境变量未设置；下列变量只用于固定 policy 的消融或回退复现。
 
 ```bash
 CUDA_VISIBLE_DEVICES=<devices> \
@@ -114,7 +128,22 @@ CUDA_VISIBLE_DEVICES=<devices> mpirun --bind-to none -np <CP> \
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：7（对应 v8.0）
+协议版本：8（对应 v10.0）
+
+### v10 反向算子的对应关系
+
+| 算子 | B 阶段 | W 阶段 | profile 解释 |
+|---|---|---|---|
+| QKV backward | 各 source 的平面 dQ/dK/dV 直接写成 destination 的完整 `[M,QKV]`，随后计算 `dX[M,H]` | `dWqkv[QKV,H]=dQKVᵀ[QKV,M]×X[M,H]` | B 使用 `A2A -> GEMM`；ready 从远端 GPU 发布，因此 acquire 是 system scope |
+| OProj backward | `dA[M,A]=dY[M,H]×Wo[H,A]`，随后直接把 head 切片写到各 peer | `dWo[H,A]=dYᵀ[H,M]×saved_A[M,A]` | B 使用 `GEMM -> A2A`；W 是独立纯 GEMM |
+
+QKV B 的通信顺序固定为“全部 Q、全部 K、全部 V”。profile 或框架接入不得先用
+PyTorch `cat/index_select/permute/contiguous` 重新造一份 `[M,QKV]`，否则测到的是
+框架重排加算子，而不是 v10 接口本身。OProj B 也直接发布最终 head-sharded 输出，
+中间不应增加独立 layout kernel。
+
+只有 QKV backward 提供轻量 role telemetry；OProj backward 目前用正式 event 和
+独立 correctness 检查，不宣称有逐 CTA profile。profile 构建仍不得进入正式表。
 
 ### A2A -> GEMM
 

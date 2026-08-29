@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v9.1
+        default: v10.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v9.1");
+              : (process.env.REQUESTED_TAG || "v10.0");
 
             const releases = {
               "v1.0": {
@@ -186,6 +186,26 @@ jobs:
                   "🩵 **补充矩阵覆盖五种真实模型宽度和原 v9 控制 shape，共 18 个 setting、36 个算子点。19 个实际启用 weighted 的点全部提升，17 个点安全回退；QKV/OProj 启用点的加速比几何平均分别为 1.1101× / 1.3915×，没有退化点。**",
                   "",
                   "正式口径为 BF16、CP4/CP8、5 warmup + 30 samples、逐样本 max-rank p50。所有实际启用 weighted 的点都通过逐元素完全一致检查。SM 锁频仍是完成性能验收的异构来源；HBM/NVLink 降频与动态 DVFS 不属于本版本的全量保证。",
+                ].join("\n"),
+              },
+              "v10.0": {
+                name: "v10.0 — QKV 与 OProj 反向融合",
+                body: [
+                  "v10.0 新增两条 BF16 反向融合算子；v9.1 的均匀与锁频异构前向接口、策略和热路径保持不变。",
+                  "",
+                  "QKV B 直接执行 Head→Sequence A2A 后计算 dX，W 计算 dWqkv=dQKVᵀ×X；OProj B 先计算 dA 再执行 Sequence→Head A2A，W 计算 dWo=dYᵀ×saved_A。通信直接读写最终布局，接口不要求框架先做 cat、index_select、permute 或 contiguous。",
+                  "",
+                  "普通模式在同一 stream 内严格执行 B→W，并用 beta=0 写权重梯度。ZeroBubble 把 B/W 拆成两个入口，W 用 beta=1 累加 BF16 main_grad；调用方必须在两阶段之间保留 dQKV+X 或 dY+saved_A，并避免多个 W 并发写同一个梯度地址。",
+                  "",
+                  "🩵 **QKV 反向相对同 shape 前向融合吞吐的几何平均为：ZeroBubble Eager/Graph 100.5%/98.0%，普通模式 104.3%/102.3%；OProj 分别为 99.6%/100.1% 与 104.0%/104.6%。**",
+                  "",
+                  "每条算子覆盖 3 个人工 shape、5 组真实模型、6 档序列长度和 CP4/CP8，共 96 个 setting；Eager/Graph 与普通/ZeroBubble 合计 768 份融合结果。正式口径为 10 warmup + 50 samples、MPI 一进程一卡、逐样本 max-rank p50/p95。",
+                  "",
+                  "经典 cuBLAS 在同一卡组上按真实 B/W MNK 和匹配 beta 完成 192 点纯 GEMM 对照。融合总吞吐达到经典 cuBLAS 的中位数为：QKV 88.8%～91.0%，OProj 89.5%～90.3%；989T MFU 中位约 62.4%～64.7%。",
+                  "",
+                  "小矩阵 exact smoke 覆盖 CP4/CP8、rank-major/causal、batch=2、普通/分离和 beta=1；正式 S=1K 还检查跨 rank route、epoch 与完整写入。v9 的 43 个旧 device-kernel 指令体在 v10 Release 构建中保持一致。",
+                  "",
+                  "完整反向 MNK、生命周期约束、两张 96 行表、TFLOPS/MFU/cuBLAS 对照和复现命令位于两个反向算子目录的 BENCHMARK.md 与 results 归档。",
                 ].join("\n"),
               },
             };

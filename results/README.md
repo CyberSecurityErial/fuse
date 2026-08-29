@@ -47,6 +47,11 @@ Committed directories:
   信息、自动方案缓存版本、经典cuBLAS吞吐和融合吞吐占比。
 - `QKVproj-a2a/te_userbuffers_shape_bench`: the matching adapted TE
   Userbuffers QKV winners.
+- `QKVproj-backward/qkv_backward_shape_bench`: v10 的 96 个 QKV 反向
+  setting。汇总同时保存 B/W MNK、Eager/Graph、普通同流/ZeroBubble、匹配
+  beta 的经典 cuBLAS、TFLOPS、989T MFU 和相对同 shape 前向吞吐。
+- `Oproj-backward/oproj_backward_shape_bench`: v10 的 96 个 OProj 反向
+  setting，字段和采样口径与 QKV 反向相同；两个算子的生产接口与自动策略仍独立。
 - `heterogeneous-cp/locked_frequency_summary.csv`: v9.0 两个独立 weighted 算子的22点锁频矩阵。它覆盖CP2/4/6/8、不同慢卡数量和本地M=2048/16384，保存实际设备组合、连续行分区、通信CTA、uniform/weighted p50及加速比。该矩阵为BF16、5次warmup + 30次采样、逐样本max-rank，并启用逐元素完全一致检查；它不覆盖自动DVFS或未经实测的HBM/NVLink降频。
 - `heterogeneous-cp/shape_generalization_summary.csv`: v9.1 选取五种真实模型宽度与原v9控制shape的18点复核，覆盖CP4/CP8和本地M=2048/16384。启用weighted的19个算子点全部提升并通过exact BF16检查，17个点安全回退；该复核用于限定功耗安全域，不宣称全量MNK覆盖。
 
@@ -54,6 +59,11 @@ Each operator directory keeps only `baseline_summary.*`, the final fused
 summary, `comparison_summary.*`, and `shape_matrix.*`; each Userbuffers
 directory keeps `summary.*`. The thousands of intermediate sweep and
 formal-run JSON files are intentionally omitted.
+
+The v10 backward directories are deliberately smaller: each keeps one
+`*_backward_summary.{json,csv,md}` triplet containing both fused and classic
+cuBLAS fields. Their 768 fused raw files and 192 cuBLAS raw files are formal
+run inputs, not release artifacts.
 
 The v2 fused directory intentionally keeps only `fused_summary.json` and
 `fused_summary.csv`. The superseded M256 probes, manual wide-N probes, raw
