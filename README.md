@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益；v12.0 为这四条边界增加纯 E4M3 FP8 版本。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益；v12.0 为这四条边界增加纯 E4M3 FP8 版本；v13.0 重构 Ulysses 源码和公开头文件层级，设备代码与 ABI 保持不变。
 
 Attention 输出按 head 分片：
 
@@ -145,7 +145,12 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v12.0（四条投影/通信边界新增纯 E4M3 FP8 版本）
+当前版本：v13.0（Ulysses 数据流原语与投影语义分层重构）
+
+v13.0 不更新性能表。与 v12.0 的干净 Release 构建逐函数比较，69 个 device
+function 的 SASS 全部一致，58 个公开符号也完全一致，因此下表继续引用对应算子的
+已发布 benchmark。新代码从 `operators/primitives` 的两种数据流开始，再由
+`operators/ulysses/projection_dataflow.h` 组合 QKV/OProj 与 Forward/Backward。
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|

@@ -3,6 +3,9 @@
 当前归档包含A2A -> O-projection历史Golden，以及132-SM H200 NVLink节点上的
 QKV projection -> A2A结果，以及v9.0/v9.1锁频异构CP的精简正式矩阵。QKV外部基线继续使用独立调优的v4/v5归档；均匀融合侧Eager/Graph结果和对比表为v8.0正式96点采样。
 
+v13.0 只重构源码和公开头文件，没有生成或替换结果文件。它与 v12.0 的 69 个
+device function 逐函数 SASS 一致，因此这里继续保留原有 Golden，不复制一套相同数据。
+
 v8归档需要同时保存用户请求的`comm_ctas=0`、实际解析出的通信CTA、实际tile和
 policy模型版本。正式runner会把0原样传给launcher，第一次prime完成自动选择，后续
 Eager样本复用该结果；不能在计时前把0替换成实际CTA，否则测不到真实自动入口。
