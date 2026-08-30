@@ -49,9 +49,13 @@ Committed directories:
   Userbuffers QKV winners.
 - `QKVproj-backward/qkv_backward_shape_bench`: v10 的 96 个 QKV 反向
   setting。汇总同时保存 B/W MNK、Eager/Graph、普通同流/ZeroBubble、匹配
-  beta 的经典 cuBLAS、TFLOPS、989T MFU 和相对同 shape 前向吞吐。
+  beta 的经典 cuBLAS、TFLOPS、989T MFU 和相对同 shape 前向吞吐；同目录还保存
+  TE Userbuffers 96 点正式对照与 TE+NCCL 12 点轻量对照。
 - `Oproj-backward/oproj_backward_shape_bench`: v10 的 96 个 OProj 反向
-  setting，字段和采样口径与 QKV 反向相同；两个算子的生产接口与自动策略仍独立。
+  setting，字段和采样口径与 QKV 反向相同；同目录也保存对应的 TE Userbuffers 与
+  TE+NCCL 对照。两个算子的生产接口与自动策略仍独立。
+- `backward_autograd_validation.json`: PyTorch forward→autograd backward 的逐张量
+  正确性记录，覆盖 CP4/CP8、两种布局、batch=2、宽 GQA、普通与 ZeroBubble。
 - `heterogeneous-cp/locked_frequency_summary.csv`: v9.0 两个独立 weighted 算子的22点锁频矩阵。它覆盖CP2/4/6/8、不同慢卡数量和本地M=2048/16384，保存实际设备组合、连续行分区、通信CTA、uniform/weighted p50及加速比。该矩阵为BF16、5次warmup + 30次采样、逐样本max-rank，并启用逐元素完全一致检查；它不覆盖自动DVFS或未经实测的HBM/NVLink降频。
 - `heterogeneous-cp/shape_generalization_summary.csv`: v9.1 选取五种真实模型宽度与原v9控制shape的18点复核，覆盖CP4/CP8和本地M=2048/16384。启用weighted的19个算子点全部提升并通过exact BF16检查，17个点安全回退；该复核用于限定功耗安全域，不宣称全量MNK覆盖。
 
@@ -60,10 +64,10 @@ summary, `comparison_summary.*`, and `shape_matrix.*`; each Userbuffers
 directory keeps `summary.*`. The thousands of intermediate sweep and
 formal-run JSON files are intentionally omitted.
 
-The v10 backward directories are deliberately smaller: each keeps one
-`*_backward_summary.{json,csv,md}` triplet containing both fused and classic
-cuBLAS fields. Their 768 fused raw files and 192 cuBLAS raw files are formal
-run inputs, not release artifacts.
+The v10 backward directories keep the fused/classic-cuBLAS summary triplet,
+the compact TE Userbuffers comparison/summary files, and the compact light
+TE+NCCL comparison files. Their thousands of sweep and per-run JSON inputs are
+not release artifacts.
 
 The v2 fused directory intentionally keeps only `fused_summary.json` and
 `fused_summary.csv`. The superseded M256 probes, manual wide-N probes, raw

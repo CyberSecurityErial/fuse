@@ -89,6 +89,7 @@ struct Options {
   bool run_all_modes = false;
 #if FUSE_ENABLE_PROFILING
   bool role_profile = false;
+  std::string trace_out;
 #endif
   std::string json_out;
   std::string json_prefix;
@@ -246,6 +247,9 @@ Options parse_options(int argc, char** argv) {
 #if FUSE_ENABLE_PROFILING
     } else if (argument == "--role-profile") {
       options.role_profile = true;
+    } else if (argument == "--trace-out") {
+      options.trace_out = take("--trace-out");
+      options.role_profile = true;
 #endif
     } else if (argument == "--help" || argument == "-h") {
       options.help = true;
@@ -275,7 +279,8 @@ void print_usage(const char* program) {
       << "  --causal-load-balanced --check|--no-check --json-out PATH\n"
       << "  --run-all-modes --json-prefix PATH  run all four launch/mode pairs\n"
 #if FUSE_ENABLE_PROFILING
-      << "  --role-profile         one diagnostic QKV B epoch after timing\n"
+      << "  --role-profile         one diagnostic B->W epoch after timing\n"
+      << "  --trace-out PATH       write its per-rank Perfetto JSON\n"
 #endif
       ;
 }
@@ -998,6 +1003,12 @@ Summary summarize(const std::vector<float>& samples) {
 }
 
 #if FUSE_ENABLE_PROFILING
+__global__ void record_global_timer_kernel(uint64_t* timestamp) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    *timestamp = fuse::detail::read_global_timer();
+  }
+}
+
 struct RoleProfileSummary {
   int32_t rank = 0;
   int32_t observed_ctas = 0;
@@ -1009,6 +1020,7 @@ struct RoleProfileSummary {
   double grid_sync_us = 0.0;
   double finalize_us = 0.0;
   double kernel_us = 0.0;
+  double weight_us = 0.0;
 };
 
 static_assert(std::is_trivially_copyable_v<RoleProfileSummary>);
@@ -1021,7 +1033,8 @@ RoleProfileSummary summarize_role_profile(
     int rank,
     int comm_ctas,
     int world,
-    const std::vector<fuse::A2AGemmCtaTimeline>& timeline) {
+    const std::vector<fuse::A2AGemmCtaTimeline>& timeline,
+    const std::array<uint64_t, 2>& weight_markers) {
   uint64_t first = std::numeric_limits<uint64_t>::max();
   uint64_t last = 0;
   uint64_t compute_first = std::numeric_limits<uint64_t>::max();
@@ -1057,6 +1070,8 @@ RoleProfileSummary summarize_role_profile(
       std::max(compute_first, route_first),
       std::min(compute_done, route_done));
   summary.kernel_us = timer_span_us(first, last);
+  summary.weight_us = timer_span_us(
+      weight_markers[0], weight_markers[1]);
   if (timeline.empty()) {
     throw std::runtime_error("empty role-profile timeline");
   }
@@ -1077,21 +1092,263 @@ RoleProfileSummary summarize_role_profile(
       summary.compute_ctas == 0 ||
       summary.observed_ctas != summary.route_ctas + summary.compute_ctas) {
     throw std::runtime_error(
-        "invalid QKV backward role profile on rank " +
+        "invalid backward role profile on rank " +
         std::to_string(rank));
   }
   return summary;
 }
 
-void run_qkv_role_profile(
+void write_backward_perfetto(
+    const Options& options,
+    int world,
+    int timeline_capacity,
+    int comm_ctas,
+    fuse::BackwardGemmPolicy policy,
+    const std::vector<fuse::A2AGemmCtaTimeline>& all_timeline,
+    const std::vector<uint64_t>& all_weight_markers) {
+  if (options.trace_out.empty()) {
+    return;
+  }
+  std::ofstream trace(options.trace_out);
+  if (!trace) {
+    throw std::runtime_error(
+        "cannot open backward trace output: " + options.trace_out);
+  }
+  const bool qkv = options.operator_kind == OperatorKind::kQkv;
+  const int projection_width = qkv
+      ? (options.q_heads + 2 * options.kv_heads) * options.head_dim
+      : options.q_heads * options.head_dim;
+  trace << "{\n  \"displayTimeUnit\": \"ns\",\n"
+        << "  \"metadata\": {\"schema\":\"v10_backward_perfetto_v1\""
+        << ",\"operator\":\"" << (qkv ? "qkv" : "oproj") << "\""
+        << ",\"world_size\":" << world
+        << ",\"local_tokens\":" << options.m
+        << ",\"hidden\":" << options.hidden
+        << ",\"projection_width\":" << projection_width
+        << ",\"b_mnk\":[" << options.m << ","
+        << (qkv ? options.hidden : projection_width) << ","
+        << (qkv ? projection_width : options.hidden) << "]"
+        << ",\"w_mnk\":[" << (qkv ? projection_width : options.hidden)
+        << "," << (qkv ? options.hidden : projection_width)
+        << "," << options.m << "]"
+        << ",\"requested_comm_ctas\":" << options.comm_ctas
+        << ",\"comm_ctas\":" << comm_ctas
+        << ",\"requested_gemm_policy\":\""
+        << gemm_policy_name(options.gemm_policy) << "\""
+        << ",\"gemm_policy\":\"" << gemm_policy_name(policy) << "\""
+        << ",\"weight_beta\":" << options.weight_beta
+        << ",\"causal_load_balanced\":"
+        << (options.causal_load_balanced ? "true" : "false")
+        << ",\"profiling_only\":true},\n"
+        << "  \"stripe_descriptions\": {\n"
+        << "    \"B boundary\": \""
+        << (qkv
+                ? "Head-sharded planar dQ/dK/dV are pushed directly into each destination's packed dQKV staging; ready flags feed the persistent dX GEMM."
+                : "The persistent dA GEMM publishes output tiles; route CTAs wait for those tiles and write final head-sharded gradients to peers.")
+        << "\",\n"
+        << "    \"compute envelope\": \"All persistent GEMM CTAs from first entry to the last local GEMM role completion; it may include ready waits.\",\n"
+        << "    \"route envelope\": \"All communication CTAs from first entry to the last local route completion; it includes queueing and ready waits, so it is not bare NVLink time.\",\n"
+        << "    \"grid/finalize\": \"Local role tail, system fence, source-complete publication, parallel per-source waits, and kernel retirement.\",\n"
+        << "    \"WGrad\": \"Separate pure GEMM after B. The two tiny timestamp marker kernels bound it; this stripe is diagnostic rather than a formal benchmark sample.\"\n"
+        << "  },\n  \"traceEvents\": [\n";
+  bool first_event = true;
+  auto emit = [&](int rank,
+                  int tid,
+                  const std::string& name,
+                  const std::string& category,
+                  uint64_t begin,
+                  uint64_t end,
+                  uint64_t origin) {
+    if (begin == 0 || end <= begin || begin < origin) {
+      return;
+    }
+    trace << (first_event ? "" : ",\n");
+    first_event = false;
+    trace << "    {\"name\":\"" << name << "\",\"cat\":\""
+          << category << "\",\"ph\":\"X\",\"pid\":" << rank
+          << ",\"tid\":" << tid << ",\"ts\":" << std::fixed
+          << std::setprecision(3)
+          << static_cast<double>(begin - origin) / 1000.0
+          << ",\"dur\":" << static_cast<double>(end - begin) / 1000.0
+          << "}";
+  };
+  for (int rank = 0; rank < world; ++rank) {
+    const auto* timeline = all_timeline.data() +
+        static_cast<size_t>(rank) * timeline_capacity;
+    const uint64_t weight_begin = all_weight_markers[2 * rank];
+    const uint64_t weight_end = all_weight_markers[2 * rank + 1];
+    uint64_t origin = std::numeric_limits<uint64_t>::max();
+    uint64_t last = 0;
+    uint64_t local_roles_done = 0;
+    uint64_t compute_first = std::numeric_limits<uint64_t>::max();
+    uint64_t compute_done = 0;
+    uint64_t route_first = std::numeric_limits<uint64_t>::max();
+    uint64_t route_done = 0;
+    for (int cta = 0; cta < timeline_capacity; ++cta) {
+      const auto& event = timeline[cta];
+      if (event.start == 0 || event.end <= event.start ||
+          event.role_done < event.start || event.role_done > event.end) {
+        continue;
+      }
+      origin = std::min(origin, event.start);
+      last = std::max(last, event.end);
+      local_roles_done = std::max(local_roles_done, event.role_done);
+      if (cta < comm_ctas) {
+        route_first = std::min(route_first, event.start);
+        route_done = std::max(route_done, event.role_done);
+      } else {
+        compute_first = std::min(compute_first, event.start);
+        compute_done = std::max(compute_done, event.role_done);
+      }
+    }
+    if (origin == std::numeric_limits<uint64_t>::max()) {
+      continue;
+    }
+    const auto& root = timeline[0];
+    uint64_t sources_done = 0;
+    for (int source = 0; source < world; ++source) {
+      sources_done = std::max(sources_done, root.source_ready[source]);
+    }
+    emit(
+        rank,
+        100,
+        qkv
+            ? "B boundary: inverse Head-to-Sequence route + dX GEMM"
+            : "B boundary: dA GEMM + Sequence-to-Head route",
+        "backward boundary",
+        origin,
+        last,
+        origin);
+    emit(
+        rank,
+        101,
+        "complete backward: B then W",
+        "backward boundary",
+        origin,
+        weight_end,
+        origin);
+    emit(
+        rank,
+        110,
+        qkv
+            ? "compute envelope: ready-driven dX GEMM"
+            : "compute envelope: dA GEMM + ready publication",
+        "compute",
+        compute_first,
+        compute_done,
+        origin);
+    emit(
+        rank,
+        111,
+        qkv
+            ? "route envelope: planar dQ/dK/dV -> packed peer dQKV"
+            : "route envelope: dA head slices -> peer gradients",
+        "communication",
+        route_first,
+        route_done,
+        origin);
+    emit(
+        rank,
+        112,
+        "compute / route overlap",
+        "overlap",
+        std::max(compute_first, route_first),
+        std::min(compute_done, route_done),
+        origin);
+    emit(
+        rank,
+        120,
+        "local roles -> cooperative grid sync",
+        "finalize",
+        local_roles_done,
+        root.grid_sync_done,
+        origin);
+    emit(
+        rank,
+        121,
+        "system fence: make routed writes visible",
+        "finalize",
+        root.grid_sync_done,
+        root.fence_done,
+        origin);
+    emit(
+        rank,
+        122,
+        "publish this source's completion epoch to every destination",
+        "finalize",
+        root.fence_done,
+        root.publish_done,
+        origin);
+    for (int source = 0; source < world; ++source) {
+      emit(
+          rank,
+          130 + source,
+          "wait for source " + std::to_string(source) +
+              " completion epoch",
+          "finalize",
+          root.publish_done,
+          root.source_ready[source],
+          origin);
+    }
+    emit(
+        rank,
+        140,
+        "kernel retire after every source is visible",
+        "finalize",
+        sources_done,
+        last,
+        origin);
+    emit(
+        rank,
+        150,
+        "B kernel completion -> WGrad marker",
+        "handoff",
+        last,
+        weight_begin,
+        origin);
+    emit(
+        rank,
+        160,
+        qkv
+            ? "WGrad GEMM: dWqkv = packed dQKV^T x saved X"
+            : "WGrad GEMM: dWo = dY^T x saved attention",
+        "weight gradient",
+        weight_begin,
+        weight_end,
+        origin);
+    for (int cta = 0; cta < timeline_capacity; ++cta) {
+      const auto& event = timeline[cta];
+      if (event.start == 0 || event.role_done <= event.start) {
+        continue;
+      }
+      const bool route_cta = cta < comm_ctas;
+      emit(
+          rank,
+          1000 + cta,
+          (route_cta ? "route CTA " : "compute CTA ") +
+              std::to_string(cta) +
+              (route_cta
+                   ? (qkv
+                          ? ": push assigned dQ/dK/dV heads and publish ready"
+                          : ": wait for GEMM tiles and route assigned head slices")
+                   : (qkv
+                          ? ": consume packed shards and execute dX tiles"
+                          : ": execute dA tiles and publish tile-ready flags")),
+          route_cta ? "communication CTA" : "compute CTA",
+          event.start,
+          event.role_done,
+          origin);
+    }
+  }
+  trace << "\n  ]\n}\n";
+}
+
+void run_backward_role_profile(
     const Options& options,
     const RankContext& context,
     const Runtime& runtime,
     OperatorState& state,
     uint32_t& epoch) {
-  if (options.operator_kind != OperatorKind::kQkv) {
-    throw std::runtime_error("--role-profile currently supports QKV only");
-  }
   int timeline_capacity = 0;
   CUDA_CHECK(cudaDeviceGetAttribute(
       &timeline_capacity,
@@ -1099,9 +1356,13 @@ void run_qkv_role_profile(
       context.device));
   auto* device_timeline =
       allocate<fuse::A2AGemmCtaTimeline>(timeline_capacity);
-  auto params = state.qkv.data;
-  params.num_comm_ctas = state.resolved_comm_ctas;
-  params.gemm_policy = state.resolved_gemm_policy;
+  auto* device_weight_markers = allocate<uint64_t>(2);
+  auto qkv_params = state.qkv.data;
+  auto oproj_params = state.oproj.data;
+  qkv_params.num_comm_ctas = state.resolved_comm_ctas;
+  qkv_params.gemm_policy = state.resolved_gemm_policy;
+  oproj_params.num_comm_ctas = state.resolved_comm_ctas;
+  oproj_params.gemm_policy = state.resolved_gemm_policy;
 
   auto launch_once = [&] {
     CUDA_CHECK(cudaMemsetAsync(
@@ -1110,12 +1371,36 @@ void run_qkv_role_profile(
         static_cast<size_t>(timeline_capacity) *
             sizeof(fuse::A2AGemmCtaTimeline),
         runtime.stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        device_weight_markers,
+        0,
+        2 * sizeof(uint64_t),
+        runtime.stream));
     CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
     ++epoch;
-    params.epoch = epoch;
+    qkv_params.epoch = epoch;
+    oproj_params.epoch = epoch;
     MPI_CHECK(MPI_Barrier(context.local_comm));
-    CUDA_CHECK(fuse::launch_qkv_backward_data_role_telemetry(
-        params, device_timeline, timeline_capacity, runtime.stream));
+    if (options.operator_kind == OperatorKind::kQkv) {
+      CUDA_CHECK(fuse::launch_qkv_backward_data_role_telemetry(
+          qkv_params,
+          device_timeline,
+          timeline_capacity,
+          runtime.stream));
+    } else {
+      CUDA_CHECK(fuse::launch_oproj_backward_data_role_telemetry(
+          oproj_params,
+          device_timeline,
+          timeline_capacity,
+          runtime.stream));
+    }
+    record_global_timer_kernel<<<1, 1, 0, runtime.stream>>>(
+        device_weight_markers);
+    CUDA_CHECK(cudaGetLastError());
+    launch_weight(options, state, runtime.stream);
+    record_global_timer_kernel<<<1, 1, 0, runtime.stream>>>(
+        device_weight_markers + 1);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
     MPI_CHECK(MPI_Barrier(context.local_comm));
   };
@@ -1125,13 +1410,23 @@ void run_qkv_role_profile(
   launch_once();
   launch_once();
   std::vector<fuse::A2AGemmCtaTimeline> timeline(timeline_capacity);
+  std::array<uint64_t, 2> weight_markers{};
   CUDA_CHECK(cudaMemcpy(
       timeline.data(),
       device_timeline,
       timeline.size() * sizeof(timeline[0]),
       cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(
+      weight_markers.data(),
+      device_weight_markers,
+      2 * sizeof(uint64_t),
+      cudaMemcpyDeviceToHost));
   const RoleProfileSummary local = summarize_role_profile(
-      context.rank, state.resolved_comm_ctas, context.world, timeline);
+      context.rank,
+      state.resolved_comm_ctas,
+      context.world,
+      timeline,
+      weight_markers);
   std::vector<RoleProfileSummary> ranks(
       context.rank == 0 ? static_cast<size_t>(context.world) : 0);
   MPI_CHECK(MPI_Gather(
@@ -1143,11 +1438,38 @@ void run_qkv_role_profile(
       MPI_BYTE,
       0,
       context.local_comm));
+  std::vector<fuse::A2AGemmCtaTimeline> all_timeline(
+      context.rank == 0
+          ? static_cast<size_t>(context.world) * timeline_capacity
+          : 0);
+  MPI_CHECK(MPI_Gather(
+      timeline.data(),
+      static_cast<int>(timeline.size() * sizeof(timeline[0])),
+      MPI_BYTE,
+      context.rank == 0 ? all_timeline.data() : nullptr,
+      static_cast<int>(timeline.size() * sizeof(timeline[0])),
+      MPI_BYTE,
+      0,
+      context.local_comm));
+  std::vector<uint64_t> all_weight_markers(
+      context.rank == 0 ? static_cast<size_t>(context.world) * 2 : 0);
+  MPI_CHECK(MPI_Gather(
+      weight_markers.data(),
+      static_cast<int>(2 * sizeof(uint64_t)),
+      MPI_BYTE,
+      context.rank == 0 ? all_weight_markers.data() : nullptr,
+      static_cast<int>(2 * sizeof(uint64_t)),
+      MPI_BYTE,
+      0,
+      context.local_comm));
   if (context.rank == 0) {
     std::cout
-        << "\nQKV backward B role profile epoch=" << epoch << "\n"
+        << "\n" << (options.operator_kind == OperatorKind::kQkv
+                          ? "QKV"
+                          : "OProj")
+        << " backward B->W role profile epoch=" << epoch << "\n"
         << "rank compute_ctas route_ctas compute_us route_us overlap_us "
-           "grid_sync_us finalize_us kernel_us\n";
+           "grid_sync_us finalize_us kernel_us wgrad_us\n";
     for (const auto& rank : ranks) {
       std::cout << std::setw(4) << rank.rank << " "
                 << std::setw(12) << rank.compute_ctas << " "
@@ -1158,9 +1480,19 @@ void run_qkv_role_profile(
                 << std::setw(10) << rank.overlap_us << " "
                 << std::setw(12) << rank.grid_sync_us << " "
                 << std::setw(11) << rank.finalize_us << " "
-                << std::setw(9) << rank.kernel_us << "\n";
+                << std::setw(9) << rank.kernel_us << " "
+                << std::setw(8) << rank.weight_us << "\n";
     }
+    write_backward_perfetto(
+        options,
+        context.world,
+        timeline_capacity,
+        state.resolved_comm_ctas,
+        state.resolved_gemm_policy,
+        all_timeline,
+        all_weight_markers);
   }
+  CUDA_CHECK(cudaFree(device_weight_markers));
   CUDA_CHECK(cudaFree(device_timeline));
 }
 #endif
@@ -1697,7 +2029,7 @@ int run(
 
 #if FUSE_ENABLE_PROFILING
   if (options.role_profile) {
-    run_qkv_role_profile(
+    run_backward_role_profile(
         options, context, runtime, state, epoch);
   }
 #endif

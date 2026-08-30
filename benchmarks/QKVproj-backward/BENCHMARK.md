@@ -307,3 +307,34 @@ runner 默认在同一次 MPI/CUDA 进程中依次完成四种启动/调度组�
 | 8 | llama31_405b | 256K | `32768×16384×18432` | `18432×16384×32768` | 55.3873 / 714.6 | 59.3872 / 666.5 / 102.0% / 93.3% | 59.8920 / 660.9 / 101.4% / 92.5% |
 | 4 | llama31_405b | 512K | `131072×16384×18432` | `18432×16384×131072` | 216.4128 / 731.6 | 236.1638 / 670.4 / 106.1% / 91.6% | 237.3715 / 667.0 / 105.7% / 91.2% |
 | 8 | llama31_405b | 512K | `65536×16384×18432` | `18432×16384×65536` | 110.5048 / 716.4 | 118.6191 / 667.4 / 105.2% / 93.2% | 120.2540 / 658.3 / 102.1% / 91.9% |
+
+## TE 反向强基线
+
+重点基线是适配版 TE Userbuffers。它先完成完整的 `dQ/dK/dV` 逆向路由，再执行
+一次完整 BF16 GEMM；不会用逐 peer `beta=1` 的不同累加顺序换取看起来更快的
+数字。每个 setting 搜索通信 SM、stream 数、push/pull、CE/SM、pack 参数和 peer
+顺序，短采样前三名都重新做 10 次预热和 50 次正式采样，最后只从正式复测中选
+winner。
+
+| 对照 | Eager 普通 | Graph 普通 | Eager ZeroBubble | Graph ZeroBubble |
+|---|---:|---:|---:|---:|
+| 融合胜场（对 TE Userbuffers） | 95/96 | 89/96 | 95/96 | 90/96 |
+| `TE-UB p50 / fused p50` 几何平均 | 1.463× | 1.222× | 1.475× | 1.216× |
+
+TE+NCCL 只作为轻量分离对照：人工中型与 Nanbeige4.2-3B，覆盖 CP4/CP8、
+S=1K/16K/128K、两种启动和两种权重模式，共 12 个 setting。NCCL 仅比较 8/16
+channels，固定 512 KiB chunk、64 KiB LL threshold，并比较 256/512 pack block。
+
+| 对照 | Eager 普通 | Graph 普通 | Eager ZeroBubble | Graph ZeroBubble |
+|---|---:|---:|---:|---:|
+| 融合胜场（对 TE+NCCL） | 12/12 | 12/12 | 12/12 | 12/12 |
+| `TE+NCCL p50 / fused p50` 几何平均 | 1.527× | 1.288× | 1.565× | 1.267× |
+
+完整逐 setting 的 fused/TE p50、p95、TFLOPS 与 winner 参数见：
+
+- [TE Userbuffers 96-case 完整表](../../results/QKVproj-backward/qkv_backward_shape_bench/qkv_backward_te_userbuffers_comparison.md)
+- [TE+NCCL 12-case 代表表](../../results/QKVproj-backward/qkv_backward_shape_bench/qkv_backward_te_nccl_comparison.md)
+
+S=1K 的 TE 对照还重复执行 route、DGrad 与 WGrad，要求确定性 mismatch 为 0。
+本算子的 1152 份 TE-UB 正式 raw 均含 50 个有限正样本；所有正确性 mismatch
+为 0，记录到的最大绝对误差为 `0.00390625`。两条反向算子合计为 2304 份 raw。

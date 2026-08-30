@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v10.0
+        default: v11.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v10.0");
+              : (process.env.REQUESTED_TAG || "v11.0");
 
             const releases = {
               "v1.0": {
@@ -206,6 +206,22 @@ jobs:
                   "小矩阵 exact smoke 覆盖 CP4/CP8、rank-major/causal、batch=2、普通/分离和 beta=1；正式 S=1K 还检查跨 rank route、epoch 与完整写入。v9 的 43 个旧 device-kernel 指令体在 v10 Release 构建中保持一致。",
                   "",
                   "完整反向 MNK、生命周期约束、两张 96 行表、TFLOPS/MFU/cuBLAS 对照和复现命令位于两个反向算子目录的 BENCHMARK.md 与 results 归档。",
+                ].join("\n"),
+              },
+              "v11.0": {
+                name: "v11.0 — 反向验证与强基线",
+                body: [
+                  "v11.0 补齐 v10 反向算子的验证与 benchmark。v10.0 的生产反向语义不变；profiling 关闭时，原有前向和生产反向热路径不因本次补测发生变化。",
+                  "",
+                  "新增 PyTorch 原生 forward→autograd backward 对照。它覆盖 CP4/CP8、rank-major/causal、batch=2、宽 GQA、普通 B→W 与 ZeroBubble 分离 B/W 共 16 组，336 项逐张量检查全部通过；连续两次 beta=1 累加的最大绝对误差为 0.0009765625。",
+                  "",
+                  "🩵 **适配版 TE Userbuffers 对 96 个 setting 完成 Eager/Graph、普通/ZeroBubble 全量搜索和 Top-3 正式 10+50 复测。QKV 四列融合胜场为 95/96、89/96、95/96、90/96，几何平均加速为 1.463×、1.222×、1.475×、1.216×；OProj 为 92/96、88/96、94/96、84/96 和 1.428×、1.146×、1.430×、1.146×。**",
+                  "",
+                  "TE+NCCL 按用户指定的轻量口径覆盖两类 shape、三档序列、CP4/CP8 和四种启动/权重模式，共 12 个 setting；两条融合算子的四列均为 12/12 胜。它用于补齐分离基线复现链路，不冒充全量精调结果。",
+                  "",
+                  "QKV/OProj 的前向与反向 Perfetto trace 已按统一协议保存，反向条带展开 B 数据路径、compute/route 包络、grid/finalize、跨 source 等待、B→W 交接和 WGrad。正式结果继续区分同 shape 前向吞吐、经典 cuBLAS 纯 GEMM与 TE 反向边界。",
+                  "",
+                  "正式 TE Userbuffers 原始数据共 2304 份，每份 50 个有限正样本，正确性 mismatch 全为 0；QKV/OProj 记录到的最大绝对误差分别为 0.00390625 和 0.0029296875。发布仓库只保留紧凑汇总，逐次搜索 raw 不入库。",
                 ].join("\n"),
               },
             };

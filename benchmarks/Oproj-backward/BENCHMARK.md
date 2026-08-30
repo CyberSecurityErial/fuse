@@ -307,3 +307,33 @@ runner 默认一次 MPI 启动完成四种组合，每种组合仍使用独立�
 | 8 | nanbeige42_3b | 256K | `32768×6144×3072` | `3072×6144×32768` | 3.6044 / 686.4 | 4.0428 / 611.9 / 101.4% / 89.2% | 4.0283 / 614.1 / 100.1% / 89.5% |
 | 4 | nanbeige42_3b | 512K | `131072×6144×3072` | `3072×6144×131072` | 13.4252 / 737.1 | 14.0278 / 705.4 / 105.3% / 95.7% | 14.1261 / 700.5 / 104.5% / 95.0% |
 | 8 | nanbeige42_3b | 512K | `65536×6144×3072` | `3072×6144×65536` | 7.1484 / 692.2 | 7.9851 / 619.6 / 100.7% / 89.5% | 8.0100 / 617.7 / 100.3% / 89.2% |
+
+## TE 反向强基线
+
+重点基线是适配版 TE Userbuffers。它先完成完整的反向 A2A 路由，再执行一次完整
+BF16 GEMM；普通与 ZeroBubble 分别匹配 `beta=0/1`。每个 setting 搜索通信 SM、
+stream 数、push/pull、CE/SM、pack 参数和 peer 顺序，短采样前三名都重新做
+10 次预热和 50 次正式采样，winner 只从正式复测中选出。
+
+| 对照 | Eager 普通 | Graph 普通 | Eager ZeroBubble | Graph ZeroBubble |
+|---|---:|---:|---:|---:|
+| 融合胜场（对 TE Userbuffers） | 92/96 | 88/96 | 94/96 | 84/96 |
+| `TE-UB p50 / fused p50` 几何平均 | 1.428× | 1.146× | 1.430× | 1.146× |
+
+TE+NCCL 只作为轻量分离对照：人工中型与 Nanbeige4.2-3B，覆盖 CP4/CP8、
+S=1K/16K/128K、两种启动和两种权重模式，共 12 个 setting。NCCL 仅比较 8/16
+channels，固定 512 KiB chunk、64 KiB LL threshold，并比较 256/512 pack block。
+
+| 对照 | Eager 普通 | Graph 普通 | Eager ZeroBubble | Graph ZeroBubble |
+|---|---:|---:|---:|---:|
+| 融合胜场（对 TE+NCCL） | 12/12 | 12/12 | 12/12 | 12/12 |
+| `TE+NCCL p50 / fused p50` 几何平均 | 1.611× | 1.327× | 1.627× | 1.293× |
+
+完整逐 setting 的 fused/TE p50、p95、TFLOPS 与 winner 参数见：
+
+- [TE Userbuffers 96-case 完整表](../../results/Oproj-backward/oproj_backward_shape_bench/oproj_backward_te_userbuffers_comparison.md)
+- [TE+NCCL 12-case 代表表](../../results/Oproj-backward/oproj_backward_shape_bench/oproj_backward_te_nccl_comparison.md)
+
+S=1K 的 TE 对照还重复执行完整 data-route 边界与 WGrad，要求确定性 mismatch 为 0。
+本算子的 1152 份 TE-UB 正式 raw 均含 50 个有限正样本；所有正确性 mismatch
+为 0，记录到的最大绝对误差为 `0.0029296875`。两条反向算子合计为 2304 份 raw。

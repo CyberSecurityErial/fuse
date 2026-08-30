@@ -128,7 +128,7 @@ CUDA_VISIBLE_DEVICES=<devices> mpirun --bind-to none -np <CP> \
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：8（对应 v10.0）
+协议版本：9（对应 v11.0）
 
 ### v10 反向算子的对应关系
 
@@ -142,8 +142,60 @@ PyTorch `cat/index_select/permute/contiguous` 重新造一份 `[M,QKV]`，否则
 框架重排加算子，而不是 v10 接口本身。OProj B 也直接发布最终 head-sharded 输出，
 中间不应增加独立 layout kernel。
 
-只有 QKV backward 提供轻量 role telemetry；OProj backward 目前用正式 event 和
-独立 correctness 检查，不宣称有逐 CTA profile。profile 构建仍不得进入正式表。
+QKV backward 和 OProj backward 都提供 profiling-only 的 role telemetry，覆盖各自
+自动策略能够选择的全部 tile。它与模型名称无关，生产 kernel 和自动策略不读取
+profile 参数。profile 构建仍不得进入正式表。
+
+### v10 backward B→W Perfetto
+
+`backward_mpi_bench --trace-out` 使用 MPI 一进程一卡同步发射一个独立 diagnostic
+epoch，并把 B 与紧随其后的 W 放在同一 rank 的时间线上。B 使用 kernel 内
+`%globaltimer`；W 前后各放一个极小的时间戳 marker kernel，因此 W 条带适合看执行
+顺序和大致跨度，但正式 W 延迟仍以 profiling 关闭后的 CUDA event 10+50 为准。
+
+通用人工中型 shape、CP8、S=16K 的标准反向命令如下。QKV 使用
+`H=5120,Hq=24,Hkv=8,D=128`，OProj 使用 `H=5120,Hq=40,D=128`；两边的
+projection width 都是 5120，便于在不绑定任何模型的情况下对照两种数据方向。
+命令保留 `comm_ctas=0` 和 `gemm_policy=auto`，验证 profiling 入口与生产自动选择
+使用同一通用策略：
+
+```bash
+# QKV backward: B=2048x5120x5120, W=5120x5120x2048
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 mpirun --bind-to none -np 8 \
+  ./build-v10-profile/backward_mpi_bench \
+  --operator qkv --m 2048 --hidden 5120 --batch 1 \
+  --q-heads 24 --kv-heads 8 --head-dim 128 \
+  --comm-ctas 0 --gemm-policy auto --weight-mode immediate \
+  --weight-beta 0 --launch eager --causal-load-balanced \
+  --warmup 1 --iterations 1 --check \
+  --trace-out /home/chen/workspace/fuse_v10_cp8_s16k_medium_traces/qkv_backward_perfetto.json
+
+# OProj backward: B=2048x5120x5120, W=5120x5120x2048
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 mpirun --bind-to none -np 8 \
+  ./build-v10-profile/backward_mpi_bench \
+  --operator oproj --m 2048 --hidden 5120 --batch 1 \
+  --q-heads 40 --kv-heads 8 --head-dim 128 \
+  --comm-ctas 0 --gemm-policy auto --weight-mode immediate \
+  --weight-beta 0 --launch eager --causal-load-balanced \
+  --warmup 1 --iterations 1 --check \
+  --trace-out /home/chen/workspace/fuse_v10_cp8_s16k_medium_traces/oproj_backward_perfetto.json
+```
+
+反向 Perfetto 的条带含义：
+
+| 条带 | 含义 |
+|---|---|
+| `B boundary` | QKV 是 `Head→Sequence route + dX GEMM`；OProj 是 `dA GEMM + Sequence→Head route` |
+| `compute envelope` | 所有 compute CTA 从最早进入到最后完成本地 GEMM 角色的包络；QKV 中包含 ready 等待 |
+| `route envelope` | 所有 comm CTA 的本地存活包络；包含任务排队和 ready 等待，不是裸 NVLink 时间 |
+| `compute / route overlap` | 两个包络的交集，只表示单 kernel 内角色同时活跃的时间 |
+| `local roles -> cooperative grid sync` | 本 rank 最慢本地角色结束后，等待所有 CTA 到达 grid barrier 的尾差 |
+| `system fence` | 确保本 source 的 routed peer writes 在发布完成 epoch 前可见 |
+| `publish this source...` | 本 source 向每个 destination 发布本轮完成标记 |
+| `wait for source N...` | 本 destination 并行等待各 source；各条会重叠，不能相加 |
+| `B kernel completion -> WGrad marker` | B 完全退出到 W 前 marker 执行的交接空隙 |
+| `WGrad GEMM` | 独立权重梯度 GEMM；普通模式 beta=0，ZeroBubble 累加模式 beta=1 |
+| `route/compute CTA N` | 单个 persistent CTA 的本地角色；名称写明它读取、等待、计算或发布什么 |
 
 ### A2A -> GEMM
 

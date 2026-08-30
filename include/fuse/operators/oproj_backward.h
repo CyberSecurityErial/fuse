@@ -3,6 +3,9 @@
 
 #include "fuse/operators/backward_common.h"
 #include "fuse/types.h"
+#if FUSE_ENABLE_PROFILING
+#include "fuse/profiling/timeline.cuh"
+#endif
 
 #include <cuda_runtime_api.h>
 
@@ -77,6 +80,16 @@ int64_t oproj_backward_ready_elements(const OprojBackwardDataParams& params);
 cudaError_t launch_oproj_backward_data(
     const OprojBackwardDataParams& params,
     cudaStream_t stream);
+#if FUSE_ENABLE_PROFILING
+// Diagnostic-only launch. It preserves the production dataflow and records
+// one timestamp record per physical CTA; profiling builds must never be used
+// for formal performance numbers.
+cudaError_t launch_oproj_backward_data_role_telemetry(
+    const OprojBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream);
+#endif
 cudaError_t launch_oproj_backward_weight(
     const OprojBackwardWeightParams& params,
     cudaStream_t stream);
