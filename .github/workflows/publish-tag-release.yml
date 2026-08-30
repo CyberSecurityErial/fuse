@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v13.0
+        default: v13.1
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v13.0");
+              : (process.env.REQUESTED_TAG || "v13.1");
 
             const releases = {
               "v1.0": {
@@ -262,6 +262,18 @@ jobs:
                   "生产、profiling、traits 和 reference 现在共用同一张 policy→kernel binding；自动计划统一复用有界两级 cache，减少重复胶水实现。",
                   "",
                   "验证包含 Release 与 profiling=ON 编译、BF16/FP8 前向与反向 8 卡 smoke、CP2/4/8 与异构规划测试。与 v12.0 干净基线逐函数比较，69/69 个 device function 的 SASS 完全一致，58/58 个公开符号完全一致。",
+                ].join("\n"),
+              },
+              "v13.1": {
+                name: "v13.1 — Ulysses 语义契约收口",
+                body: [
+                  "v13.1 是 v13.0 的结构补丁，不改变 kernel、自动策略、参数布局或 benchmark 数据。",
+                  "",
+                  "新增通用 `SemanticSpec` 与无状态 `PersistentOperator`：通用层只描述数据流、输入/输出布局、路由和完成条件，不携带 QKV、前反向、精度或 ZeroBubble 等 Ulysses 专属概念。",
+                  "",
+                  "Ulysses 投影层单独注册 QKV/OProj 前向与反向四份语义契约，补充 Projection/Pass、BF16/FP8 参数和独立 wgrad 规则。生产、profiling、traits 与 reference 的 policy→kernel binding 现在直接接收完整契约，并在编译期检查 GEMM→A2A / A2A→GEMM 方向是否匹配。",
+                  "",
+                  "旧 `GemmA2A<Projection, Pass>`、`A2AGemm<Projection, Pass>` 与 `operators/ulysses/projection_dataflow.h` 均保留为兼容入口。Release 与 profiling=ON 构建通过；BF16/FP8 前向、反向、CP2/4/8、causal、padding、defer-V 和异构规划测试通过。69/69 个 device function 的 SASS 与公开符号集合均和 v13.0 一致。",
                 ].join("\n"),
               },
             };

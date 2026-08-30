@@ -613,3 +613,21 @@ ZeroBubble 延迟执行。旧平铺头文件保留为兼容 include。
 计划共用统一的有界两级 cache。验证覆盖 Release、profiling=ON、BF16/FP8 前向与
 反向 8 卡 smoke、CP2/4/8 和异构规划测试。相对 v12.0 干净构建，69/69 个 device
 function 的 SASS 完全一致，58/58 个公开符号完全一致。
+
+## v13.1：Ulysses 语义契约收口
+
+状态：已发布。
+
+v13.1 是 v13.0 的结构补丁。通用 `SemanticSpec` 只规定物理数据流、输入/输出布局、
+路由方向和完成条件；它不要求投影类型、前反向、BF16/FP8 或 ZeroBubble 字段，避免
+把 Ulysses 的上层概念重新塞回通用元操作。
+
+`operators/semantics/ulysses/projection.h` 在通用契约上增加投影专属规则，集中注册
+QKV/OProj 前向和反向四个组合，以及对应精度参数和独立 wgrad 语义。内部
+policy→kernel binding 直接接收完整 spec，并在编译期检查它与 GEMM→A2A 或
+A2A→GEMM 的物理方向一致。旧模板和旧头文件继续作为兼容入口。
+
+本补丁不改变 kernel 参数、调度、自动策略、ABI 或 benchmark 数据。Release 与
+profiling=ON 构建通过；BF16/FP8 前向和反向、CP2/4/8、causal、padding、defer-V
+及异构规划测试通过。69/69 个 device function 的 SASS 与公开符号集合均和 v13.0
+一致。

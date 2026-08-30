@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #define CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED 1
-#include "fuse/operators/ulysses/projection_dataflow.h"
+#include "fuse/operators/semantics/ulysses/projection.h"
 #include "fuse/operators/ulysses/heterogeneous_cp.h"
 
 #include "fuse/arch/sm90.cuh"

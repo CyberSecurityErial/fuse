@@ -8,11 +8,16 @@ duplicate CUTLASS kernels or change device code generation.
 
 - `operators/primitives/gemm_a2a.h` and `a2a_gemm.h` define the two physical
   dataflow primitives.
-- `operators/ulysses/projection_dataflow.h` binds projection semantics and
-  forward/backward direction to those primitives with templates.
+- `operators/semantics/operator.h` defines the generic compile-time semantic
+  contract and stateless operator facade.
+- `operators/semantics/ulysses/projection.h` registers the four projection
+  semantics and adds projection-specific precision/wgrad requirements. Each
+  policy-to-kernel binding takes one complete specification, rather than
+  separate projection/pass labels.
 - `operators/ulysses/qkv_backward.h` and `oproj_backward.h` own the independent
   weight-gradient phase and its immediate/deferred ZeroBubble contract.
-- The former flat headers remain compatibility includes only.
+- The former flat headers and `ulysses/projection_dataflow.h` remain
+  compatibility includes only.
 
 ## Private implementation
 
@@ -45,3 +50,5 @@ duplicate CUTLASS kernels or change device code generation.
    launch glue belongs in `api/`.
 5. A change that alters kernel parameters or a CUTLASS type needs correctness
    and performance validation. A file move alone must preserve generated SASS.
+6. Tensor meaning, route direction and completion semantics belong in a
+   semantic specification. Do not add model-name branches to a primitive.
