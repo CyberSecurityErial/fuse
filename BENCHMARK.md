@@ -1,6 +1,6 @@
 # Benchmark Index
 
-当前版本：v13.0
+当前版本：v13.1
 
 从 v4.0 开始，每个通算融合算子独立维护 benchmark、调优空间、正式结果与复现命令：
 
@@ -52,7 +52,7 @@ Tensor Core 内部使用 FP32 累加；量化、amax 和 scale 的生成由调�
 自动策略只读取 shape、SM 数、通信量和 FP8 wave 标定，不读取模型名或逐点赢家。
 接口、正确性和复现方式见 [`四算子 FP8 benchmark`](benchmarks/fp8/BENCHMARK.md)。
 
-v13.0 是纯结构重构，不生成新的性能结果，也不改写任何历史 Golden。重构版与
+v13.0/v13.1 是纯结构重构，不生成新的性能结果，也不改写任何历史 Golden。重构版与
 v12.0 干净 Release 基线的 69 个 device function 逐函数 SASS 完全一致，58 个公开
 符号完全一致；Release/profiling 构建以及 BF16/FP8 前向、反向 smoke 均通过。
 因此本页所有性能数字继续使用对应算子的已发布归档。

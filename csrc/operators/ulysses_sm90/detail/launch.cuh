@@ -527,16 +527,22 @@ struct TypeTag {
 // visitor can therefore share one registration across production, profiling,
 // traits and reference paths without reconstructing what the kernel means.
 template <
-    class ProjectionType,
-    class PassType,
+    class SemanticSpecType,
+    class PhysicalDataflowType,
     class GemmType,
     class CommType,
     class PureGemmType = void,
     class TelemetryGemmType = GemmType,
     class TelemetryCommType = CommType>
 struct DataflowKernelBinding {
-  using Projection = ProjectionType;
-  using Pass = PassType;
+  static_assert(ulysses::kIsProjectionSemanticSpec<SemanticSpecType>);
+  using Semantic = SemanticSpecType;
+  static_assert(std::is_same_v<
+                typename Semantic::Dataflow,
+                PhysicalDataflowType>);
+  using Projection = typename Semantic::Projection;
+  using Pass = typename Semantic::Pass;
+  using Dataflow = typename Semantic::Dataflow;
   using Gemm = GemmType;
   using Comm = CommType;
   using Kernel = detail::MonolithicGemm<Gemm, Comm>;
@@ -549,42 +555,74 @@ struct DataflowKernelBinding {
 #endif
 };
 
+template <
+    class SemanticSpecType,
+    class GemmType,
+    class CommType,
+    class PureGemmType = void,
+    class TelemetryGemmType = GemmType,
+    class TelemetryCommType = CommType>
+using GemmA2AKernelBinding = DataflowKernelBinding<
+    SemanticSpecType,
+    operators::dataflow::GemmThenA2A,
+    GemmType,
+    CommType,
+    PureGemmType,
+    TelemetryGemmType,
+    TelemetryCommType>;
+
+template <
+    class SemanticSpecType,
+    class GemmType,
+    class CommType,
+    class PureGemmType = void,
+    class TelemetryGemmType = GemmType,
+    class TelemetryCommType = CommType>
+using A2AGemmKernelBinding = DataflowKernelBinding<
+    SemanticSpecType,
+    operators::dataflow::A2AThenGemm,
+    GemmType,
+    CommType,
+    PureGemmType,
+    TelemetryGemmType,
+    TelemetryCommType>;
+
 #if FUSE_ENABLE_PROFILING
-using OprojForwardM64Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardM64Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsM64Gemm, A2ALhsM64InputComm, M64PureGemm,
     A2ALhsM64TelemetryGemm, A2ALhsM64TelemetryInputComm>;
-using OprojForwardN128Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN128Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsInputGemm, A2ALhsInputComm, ::fuse::PureGemm,
     A2ALhsTelemetryGemm, A2ALhsTelemetryInputComm>;
-using OprojForwardN160Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN160Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsN160Gemm, A2ALhsInputComm, N160PureGemm,
     A2ALhsN160TelemetryGemm, A2ALhsTelemetryInputComm>;
-using OprojForwardN256Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN256Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsProjectionGemm, A2ALhsInputComm, ProjectionPureGemm,
     A2ALhsProjectionTelemetryGemm, A2ALhsTelemetryInputComm>;
-using OprojForwardN320Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN320Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsWideN320Gemm, A2ALhsInputComm, WideN320PureGemm,
     A2ALhsWideN320TelemetryGemm, A2ALhsTelemetryInputComm>;
 #else
-using OprojForwardM64Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardM64Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsM64Gemm, A2ALhsM64InputComm, M64PureGemm>;
-using OprojForwardN128Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN128Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsInputGemm, A2ALhsInputComm, ::fuse::PureGemm>;
-using OprojForwardN160Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN160Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsN160Gemm, A2ALhsInputComm, N160PureGemm>;
-using OprojForwardN256Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN256Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsProjectionGemm, A2ALhsInputComm, ProjectionPureGemm>;
-using OprojForwardN320Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Forward,
+using OprojForwardN320Binding = A2AGemmKernelBinding<
+    ulysses::OprojForwardSpec,
     A2ALhsWideN320Gemm, A2ALhsInputComm, WideN320PureGemm>;
 #endif
 
@@ -709,26 +747,26 @@ cudaError_t launch_gemm_a2a_impl(
   return detail::launch_cooperative<Kernel>(kernel_params, stream, sm_count);
 }
 
-using QkvForwardN64Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN64Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     N64OutputGemm, QkvGqaPackCommN64, N64PureGemm>;
-using QkvForwardN128Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN128Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     OutputGemm, QkvGqaPackCommSmall, ::fuse::PureGemm>;
-using QkvForwardN128InterleavedBinding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN128InterleavedBinding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     OutputGemm, QkvGqaPackCommSmallInterleaved, ::fuse::PureGemm>;
-using QkvForwardN160Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN160Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     N160OutputGemm, QkvGqaPackCommN160, N160PureGemm>;
-using QkvForwardN192Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN192Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     N192OutputGemm, QkvGqaPackCommN192, N192PureGemm>;
-using QkvForwardN256Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN256Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     ProjectionOutputGemm, QkvGqaPackCommWide, ProjectionPureGemm>;
-using QkvForwardN320Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Forward,
+using QkvForwardN320Binding = GemmA2AKernelBinding<
+    ulysses::QkvForwardSpec,
     WideN320OutputGemm, QkvGqaPackCommN320, WideN320PureGemm>;
 
 template <class Visitor>
@@ -796,23 +834,23 @@ cudaError_t launch_qkv_forward_policy(
       policy, params.route.qkv_peer_interleaved, launch);
 }
 
-using QkvBackwardN64ClusterM2Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN64ClusterM2Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardN64ClusterM2ReadyGemm, QkvBackwardPushComm>;
-using QkvBackwardN64Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN64Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardN64ReadyGemm, QkvBackwardPushComm>;
-using QkvBackwardN128Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN128Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardN128ReadyGemm, QkvBackwardPushComm>;
-using QkvBackwardN160Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN160Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardN160ReadyGemm, QkvBackwardPushComm>;
-using QkvBackwardN192Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN192Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardN192ReadyGemm, QkvBackwardPushComm>;
-using QkvBackwardN256Binding = DataflowKernelBinding<
-    ulysses::QkvProjection, ulysses::Backward,
+using QkvBackwardN256Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
     BackwardA2ALhsGemm, QkvBackwardPushComm>;
 
 template <class Visitor>
@@ -836,20 +874,20 @@ cudaError_t visit_qkv_backward_policy(
   }
 }
 
-using OprojBackwardN64Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Backward,
+using OprojBackwardN64Binding = GemmA2AKernelBinding<
+    ulysses::OprojBackwardSpec,
     BackwardN64SignalingGemm, OprojBackwardHeadCommN64>;
-using OprojBackwardN128Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Backward,
+using OprojBackwardN128Binding = GemmA2AKernelBinding<
+    ulysses::OprojBackwardSpec,
     BackwardN128SignalingGemm, OprojBackwardHeadCommN128>;
-using OprojBackwardN160Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Backward,
+using OprojBackwardN160Binding = GemmA2AKernelBinding<
+    ulysses::OprojBackwardSpec,
     BackwardN160SignalingGemm, OprojBackwardHeadCommN160>;
-using OprojBackwardN192Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Backward,
+using OprojBackwardN192Binding = GemmA2AKernelBinding<
+    ulysses::OprojBackwardSpec,
     BackwardN192SignalingGemm, OprojBackwardHeadCommN192>;
-using OprojBackwardN256Binding = DataflowKernelBinding<
-    ulysses::OutputProjection, ulysses::Backward,
+using OprojBackwardN256Binding = GemmA2AKernelBinding<
+    ulysses::OprojBackwardSpec,
     BackwardProjectionOutputGemm, OprojBackwardHeadCommN256>;
 
 template <class Visitor>

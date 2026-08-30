@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Public API implementation; assembled by csrc/operators/ulysses_sm90.cu.
-// Declarations: fuse/operators/ulysses/projection_dataflow.h.
+// Declarations: fuse/operators/semantics/ulysses/projection.h.
 //
 // Module index:
 //   - BF16/FP8 A2A-then-GEMM production and telemetry entry points
