@@ -1,6 +1,6 @@
 # Benchmark Index
 
-当前版本：v11.0
+当前版本：v11.2
 
 从 v4.0 开始，每个通算融合算子独立维护 benchmark、调优空间、正式结果与复现命令：
 
@@ -9,6 +9,7 @@
 - [锁频异构 CP（v9.1 实验特性）](benchmarks/heterogeneous_cp/BENCHMARK.md)
 - [QKV Projection backward](benchmarks/QKVproj-backward/BENCHMARK.md)
 - [Output Projection backward](benchmarks/Oproj-backward/BENCHMARK.md)
+- [四算子完整训练 E2E](benchmarks/e2e/BENCHMARK.md)
 
 两个均匀算子文档使用同一口径：BF16、10 次 warmup + 50 次正式采样、逐样本先取跨 rank 最大延迟，再报告 p50/p95；eager 与 CUDA Graph 分别采样、分别成列。Graph capture、instantiate 与显式 upload 均在正式采样外。QKV 正式数据固定 MPI 一进程一卡，单进程多卡只用于诊断。TE、经典 cuBLAS、cuBLASLt、NCCL 和适配版 TE Userbuffers 的调优方法与 winner 配置都在对应文档中逐点列出。
 
@@ -37,5 +38,11 @@ ZeroBubble 表、TFLOPS、989T MFU 和经典 cuBLAS 占比均放在各自算子�
 `1.463×/1.475×`，Graph 为 `1.222×/1.216×`；OProj 对应为
 `1.428×/1.430×` 与 `1.146×/1.146×`。轻量 TE+NCCL 另取两类 shape、三档序列、
 CP4/CP8 共 12 点，只用于证明分离基线口径和复现链路，不作为全量调参结论。
+
+v11.2 把 QKV/OProj 的前向和反向四条融合边界接入完整 Megatron 训练，并与同配置
+原生 TE 做 full-iteration CUDA Graph 对照。Nanbeige、Llama-3 8B geometry、
+Qwen2.5 7B geometry 各覆盖 1K/4K/16K/64K/128K，共 15 个 setting，融合侧
+`15/15` 获胜，完整 step 吞吐几何平均提升 `2.09%`，最大提升 `4.26%`。逐点
+时间和测试边界见 [`四算子 E2E benchmark`](benchmarks/e2e/BENCHMARK.md)。
 
 版本级改动与历史结果见 [VERSION_HISTORY.md](VERSION_HISTORY.md)。

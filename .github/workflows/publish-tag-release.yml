@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v11.0
+        default: v11.2
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v11.0");
+              : (process.env.REQUESTED_TAG || "v11.2");
 
             const releases = {
               "v1.0": {
@@ -222,6 +222,18 @@ jobs:
                   "QKV/OProj 的前向与反向 Perfetto trace 已按统一协议保存，反向条带展开 B 数据路径、compute/route 包络、grid/finalize、跨 source 等待、B→W 交接和 WGrad。正式结果继续区分同 shape 前向吞吐、经典 cuBLAS 纯 GEMM与 TE 反向边界。",
                   "",
                   "正式 TE Userbuffers 原始数据共 2304 份，每份 50 个有限正样本，正确性 mismatch 全为 0；QKV/OProj 记录到的最大绝对误差分别为 0.00390625 和 0.0029296875。发布仓库只保留紧凑汇总，逐次搜索 raw 不入库。",
+                ].join("\n"),
+              },
+              "v11.2": {
+                name: "v11.2 — 四算子完整训练 E2E 验证",
+                body: [
+                  "v11.2 不修改生产 kernel。它将 QKV Projection+A2A、A2A+OProj 的前向和反向四条融合路径同时接入 Megatron Core v0.16.1 完整训练。",
+                  "",
+                  "原生侧与融合侧使用相同 BF16、随机种子、mock token、优化器、全量激活重计算和卡组，两边都开启 full-iteration CUDA Graph。时间包含前向、重计算、反向和优化器，不是把四个 microbenchmark 的收益相加。",
+                  "",
+                  "🩵 **Nanbeige4.2-3B、Llama-3 8B geometry、Qwen2.5 7B geometry 各覆盖 1K/4K/16K/64K/128K，共 15 个 setting，融合侧 15/15 全部获胜；全部点的 E2E 吞吐几何平均提升 2.09%，最大提升为 Nanbeige 16K 的 4.26%。**",
+                  "",
+                  "Qwen 128K 通过在不会并发使用的层之间复用融合算子临时工作区装入显存；该复用不跳过计算、不改变数据依赖。生产 kernel 与 v11.0/v11.1 保持一致。",
                 ].join("\n"),
               },
             };

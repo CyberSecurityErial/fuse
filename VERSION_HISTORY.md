@@ -540,3 +540,33 @@ PyTorch 参考不是手写 GEMM：脚本先执行 `torch.nn.functional.linear` �
 autograd 生成 `dX/dW`。CP4/CP8、rank-major/causal、batch=2、宽 GQA、普通与
 ZeroBubble 共 16 组全部通过；ZeroBubble 从非零 `main_grad` 连续累加两次，最大
 绝对误差为 `0.0009765625`。两份完整前向 smoke 继续通过，旧前向热核指令体未变。
+
+## v11.1：反向 trace 启动偏斜说明
+
+状态：已发布，仅说明文字。
+
+v11.1 与 v11.0 指向同一提交，不修改源码、数据或二进制。该 tag 说明 CP8 Eager
+诊断 trace 中的 `wait source` 条带同时包含不同 rank 到达 kernel 的时间差，不能
+直接当作裸 NVLink 延迟或单张卡的纯计算时间。该结论只用于解释 trace，不是新的
+96 点性能结论。
+
+## v11.2：四算子完整训练 E2E 验证
+
+状态：已发布。
+
+v11.2 不修改生产 kernel。它把 QKV Projection+A2A、A2A+OProj 的前向和反向
+四条融合路径同时接入 Megatron Core v0.16.1 完整训练，并与同一配置的原生 TE
+路径做 full-iteration CUDA Graph 对照。两侧使用相同 BF16、随机种子、mock token、
+优化器、全量激活重计算和卡组；融合侧关闭 checkpoint 前向复用、attention 状态
+复用与额外 WGrad stream overlap。
+
+Nanbeige4.2-3B、Llama-3 8B geometry、Qwen2.5 7B geometry 各覆盖全局序列
+1K、4K、16K、64K、128K，共 15 个 setting。融合侧 `15/15` 获胜；三个模型组的
+完整 step 吞吐几何平均分别提升 `2.43%`、`2.01%`、`1.82%`，全部 15 点几何
+平均提升 `2.09%`，最大提升为 Nanbeige 16K 的 `4.26%`。时间包含前向、重计算、
+反向和优化器。
+
+Qwen 128K 的融合路径需要在不会并发使用的层之间复用临时通信工作区才能装入显存；
+该复用不跳过计算或改变依赖。完整逐点结果、测试边界与二进制指纹见
+[`benchmarks/e2e/BENCHMARK.md`](benchmarks/e2e/BENCHMARK.md) 和
+[`results/e2e`](results/e2e)。
