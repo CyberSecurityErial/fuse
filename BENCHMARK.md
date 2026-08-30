@@ -1,6 +1,6 @@
 # Benchmark Index
 
-当前版本：v11.2
+当前版本：v12.0
 
 从 v4.0 开始，每个通算融合算子独立维护 benchmark、调优空间、正式结果与复现命令：
 
@@ -10,6 +10,7 @@
 - [QKV Projection backward](benchmarks/QKVproj-backward/BENCHMARK.md)
 - [Output Projection backward](benchmarks/Oproj-backward/BENCHMARK.md)
 - [四算子完整训练 E2E](benchmarks/e2e/BENCHMARK.md)
+- [四算子 FP8](benchmarks/fp8/BENCHMARK.md)
 
 两个均匀算子文档使用同一口径：BF16、10 次 warmup + 50 次正式采样、逐样本先取跨 rank 最大延迟，再报告 p50/p95；eager 与 CUDA Graph 分别采样、分别成列。Graph capture、instantiate 与显式 upload 均在正式采样外。QKV 正式数据固定 MPI 一进程一卡，单进程多卡只用于诊断。TE、经典 cuBLAS、cuBLASLt、NCCL 和适配版 TE Userbuffers 的调优方法与 winner 配置都在对应文档中逐点列出。
 
@@ -44,5 +45,11 @@ v11.2 把 QKV/OProj 的前向和反向四条融合边界接入完整 Megatron �
 Qwen2.5 7B geometry 各覆盖 1K/4K/16K/64K/128K，共 15 个 setting，融合侧
 `15/15` 获胜，完整 step 吞吐几何平均提升 `2.09%`，最大提升 `4.26%`。逐点
 时间和测试边界见 [`四算子 E2E benchmark`](benchmarks/e2e/BENCHMARK.md)。
+
+v12.0 给同样四条边界增加纯 E4M3 路径。输入、权重、通信数据和输出均为 E4M3，
+Tensor Core 内部使用 FP32 累加；量化、amax 和 scale 的生成由调用方负责，不计入
+本轮 kernel 延迟。正式 QKV 使用 MPI 一进程一卡、10+50 和预上传 CUDA Graph；
+自动策略只读取 shape、SM 数、通信量和 FP8 wave 标定，不读取模型名或逐点赢家。
+接口、正确性和复现方式见 [`四算子 FP8 benchmark`](benchmarks/fp8/BENCHMARK.md)。
 
 版本级改动与历史结果见 [VERSION_HISTORY.md](VERSION_HISTORY.md)。

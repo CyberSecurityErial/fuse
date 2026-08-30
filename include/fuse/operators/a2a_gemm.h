@@ -60,6 +60,29 @@ struct A2AGemmParams {
   float alpha = 1.0f;
 };
 
+// Explicit precision name for new integrations.  A2AGemmParams remains the
+// source-compatible BF16 spelling used by existing callers.
+using Bf16A2AGemmParams = A2AGemmParams;
+
+// FP8 inverse A2A followed by FP8 GEMM with FP32 accumulation and E4M3 output.
+// The caller owns quantization scales/amax; alpha is the already-combined
+// scale applied before the result is rounded to E4M3.
+struct Fp8A2AGemmParams {
+  const Fp8E4m3* peer_input[kMaxWorldSize]{};
+  Fp8E4m3* input_staging = nullptr;
+  const uint32_t* peer_input_ready[kMaxWorldSize]{};
+  Fp8E4m3* rhs_nt = nullptr;
+  Fp8E4m3* output = nullptr;
+  uint32_t* ready = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  A2ALhsGemmPolicy lhs_policy = A2ALhsGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  uint32_t input_epoch = 0;
+  float alpha = 1.0f;
+};
+
 KernelTraits cutlass_kernel_traits();
 
 int64_t a2a_lhs_gemm_ready_elements(
@@ -80,6 +103,10 @@ cudaError_t launch_a2a_gemm_cutlass(
     const A2AGemmParams& params,
     cudaStream_t stream);
 
+cudaError_t launch_a2a_gemm_fp8_cutlass(
+    const Fp8A2AGemmParams& params,
+    cudaStream_t stream);
+
 #if FUSE_ENABLE_PROFILING
 cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     const A2AGemmParams& params,
@@ -97,8 +124,17 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
     cudaStream_t stream,
     int32_t reserved_comm_ctas = 0);
 
+cudaError_t launch_a2a_gemm_fp8_cutlass_reference(
+    const Fp8A2AGemmParams& params,
+    cudaStream_t stream,
+    int32_t reserved_comm_ctas = 0);
+
 cudaError_t launch_a2a_gemm_copy_reference(
     const A2AGemmParams& params,
+    cudaStream_t stream);
+
+cudaError_t launch_a2a_gemm_fp8_copy_reference(
+    const Fp8A2AGemmParams& params,
     cudaStream_t stream);
 
 }  // namespace fuse

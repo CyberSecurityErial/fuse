@@ -65,6 +65,54 @@ struct OprojBackwardParams {
   WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
 };
 
+using Bf16OprojBackwardDataParams = OprojBackwardDataParams;
+using Bf16OprojBackwardWeightParams = OprojBackwardWeightParams;
+using Bf16OprojBackwardParams = OprojBackwardParams;
+
+// FP8 OProj backward keeps the BF16 B/W split. Inputs, routed dA and dWo are
+// E4M3 while tensor-core accumulation remains FP32. The caller owns
+// quantization scales/amax, and alpha is applied before E4M3 rounding.
+struct Fp8OprojBackwardDataParams {
+  const Fp8E4m3* grad_output = nullptr;
+  // FP8 dgrad uses the quantized transpose copy [A,H].
+  const Fp8E4m3* weight_nt = nullptr;
+  Fp8E4m3* local_grad_attention = nullptr;
+  Fp8E4m3* peer_grad_attention[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  uint32_t* ready = nullptr;
+  int32_t local_tokens = 0;
+  int32_t hidden = 0;
+  int32_t batch = 1;
+  int32_t q_heads = 0;
+  int32_t head_dim = 0;
+  int32_t world_size = 1;
+  int32_t rank = 0;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  bool causal_load_balanced = false;
+  float alpha = 1.0f;
+};
+
+struct Fp8OprojBackwardWeightParams {
+  // CUTLASS FP8 TN operands: [H,M] and [A,M].
+  const Fp8E4m3* grad_output_t = nullptr;
+  const Fp8E4m3* saved_attention_t = nullptr;
+  Fp8E4m3* grad_weight = nullptr;
+  int32_t local_tokens = 0;
+  int32_t hidden = 0;
+  int32_t q_heads = 0;
+  int32_t head_dim = 0;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+};
+
+struct Fp8OprojBackwardParams {
+  Fp8OprojBackwardDataParams data;
+  Fp8OprojBackwardWeightParams weight;
+  WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
+};
+
 int32_t recommended_oproj_backward_comm_ctas(
     const OprojBackwardDataParams& params);
 BackwardGemmPolicy recommended_oproj_backward_gemm_policy(
@@ -95,6 +143,32 @@ cudaError_t launch_oproj_backward_weight(
     cudaStream_t stream);
 cudaError_t launch_oproj_backward(
     const OprojBackwardParams& params,
+    cudaStream_t stream);
+
+int32_t recommended_oproj_backward_fp8_comm_ctas(
+    const Fp8OprojBackwardDataParams& params);
+KernelTraits oproj_backward_fp8_kernel_traits(
+    const Fp8OprojBackwardDataParams& params,
+    int32_t resolved_comm_ctas,
+    int32_t sm_count);
+int64_t oproj_backward_fp8_ready_elements(
+    const Fp8OprojBackwardDataParams& params);
+
+cudaError_t launch_oproj_backward_fp8_data(
+    const Fp8OprojBackwardDataParams& params,
+    cudaStream_t stream);
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_oproj_backward_fp8_data_role_telemetry(
+    const Fp8OprojBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream);
+#endif
+cudaError_t launch_oproj_backward_fp8_weight(
+    const Fp8OprojBackwardWeightParams& params,
+    cudaStream_t stream);
+cudaError_t launch_oproj_backward_fp8(
+    const Fp8OprojBackwardParams& params,
     cudaStream_t stream);
 
 }  // namespace fuse

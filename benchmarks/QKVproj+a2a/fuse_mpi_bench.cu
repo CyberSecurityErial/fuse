@@ -22,6 +22,7 @@
 namespace {
 
 using fuse::Bf16;
+using fuse::Fp8E4m3;
 
 #define CUDA_CHECK(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 #define MPI_CHECK(expr) check_mpi((expr), #expr, __FILE__, __LINE__)
@@ -50,6 +51,11 @@ enum class LaunchMode {
   kGraph,
 };
 
+enum class Precision {
+  kBf16,
+  kFp8,
+};
+
 struct Options {
   int m = 128;
   int k = 4096;
@@ -66,6 +72,7 @@ struct Options {
   bool check = true;
   bool help = false;
   LaunchMode launch_mode = LaunchMode::kEager;
+  Precision precision = Precision::kBf16;
   std::string json_out;
 #if FUSE_ENABLE_PROFILING
   bool role_profile = false;
@@ -75,6 +82,20 @@ struct Options {
 
 const char* launch_mode_name(LaunchMode mode) {
   return mode == LaunchMode::kGraph ? "graph" : "eager";
+}
+
+const char* precision_name(Precision precision) {
+  return precision == Precision::kFp8 ? "fp8_e4m3" : "bf16";
+}
+
+const char* fp8_pipeline_name(Precision precision) {
+  if (precision != Precision::kFp8) {
+    return "not_applicable";
+  }
+  const char* value = std::getenv("FUSE_FP8_GEMM_PIPELINE");
+  return value != nullptr && std::strcmp(value, "cooperative") == 0
+      ? "cooperative"
+      : "pingpong";
 }
 
 const char* raster_name(fuse::GemmRaster raster) {
@@ -162,6 +183,15 @@ Options parse_options(int argc, char** argv) {
       }
     } else if (argument == "--cuda-graph") {
       options.launch_mode = LaunchMode::kGraph;
+    } else if (argument == "--precision") {
+      const std::string value = take("--precision");
+      if (value == "bf16") {
+        options.precision = Precision::kBf16;
+      } else if (value == "fp8" || value == "fp8_e4m3") {
+        options.precision = Precision::kFp8;
+      } else {
+        throw std::runtime_error("--precision must be bf16 or fp8");
+      }
     } else if (argument == "--defer-v-a2a") {
       options.defer_v_a2a = true;
     } else if (argument == "--check") {
@@ -196,6 +226,7 @@ void print_usage(const char* program) {
       << "  --launch eager|graph   graph is one pre-uploaded replay containing\n"
       << "                         warmup+sample kernels with monotonic epochs\n"
       << "  --warmup N --iterations N   defaults: 10 and 50\n"
+      << "  --precision bf16|fp8  FP8 uses E4M3 input, weight, route, and output\n"
       << "  --defer-v-a2a --check|--no-check --json-out PATH\n"
 #if FUSE_ENABLE_PROFILING
       << "  --role-profile         one synchronized diagnostic epoch per rank\n"
@@ -328,6 +359,25 @@ __global__ void fill_weight_kernel(Bf16* data, int64_t elements, int seed) {
   }
 }
 
+__global__ void fill_fp8_kernel(Fp8E4m3* data, int64_t elements, int seed) {
+  for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int value = static_cast<int>((index * 17 + seed * 13) % 19) - 9;
+    data[index] = Fp8E4m3(static_cast<float>(value) / 32.0f);
+  }
+}
+
+__global__ void fill_fp8_weight_kernel(
+    Fp8E4m3* data, int64_t elements, int seed) {
+  for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int value = static_cast<int>((index * 17 + seed * 13) % 19) - 9;
+    data[index] = Fp8E4m3(static_cast<float>(value) / 32.0f);
+  }
+}
+
 __global__ void count_sentinel_kernel(
     const uint16_t* data,
     int64_t elements,
@@ -343,8 +393,32 @@ __global__ void count_sentinel_kernel(
   }
 }
 
+__global__ void count_fp8_sentinel_kernel(
+    const uint8_t* data,
+    int64_t elements,
+    unsigned long long* count) {
+  unsigned long long local = 0;
+  for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    local += data[index] == 0xffu;
+  }
+  if (local != 0) {
+    atomicAdd(count, local);
+  }
+}
+
 template <class Kernel>
 void launch_fill(Kernel kernel, Bf16* pointer, int64_t elements, int seed,
+                 cudaStream_t stream) {
+  const int blocks = static_cast<int>(
+      std::min<int64_t>((elements + 255) / 256, 4096));
+  kernel<<<blocks, 256, 0, stream>>>(pointer, elements, seed);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Kernel>
+void launch_fill(Kernel kernel, Fp8E4m3* pointer, int64_t elements, int seed,
                  cudaStream_t stream) {
   const int blocks = static_cast<int>(
       std::min<int64_t>((elements + 255) / 256, 4096));
@@ -362,17 +436,23 @@ static_assert(std::is_trivially_copyable_v<IpcHandles>);
 struct Buffers {
   Bf16* lhs = nullptr;
   Bf16* rhs_nt = nullptr;
+  Fp8E4m3* fp8_lhs = nullptr;
+  Fp8E4m3* fp8_rhs_nt = nullptr;
   Bf16* local_output = nullptr;
   Bf16* owned_output = nullptr;
+  Fp8E4m3* fp8_local_output = nullptr;
+  Fp8E4m3* fp8_owned_output = nullptr;
   uint32_t* ready = nullptr;
   uint32_t* owned_epoch = nullptr;
   int64_t output_elements = 0;
   int64_t ready_elements = 0;
   std::vector<Bf16*> peer_output;
+  std::vector<Fp8E4m3*> fp8_peer_output;
   std::vector<uint32_t*> peer_epoch;
 };
 
 Buffers allocate_and_exchange_buffers(
+    Precision precision,
     const RankContext& context,
     const Runtime& runtime,
     int m,
@@ -383,36 +463,72 @@ Buffers allocate_and_exchange_buffers(
   Buffers buffers;
   buffers.output_elements = output_elements;
   buffers.ready_elements = ready_elements;
-  buffers.lhs = allocate<Bf16>(static_cast<int64_t>(m) * k);
-  buffers.rhs_nt = allocate<Bf16>(static_cast<int64_t>(n) * k);
-  buffers.local_output = allocate<Bf16>(static_cast<int64_t>(m) * n);
-  buffers.owned_output = allocate<Bf16>(output_elements);
+  if (precision == Precision::kFp8) {
+    buffers.fp8_lhs = allocate<Fp8E4m3>(static_cast<int64_t>(m) * k);
+    buffers.fp8_rhs_nt = allocate<Fp8E4m3>(static_cast<int64_t>(n) * k);
+    buffers.fp8_local_output =
+        allocate<Fp8E4m3>(static_cast<int64_t>(m) * n);
+    buffers.fp8_owned_output = allocate<Fp8E4m3>(output_elements);
+  } else {
+    buffers.lhs = allocate<Bf16>(static_cast<int64_t>(m) * k);
+    buffers.rhs_nt = allocate<Bf16>(static_cast<int64_t>(n) * k);
+    buffers.local_output = allocate<Bf16>(static_cast<int64_t>(m) * n);
+    buffers.owned_output = allocate<Bf16>(output_elements);
+  }
   buffers.ready = allocate<uint32_t>(ready_elements);
   buffers.owned_epoch = allocate<uint32_t>(
       static_cast<int64_t>(context.world) * fuse::kReadyFlagStride);
 
-  launch_fill(
-      fill_kernel,
-      buffers.lhs,
-      static_cast<int64_t>(m) * k,
-      context.rank + 601,
-      runtime.stream);
-  launch_fill(
-      fill_weight_kernel,
-      buffers.rhs_nt,
-      static_cast<int64_t>(n) * k,
-      context.rank + 701,
-      runtime.stream);
-  CUDA_CHECK(cudaMemsetAsync(
-      buffers.local_output,
-      0,
-      static_cast<size_t>(m) * n * sizeof(Bf16),
-      runtime.stream));
-  CUDA_CHECK(cudaMemsetAsync(
-      buffers.owned_output,
-      0xff,
-      static_cast<size_t>(output_elements) * sizeof(Bf16),
-      runtime.stream));
+  if (precision == Precision::kFp8) {
+    launch_fill(
+        fill_fp8_kernel,
+        buffers.fp8_lhs,
+        static_cast<int64_t>(m) * k,
+        context.rank + 601,
+        runtime.stream);
+    launch_fill(
+        fill_fp8_weight_kernel,
+        buffers.fp8_rhs_nt,
+        static_cast<int64_t>(n) * k,
+        context.rank + 701,
+        runtime.stream);
+  } else {
+    launch_fill(
+        fill_kernel,
+        buffers.lhs,
+        static_cast<int64_t>(m) * k,
+        context.rank + 601,
+        runtime.stream);
+    launch_fill(
+        fill_weight_kernel,
+        buffers.rhs_nt,
+        static_cast<int64_t>(n) * k,
+        context.rank + 701,
+        runtime.stream);
+  }
+  if (precision == Precision::kFp8) {
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.fp8_local_output,
+        0,
+        static_cast<size_t>(m) * n * sizeof(Fp8E4m3),
+        runtime.stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.fp8_owned_output,
+        0xff,
+        static_cast<size_t>(output_elements) * sizeof(Fp8E4m3),
+        runtime.stream));
+  } else {
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.local_output,
+        0,
+        static_cast<size_t>(m) * n * sizeof(Bf16),
+        runtime.stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.owned_output,
+        0xff,
+        static_cast<size_t>(output_elements) * sizeof(Bf16),
+        runtime.stream));
+  }
   CUDA_CHECK(cudaMemsetAsync(
       buffers.ready,
       0,
@@ -428,7 +544,10 @@ Buffers allocate_and_exchange_buffers(
 
   IpcHandles local_handles{};
   CUDA_CHECK(cudaIpcGetMemHandle(
-      &local_handles.output, buffers.owned_output));
+      &local_handles.output,
+      precision == Precision::kFp8
+          ? static_cast<void*>(buffers.fp8_owned_output)
+          : static_cast<void*>(buffers.owned_output)));
   CUDA_CHECK(cudaIpcGetMemHandle(
       &local_handles.epoch, buffers.owned_epoch));
   std::vector<IpcHandles> handles(context.world);
@@ -442,17 +561,29 @@ Buffers allocate_and_exchange_buffers(
       context.local_comm));
 
   buffers.peer_output.resize(context.world);
+  buffers.fp8_peer_output.resize(context.world);
   buffers.peer_epoch.resize(context.world);
   for (int peer = 0; peer < context.world; ++peer) {
     if (peer == context.rank) {
-      buffers.peer_output[peer] = buffers.owned_output;
+      if (precision == Precision::kFp8) {
+        buffers.fp8_peer_output[peer] = buffers.fp8_owned_output;
+      } else {
+        buffers.peer_output[peer] = buffers.owned_output;
+      }
       buffers.peer_epoch[peer] = buffers.owned_epoch;
       continue;
     }
-    CUDA_CHECK(cudaIpcOpenMemHandle(
-        reinterpret_cast<void**>(&buffers.peer_output[peer]),
-        handles[peer].output,
-        cudaIpcMemLazyEnablePeerAccess));
+    if (precision == Precision::kFp8) {
+      CUDA_CHECK(cudaIpcOpenMemHandle(
+          reinterpret_cast<void**>(&buffers.fp8_peer_output[peer]),
+          handles[peer].output,
+          cudaIpcMemLazyEnablePeerAccess));
+    } else {
+      CUDA_CHECK(cudaIpcOpenMemHandle(
+          reinterpret_cast<void**>(&buffers.peer_output[peer]),
+          handles[peer].output,
+          cudaIpcMemLazyEnablePeerAccess));
+    }
     CUDA_CHECK(cudaIpcOpenMemHandle(
         reinterpret_cast<void**>(&buffers.peer_epoch[peer]),
         handles[peer].epoch,
@@ -500,6 +631,45 @@ fuse::GemmA2AParams make_params(
   return params;
 }
 
+fuse::Fp8GemmA2AParams make_fp8_params(
+    const Options& options,
+    const RankContext& context,
+    const Buffers& buffers,
+    int n,
+    int launch_comm_ctas) {
+  fuse::Fp8GemmA2AParams params{};
+  params.lhs = buffers.fp8_lhs;
+  params.rhs_nt = buffers.fp8_rhs_nt;
+  params.local_output = buffers.fp8_local_output;
+  for (int peer = 0; peer < context.world; ++peer) {
+    params.peer_output[peer] = buffers.fp8_peer_output[peer];
+    params.peer_route_done_epoch[peer] = buffers.peer_epoch[peer];
+  }
+  params.ready = buffers.ready;
+  params.gemm = {options.m, n, options.k, 1};
+  params.gemm.input_dtype = fuse::DType::kFloat8E4M3;
+  params.gemm.weight_dtype = fuse::DType::kFloat8E4M3;
+  params.gemm.output_dtype = fuse::DType::kFloat8E4M3;
+  params.gemm.raster = options.raster;
+  params.gemm.max_swizzle_size = options.swizzle;
+  params.route.world_size = context.world;
+  params.route.rank = context.rank;
+  params.route.batch = options.batch;
+  params.route.seq_local = options.m / options.batch;
+  params.route.global_seq = params.route.seq_local * context.world;
+  params.route.q_heads = options.q_heads;
+  params.route.kv_heads = options.kv_heads;
+  params.route.head_dim = options.head_dim;
+  // The fixed FP8 baseline has one non-interleaved route implementation.
+  params.route.qkv_peer_interleaved = false;
+  params.route.kind = fuse::RouteKind::kQkvGqaPack;
+  params.route.direction = fuse::RouteDirection::kForward;
+  params.route.defer_v_a2a = options.defer_v_a2a;
+  params.num_comm_ctas = launch_comm_ctas;
+  params.epoch = 1;
+  return params;
+}
+
 void launch_fused(
     fuse::GemmA2AParams& params,
     uint32_t epoch,
@@ -508,10 +678,19 @@ void launch_fused(
   CUDA_CHECK(fuse::launch_gemm_a2a_cutlass(params, stream));
 }
 
+void launch_fused(
+    fuse::Fp8GemmA2AParams& params,
+    uint32_t epoch,
+    cudaStream_t stream) {
+  params.epoch = epoch;
+  CUDA_CHECK(fuse::launch_gemm_a2a_fp8_cutlass(params, stream));
+}
+
+template <class Params>
 void prime(
     const RankContext& context,
     const Runtime& runtime,
-    fuse::GemmA2AParams& params,
+    Params& params,
     uint32_t& epoch) {
   ++epoch;
   MPI_CHECK(MPI_Barrier(context.local_comm));
@@ -520,11 +699,12 @@ void prime(
   MPI_CHECK(MPI_Barrier(context.local_comm));
 }
 
+template <class Params>
 std::vector<float> time_eager(
     const Options& options,
     const RankContext& context,
     const Runtime& runtime,
-    fuse::GemmA2AParams& params,
+    Params& params,
     uint32_t& epoch) {
   for (int step = 0; step < options.warmup; ++step) {
     ++epoch;
@@ -561,11 +741,12 @@ std::vector<float> time_eager(
 // one MPI-barrier-to-cudaGraphLaunch host skew; each fused kernel's finalizer
 // keeps subsequent epochs aligned across ranks.  Event nodes around every
 // measured kernel retain the usual per-sample max-rank timing definition.
+template <class Params>
 std::vector<float> time_graph(
     const Options& options,
     const RankContext& context,
     const Runtime& runtime,
-    fuse::GemmA2AParams& params,
+    Params& params,
     uint32_t& epoch) {
   std::vector<cudaEvent_t> starts(options.iterations, nullptr);
   std::vector<cudaEvent_t> stops(options.iterations, nullptr);
@@ -879,6 +1060,11 @@ void write_role_profile_json(
   }
   const char* gemm_policy = std::getenv("FUSE_QKV_GEMM_POLICY");
   const char* comm_policy = std::getenv("FUSE_QKV_COMM_POLICY");
+  const char* fp8_tile = std::getenv("FUSE_FP8_GEMM_TILE");
+  const bool known_fp8_tile = fp8_tile != nullptr &&
+      (std::strcmp(fp8_tile, "m128n64") == 0 ||
+       std::strcmp(fp8_tile, "m128n128") == 0 ||
+       std::strcmp(fp8_tile, "m128n256") == 0);
   const bool known_gemm_policy = gemm_policy != nullptr &&
       (std::strcmp(gemm_policy, "legacy") == 0 ||
        std::strcmp(gemm_policy, "wave_time_model") == 0 ||
@@ -905,6 +1091,10 @@ void write_role_profile_json(
   output << std::setprecision(10)
          << "{\n"
          << "  \"mode\": \"qkv_gemm_a2a_mpi_role_profile\",\n"
+         << "  \"precision\": \"" << precision_name(options.precision)
+         << "\",\n"
+         << "  \"fp8_pipeline\": \""
+         << fp8_pipeline_name(options.precision) << "\",\n"
          << "  \"profiling_build\": true,\n"
          << "  \"diagnostic_launch\": \"mpi_synchronized_eager\",\n"
          << "  \"production_timing_launch\": \""
@@ -928,17 +1118,29 @@ void write_role_profile_json(
          << ", \"dynamic_smem_bytes\": " << traits.dynamic_smem_bytes
          << "},\n"
          << "  \"qkv_policy_request\": \""
-         << (gemm_policy == nullptr
-                 ? "auto"
-                 : (known_gemm_policy ? gemm_policy : "unrecognized"))
+         << (options.precision == Precision::kFp8
+                 ? (fp8_tile == nullptr
+                        ? "auto"
+                        : (known_fp8_tile ? fp8_tile : "unrecognized"))
+                 : (gemm_policy == nullptr
+                        ? "auto"
+                        : (known_gemm_policy ? gemm_policy : "unrecognized")))
          << "\",\n"
          << "  \"qkv_comm_policy_request\": \""
          << (comm_policy == nullptr
                  ? "auto"
                  : (known_comm_policy ? comm_policy : "unrecognized"))
          << "\",\n"
-         << "  \"qkv_policy_model\": \"" << policy_model << "\",\n"
-         << "  \"launch_plan_cache\": \"per_process_v1\",\n"
+         << "  \"qkv_policy_model\": \""
+         << (options.precision == Precision::kFp8
+                 ? "fp8_joint_tile_comm_signaling_wave_v4"
+                 : policy_model)
+         << "\",\n"
+         << "  \"launch_plan_cache\": \""
+         << (options.precision == Precision::kFp8
+                 ? "comm_recommendation_only_v1"
+                 : "per_process_v1")
+         << "\",\n"
          << "  \"raster\": \"" << raster_name(options.raster) << "\",\n"
          << "  \"swizzle\": " << options.swizzle << ",\n"
          << "  \"defer_v_a2a\": "
@@ -962,11 +1164,30 @@ void write_role_profile_json(
   output << "  ]\n}\n";
 }
 
+cudaError_t launch_role_telemetry(
+    const fuse::GemmA2AParams& params,
+    fuse::A2AGemmCtaTimeline* timeline,
+    int timeline_capacity,
+    cudaStream_t stream) {
+  return fuse::launch_gemm_a2a_role_telemetry(
+      params, timeline, timeline_capacity, stream);
+}
+
+cudaError_t launch_role_telemetry(
+    const fuse::Fp8GemmA2AParams& params,
+    fuse::A2AGemmCtaTimeline* timeline,
+    int timeline_capacity,
+    cudaStream_t stream) {
+  return fuse::launch_gemm_a2a_fp8_role_telemetry(
+      params, timeline, timeline_capacity, stream);
+}
+
+template <class Params>
 void run_role_profile(
     const Options& options,
     const RankContext& context,
     const Runtime& runtime,
-    const fuse::GemmA2AParams& params,
+    const Params& params,
     int n,
     int resolved_comm_ctas,
     const fuse::KernelTraits& traits,
@@ -993,7 +1214,7 @@ void run_role_profile(
   ++epoch;
   diagnostic_params.epoch = epoch;
   MPI_CHECK(MPI_Barrier(context.local_comm));
-  CUDA_CHECK(fuse::launch_gemm_a2a_role_telemetry(
+  CUDA_CHECK(launch_role_telemetry(
       diagnostic_params,
       device_timeline,
       timeline_capacity,
@@ -1014,7 +1235,7 @@ void run_role_profile(
   ++epoch;
   diagnostic_params.epoch = epoch;
   MPI_CHECK(MPI_Barrier(context.local_comm));
-  CUDA_CHECK(fuse::launch_gemm_a2a_role_telemetry(
+  CUDA_CHECK(launch_role_telemetry(
       diagnostic_params,
       device_timeline,
       timeline_capacity,
@@ -1074,6 +1295,7 @@ void run_role_profile(
 #endif
 
 void validate_result(
+    Precision precision,
     const RankContext& context,
     const Runtime& runtime,
     const Buffers& buffers,
@@ -1100,10 +1322,17 @@ void validate_result(
       sentinel_count, 0, sizeof(unsigned long long), runtime.stream));
   const int blocks = static_cast<int>(std::min<int64_t>(
       (buffers.output_elements + 255) / 256, 4096));
-  count_sentinel_kernel<<<blocks, 256, 0, runtime.stream>>>(
-      reinterpret_cast<const uint16_t*>(buffers.owned_output),
-      buffers.output_elements,
-      sentinel_count);
+  if (precision == Precision::kFp8) {
+    count_fp8_sentinel_kernel<<<blocks, 256, 0, runtime.stream>>>(
+        reinterpret_cast<const uint8_t*>(buffers.fp8_owned_output),
+        buffers.output_elements,
+        sentinel_count);
+  } else {
+    count_sentinel_kernel<<<blocks, 256, 0, runtime.stream>>>(
+        reinterpret_cast<const uint16_t*>(buffers.owned_output),
+        buffers.output_elements,
+        sentinel_count);
+  }
   CUDA_CHECK(cudaGetLastError());
   unsigned long long local_sentinel = 0;
   CUDA_CHECK(cudaMemcpyAsync(
@@ -1233,6 +1462,86 @@ void validate_numerics(
   }
 }
 
+void validate_numerics(
+    const RankContext& context,
+    const Runtime& runtime,
+    Buffers& buffers,
+    const fuse::Fp8GemmA2AParams& params,
+    int resolved_comm_ctas) {
+  auto reference_params = params;
+  reference_params.num_comm_ctas = resolved_comm_ctas;
+  std::vector<Fp8E4m3> actual(
+      static_cast<size_t>(buffers.output_elements));
+  std::vector<Fp8E4m3> reference(
+      static_cast<size_t>(buffers.output_elements));
+  CUDA_CHECK(cudaMemcpyAsync(
+      actual.data(),
+      buffers.fp8_owned_output,
+      actual.size() * sizeof(Fp8E4m3),
+      cudaMemcpyDeviceToHost,
+      runtime.stream));
+  CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+
+  MPI_CHECK(MPI_Barrier(context.local_comm));
+  CUDA_CHECK(fuse::launch_dense_fp8_cutlass_reference(
+      reference_params, runtime.stream));
+  CUDA_CHECK(fuse::launch_gemm_a2a_fp8_copy_reference(
+      reference_params, runtime.stream));
+  CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+  MPI_CHECK(MPI_Barrier(context.local_comm));
+
+  CUDA_CHECK(cudaMemcpyAsync(
+      reference.data(),
+      buffers.fp8_owned_output,
+      reference.size() * sizeof(Fp8E4m3),
+      cudaMemcpyDeviceToHost,
+      runtime.stream));
+  CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+
+  constexpr float kTolerance = 0.0f;
+  unsigned long long local_mismatches = 0;
+  float local_max_abs = 0.0f;
+  for (size_t index = 0; index < actual.size(); ++index) {
+    const float difference = std::abs(
+        static_cast<float>(actual[index]) -
+        static_cast<float>(reference[index]));
+    if (!std::isfinite(difference)) {
+      local_max_abs = std::numeric_limits<float>::infinity();
+      ++local_mismatches;
+    } else {
+      local_max_abs = std::max(local_max_abs, difference);
+      local_mismatches += difference > kTolerance;
+    }
+  }
+  unsigned long long global_mismatches = 0;
+  float global_max_abs = 0.0f;
+  MPI_CHECK(MPI_Allreduce(
+      &local_mismatches,
+      &global_mismatches,
+      1,
+      MPI_UNSIGNED_LONG_LONG,
+      MPI_SUM,
+      context.local_comm));
+  MPI_CHECK(MPI_Allreduce(
+      &local_max_abs,
+      &global_max_abs,
+      1,
+      MPI_FLOAT,
+      MPI_MAX,
+      context.local_comm));
+  if (global_mismatches != 0 || global_max_abs > kTolerance) {
+    throw std::runtime_error(
+        "FP8 fused vs separated reference failed: mismatches=" +
+        std::to_string(global_mismatches) + " max_abs=" +
+        std::to_string(global_max_abs));
+  }
+  if (context.rank == 0) {
+    std::cout << "Numerical check: FP8 fused vs separated max_abs="
+              << global_max_abs << " mismatches=" << global_mismatches
+              << "\n";
+  }
+}
+
 void write_json(
     const Options& options,
     const RankContext& context,
@@ -1250,6 +1559,11 @@ void write_json(
   }
   const char* policy_override = std::getenv("FUSE_QKV_GEMM_POLICY");
   const char* comm_policy_override = std::getenv("FUSE_QKV_COMM_POLICY");
+  const char* fp8_tile_override = std::getenv("FUSE_FP8_GEMM_TILE");
+  const bool known_fp8_tile = fp8_tile_override != nullptr &&
+      (std::strcmp(fp8_tile_override, "m128n64") == 0 ||
+       std::strcmp(fp8_tile_override, "m128n128") == 0 ||
+       std::strcmp(fp8_tile_override, "m128n256") == 0);
   const bool known_policy = policy_override != nullptr &&
       (std::strcmp(policy_override, "legacy") == 0 ||
        std::strcmp(policy_override, "wave_time_model") == 0 ||
@@ -1277,6 +1591,10 @@ void write_json(
   output << std::setprecision(10)
          << "{\n"
          << "  \"mode\": \"qkv_gemm_a2a_mpi\",\n"
+         << "  \"precision\": \"" << precision_name(options.precision)
+         << "\",\n"
+         << "  \"fp8_pipeline\": \""
+         << fp8_pipeline_name(options.precision) << "\",\n"
 #if FUSE_ENABLE_PROFILING
          << "  \"profiling_build\": true,\n"
          << "  \"role_profile_requested\": "
@@ -1304,9 +1622,15 @@ void write_json(
          << "  \"requested_comm_ctas\": " << options.comm_ctas << ",\n"
          << "  \"comm_ctas\": " << resolved_comm_ctas << ",\n"
          << "  \"qkv_policy_request\": \""
-         << (policy_override == nullptr
-                 ? "auto"
-                 : (known_policy ? policy_override : "unrecognized"))
+         << (options.precision == Precision::kFp8
+                 ? (fp8_tile_override == nullptr
+                        ? "auto"
+                        : (known_fp8_tile
+                               ? fp8_tile_override
+                               : "unrecognized"))
+                 : (policy_override == nullptr
+                        ? "auto"
+                        : (known_policy ? policy_override : "unrecognized")))
          << "\",\n"
          << "  \"qkv_comm_policy_request\": \""
          << (comm_policy_override == nullptr
@@ -1314,9 +1638,15 @@ void write_json(
                  : (known_comm_policy ? comm_policy_override : "unrecognized"))
          << "\",\n"
          << "  \"qkv_policy_model\": \""
-         << policy_model
+         << (options.precision == Precision::kFp8
+                 ? "fp8_joint_tile_comm_signaling_wave_v4"
+                 : policy_model)
          << "\",\n"
-         << "  \"launch_plan_cache\": \"per_process_v1\",\n"
+         << "  \"launch_plan_cache\": \""
+         << (options.precision == Precision::kFp8
+                 ? "comm_recommendation_only_v1"
+                 : "per_process_v1")
+         << "\",\n"
          << "  \"kernel_traits\": {\"tile_m\": " << traits.block_m
          << ", \"tile_n\": " << traits.block_n
          << ", \"tile_k\": " << traits.block_k
@@ -1344,23 +1674,36 @@ void write_json(
   output << "]\n}\n";
 }
 
-void cleanup_buffers(const RankContext& context, Buffers& buffers) {
+void cleanup_buffers(
+    Precision precision,
+    const RankContext& context,
+    Buffers& buffers) {
   CUDA_CHECK(cudaDeviceSynchronize());
   MPI_CHECK(MPI_Barrier(context.local_comm));
   for (int peer = 0; peer < context.world; ++peer) {
     if (peer == context.rank) {
       continue;
     }
-    CUDA_CHECK(cudaIpcCloseMemHandle(buffers.peer_output[peer]));
+    CUDA_CHECK(cudaIpcCloseMemHandle(
+        precision == Precision::kFp8
+            ? static_cast<void*>(buffers.fp8_peer_output[peer])
+            : static_cast<void*>(buffers.peer_output[peer])));
     CUDA_CHECK(cudaIpcCloseMemHandle(buffers.peer_epoch[peer]));
   }
   MPI_CHECK(MPI_Barrier(context.local_comm));
   CUDA_CHECK(cudaFree(buffers.owned_epoch));
   CUDA_CHECK(cudaFree(buffers.ready));
-  CUDA_CHECK(cudaFree(buffers.owned_output));
-  CUDA_CHECK(cudaFree(buffers.local_output));
-  CUDA_CHECK(cudaFree(buffers.rhs_nt));
-  CUDA_CHECK(cudaFree(buffers.lhs));
+  if (precision == Precision::kFp8) {
+    CUDA_CHECK(cudaFree(buffers.fp8_owned_output));
+    CUDA_CHECK(cudaFree(buffers.fp8_local_output));
+    CUDA_CHECK(cudaFree(buffers.fp8_rhs_nt));
+    CUDA_CHECK(cudaFree(buffers.fp8_lhs));
+  } else {
+    CUDA_CHECK(cudaFree(buffers.owned_output));
+    CUDA_CHECK(cudaFree(buffers.local_output));
+    CUDA_CHECK(cudaFree(buffers.rhs_nt));
+    CUDA_CHECK(cudaFree(buffers.lhs));
+  }
 }
 
 void validate_shape(
@@ -1394,7 +1737,12 @@ int run(const Options& options, RankContext& context) {
 #endif
   const int n =
       (options.q_heads + 2 * options.kv_heads) * options.head_dim;
-  const fuse::GemmProblem problem{options.m, n, options.k, 1};
+  fuse::GemmProblem problem{options.m, n, options.k, 1};
+  if (options.precision == Precision::kFp8) {
+    problem.input_dtype = fuse::DType::kFloat8E4M3;
+    problem.weight_dtype = fuse::DType::kFloat8E4M3;
+    problem.output_dtype = fuse::DType::kFloat8E4M3;
+  }
   Runtime runtime = initialize_runtime();
   const int seq_local = options.m / options.batch;
   const int global_seq = seq_local * context.world;
@@ -1410,7 +1758,7 @@ int run(const Options& options, RankContext& context) {
   route.kind = fuse::RouteKind::kQkvGqaPack;
   route.direction = fuse::RouteDirection::kForward;
   route.defer_v_a2a = options.defer_v_a2a;
-  route.qkv_peer_interleaved =
+  route.qkv_peer_interleaved = options.precision == Precision::kBf16 &&
       options.m < 2048 && options.head_dim == 128 &&
       options.raster == fuse::GemmRaster::kAlongM;
   const int resolved_comm_ctas = options.comm_ctas == 0
@@ -1422,8 +1770,11 @@ int run(const Options& options, RankContext& context) {
   if (resolved_comm_ctas <= 0 || resolved_comm_ctas >= sm_count) {
     throw std::runtime_error("comm CTAs must leave at least one compute CTA");
   }
-  const auto traits = fuse::qkv_cutlass_kernel_traits(
-      problem, route, resolved_comm_ctas, sm_count);
+  const auto traits = options.precision == Precision::kFp8
+      ? fuse::fp8_cutlass_kernel_traits(
+            problem, route, resolved_comm_ctas, sm_count)
+      : fuse::qkv_cutlass_kernel_traits(
+            problem, route, resolved_comm_ctas, sm_count);
   validate_shape(options, context, n, traits);
 
   const int local_width =
@@ -1436,12 +1787,16 @@ int run(const Options& options, RankContext& context) {
       static_cast<int64_t>((options.m + traits.block_m - 1) / traits.block_m) *
       ((n + traits.block_n - 1) / traits.block_n) * fuse::kReadyFlagStride;
   if (static_cast<uint64_t>(output_elements64) >
-          std::numeric_limits<size_t>::max() / sizeof(Bf16) ||
+          std::numeric_limits<size_t>::max() /
+              (options.precision == Precision::kFp8
+                   ? sizeof(Fp8E4m3)
+                   : sizeof(Bf16)) ||
       ready_elements64 > std::numeric_limits<int>::max()) {
     throw std::runtime_error("shape exceeds the focused benchmark's index range");
   }
 
   Buffers buffers = allocate_and_exchange_buffers(
+      options.precision,
       context,
       runtime,
       options.m,
@@ -1452,34 +1807,83 @@ int run(const Options& options, RankContext& context) {
   // Preserve an auto request in the production launch path. The priming
   // launch populates the internal launch-plan cache; Eager warmup/timing and
   // Graph capture then exercise its cache-hit path.
-  auto params = make_params(
-      options, context, buffers, n, options.comm_ctas);
-
   uint32_t epoch = 0;
-  prime(context, runtime, params, epoch);
-  // The priming launch validates lazy module/IPC setup but must not satisfy the
-  // post-run output check on behalf of the timed eager/graph path.
-  CUDA_CHECK(cudaMemsetAsync(
-      buffers.owned_output,
-      0xff,
-      static_cast<size_t>(buffers.output_elements) * sizeof(Bf16),
-      runtime.stream));
-  CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
-  MPI_CHECK(MPI_Barrier(context.local_comm));
-  const auto samples = options.launch_mode == LaunchMode::kGraph
-      ? time_graph(options, context, runtime, params, epoch)
-      : time_eager(options, context, runtime, params, epoch);
-  const Summary stats = summarize(samples);
-
-  if (options.check) {
-    validate_result(context, runtime, buffers, epoch);
-    validate_numerics(
-        context, runtime, buffers, params, resolved_comm_ctas);
+  std::vector<float> samples;
+  if (options.precision == Precision::kFp8) {
+    auto params = make_fp8_params(
+        options, context, buffers, n, options.comm_ctas);
+    prime(context, runtime, params, epoch);
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.fp8_owned_output,
+        0xff,
+        static_cast<size_t>(buffers.output_elements) * sizeof(Fp8E4m3),
+        runtime.stream));
+    CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+    MPI_CHECK(MPI_Barrier(context.local_comm));
+    samples = options.launch_mode == LaunchMode::kGraph
+        ? time_graph(options, context, runtime, params, epoch)
+        : time_eager(options, context, runtime, params, epoch);
+    if (options.check) {
+      validate_result(options.precision, context, runtime, buffers, epoch);
+      validate_numerics(
+          context, runtime, buffers, params, resolved_comm_ctas);
+    }
+#if FUSE_ENABLE_PROFILING
+    // Keep the diagnostic kernel outside formal timing and result JSON.
+    if (options.role_profile) {
+      run_role_profile(
+          options,
+          context,
+          runtime,
+          params,
+          n,
+          resolved_comm_ctas,
+          traits,
+          epoch);
+    }
+#endif
+  } else {
+    auto params = make_params(
+        options, context, buffers, n, options.comm_ctas);
+    prime(context, runtime, params, epoch);
+    // The priming launch validates lazy module/IPC setup but must not satisfy
+    // the post-run output check on behalf of the timed eager/graph path.
+    CUDA_CHECK(cudaMemsetAsync(
+        buffers.owned_output,
+        0xff,
+        static_cast<size_t>(buffers.output_elements) * sizeof(Bf16),
+        runtime.stream));
+    CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+    MPI_CHECK(MPI_Barrier(context.local_comm));
+    samples = options.launch_mode == LaunchMode::kGraph
+        ? time_graph(options, context, runtime, params, epoch)
+        : time_eager(options, context, runtime, params, epoch);
+    if (options.check) {
+      validate_result(options.precision, context, runtime, buffers, epoch);
+      validate_numerics(
+          context, runtime, buffers, params, resolved_comm_ctas);
+    }
+#if FUSE_ENABLE_PROFILING
+    // Keep the diagnostic kernel outside formal timing and result JSON.
+    if (options.role_profile) {
+      run_role_profile(
+          options,
+          context,
+          runtime,
+          params,
+          n,
+          resolved_comm_ctas,
+          traits,
+          epoch);
+    }
+#endif
   }
+  const Summary stats = summarize(samples);
   if (context.rank == 0) {
     const double flops = 2.0 * options.m * n * options.k;
     const double tflops = flops / stats.p50 / 1.0e9;
-    std::cout << "QKV GEMM->A2A MPI/IPC launch="
+    std::cout << "QKV GEMM->A2A MPI/IPC precision="
+              << precision_name(options.precision) << " launch="
               << launch_mode_name(options.launch_mode)
               << " world=" << context.world << " shape=" << options.m << "x"
               << n << "x" << options.k << " comm_ctas="
@@ -1498,24 +1902,7 @@ int run(const Options& options, RankContext& context) {
   write_json(
       options, context, n, resolved_comm_ctas, traits, stats, samples);
 
-#if FUSE_ENABLE_PROFILING
-  // Keep the diagnostic kernel outside the formal timing, correctness, and
-  // result JSON. This prevents profile builds from silently becoming Golden
-  // benchmark inputs while still preserving the monotonic epoch protocol.
-  if (options.role_profile) {
-    run_role_profile(
-        options,
-        context,
-        runtime,
-        params,
-        n,
-        resolved_comm_ctas,
-        traits,
-        epoch);
-  }
-#endif
-
-  cleanup_buffers(context, buffers);
+  cleanup_buffers(options.precision, context, buffers);
   CUDA_CHECK(cudaEventDestroy(runtime.stop));
   CUDA_CHECK(cudaEventDestroy(runtime.start));
   CUDA_CHECK(cudaStreamDestroy(runtime.stream));
