@@ -594,3 +594,22 @@ Graph。最终 96 点相对同 shape BF16 Graph 的 p50 几何平均为 `1.763×
 ZeroBubble `beta=1` 累加。普通反向仍在同一 stream 内执行 B→W；ZeroBubble 仍由
 调用方在 B/W 间保留 W 所需输入。完整口径和复现命令见
 [`benchmarks/fp8/BENCHMARK.md`](benchmarks/fp8/BENCHMARK.md)。
+
+## v13.0：Ulysses 算子结构重构
+
+状态：已发布。
+
+v13.0 不修改 kernel 算法、自动策略、参数语义或 benchmark 数据。原先约 9,394 行
+的 `csrc/operators/ulysses_sm90.cu` 缩成约 51 行组装入口；实现按公共设备类型、
+A2A→GEMM、GEMM→A2A、backward、launch/policy 与 public API 分开维护，同时仍由
+同一个 CUDA translation unit 编译，避免 CUTLASS kernel 重复实例化。
+
+公开头文件现在分为两层：`operators/primitives` 只描述物理数据流，
+`operators/ulysses` 描述投影语义。统一模板注册 QKV/OProj 与 Forward/Backward 的
+四个合法组合；独立 wgrad 继续留在 backward 语义接口，由调用方选择普通同流或
+ZeroBubble 延迟执行。旧平铺头文件保留为兼容 include。
+
+生产、profiling、traits 和 reference 共用同一张 policy→kernel binding；自动启动
+计划共用统一的有界两级 cache。验证覆盖 Release、profiling=ON、BF16/FP8 前向与
+反向 8 卡 smoke、CP2/4/8 和异构规划测试。相对 v12.0 干净构建，69/69 个 device
+function 的 SASS 完全一致，58/58 个公开符号完全一致。

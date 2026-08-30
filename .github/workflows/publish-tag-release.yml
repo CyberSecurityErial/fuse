@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v12.0
+        default: v13.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v12.0");
+              : (process.env.REQUESTED_TAG || "v13.0");
 
             const releases = {
               "v1.0": {
@@ -248,6 +248,20 @@ jobs:
                   "🩵 **最终 96 点 CUDA Graph 相对同 shape BF16 Graph 的 p50 几何平均为 1.763×，85/96 达到 1.5×。未过 1.5× 的短点如实保留，没有按模型特判。**",
                   "",
                   "两条 backward 保持普通同流 B→W 和 ZeroBubble 分离 B/W 两种语义；确定性 smoke 检查 routed 输出、dX、dW、普通写入和 beta=1 累加。正式 QKV 口径为 MPI 一进程一卡、CP4/CP8、10 warmup + 50 samples 和预上传 CUDA Graph。",
+                ].join("\n"),
+              },
+              "v13.0": {
+                name: "v13.0 — Ulysses 算子结构重构",
+                body: [
+                  "v13.0 只重构 Ulysses 算子的源码与公开头文件层级，不改变 v12.0 的 kernel、自动策略、参数语义或 benchmark 数据。",
+                  "",
+                  "原先约 9,394 行的 `ulysses_sm90.cu` 现在只保留约 51 行组装入口；设备实现按 A2A→GEMM、GEMM→A2A、backward、launch/policy 和 public API 拆开，但仍编译为同一个 CUDA translation unit，避免重复实例化 CUTLASS kernel。",
+                  "",
+                  "公开接口分为 `operators/primitives` 数据流原语和 `operators/ulysses` 投影语义层。QKV/OProj 与 Forward/Backward 作为模板参数，形成四个合法数据流组合；wgrad 继续由 backward 语义层管理普通或 ZeroBubble 延迟执行。旧平铺头文件保留为兼容入口。",
+                  "",
+                  "生产、profiling、traits 和 reference 现在共用同一张 policy→kernel binding；自动计划统一复用有界两级 cache，减少重复胶水实现。",
+                  "",
+                  "验证包含 Release 与 profiling=ON 编译、BF16/FP8 前向与反向 8 卡 smoke、CP2/4/8 与异构规划测试。与 v12.0 干净基线逐函数比较，69/69 个 device function 的 SASS 完全一致，58/58 个公开符号完全一致。",
                 ].join("\n"),
               },
             };
