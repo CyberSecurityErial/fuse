@@ -1,0 +1,2553 @@
+{
+  "schema": "v10_backward_torch_autograd_v1",
+  "torch": "2.9.0+cu128",
+  "cuda": "12.8",
+  "deterministic_algorithms": true,
+  "cublas_workspace_config": ":4096:8",
+  "tf32": false,
+  "reference": "torch.nn.functional.linear forward + torch.autograd.grad; native torch route construction",
+  "cases": [
+    {
+      "name": "cp4_rank_major",
+      "world": 4,
+      "local_tokens": 16,
+      "hidden": 256,
+      "batch": 1,
+      "q_heads": 16,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "causal": false
+    },
+    {
+      "name": "cp8_causal",
+      "world": 8,
+      "local_tokens": 16,
+      "hidden": 256,
+      "batch": 1,
+      "q_heads": 16,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "causal": true
+    },
+    {
+      "name": "cp4_batch2_causal",
+      "world": 4,
+      "local_tokens": 32,
+      "hidden": 256,
+      "batch": 2,
+      "q_heads": 16,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "causal": true
+    },
+    {
+      "name": "cp8_wide_rank_major",
+      "world": 8,
+      "local_tokens": 16,
+      "hidden": 512,
+      "batch": 1,
+      "q_heads": 40,
+      "kv_heads": 8,
+      "head_dim": 128,
+      "causal": false
+    }
+  ],
+  "results": [
+    {
+      "case": "cp4_rank_major",
+      "operator": "qkv",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "qkv/immediate/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp4_rank_major",
+      "operator": "qkv",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.00048828125,
+      "checks": [
+        {
+          "tensor": "qkv/deferred/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank0/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank1/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank2/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank3/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp4_rank_major",
+      "operator": "oproj",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "oproj/immediate/rank0/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp4_rank_major",
+      "operator": "oproj",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.00048828125,
+      "checks": [
+        {
+          "tensor": "oproj/deferred/rank0/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp8_causal",
+      "operator": "qkv",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "qkv/immediate/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank4/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank4/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank5/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank5/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank6/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank6/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank7/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank7/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank4/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank5/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank6/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank7/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp8_causal",
+      "operator": "qkv",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.0009765625,
+      "checks": [
+        {
+          "tensor": "qkv/deferred/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank0/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank1/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank2/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank3/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank4/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank4/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank5/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank5/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank6/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank6/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank7/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank7/dX",
+          "elements": 4096,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank4/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank5/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank6/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank7/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank4/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank5/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank6/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank7/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp8_causal",
+      "operator": "oproj",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "oproj/immediate/rank0/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp8_causal",
+      "operator": "oproj",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.00048828125,
+      "checks": [
+        {
+          "tensor": "oproj/deferred/rank0/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank4/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank4/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank5/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank5/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank6/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank6/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank7/local_dA",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank7/route",
+          "elements": 32768,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank4/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank5/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank6/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank7/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank4/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank5/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank6/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank7/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp4_batch2_causal",
+      "operator": "qkv",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "qkv/immediate/rank0/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dW",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp4_batch2_causal",
+      "operator": "qkv",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.0009765625,
+      "checks": [
+        {
+          "tensor": "qkv/deferred/rank0/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank0/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank1/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank1/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank2/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank2/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank3/route",
+          "elements": 131072,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank3/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.000244140625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.000244140625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_once",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.000244140625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_twice",
+          "elements": 1048576,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp4_batch2_causal",
+      "operator": "oproj",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "oproj/immediate/rank0/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/dW",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp4_batch2_causal",
+      "operator": "oproj",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.0009765625,
+      "checks": [
+        {
+          "tensor": "oproj/deferred/rank0/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/local_dA",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/route",
+          "elements": 65536,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_once",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_twice",
+          "elements": 524288,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp8_wide_rank_major",
+      "operator": "qkv",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "qkv/immediate/rank0/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank4/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank4/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank5/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank5/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank6/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank6/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank7/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/immediate/rank7/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank0/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank1/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank2/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank3/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank4/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank5/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank6/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/immediate/rank7/dW",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp8_wide_rank_major",
+      "operator": "qkv",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.0009765625,
+      "checks": [
+        {
+          "tensor": "qkv/deferred/rank0/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank0/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank1/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank1/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank2/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank2/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank3/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank3/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank4/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank4/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank5/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank5/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank6/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank6/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank7/route",
+          "elements": 114688,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.0
+        },
+        {
+          "tensor": "qkv/deferred/rank7/dX",
+          "elements": 8192,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank4/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank5/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank6/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank7/main_grad_once",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank0/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank1/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank2/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank3/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank4/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank5/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank6/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "qkv/deferred/rank7/main_grad_twice",
+          "elements": 3670016,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        }
+      ]
+    },
+    {
+      "case": "cp8_wide_rank_major",
+      "operator": "oproj",
+      "mode": "immediate",
+      "status": "pass",
+      "max_abs": 0.0,
+      "checks": [
+        {
+          "tensor": "oproj/immediate/rank0/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank0/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank1/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank2/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank3/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank4/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank5/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank6/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/immediate/rank7/dW",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        }
+      ]
+    },
+    {
+      "case": "cp8_wide_rank_major",
+      "operator": "oproj",
+      "mode": "deferred",
+      "status": "pass",
+      "max_abs": 0.0009765625,
+      "checks": [
+        {
+          "tensor": "oproj/deferred/rank0/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank1/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank2/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank3/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank4/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank4/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank5/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank5/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank6/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank6/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank7/local_dA",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank7/route",
+          "elements": 81920,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.125
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank4/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank5/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank6/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank7/main_grad_once",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank0/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank1/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank2/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank3/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank4/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank5/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.00048828125,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank6/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        },
+        {
+          "tensor": "oproj/deferred/rank7/main_grad_twice",
+          "elements": 2621440,
+          "mismatches": 0,
+          "max_abs": 0.0009765625,
+          "atol": 0.25
+        }
+      ]
+    }
+  ]
+}

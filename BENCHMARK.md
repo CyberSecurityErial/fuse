@@ -1,6 +1,6 @@
 # Benchmark Index
 
-当前版本：v10.0
+当前版本：v11.0
 
 从 v4.0 开始，每个通算融合算子独立维护 benchmark、调优空间、正式结果与复现命令：
 
@@ -31,5 +31,11 @@ MNK 和匹配 beta，只测纯 GEMM；它不包含 A2A。
 `98.0%～104.3%`，在 OProj 中为 `99.6%～104.6%`。完整的 96 行普通表、96 行
 ZeroBubble 表、TFLOPS、989T MFU 和经典 cuBLAS 占比均放在各自算子文档与
 `results/QKVproj-backward`、`results/Oproj-backward`。
+
+反向外部主对照使用适配版 TE Userbuffers：每个 setting 对结构参数做搜索，短采样
+前三名统一进行 10+50 正式复测。QKV 的 Eager 普通/ZeroBubble 几何平均分别领先
+`1.463×/1.475×`，Graph 为 `1.222×/1.216×`；OProj 对应为
+`1.428×/1.430×` 与 `1.146×/1.146×`。轻量 TE+NCCL 另取两类 shape、三档序列、
+CP4/CP8 共 12 点，只用于证明分离基线口径和复现链路，不作为全量调参结论。
 
 版本级改动与历史结果见 [VERSION_HISTORY.md](VERSION_HISTORY.md)。

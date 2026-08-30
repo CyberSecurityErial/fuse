@@ -522,3 +522,21 @@ batch=2、普通/分离和 `beta=1`；正式 S=1K 还检查跨 rank route、epoc
 完整 96 行 ZeroBubble/普通表、TFLOPS、989T MFU、经典 cuBLAS 对照与复现命令见
 [`QKV backward`](benchmarks/QKVproj-backward/BENCHMARK.md) 和
 [`OProj backward`](benchmarks/Oproj-backward/BENCHMARK.md)。
+
+## v11.0：反向验证与强基线
+
+状态：已发布。
+
+v11.0 不改变 v10.0 的生产反向语义，补齐正确性、外部强基线和前后向 trace。
+反向外部基线使用干净的 Transformer Engine `a7aec214`。适配版
+TE Userbuffers 对每个 setting 做结构搜索并把前三名统一正式复测；QKV 四列
+Eager普通/Graph普通/Eager ZeroBubble/Graph ZeroBubble 对 TE 的融合胜场为
+`95/96、89/96、95/96、90/96`，几何平均为
+`1.463×、1.222×、1.475×、1.216×`。OProj 对应为
+`92/96、88/96、94/96、84/96` 和 `1.428×、1.146×、1.430×、1.146×`。
+另有 12 点轻量 TE+NCCL 复核，不把它写成全量精调结果。
+
+PyTorch 参考不是手写 GEMM：脚本先执行 `torch.nn.functional.linear` 前向，再由
+autograd 生成 `dX/dW`。CP4/CP8、rank-major/causal、batch=2、宽 GQA、普通与
+ZeroBubble 共 16 组全部通过；ZeroBubble 从非零 `main_grad` 连续累加两次，最大
+绝对误差为 `0.0009765625`。两份完整前向 smoke 继续通过，旧前向热核指令体未变。

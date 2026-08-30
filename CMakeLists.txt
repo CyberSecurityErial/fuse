@@ -77,6 +77,30 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
+# Benchmark-only raw-pointer bridge for the PyTorch autograd conformance test.
+# It deliberately has no Torch dependency and does not change the production
+# ABI; Python owns all tensors and passes their current CUDA stream addresses.
+add_library(
+  fuse_backward_torch_bridge SHARED EXCLUDE_FROM_ALL
+  "benchmarks/backward/backward_torch_bridge.cu"
+  csrc/operators/ulysses_sm90.cu)
+target_compile_definitions(
+  fuse_backward_torch_bridge PRIVATE FUSE_ENABLE_PROFILING=0)
+target_include_directories(
+  fuse_backward_torch_bridge
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CUTLASS_ROOT}/include
+    ${CUTLASS_ROOT}/tools/util/include)
+target_link_libraries(
+  fuse_backward_torch_bridge PRIVATE CUDA::cudart)
+target_compile_options(
+  fuse_backward_torch_bridge
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+set_target_properties(
+  fuse_backward_torch_bridge PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
 # The focused one-process-per-GPU benchmark is optional so the core library and
 # single-process tools remain buildable on systems without an MPI development
 # package. CUDA IPC supplies the peer data/control mappings; MPI is bootstrap

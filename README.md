@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；原有前向热路径不变。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace，原有前向热路径不变。
 
 Attention 输出按 head 分片：
 
@@ -145,7 +145,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v10.0（原有前向策略沿用 v9.1；新增两条 BF16 反向融合算子与普通/ZeroBubble 两种调度语义）
+当前版本：v11.0（v10.0 反向语义不变；补齐 autograd、TE 强基线与前后向 trace）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -182,6 +182,13 @@ cuBLAS 纯 GEMM。
 覆盖 CP4/CP8、rank-major/causal、batch=2、同流/分离和 `beta=1`；正式 S=1K
 再检查跨 rank route、epoch 与完整写入。v9 的 43 个旧前向 device-kernel 指令体
 在 v10 Release 构建中保持一致。
+
+适配版 TE Userbuffers 的 96 点正式强基线也已完成。QKV 的 Eager 普通/
+ZeroBubble 几何平均加速为 `1.463×/1.475×`，Graph 为 `1.222×/1.216×`；OProj
+对应为 `1.428×/1.430×` 与 `1.146×/1.146×`。PyTorch 原生 forward→autograd
+backward 对照覆盖两种布局、CP4/CP8、batch=2、宽 GQA、普通与 ZeroBubble 共
+16 组，全部通过；ZeroBubble 连续两次 `beta=1` 累加的最大绝对误差为
+`0.0009765625`。
 
 完整数据与复现流程：
 

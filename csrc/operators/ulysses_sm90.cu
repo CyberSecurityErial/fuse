@@ -709,6 +709,15 @@ using A2ALhsN160Gemm = cutlass::gemm::kernel::GemmUniversal<
     A2ALhsN160Mainloop,
     N160Epilogue,
     detail::MonolithicPersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
+using A2ALhsN160TelemetryMainloop =
+    detail::A2ALhsReadyMainloop<N160Mainloop, 1, false, true>;
+using A2ALhsN160TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    A2ALhsN160TelemetryMainloop,
+    N160Epilogue,
+    detail::MonolithicPersistentScheduler>;
+#endif
 using N160PureGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     N160Mainloop,
@@ -2286,6 +2295,10 @@ using A2ALhsGemmKernel =
 using A2ALhsN160GemmKernel =
     detail::MonolithicGemm<A2ALhsN160Gemm, A2ALhsInputComm>;
 #if FUSE_ENABLE_PROFILING
+using A2ALhsN160TelemetryBase = detail::MonolithicGemm<
+    A2ALhsN160TelemetryGemm, A2ALhsTelemetryInputComm>;
+using A2ALhsN160TelemetryKernel =
+    detail::RoleTelemetryKernel<A2ALhsN160TelemetryBase>;
 using A2ALhsTelemetryBase =
     detail::MonolithicGemm<A2ALhsTelemetryGemm, A2ALhsTelemetryInputComm>;
 using A2ALhsTelemetryKernel =
@@ -3990,16 +4003,31 @@ cudaError_t launch_qkv_backward_data_telemetry_impl(
     case BackwardGemmPolicy::kM128N64ClusterM2:
       return launch_qkv_backward_data_policy<
           BackwardN64ClusterM2ReadyGemm,
-          QkvBackwardDataKernelN64ClusterM2>(
-              params, stream, sm_count, device);
+          QkvBackwardDataKernelN64ClusterM2,
+          true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N64:
       return launch_qkv_backward_data_policy<
           BackwardN64ReadyGemm, QkvBackwardDataKernelN64, true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
+    case BackwardGemmPolicy::kM128N128:
+      return launch_qkv_backward_data_policy<
+          BackwardN128ReadyGemm, QkvBackwardDataKernelN128, true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
+    case BackwardGemmPolicy::kM128N160:
+      return launch_qkv_backward_data_policy<
+          BackwardN160ReadyGemm, QkvBackwardDataKernelN160, true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
+    case BackwardGemmPolicy::kM128N192:
+      return launch_qkv_backward_data_policy<
+          BackwardN192ReadyGemm, QkvBackwardDataKernelN192, true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
+    case BackwardGemmPolicy::kM128N256:
+      return launch_qkv_backward_data_policy<
+          BackwardA2ALhsGemm, QkvBackwardDataKernelN256, true>(
+              params, stream, sm_count, device, timeline, timeline_capacity);
     default:
-      // The diagnostic is intentionally narrow so profiling builds do not
-      // instantiate five extra copies of the already-large backward kernel.
-      return cudaErrorNotSupported;
+      return cudaErrorInvalidValue;
   }
 }
 #endif
@@ -4040,12 +4068,32 @@ cudaError_t launch_qkv_backward_data_impl(
   }
 }
 
-template <class Gemm, class Comm, class Kernel>
+template <
+    class Gemm,
+    class Comm,
+    class BaseKernel
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
 cudaError_t launch_oproj_backward_data_policy(
     const OprojBackwardKernelParams& params,
     cudaStream_t stream,
     int32_t sm_count,
-    int32_t device) {
+    int32_t device
+#if FUSE_ENABLE_PROFILING
+    , A2AGemmCtaTimeline* timeline = nullptr,
+    int32_t timeline_capacity = 0
+#endif
+    ) {
+#if FUSE_ENABLE_PROFILING
+  using Kernel = std::conditional_t<
+      Instrumented,
+      GemmA2ARoleTelemetryKernel<Gemm, Comm>,
+      BaseKernel>;
+#else
+  using Kernel = BaseKernel;
+#endif
   constexpr int32_t tile_m = static_cast<int32_t>(
       cute::size<0>(typename Gemm::TileShape{}));
   constexpr int32_t tile_n = static_cast<int32_t>(
@@ -4054,6 +4102,12 @@ cudaError_t launch_oproj_backward_data_policy(
   const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
 
   typename Kernel::Arguments args{};
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Instrumented) {
+    args.timeline = timeline;
+    args.timeline_capacity = timeline_capacity;
+  }
+#endif
   args.num_comm_ctas = params.num_comm_ctas;
   args.comm.params = params;
   cudaError_t status = Comm::initialize(args.comm);
@@ -4104,6 +4158,85 @@ cudaError_t launch_oproj_backward_data_policy(
   return detail::launch_cooperative<Kernel>(
       Kernel::to_underlying_arguments(args, nullptr), stream, sm_count);
 }
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_oproj_backward_data_telemetry_impl(
+    const OprojBackwardKernelParams& params,
+    BackwardGemmPolicy policy,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (timeline == nullptr || timeline_capacity < sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  switch (policy) {
+    case BackwardGemmPolicy::kM128N64:
+      return launch_oproj_backward_data_policy<
+          BackwardN64SignalingGemm,
+          OprojBackwardHeadCommN64,
+          OprojBackwardDataKernelN64,
+          true>(
+              params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case BackwardGemmPolicy::kM128N128:
+      return launch_oproj_backward_data_policy<
+          BackwardN128SignalingGemm,
+          OprojBackwardHeadCommN128,
+          OprojBackwardDataKernelN128,
+          true>(
+              params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case BackwardGemmPolicy::kM128N160:
+      return launch_oproj_backward_data_policy<
+          BackwardN160SignalingGemm,
+          OprojBackwardHeadCommN160,
+          OprojBackwardDataKernelN160,
+          true>(
+              params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case BackwardGemmPolicy::kM128N192:
+      return launch_oproj_backward_data_policy<
+          BackwardN192SignalingGemm,
+          OprojBackwardHeadCommN192,
+          OprojBackwardDataKernelN192,
+          true>(
+              params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    case BackwardGemmPolicy::kM128N256:
+      return launch_oproj_backward_data_policy<
+          BackwardProjectionOutputGemm,
+          OprojBackwardHeadCommN256,
+          OprojBackwardDataKernelN256,
+          true>(
+              params,
+              stream,
+              sm_count,
+              device,
+              timeline,
+              timeline_capacity);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+#endif
 
 cudaError_t launch_oproj_backward_data_impl(
     const OprojBackwardKernelParams& params,
@@ -5165,6 +5298,74 @@ cudaError_t launch_oproj_backward_data(
   return launch_oproj_backward_data_impl(
       launch, plan.policy, stream, plan.sm_count, plan.device);
 }
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_oproj_backward_data_role_telemetry(
+    const OprojBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  if (!params.grad_output || !params.weight ||
+      !params.local_grad_attention || !params.ready ||
+      params.local_tokens <= 0 || params.hidden <= 0 || params.batch <= 0 ||
+      params.local_tokens % params.batch != 0 || params.q_heads <= 0 ||
+      params.head_dim <= 0 || params.head_dim % kAlignment != 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.rank < 0 || params.rank >= params.world_size ||
+      params.q_heads % params.world_size != 0 || params.epoch == 0 ||
+      (params.causal_load_balanced &&
+       (params.local_tokens / params.batch) % 2 != 0)) {
+    return cudaErrorInvalidValue;
+  }
+  OprojBackwardLaunchPlan plan{};
+  cudaError_t status = cached_oproj_backward_launch_plan(params, &plan);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  OprojBackwardKernelParams launch{};
+  launch.lhs = params.grad_output;
+  launch.rhs_nt = params.weight;
+  launch.local_output = params.local_grad_attention;
+  for (int32_t peer = 0; peer < params.world_size; ++peer) {
+    launch.peer_output[peer] = params.peer_grad_attention[peer];
+    launch.peer_route_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  launch.ready = params.ready;
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  launch.gemm = {
+      params.local_tokens, attention_width, params.hidden, 1};
+  launch.gemm.transpose_b = true;
+  launch.gemm.stride_b.row = attention_width;
+  launch.gemm.raster = GemmRaster::kAlongN;
+  launch.gemm.max_swizzle_size = 1;
+  launch.route.world_size = params.world_size;
+  launch.route.rank = params.rank;
+  launch.route.batch = params.batch;
+  launch.route.seq_local = params.local_tokens / params.batch;
+  launch.route.global_seq = launch.route.seq_local * params.world_size;
+  launch.route.q_heads = params.q_heads;
+  launch.route.local_heads = params.q_heads / params.world_size;
+  launch.route.head_dim = params.head_dim;
+  launch.route.causal_load_balanced = params.causal_load_balanced;
+  launch.route.kind = RouteKind::kHeadToSequence;
+  launch.route.direction = RouteDirection::kForward;
+  launch.num_comm_ctas = plan.num_comm_ctas;
+  launch.epoch = params.epoch;
+  launch.alpha = params.alpha;
+  if (launch.num_comm_ctas <= 0 || launch.num_comm_ctas >= plan.sm_count ||
+      launch.num_comm_ctas % 2 != 0) {
+    return cudaErrorInvalidConfiguration;
+  }
+  return launch_oproj_backward_data_telemetry_impl(
+      launch,
+      plan.policy,
+      timeline,
+      timeline_capacity,
+      stream,
+      plan.sm_count,
+      plan.device);
+}
+#endif
 
 cudaError_t launch_oproj_backward_weight(
     const OprojBackwardWeightParams& params,
@@ -6799,6 +7000,21 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     return launch_a2a_lhs_gemm_policy<
         A2ALhsWideN320TelemetryGemm,
         A2ALhsWideN320TelemetryKernel,
+        A2ALhsTelemetryInputComm,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity,
+            peer_timeline,
+            peer_timeline_capacity);
+  }
+  if (selected.policy == A2ALhsGemmPolicy::kM128N160) {
+    return launch_a2a_lhs_gemm_policy<
+        A2ALhsN160TelemetryGemm,
+        A2ALhsN160TelemetryKernel,
         A2ALhsTelemetryInputComm,
         true>(
             launch_params,
