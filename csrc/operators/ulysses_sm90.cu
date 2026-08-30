@@ -53,6 +53,8 @@ using N192TileShape = Shape<_128, _192, _64>;
 using ProjectionTileShape = Shape<_128, _256, _64>;
 using WideN320TileShape = Shape<_128, Int<320>, _64>;
 using Fp8TileShape = Shape<_128, _128, _128>;
+using Fp8N64TileShape = Shape<_128, _64, _128>;
+using Fp8WideTileShape = Shape<_128, _256, _128>;
 using ClusterShape = Shape<_1, _1, _1>;
 using M64ClusterShape = Shape<_1, _1, _1>;
 using ProjectionClusterShape = Shape<_2, _1, _1>;
@@ -88,6 +90,52 @@ RasterOptions raster_option(GemmRaster requested, RasterOptions fallback) {
     default:
       return fallback;
   }
+}
+
+enum class Fp8PipelinePolicy {
+  kPingpong,
+  kCooperative,
+};
+
+enum class Fp8TilePolicy {
+  kM128N64,
+  kM128N128,
+  kM128N256ClusterM2,
+};
+
+bool requested_fp8_tile_override(Fp8TilePolicy* policy) {
+  const char* value = std::getenv("FUSE_FP8_GEMM_TILE");
+  if (value != nullptr && std::strcmp(value, "m128n64") == 0) {
+    *policy = Fp8TilePolicy::kM128N64;
+    return true;
+  }
+  if (value != nullptr && std::strcmp(value, "m128n256") == 0) {
+    *policy = Fp8TilePolicy::kM128N256ClusterM2;
+    return true;
+  }
+  if (value != nullptr && std::strcmp(value, "m128n128") == 0) {
+    *policy = Fp8TilePolicy::kM128N128;
+    return true;
+  }
+  return false;
+}
+
+Fp8TilePolicy select_fp8_qkv_tile(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    int32_t device);
+
+Fp8PipelinePolicy selected_fp8_pipeline(const GemmProblem&) {
+  const char* value = std::getenv("FUSE_FP8_GEMM_PIPELINE");
+  if (value != nullptr && std::strcmp(value, "cooperative") == 0) {
+    return Fp8PipelinePolicy::kCooperative;
+  }
+  // Until the independent FP8 wave table is complete, preserve the measured
+  // V12 development baseline.  `pingpong` and `auto` therefore mean the same
+  // thing here; the automatic branch is replaced by the calibrated model.
+  return Fp8PipelinePolicy::kPingpong;
 }
 
 __host__ __device__ constexpr int64_t stride_or(int64_t stride, int64_t packed) {
@@ -129,7 +177,8 @@ bool supported_problem(const GemmProblem& p) {
       a_batch_stride(p) % kAlignment == 0 &&
       b_row_stride(p) % kAlignment == 0 &&
       b_batch_stride(p) % kAlignment == 0 &&
-      d_row_stride(p) % kAlignment == 0 && d_batch_stride(p) % kAlignment == 0;
+      d_row_stride(p) % kAlignment == 0 &&
+      d_batch_stride(p) % kAlignment == 0;
   const bool batches = p.l == 1 ||
       (a_batch_stride(p) >= a_row_stride(p) * p.m &&
        (b_batch_stride(p) == 0 || b_batch_stride(p) >= b_row_stride(p) * p.n) &&
@@ -172,7 +221,8 @@ bool supported_fp8_problem(const GemmProblem& p) {
       a_batch_stride(p) % kFp8Alignment == 0 &&
       b_row_stride(p) % kFp8Alignment == 0 &&
       b_batch_stride(p) % kFp8Alignment == 0 &&
-      d_row_stride(p) % kAlignment == 0 && d_batch_stride(p) % kAlignment == 0;
+      d_row_stride(p) % kFp8Alignment == 0 &&
+      d_batch_stride(p) % kFp8Alignment == 0;
   const bool batches = p.l == 1 ||
       (a_batch_stride(p) >= a_row_stride(p) * p.m &&
        (b_batch_stride(p) == 0 || b_batch_stride(p) >= b_row_stride(p) * p.n) &&
@@ -181,7 +231,27 @@ bool supported_fp8_problem(const GemmProblem& p) {
       leading_dimensions && batches && !p.transpose_a && !p.transpose_b &&
       p.input_dtype == DType::kFloat8E4M3 &&
       p.weight_dtype == DType::kFloat8E4M3 &&
-      p.output_dtype == DType::kBfloat16 &&
+      p.output_dtype == DType::kFloat8E4M3 &&
+      (p.max_swizzle_size == 1 || p.max_swizzle_size == 2 ||
+       p.max_swizzle_size == 4 || p.max_swizzle_size == 8);
+}
+
+bool supported_fp8_transpose_b_problem(const GemmProblem& p) {
+  const bool unit_strides =
+      (p.stride_a.column < 0 || p.stride_a.column == 1) &&
+      (p.stride_b.column < 0 || p.stride_b.column == 1) &&
+      (p.stride_d.column < 0 || p.stride_d.column == 1);
+  const bool leading_dimensions =
+      a_row_stride(p) >= p.k && b_row_stride(p) >= p.n &&
+      d_row_stride(p) >= p.n &&
+      a_row_stride(p) % kFp8Alignment == 0 &&
+      b_row_stride(p) % kFp8Alignment == 0 &&
+      d_row_stride(p) % kFp8Alignment == 0;
+  return p.m > 0 && p.n > 0 && p.k > 0 && p.l == 1 && unit_strides &&
+      leading_dimensions && !p.transpose_a && p.transpose_b &&
+      p.input_dtype == DType::kFloat8E4M3 &&
+      p.weight_dtype == DType::kFloat8E4M3 &&
+      p.output_dtype == DType::kFloat8E4M3 &&
       (p.max_swizzle_size == 1 || p.max_swizzle_size == 2 ||
        p.max_swizzle_size == 4 || p.max_swizzle_size == 8);
 }
@@ -256,6 +326,23 @@ struct QkvBackwardKernelParams {
   float alpha = 1.0f;
 };
 
+struct Fp8QkvBackwardKernelParams {
+  const Fp8Element* local_q = nullptr;
+  const Fp8Element* local_k = nullptr;
+  const Fp8Element* local_v = nullptr;
+  Fp8Element* peer_staging[kMaxWorldSize]{};
+  uint32_t* peer_ready[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  const Fp8Element* weight = nullptr;
+  Fp8Element* grad_input = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  float alpha = 1.0f;
+};
+
 // Private normalized form for OProj backward. Keeping it distinct from the
 // public forward GemmA2AParams lets the shared route template select its
 // q-head-only semantics without adding a new template argument to every
@@ -265,6 +352,21 @@ struct OprojBackwardKernelParams {
   const Bf16* rhs_nt = nullptr;
   Bf16* local_output = nullptr;
   Bf16* peer_output[kMaxWorldSize]{};
+  uint32_t* peer_route_done_epoch[kMaxWorldSize]{};
+  uint32_t* ready = nullptr;
+  uint32_t* completion_epoch = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  uint32_t epoch = 0;
+  float alpha = 1.0f;
+};
+
+struct Fp8OprojBackwardKernelParams {
+  const Fp8Element* lhs = nullptr;
+  const Fp8Element* rhs_nt = nullptr;
+  Fp8Element* local_output = nullptr;
+  Fp8Element* peer_output[kMaxWorldSize]{};
   uint32_t* peer_route_done_epoch[kMaxWorldSize]{};
   uint32_t* ready = nullptr;
   uint32_t* completion_epoch = nullptr;
@@ -353,6 +455,166 @@ constexpr int64_t kQkvRouteTaskWaveNs = 4300;
 // saturation point to cap its NVLink bandwidth estimate; it is not a tile
 // eligibility threshold.
 constexpr int32_t kQkvFabricSaturationCommCtas = 16;
+
+struct Fp8QkvWaveCalibrationRow {
+  int32_t k;
+  // Index order is N64/C1, N128/C1, N256/C2.
+  std::array<int32_t, 3> one_wave_elapsed_ns;
+  std::array<int32_t, 3> steady_wave_increment_ns;
+};
+
+// H200 E4M3 calibration for the three production FP8 candidates.  The role
+// telemetry kernels run with 120 resident compute CTAs (comm=12), the route
+// role enabled, raster-N, and report the maximum compute-role interval across
+// the four ranks.  Each geometry is measured at exactly one and eight physical
+// worker waves; the latter gives (T8 - T1) / 7.  This deliberately measures the
+// signaling GEMM while route traffic is resident instead of borrowing a pure
+// GEMM table that cannot see ready-publication interference.
+//
+// Geometry         one-wave shape        eight-wave shape
+// N64/C1           M128 x N7680          M1024 x N7680
+// N128/C1          M128 x N15360         M1024 x N15360
+// N256/ClusterM2   M256 x N15360         M2048 x N15360
+//
+// The model is T(w) = T(one wave) + (w - 1) * steady increment.  The first
+// term is not a reusable "wave cost": it contains the one-time prefetch and
+// final drain around one tile per active worker. Regenerate whenever the FP8
+// pipeline, signaling path, route kernel, or toolchain changes.
+constexpr std::array<Fp8QkvWaveCalibrationRow, 5>
+    kFp8QkvWaveCalibration{{
+        {2048, {5790, 8030, 13220}, {3836, 5587, 13174}},
+        {3072, {7420, 14460, 19870}, {5271, 11411, 20301}},
+        {4096, {9180, 19680, 25340}, {6643, 16640, 25793}},
+        {5120, {10720, 24030, 30750}, {8854, 20869, 30533}},
+        {16384, {40860, 72260, 97250}, {43109, 68909, 94263}},
+    }};
+
+// FP8 routes half the bytes of BF16, but each route task retains most of the
+// fixed TMA/ready protocol cost. CP8 role profiles at 43 task waves (comm=4)
+// measured 178.1 us, or 4.14 us/wave; use the rounded primitive cost below.
+constexpr int64_t kFp8QkvRouteTaskWaveNs = 4150;
+constexpr int32_t kFp8QkvFabricSaturationCommCtas = 12;
+// Short one-wave sweeps have a wider latency plateau: c16 is consistently
+// within 1.5% of the winner across CP4/CP8 and K=2K..16K, while using c16
+// costs no compute residency when the problem grid is already truncated.
+// Keep this distinct from the c12 steady-bandwidth saturation point above.
+constexpr int32_t kFp8QkvLatencySaturationCommCtas = 16;
+
+struct Fp8QkvComputeEstimate {
+  Fp8TilePolicy policy = Fp8TilePolicy::kM128N128;
+  int32_t tile_n = 128;
+  int32_t cluster_m = 1;
+  int64_t waves = 0;
+  double wave_equivalents = 0.0;
+  int64_t one_wave_elapsed_ns = 0;
+  int64_t steady_wave_increment_ns = 0;
+  double total_ns = 0.0;
+  bool valid = false;
+};
+
+int64_t interpolate_fp8_qkv_wave_field(
+    int32_t k,
+    size_t policy_index,
+    bool steady) {
+  const auto value = [steady, policy_index](
+                         const Fp8QkvWaveCalibrationRow& row) {
+    return steady ? row.steady_wave_increment_ns[policy_index] :
+        row.one_wave_elapsed_ns[policy_index];
+  };
+  if (k < kFp8QkvWaveCalibration.front().k ||
+      k > kFp8QkvWaveCalibration.back().k) {
+    return -1;
+  }
+  for (size_t row = 0; row < kFp8QkvWaveCalibration.size(); ++row) {
+    if (k == kFp8QkvWaveCalibration[row].k) {
+      return value(kFp8QkvWaveCalibration[row]);
+    }
+    if (k < kFp8QkvWaveCalibration[row].k) {
+      const auto& lo = kFp8QkvWaveCalibration[row - 1];
+      const auto& hi = kFp8QkvWaveCalibration[row];
+      const int64_t numerator =
+          (value(hi) - value(lo)) * static_cast<int64_t>(k - lo.k);
+      return value(lo) +
+          (numerator + (hi.k - lo.k) / 2) / (hi.k - lo.k);
+    }
+  }
+  return value(kFp8QkvWaveCalibration.back());
+}
+
+Fp8QkvComputeEstimate estimate_fp8_qkv_compute(
+    const GemmProblem& problem,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    Fp8TilePolicy policy) {
+  Fp8QkvComputeEstimate estimate{};
+  estimate.policy = policy;
+  size_t policy_index = 1;
+  if (policy == Fp8TilePolicy::kM128N64) {
+    estimate.tile_n = 64;
+    policy_index = 0;
+  } else if (policy == Fp8TilePolicy::kM128N256ClusterM2) {
+    estimate.tile_n = 256;
+    estimate.cluster_m = 2;
+    policy_index = 2;
+  }
+  const int32_t compute_ctas = sm_count - num_comm_ctas;
+  if (problem.m <= 0 || problem.n <= 0 || problem.k <= 0 ||
+      problem.l <= 0 || compute_ctas <= 0 || sm_count != 132 ||
+      (estimate.cluster_m == 2 &&
+       (num_comm_ctas % 2 != 0 || compute_ctas % 2 != 0))) {
+    return estimate;
+  }
+  estimate.one_wave_elapsed_ns =
+      interpolate_fp8_qkv_wave_field(problem.k, policy_index, false);
+  estimate.steady_wave_increment_ns =
+      interpolate_fp8_qkv_wave_field(problem.k, policy_index, true);
+  if (estimate.one_wave_elapsed_ns <= 0 ||
+      estimate.steady_wave_increment_ns <= 0) {
+    return estimate;
+  }
+  const int64_t m_tiles = (problem.m + kBlockM - 1) / kBlockM;
+  const int64_t m_work_units =
+      (m_tiles + estimate.cluster_m - 1) / estimate.cluster_m;
+  const int64_t n_work_units =
+      (problem.n + estimate.tile_n - 1) / estimate.tile_n;
+  const int64_t work_units = m_work_units * n_work_units * problem.l;
+  const int64_t workers = compute_ctas / estimate.cluster_m;
+  estimate.waves =
+      (work_units + workers - 1) / workers;
+  // A partial persistent tail still pays essentially one full worker service
+  // interval: M256/N18432 profiles show that 12 active Cluster-M2 workers in
+  // the second wave do not scale down in proportion to 64 resident workers.
+  // Therefore use the integer physical-wave count, not fractional occupancy.
+  estimate.wave_equivalents = std::max(
+      1.0,
+      static_cast<double>(work_units) / workers);
+  // N64 publishes twice as many producer-ready flags for each 128-column
+  // route chunk, and that route chunk cannot start until both adjacent N64
+  // producers are ready.  Its signaling calibration directly covers one
+  // through eight physical waves; beyond that range the accumulated
+  // two-producer hand-off is no longer represented by the measured steady
+  // increment.  Keep N64 as a short-grid policy instead of extrapolating it
+  // into the long persistent regime.  The explicit m128n64 override remains
+  // available for calibration and architecture bring-up.
+  if (policy == Fp8TilePolicy::kM128N64 && estimate.waves > 8) {
+    return estimate;
+  }
+  // A 256-column producer publishes one ready flag only after the paired
+  // Cluster-M2 work has completed.  With less than two physical worker waves,
+  // the delayed route start is not amortized; profiles from M256 through long
+  // M show no critical-path gain at two waves and the first repeatable gain at
+  // three waves.  This is a pipeline
+  // granularity constraint, not a model/shape winner table.
+  if (policy == Fp8TilePolicy::kM128N256ClusterM2 &&
+      estimate.waves < 3) {
+    return estimate;
+  }
+  estimate.total_ns = estimate.one_wave_elapsed_ns +
+      static_cast<double>(estimate.waves - 1) *
+          estimate.steady_wave_increment_ns;
+  estimate.valid = estimate.waves > 0;
+  return estimate;
+}
 
 bool qkv_pipeline_policy_enabled() {
   const char* value = std::getenv("FUSE_QKV_COMM_POLICY");
@@ -1162,10 +1424,10 @@ using Fp8BaseEpilogue = typename cutlass::epilogue::collective::CollectiveBuilde
     void,
     LayoutD,
     kAlignment,
-    Element,
+    Fp8Element,
     LayoutD,
-    kAlignment,
-    cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+    kFp8Alignment,
+    cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
 
 using Fp8BaseMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm90,
@@ -1181,7 +1443,7 @@ using Fp8BaseMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename Fp8BaseEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>::CollectiveOp;
+    cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum>::CollectiveOp;
 
 using Fp8ObservedEpilogue = detail::SignalingEpilogue<Fp8BaseEpilogue>;
 using Fp8OutputGemm = cutlass::gemm::kernel::GemmUniversal<
@@ -1193,6 +1455,228 @@ using Fp8PureGemm = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
     Fp8BaseMainloop,
     Fp8BaseEpilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+// Keep both SM90 FP8 warp-specialized pipelines as measurable candidates.
+// Ping-pong has higher steady-state throughput once several waves are in
+// flight, while cooperative pays less fixed scheduling cost for short grids.
+// The final automatic choice is calibrated from whole-wave measurements; the
+// environment override exists only to reproduce that calibration.
+using Fp8CooperativeEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Fp8Element,
+        LayoutD,
+        kFp8Alignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+using Fp8CooperativeMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8Element,
+        LayoutA,
+        kFp8Alignment,
+        Fp8Element,
+        LayoutB,
+        kFp8Alignment,
+        Accumulator,
+        Fp8TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(
+                sizeof(typename Fp8CooperativeEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>::CollectiveOp;
+using Fp8CooperativeObservedEpilogue =
+    detail::SignalingEpilogue<Fp8CooperativeEpilogue>;
+using Fp8CooperativeOutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8CooperativeMainloop,
+    Fp8CooperativeObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using Fp8CooperativePureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8CooperativeMainloop,
+    Fp8CooperativeEpilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+// Narrow-N FP8 producer for grids whose N128 tiles leave most SMs idle.
+// CopyBlockN remains one 128-column attention head, so route waits for two
+// N64 producer tiles without introducing a packing copy.
+using Fp8N64Epilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8N64TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Fp8Element,
+        LayoutD,
+        kFp8Alignment,
+        cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+using Fp8N64Mainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8Element,
+        LayoutA,
+        kFp8Alignment,
+        Fp8Element,
+        LayoutB,
+        kFp8Alignment,
+        Accumulator,
+        Fp8N64TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Fp8N64Epilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum>::CollectiveOp;
+using Fp8N64ObservedEpilogue = detail::SignalingEpilogue<Fp8N64Epilogue>;
+using Fp8N64OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8N64Mainloop,
+    Fp8N64ObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using Fp8N64PureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8N64Mainloop,
+    Fp8N64Epilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+// Wide-N FP8 producer. Cluster-M2 multicasts each A tile across two
+// 256-column producer CTAs, matching the established wide BF16 geometry while
+// retaining K128 FP8 tensor-core instructions.
+using Fp8WideEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8WideTileShape,
+        ProjectionClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        void,
+        LayoutD,
+        kAlignment,
+        Fp8Element,
+        LayoutD,
+        kFp8Alignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+using Fp8WideMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8Element,
+        LayoutA,
+        kFp8Alignment,
+        Fp8Element,
+        LayoutB,
+        kFp8Alignment,
+        Accumulator,
+        Fp8WideTileShape,
+        ProjectionClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Fp8WideEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>::CollectiveOp;
+using Fp8WideObservedEpilogue =
+    detail::SignalingEpilogue<Fp8WideEpilogue>;
+using Fp8WideOutputGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8WideMainloop,
+    Fp8WideObservedEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using Fp8WidePureGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8WideMainloop,
+    Fp8WideEpilogue,
+    cutlass::gemm::PersistentScheduler>;
+
+// V12 baseline: keep the established monolithic role scheduling and epoch
+// protocol while using E4M3 operands, routed values, and outputs with FP32
+// tensor-core accumulation.
+// The fixed M128N128K128 geometry is measured before introducing any FP8-only
+// policy; it is not presented as an optimized selector.
+using Fp8A2ALhsMainloop =
+    detail::A2ALhsReadyMainloop<Fp8BaseMainloop>;
+using Fp8A2ALhsGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8A2ALhsMainloop,
+    Fp8BaseEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using Fp8CooperativeA2ALhsMainloop =
+    detail::A2ALhsReadyMainloop<Fp8CooperativeMainloop>;
+using Fp8CooperativeA2ALhsGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8CooperativeA2ALhsMainloop,
+    Fp8CooperativeEpilogue,
+    detail::MonolithicPersistentScheduler>;
+// Hopper's FP8 fast-accumulate builder accepts the TN operand contract.  FP8
+// training integrations therefore pass their already-quantized transpose
+// copies (weight_nt for dgrad; *_t operands for wgrad) instead of inserting a
+// transpose kernel inside this operator.
+using Fp8BackwardBaseMainloop = Fp8BaseMainloop;
+using Fp8BackwardReadyMainloop =
+    detail::A2ALhsReadyMainloop<Fp8BackwardBaseMainloop, 1, true>;
+using Fp8BackwardReadyGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8BackwardReadyMainloop,
+    Fp8BaseEpilogue,
+    detail::MonolithicPersistentScheduler>;
+using Fp8BackwardSignalingGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8BackwardBaseMainloop,
+    detail::SignalingEpilogue<Fp8BaseEpilogue>,
+    detail::MonolithicPersistentScheduler>;
+
+using Fp8BackwardWgradEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8TileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        Accumulator,
+        Accumulator,
+        Fp8Element,
+        LayoutD,
+        kFp8Alignment,
+        Fp8Element,
+        LayoutD,
+        kFp8Alignment,
+        cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
+using Fp8BackwardWgradMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm90,
+        cutlass::arch::OpClassTensorOp,
+        Fp8Element,
+        LayoutA,
+        kFp8Alignment,
+        Fp8Element,
+        LayoutB,
+        kFp8Alignment,
+        Accumulator,
+        Fp8TileShape,
+        ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(
+                typename Fp8BackwardWgradEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>::CollectiveOp;
+using Fp8BackwardWgradGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    Fp8BackwardWgradMainloop,
+    Fp8BackwardWgradEpilogue,
     cutlass::gemm::PersistentScheduler>;
 
 __host__ __device__ constexpr int32_t ceil_div(int32_t x, int32_t y) {
@@ -1316,6 +1800,12 @@ template <
 #endif
     >
 struct A2ALhsInputCommT {
+  using CommElement = std::remove_cv_t<std::remove_pointer_t<
+      decltype(ParamsType{}.input_staging)>>;
+  static constexpr bool kFp8Input =
+      std::is_same_v<CommElement, Fp8Element>;
+  static constexpr int32_t kCommElementsPerVector =
+      16 / sizeof(CommElement);
   static constexpr int32_t kReadyBlockM = ReadyBlockM;
   static constexpr size_t SharedStorageBytes =
       kA2ALhsBulkSlots * kA2ALhsBulkStageBytes +
@@ -1367,7 +1857,7 @@ struct A2ALhsInputCommT {
       return cudaErrorInvalidValue;
     }
     const int32_t shard_width = route.local_heads * route.head_dim;
-    const int32_t row_bytes = shard_width * sizeof(Element);
+    const int32_t row_bytes = shard_width * sizeof(CommElement);
     const int32_t max_rows = row_bytes > 0
         ? kA2ALhsBulkStageBytes / row_bytes
         : 0;
@@ -1392,8 +1882,8 @@ struct A2ALhsInputCommT {
     }
 
     // Store a narrow peer shard as a small 3D tensor instead of one TMA per
-    // row. Four BF16 values form one raw 64-bit tensor element; the first two
-    // dimensions factor the contiguous K shard and the third is M.
+    // row. The descriptor treats either precision as raw 64-bit groups; the
+    // first two dimensions factor the contiguous K shard and the third is M.
     const int32_t shard_u64 = row_bytes / sizeof(uint64_t);
     int32_t inner_u64 = 0;
     for (int32_t candidate = 256; candidate >= 2; candidate >>= 1) {
@@ -1457,13 +1947,17 @@ struct A2ALhsInputCommT {
                 route.batch * route.seq_local;
       }
     }
-    return pointers && p.epoch > 0 && supported_problem(p.gemm) &&
+    const bool problem_supported = kFp8Input
+        ? supported_fp8_problem(p.gemm)
+        : supported_problem(p.gemm);
+    return pointers && p.epoch > 0 && problem_supported &&
         supported_route_base(route) &&
         route.kind == RouteKind::kHeadToSequence &&
         route.direction == RouteDirection::kInverse &&
         route.q_heads > 0 && route.local_heads > 0 &&
         route.q_heads == route.local_heads * route.world_size &&
-        route.head_dim > 0 && route.head_dim % kAlignment == 0 &&
+        route.head_dim > 0 &&
+        route.head_dim % kCommElementsPerVector == 0 &&
         sequence_supported &&
         (!route.causal_load_balanced || route.seq_local % 2 == 0) &&
         p.gemm.l == 1 && rows_supported &&
@@ -1564,7 +2058,7 @@ struct A2ALhsInputCommT {
     const int32_t tasks_per_m = route.world_size * chunks_per_tile;
     const int32_t tasks = m_tiles * tasks_per_m;
     const int32_t shard_width = route.local_heads * route.head_dim;
-    constexpr int32_t elements_per_vector = kAlignment;
+    constexpr int32_t elements_per_vector = kCommElementsPerVector;
     const int32_t vectors_per_row = shard_width / elements_per_vector;
     int32_t waited_peer = -1;
 
@@ -1577,7 +2071,7 @@ struct A2ALhsInputCommT {
       if (slot >= kA2ALhsBulkSlots) {
         return;
       }
-      auto* stage = reinterpret_cast<Element*>(
+      auto* stage = reinterpret_cast<CommElement*>(
           dynamic_smem + slot * kA2ALhsBulkStageBytes);
       uint64_t* barrier = barriers + slot;
       int32_t phase = 0;
@@ -1680,7 +2174,7 @@ struct A2ALhsInputCommT {
               (static_cast<int64_t>(batch) * route.global_seq +
                source_sequence) * shard_width;
           const int32_t copy_bytes =
-              copy_rows * shard_width * sizeof(Element);
+              copy_rows * shard_width * sizeof(CommElement);
           cute::set_barrier_transaction_bytes(*barrier, copy_bytes);
 #if FUSE_ENABLE_PROFILING
           if constexpr (Instrumented) {
@@ -1723,7 +2217,7 @@ struct A2ALhsInputCommT {
                   p.input_staging +
                       static_cast<int64_t>(m_begin + row) * p.gemm.k +
                       peer_slot * shard_width,
-                  shard_width * sizeof(Element));
+                  shard_width * sizeof(CommElement));
               if (++residual_ops == 8) {
                 cute::tma_store_arrive();
                 residual_ops = 0;
@@ -1739,7 +2233,7 @@ struct A2ALhsInputCommT {
                   p.input_staging +
                       static_cast<int64_t>(m_begin + row) * p.gemm.k +
                       peer_slot * shard_width,
-                  shard_width * sizeof(Element));
+                  shard_width * sizeof(CommElement));
               if ((row & 7) == 7) {
                 cute::tma_store_arrive();
               }
@@ -1856,7 +2350,7 @@ struct A2ALhsInputCommT {
             vector_k;
         const int64_t dst =
             static_cast<int64_t>(destination_row) *
-                (p.gemm.k / kAlignment) +
+                (p.gemm.k / elements_per_vector) +
             peer_slot * vectors_per_row + vector_k;
         destination[dst] = source[src];
       }
@@ -1891,15 +2385,23 @@ struct A2ALhsInputCommT {
 // QKV backward source-push route. Each rank reads its planar local-head
 // dQ/dK/dV tensors and writes every destination's [M,QKV] staging matrix in
 // the exact forward projection order [all Q][all K][all V].
-template <int32_t ReadyBlockM>
+template <
+    int32_t ReadyBlockM,
+    class KernelParamsType = QkvBackwardKernelParams>
 struct QkvBackwardPushCommT {
+  using CommElement = std::remove_cv_t<std::remove_pointer_t<
+      decltype(KernelParamsType{}.local_q)>>;
+  static constexpr bool kFp8Input =
+      std::is_same_v<CommElement, Fp8Element>;
+  static constexpr int32_t kElementsPerVector =
+      16 / static_cast<int32_t>(sizeof(CommElement));
   static constexpr size_t SharedStorageBytes =
       kQkvBulkSlots * kQkvBulkStageBytes +
       kQkvBulkSlots * sizeof(uint64_t);
   static constexpr bool kNeedsGridFinalize = true;
 
   struct Arguments {
-    QkvBackwardKernelParams params{};
+    KernelParamsType params{};
     cute::TmaDescriptor source_tma[3]{};
     cute::TmaDescriptor peer_staging_tma[kMaxWorldSize]{};
     bool use_tma = false;
@@ -1922,17 +2424,19 @@ struct QkvBackwardPushCommT {
         kQkvBulkColumns, kQkvBulkRows};
     constexpr uint32_t element_strides[2] = {1, 1};
     auto encode = [&](cute::TmaDescriptor* descriptor,
-                      Bf16* pointer,
+                      CommElement* pointer,
                       int32_t columns,
                       int32_t rows) {
       const uint64_t global_dims[2] = {
           static_cast<uint64_t>(columns),
           static_cast<uint64_t>(rows)};
       const uint64_t global_strides[1] = {
-          static_cast<uint64_t>(columns) * sizeof(Bf16)};
+          static_cast<uint64_t>(columns) * sizeof(CommElement)};
       return CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
           descriptor,
-          CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+          kFp8Input
+              ? CU_TENSOR_MAP_DATA_TYPE_UINT8
+              : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
           2,
           pointer,
           global_dims,
@@ -1952,17 +2456,17 @@ struct QkvBackwardPushCommT {
     const int32_t global_rows = route.batch * route.global_seq;
     if (!encode(
             &args.source_tma[0],
-            const_cast<Bf16*>(p.local_q),
+            const_cast<CommElement*>(p.local_q),
             q_local_width,
             global_rows) ||
         !encode(
             &args.source_tma[1],
-            const_cast<Bf16*>(p.local_k),
+            const_cast<CommElement*>(p.local_k),
             kv_local_width,
             global_rows) ||
         !encode(
             &args.source_tma[2],
-            const_cast<Bf16*>(p.local_v),
+            const_cast<CommElement*>(p.local_v),
             kv_local_width,
             global_rows)) {
       return cudaSuccess;
@@ -1998,12 +2502,15 @@ struct QkvBackwardPushCommT {
         route.q_heads % route.kv_heads == 0 &&
         route.q_heads % route.world_size == 0 &&
         route.kv_heads % route.world_size == 0 &&
-        route.head_dim > 0 && route.head_dim % kAlignment == 0 &&
+        route.head_dim > 0 && route.head_dim % kElementsPerVector == 0 &&
         route.global_seq == route.seq_local * route.world_size &&
         (!route.causal_load_balanced || route.seq_local % 2 == 0) &&
         p.gemm.l == 1 && p.gemm.m == route.batch * route.seq_local &&
         p.gemm.k == packed_heads * route.head_dim && p.gemm.n > 0 &&
-        p.gemm.transpose_b;
+        (kFp8Input
+             ? supported_fp8_problem(p.gemm)
+             : (p.gemm.transpose_b &&
+                supported_transpose_b_problem(p.gemm)));
   }
 
   static Params to_underlying_arguments(const Arguments& args) { return args; }
@@ -2043,12 +2550,12 @@ struct QkvBackwardPushCommT {
     const int32_t m_tiles = ceil_div(p.gemm.m, ReadyBlockM);
     const int32_t tasks =
         m_tiles * route.world_size * local_packed_heads;
-    constexpr int32_t elements_per_vector = kAlignment;
+    constexpr int32_t elements_per_vector = kElementsPerVector;
     const int32_t vectors_per_head = route.head_dim / elements_per_vector;
 
     if (args.use_tma) {
       extern __shared__ char dynamic_smem[];
-      auto* stages = reinterpret_cast<Bf16*>(dynamic_smem);
+      auto* stages = reinterpret_cast<CommElement*>(dynamic_smem);
       auto* barriers = reinterpret_cast<uint64_t*>(
           dynamic_smem + kQkvBulkSlots * kQkvBulkStageBytes);
       const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31;
@@ -2104,7 +2611,8 @@ struct QkvBackwardPushCommT {
                   global_sequence_row(
                       route, destination_rank, local_sequence);
               cute::set_barrier_transaction_bytes(
-                  *barrier, kQkvBulkStageBytes);
+                  *barrier,
+                  kQkvBulkRows * kQkvBulkColumns * sizeof(CommElement));
               cute::SM90_TMA_LOAD_2D::copy(
                   &args.source_tma[segment],
                   barrier,
@@ -2152,7 +2660,7 @@ struct QkvBackwardPushCommT {
       int32_t segment_head = local_head;
       int32_t global_head = 0;
       int32_t segment_width = q_local_heads * route.head_dim;
-      const Bf16* segment = p.local_q;
+      const CommElement* segment = p.local_q;
       if (local_head >= q_local_heads + kv_local_heads) {
         segment_head = local_head - q_local_heads - kv_local_heads;
         global_head = route.q_heads + route.kv_heads +
@@ -2276,7 +2784,11 @@ struct QkvBackwardPushCommT {
 
 using A2ALhsInputComm = A2ALhsInputCommT<kBlockM>;
 using A2ALhsM64InputComm = A2ALhsInputCommT<64>;
+using Fp8A2ALhsInputComm =
+    A2ALhsInputCommT<kBlockM, Fp8A2AGemmParams>;
 using QkvBackwardPushComm = QkvBackwardPushCommT<kBlockM>;
+using Fp8QkvBackwardPushComm =
+    QkvBackwardPushCommT<kBlockM, Fp8QkvBackwardKernelParams>;
 template <int32_t ReadyBlockM, bool Finalize>
 using WeightedA2ALhsInputComm = A2ALhsInputCommT<
     ReadyBlockM,
@@ -2292,6 +2804,10 @@ using A2ALhsM64TelemetryInputComm =
 
 using A2ALhsGemmKernel =
     detail::MonolithicGemm<A2ALhsInputGemm, A2ALhsInputComm>;
+using Fp8A2ALhsGemmKernel =
+    detail::MonolithicGemm<Fp8A2ALhsGemm, Fp8A2ALhsInputComm>;
+using Fp8CooperativeA2ALhsGemmKernel = detail::MonolithicGemm<
+    Fp8CooperativeA2ALhsGemm, Fp8A2ALhsInputComm>;
 using A2ALhsN160GemmKernel =
     detail::MonolithicGemm<A2ALhsN160Gemm, A2ALhsInputComm>;
 #if FUSE_ENABLE_PROFILING
@@ -2324,6 +2840,8 @@ using QkvBackwardDataKernelN256 =
     QkvBackwardDataKernelT<BackwardA2ALhsGemm>;
 using QkvBackwardDataKernelN64ClusterM2 =
     QkvBackwardDataKernelT<BackwardN64ClusterM2ReadyGemm>;
+using Fp8QkvBackwardDataKernel = detail::MonolithicGemm<
+    Fp8BackwardReadyGemm, Fp8QkvBackwardPushComm>;
 #if FUSE_ENABLE_PROFILING
 using A2ALhsProjectionTelemetryBase = detail::MonolithicGemm<
     A2ALhsProjectionTelemetryGemm, A2ALhsTelemetryInputComm>;
@@ -2381,6 +2899,13 @@ template <
     bool FinalizeAcrossRanks = true,
     bool Heterogeneous = false>
 struct QkvGqaPackCommT {
+  using CommElement = std::remove_cv_t<std::remove_pointer_t<
+      decltype(ParamsType{}.local_output)>>;
+  static constexpr int32_t kCommAlignment = 16 / sizeof(CommElement);
+  static constexpr int32_t kBulkStageElements =
+      kQkvBulkRows * kQkvBulkColumns;
+  static constexpr int32_t kBulkStageBytes =
+      kBulkStageElements * sizeof(CommElement);
   struct Arguments {
     ParamsType params{};
     cute::TmaDescriptor local_output_tma{};
@@ -2390,11 +2915,12 @@ struct QkvGqaPackCommT {
   };
   using Params = Arguments;
   static constexpr size_t SharedStorageBytes =
-      kQkvBulkSlots * kQkvBulkStageBytes +
+      kQkvBulkSlots * kBulkStageBytes +
       kQkvBulkSlots * sizeof(uint64_t);
   static constexpr bool kNeedsGridFinalize = FinalizeAcrossRanks;
   static constexpr bool kUniformHeads =
-      std::is_same_v<ParamsType, OprojBackwardKernelParams>;
+      std::is_same_v<ParamsType, OprojBackwardKernelParams> ||
+      std::is_same_v<ParamsType, Fp8OprojBackwardKernelParams>;
 
   CUTLASS_HOST_DEVICE static int32_t logical_source_rank(
       const ParamsType& p) {
@@ -2454,7 +2980,7 @@ struct QkvGqaPackCommT {
     const auto& p = args.params;
     args.use_tma = p.route.head_dim == kQkvBulkColumns &&
         d_row_stride(p.gemm) >= p.gemm.n &&
-        d_row_stride(p.gemm) % kAlignment == 0;
+        d_row_stride(p.gemm) % kCommAlignment == 0;
     if (!args.use_tma) {
       return cudaSuccess;
     }
@@ -2462,16 +2988,17 @@ struct QkvGqaPackCommT {
         static_cast<uint64_t>(p.gemm.n),
         static_cast<uint64_t>(p.gemm.m)};
     const uint64_t global_strides[1] = {
-        static_cast<uint64_t>(d_row_stride(p.gemm)) * sizeof(Element)};
+        static_cast<uint64_t>(d_row_stride(p.gemm)) * sizeof(CommElement)};
     constexpr uint32_t box_dims[2] = {
         kQkvBulkColumns, kQkvBulkRows};
     constexpr uint32_t element_strides[2] = {1, 1};
     CUresult result =
         CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
             &args.local_output_tma,
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            IsFp8 ? CU_TENSOR_MAP_DATA_TYPE_UINT8
+                  : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             2,
-            const_cast<Element*>(p.local_output),
+            const_cast<CommElement*>(p.local_output),
             global_dims,
             global_strides,
             box_dims,
@@ -2516,12 +3043,13 @@ struct QkvGqaPackCommT {
         const uint64_t destination_dims[2] = {
             static_cast<uint64_t>(segment_width), output_rows};
         const uint64_t destination_strides[1] = {
-            static_cast<uint64_t>(segment_width) * sizeof(Element)};
+            static_cast<uint64_t>(segment_width) * sizeof(CommElement)};
         result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
             &args.peer_output_tma[peer][segment],
-            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            IsFp8 ? CU_TENSOR_MAP_DATA_TYPE_UINT8
+                  : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             2,
-            const_cast<Element*>(p.peer_output[peer] + segment_offset),
+            const_cast<CommElement*>(p.peer_output[peer] + segment_offset),
             destination_dims,
             destination_strides,
             box_dims,
@@ -2548,9 +3076,10 @@ struct QkvGqaPackCommT {
     const int32_t packed_heads = p.route.q_heads +
         (kUniformHeads ? 0 : 2 * p.route.kv_heads);
     const bool problem_supported = IsFp8
-        ? supported_fp8_problem(p.gemm)
-        : (kUniformHeads ? supported_transpose_b_problem(p.gemm)
-                        : supported_problem(p.gemm));
+        ? (p.gemm.transpose_b ? supported_fp8_transpose_b_problem(p.gemm)
+                              : supported_fp8_problem(p.gemm))
+        : (p.gemm.transpose_b ? supported_transpose_b_problem(p.gemm)
+                              : supported_problem(p.gemm));
     bool rows_supported =
         p.gemm.m == p.route.batch * p.route.seq_local;
     bool sequence_supported =
@@ -2586,11 +3115,12 @@ struct QkvGqaPackCommT {
           p.route.q_heads % p.route.kv_heads == 0)) &&
         p.route.q_heads % p.route.world_size == 0 &&
         (kUniformHeads || p.route.kv_heads % p.route.world_size == 0) &&
-        p.route.head_dim > 0 && p.route.head_dim % kAlignment == 0 &&
+        p.route.head_dim > 0 &&
+        p.route.head_dim % kCommAlignment == 0 &&
         rows_supported &&
         sequence_supported &&
         p.gemm.n == packed_heads * p.route.head_dim &&
-        p.gemm.n % kAlignment == 0 &&
+        p.gemm.n % kCommAlignment == 0 &&
         (!kUniformHeads ||
          (!p.route.defer_v_a2a && !p.route.qkv_peer_interleaved)) &&
         p.route.qkv_peer_interleaved == PeerInterleaved &&
@@ -2638,7 +3168,8 @@ struct QkvGqaPackCommT {
     const int32_t head_chunks = route_heads * chunks_per_head;
     const int32_t tasks =
         p.route.world_size * m_groups * head_chunks;
-    const int64_t source_row_vectors = d_row_stride(p.gemm) / kAlignment;
+    const int64_t source_row_vectors =
+        d_row_stride(p.gemm) / kCommAlignment;
     const int32_t q_local_width = q_local_heads * p.route.head_dim;
     const int32_t kv_local_width = kv_local_heads * p.route.head_dim;
     const int64_t segment_rows =
@@ -2647,14 +3178,14 @@ struct QkvGqaPackCommT {
     if (args.use_tma) {
       static_assert(CopyBlockN >= kQkvBulkColumns);
       extern __shared__ char dynamic_smem[];
-      auto* stages = reinterpret_cast<Element*>(dynamic_smem);
+      auto* stages = reinterpret_cast<CommElement*>(dynamic_smem);
       auto* barriers = reinterpret_cast<uint64_t*>(
-          dynamic_smem + kQkvBulkSlots * kQkvBulkStageBytes);
+          dynamic_smem + kQkvBulkSlots * kBulkStageBytes);
       const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31;
       const int32_t slot = static_cast<int32_t>(threadIdx.x) >> 5;
       if (slot < kQkvBulkSlots) {
-        Element* stage = stages +
-            static_cast<int64_t>(slot) * kQkvBulkRows * kQkvBulkColumns;
+        CommElement* stage = stages +
+            static_cast<int64_t>(slot) * kBulkStageElements;
         uint64_t* barrier = barriers + slot;
         int32_t phase = 0;
         if (lane == 0) {
@@ -2720,7 +3251,7 @@ struct QkvGqaPackCommT {
 
           if (lane == 0) {
             cute::set_barrier_transaction_bytes(
-                *barrier, kQkvBulkStageBytes);
+                *barrier, kBulkStageBytes);
             cute::SM90_TMA_LOAD_2D::copy(
                 &args.local_output_tma,
                 barrier,
@@ -2774,7 +3305,7 @@ struct QkvGqaPackCommT {
                 cute::SM90_BULK_COPY_S2G::copy(
                     stage + static_cast<int64_t>(row) * kQkvBulkColumns,
                     destination + dst,
-                    kQkvBulkColumns * sizeof(Element));
+                    kQkvBulkColumns * sizeof(CommElement));
                 if ((row & 7) == 7) {
                   cute::tma_store_arrive();
                 }
@@ -2858,7 +3389,7 @@ struct QkvGqaPackCommT {
       const int32_t m_begin = m_group * MTilesPerTask * BlockM;
       const int32_t copy_m =
           min(BlockM * MTilesPerTask, p.gemm.m - m_begin);
-      const int32_t vectors_per_row = copy_n / kAlignment;
+      const int32_t vectors_per_row = copy_n / kCommAlignment;
       const int32_t vector_count = copy_m * vectors_per_row;
       const auto* source = reinterpret_cast<const uint4*>(
           p.local_output);
@@ -2881,19 +3412,19 @@ struct QkvGqaPackCommT {
         const int32_t source_row = m_begin + row;
         const int64_t src =
             static_cast<int64_t>(source_row) * source_row_vectors +
-            physical_feature / kAlignment + vector_n;
+            physical_feature / kCommAlignment + vector_n;
         const int64_t destination_row_value =
             destination_row(p, source_row);
         const int64_t dst = p.route.defer_v_a2a
             ? (destination_row_value *
                    (q_local_width + kv_local_width) +
                local_feature) /
-                    kAlignment +
+                    kCommAlignment +
                 vector_n
             : (segment_offset +
                destination_row_value * segment_width +
                local_feature - local_segment_base) /
-                    kAlignment +
+                    kCommAlignment +
                 vector_n;
         destination[dst] = source[src];
       }
@@ -3076,6 +3607,22 @@ using Fp8QkvGqaPackComm = QkvGqaPackCommT<
     true,
     static_cast<int32_t>(cute::size<0>(Fp8TileShape{})),
     static_cast<int32_t>(cute::size<1>(Fp8TileShape{}))>;
+using Fp8QkvGqaPackCommN64 = QkvGqaPackCommT<
+    Fp8GemmA2AParams,
+    true,
+    static_cast<int32_t>(cute::size<0>(Fp8N64TileShape{})),
+    static_cast<int32_t>(cute::size<1>(Fp8N64TileShape{})),
+    4,
+    false,
+    kQkvBulkColumns>;
+using Fp8QkvGqaPackCommWide = QkvGqaPackCommT<
+    Fp8GemmA2AParams,
+    true,
+    static_cast<int32_t>(cute::size<0>(Fp8WideTileShape{})),
+    static_cast<int32_t>(cute::size<1>(Fp8WideTileShape{})),
+    1,
+    false,
+    kQkvBulkColumns>;
 template <
     int32_t BlockM,
     int32_t BlockN,
@@ -3096,6 +3643,16 @@ using OprojBackwardHeadCommN128 = OprojBackwardHeadCommT<128, 128, 4, 128>;
 using OprojBackwardHeadCommN160 = OprojBackwardHeadCommT<128, 160, 4, 160>;
 using OprojBackwardHeadCommN192 = OprojBackwardHeadCommT<128, 192, 4, 192>;
 using OprojBackwardHeadCommN256 = OprojBackwardHeadCommT<128, 256, 1, 256>;
+using Fp8OprojBackwardHeadComm = QkvGqaPackCommT<
+    Fp8OprojBackwardKernelParams,
+    true,
+    128,
+    128,
+    4,
+    false,
+    128,
+    true,
+    false>;
 
 template <bool Finalize>
 using WeightedQkvGqaPackCommN64 = QkvGqaPackCommT<
@@ -3189,6 +3746,14 @@ using QkvGemmA2AKernelSmall =
     detail::MonolithicGemm<OutputGemm, QkvGqaPackCommSmall>;
 using Fp8GemmA2AKernel =
     detail::MonolithicGemm<Fp8OutputGemm, Fp8QkvGqaPackComm>;
+using Fp8CooperativeGemmA2AKernel = detail::MonolithicGemm<
+    Fp8CooperativeOutputGemm, Fp8QkvGqaPackComm>;
+using Fp8N64GemmA2AKernel =
+    detail::MonolithicGemm<Fp8N64OutputGemm, Fp8QkvGqaPackCommN64>;
+using Fp8WideGemmA2AKernel =
+    detail::MonolithicGemm<Fp8WideOutputGemm, Fp8QkvGqaPackCommWide>;
+using Fp8OprojBackwardDataKernel = detail::MonolithicGemm<
+    Fp8BackwardSignalingGemm, Fp8OprojBackwardHeadComm>;
 template <class Gemm, class Comm>
 using OprojBackwardDataKernelT = detail::MonolithicGemm<Gemm, Comm>;
 using OprojBackwardDataKernelN64 = OprojBackwardDataKernelT<
@@ -3322,6 +3887,27 @@ static_assert(
 static_assert(
     sizeof(typename Fp8GemmA2AKernel::SharedStorage) >=
         Fp8QkvGqaPackComm::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8CooperativeGemmA2AKernel::SharedStorage) >=
+        Fp8QkvGqaPackComm::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8N64GemmA2AKernel::SharedStorage) >=
+        Fp8QkvGqaPackCommN64::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8WideGemmA2AKernel::SharedStorage) >=
+        Fp8QkvGqaPackCommWide::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8A2ALhsGemmKernel::SharedStorage) >=
+        Fp8A2ALhsInputComm::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8CooperativeA2ALhsGemmKernel::SharedStorage) >=
+        Fp8A2ALhsInputComm::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8QkvBackwardDataKernel::SharedStorage) >=
+        Fp8QkvBackwardPushComm::SharedStorageBytes);
+static_assert(
+    sizeof(typename Fp8OprojBackwardDataKernel::SharedStorage) >=
+        Fp8OprojBackwardHeadComm::SharedStorageBytes);
 
 template <class Comm>
 __global__ __launch_bounds__(384)
@@ -3454,9 +4040,9 @@ cudaError_t launch_gemm_reference_impl(
       Kernel::to_underlying_arguments(args, nullptr), stream);
 }
 
-template <class Kernel>
+template <class Kernel, class ParamsType>
 cudaError_t launch_a2a_lhs_reference_impl(
-    const A2AGemmParams& params,
+    const ParamsType& params,
     cudaStream_t stream,
     int32_t sm_count,
     int32_t device,
@@ -3889,13 +4475,14 @@ cudaError_t launch_gemm_a2a_impl(
 
 template <
     class Gemm,
-    class BaseKernel
+    class BaseKernel,
+    class KernelParamsType
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
     >
 cudaError_t launch_qkv_backward_data_policy(
-    const QkvBackwardKernelParams& params,
+    const KernelParamsType& params,
     cudaStream_t stream,
     int32_t sm_count,
     int32_t device
@@ -3904,7 +4491,10 @@ cudaError_t launch_qkv_backward_data_policy(
     int32_t timeline_capacity = 0
 #endif
     ) {
-  using Comm = QkvBackwardPushComm;
+  using Comm = std::conditional_t<
+      std::is_same_v<KernelParamsType, Fp8QkvBackwardKernelParams>,
+      Fp8QkvBackwardPushComm,
+      QkvBackwardPushComm>;
 #if FUSE_ENABLE_PROFILING
   using Kernel = std::conditional_t<
       Instrumented,
@@ -3948,12 +4538,20 @@ cudaError_t launch_qkv_backward_data_policy(
       _1{},
       static_cast<int64_t>(params.gemm.m) * params.gemm.k);
   args.gemm.mainloop.ptr_B = params.weight;
-  // CUTLASS B coordinates are [N,K]. The stored forward weight is row-major
-  // [K,N], hence address(n,k) = n + k*N.
-  args.gemm.mainloop.dB = make_stride(
-      _1{},
-      static_cast<int64_t>(params.gemm.n),
-      static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  if constexpr (std::is_same_v<
+                    KernelParamsType, Fp8QkvBackwardKernelParams>) {
+    // FP8 dgrad consumes the TN-friendly [N,K] quantized transpose copy.
+    args.gemm.mainloop.dB = make_stride(
+        static_cast<int64_t>(params.gemm.k),
+        _1{},
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  } else {
+    // BF16 consumes the original row-major forward weight [K,N].
+    args.gemm.mainloop.dB = make_stride(
+        _1{},
+        static_cast<int64_t>(params.gemm.n),
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  }
   args.gemm.mainloop.ready = params.peer_ready[params.route.rank];
   args.gemm.mainloop.world_size = packed_heads;
   args.gemm.mainloop.m_tiles = ceil_div(params.gemm.m, tile_m);
@@ -4004,27 +4602,43 @@ cudaError_t launch_qkv_backward_data_telemetry_impl(
       return launch_qkv_backward_data_policy<
           BackwardN64ClusterM2ReadyGemm,
           QkvBackwardDataKernelN64ClusterM2,
+          QkvBackwardKernelParams,
           true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N64:
       return launch_qkv_backward_data_policy<
-          BackwardN64ReadyGemm, QkvBackwardDataKernelN64, true>(
+          BackwardN64ReadyGemm,
+          QkvBackwardDataKernelN64,
+          QkvBackwardKernelParams,
+          true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N128:
       return launch_qkv_backward_data_policy<
-          BackwardN128ReadyGemm, QkvBackwardDataKernelN128, true>(
+          BackwardN128ReadyGemm,
+          QkvBackwardDataKernelN128,
+          QkvBackwardKernelParams,
+          true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N160:
       return launch_qkv_backward_data_policy<
-          BackwardN160ReadyGemm, QkvBackwardDataKernelN160, true>(
+          BackwardN160ReadyGemm,
+          QkvBackwardDataKernelN160,
+          QkvBackwardKernelParams,
+          true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N192:
       return launch_qkv_backward_data_policy<
-          BackwardN192ReadyGemm, QkvBackwardDataKernelN192, true>(
+          BackwardN192ReadyGemm,
+          QkvBackwardDataKernelN192,
+          QkvBackwardKernelParams,
+          true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     case BackwardGemmPolicy::kM128N256:
       return launch_qkv_backward_data_policy<
-          BackwardA2ALhsGemm, QkvBackwardDataKernelN256, true>(
+          BackwardA2ALhsGemm,
+          QkvBackwardDataKernelN256,
+          QkvBackwardKernelParams,
+          true>(
               params, stream, sm_count, device, timeline, timeline_capacity);
     default:
       return cudaErrorInvalidValue;
@@ -4068,16 +4682,53 @@ cudaError_t launch_qkv_backward_data_impl(
   }
 }
 
+cudaError_t launch_qkv_backward_fp8_data_impl(
+    const Fp8QkvBackwardKernelParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  return launch_qkv_backward_data_policy<
+      Fp8BackwardReadyGemm,
+      Fp8QkvBackwardDataKernel>(
+          params, stream, sm_count, device);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_qkv_backward_fp8_data_telemetry_impl(
+    const Fp8QkvBackwardKernelParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (timeline == nullptr || timeline_capacity < sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_qkv_backward_data_policy<
+      Fp8BackwardReadyGemm,
+      Fp8QkvBackwardDataKernel,
+      Fp8QkvBackwardKernelParams,
+      true>(
+          params,
+          stream,
+          sm_count,
+          device,
+          timeline,
+          timeline_capacity);
+}
+#endif
+
 template <
     class Gemm,
     class Comm,
-    class BaseKernel
+    class BaseKernel,
+    class KernelParamsType
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
     >
 cudaError_t launch_oproj_backward_data_policy(
-    const OprojBackwardKernelParams& params,
+    const KernelParamsType& params,
     cudaStream_t stream,
     int32_t sm_count,
     int32_t device
@@ -4123,10 +4774,18 @@ cudaError_t launch_oproj_backward_data_policy(
       _1{},
       static_cast<int64_t>(params.gemm.m) * params.gemm.k);
   args.gemm.mainloop.ptr_B = params.rhs_nt;
-  args.gemm.mainloop.dB = make_stride(
-      _1{},
-      static_cast<int64_t>(params.gemm.n),
-      static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  if constexpr (std::is_same_v<
+                    KernelParamsType, Fp8OprojBackwardKernelParams>) {
+    args.gemm.mainloop.dB = make_stride(
+        static_cast<int64_t>(params.gemm.k),
+        _1{},
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  } else {
+    args.gemm.mainloop.dB = make_stride(
+        _1{},
+        static_cast<int64_t>(params.gemm.n),
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  }
   args.gemm.epilogue.thread.alpha = params.alpha;
   args.gemm.epilogue.thread.beta = 0.0f;
   args.gemm.epilogue.ptr_C = nullptr;
@@ -4177,6 +4836,7 @@ cudaError_t launch_oproj_backward_data_telemetry_impl(
           BackwardN64SignalingGemm,
           OprojBackwardHeadCommN64,
           OprojBackwardDataKernelN64,
+          OprojBackwardKernelParams,
           true>(
               params,
               stream,
@@ -4189,6 +4849,7 @@ cudaError_t launch_oproj_backward_data_telemetry_impl(
           BackwardN128SignalingGemm,
           OprojBackwardHeadCommN128,
           OprojBackwardDataKernelN128,
+          OprojBackwardKernelParams,
           true>(
               params,
               stream,
@@ -4201,6 +4862,7 @@ cudaError_t launch_oproj_backward_data_telemetry_impl(
           BackwardN160SignalingGemm,
           OprojBackwardHeadCommN160,
           OprojBackwardDataKernelN160,
+          OprojBackwardKernelParams,
           true>(
               params,
               stream,
@@ -4213,6 +4875,7 @@ cudaError_t launch_oproj_backward_data_telemetry_impl(
           BackwardN192SignalingGemm,
           OprojBackwardHeadCommN192,
           OprojBackwardDataKernelN192,
+          OprojBackwardKernelParams,
           true>(
               params,
               stream,
@@ -4225,6 +4888,7 @@ cudaError_t launch_oproj_backward_data_telemetry_impl(
           BackwardProjectionOutputGemm,
           OprojBackwardHeadCommN256,
           OprojBackwardDataKernelN256,
+          OprojBackwardKernelParams,
           true>(
               params,
               stream,
@@ -4274,6 +4938,44 @@ cudaError_t launch_oproj_backward_data_impl(
       return cudaErrorInvalidValue;
   }
 }
+
+cudaError_t launch_oproj_backward_fp8_data_impl(
+    const Fp8OprojBackwardKernelParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  return launch_oproj_backward_data_policy<
+      Fp8BackwardSignalingGemm,
+      Fp8OprojBackwardHeadComm,
+      Fp8OprojBackwardDataKernel>(
+          params, stream, sm_count, device);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_oproj_backward_fp8_data_telemetry_impl(
+    const Fp8OprojBackwardKernelParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (timeline == nullptr || timeline_capacity < sm_count) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_oproj_backward_data_policy<
+      Fp8BackwardSignalingGemm,
+      Fp8OprojBackwardHeadComm,
+      Fp8OprojBackwardDataKernel,
+      Fp8OprojBackwardKernelParams,
+      true>(
+          params,
+          stream,
+          sm_count,
+          device,
+          timeline,
+          timeline_capacity);
+}
+#endif
 
 cudaError_t launch_backward_wgrad_impl(
     const Bf16* output_gradient,
@@ -4336,6 +5038,69 @@ cudaError_t launch_backward_wgrad_impl(
   }
   return launch_regular<BackwardWgradGemm>(
       BackwardWgradGemm::to_underlying_arguments(args, nullptr), stream);
+}
+
+cudaError_t launch_backward_fp8_wgrad_impl(
+    const Fp8Element* output_gradient,
+    const Fp8Element* saved_input,
+    Fp8Element* grad_weight,
+    int32_t weight_rows,
+    int32_t weight_columns,
+    int32_t tokens,
+    float alpha,
+    float beta,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  if (!output_gradient || !saved_input || !grad_weight ||
+      weight_rows <= 0 || weight_columns <= 0 || tokens <= 0 ||
+      weight_rows % kFp8Alignment != 0 ||
+      weight_columns % kFp8Alignment != 0 ||
+      tokens % kFp8Alignment != 0) {
+    return cudaErrorInvalidValue;
+  }
+  typename Fp8BackwardWgradGemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.problem_shape = make_shape(
+      weight_rows, weight_columns, tokens, 1);
+  args.mainloop.ptr_A = output_gradient;
+  // FP8 wgrad receives the quantized transpose [weight_rows,tokens].
+  args.mainloop.dA = make_stride(
+      static_cast<int64_t>(tokens),
+      _1{},
+      static_cast<int64_t>(tokens) * weight_rows);
+  args.mainloop.ptr_B = saved_input;
+  // saved_input_t is [weight_columns,tokens].
+  args.mainloop.dB = make_stride(
+      static_cast<int64_t>(tokens),
+      _1{},
+      static_cast<int64_t>(tokens) * weight_columns);
+  args.epilogue.thread.alpha = alpha;
+  args.epilogue.thread.beta = beta;
+  args.epilogue.ptr_C = beta == 0.0f ? nullptr : grad_weight;
+  args.epilogue.dC = make_stride(
+      static_cast<int64_t>(weight_columns),
+      _1{},
+      static_cast<int64_t>(weight_rows) * weight_columns);
+  args.epilogue.ptr_D = grad_weight;
+  args.epilogue.dD = make_stride(
+      static_cast<int64_t>(weight_columns),
+      _1{},
+      static_cast<int64_t>(weight_rows) * weight_columns);
+  args.hw_info.device_id = device;
+  args.hw_info.sm_count = sm_count;
+  args.scheduler.max_swizzle_size = 1;
+  args.scheduler.raster_order = RasterOptions::AlongN;
+  if (!Fp8BackwardWgradGemm::can_implement(args) ||
+      Fp8BackwardWgradGemm::get_workspace_size(args) != 0) {
+    return cudaErrorNotSupported;
+  }
+  if (Fp8BackwardWgradGemm::initialize_workspace(args, nullptr, stream) !=
+      cutlass::Status::kSuccess) {
+    return cudaErrorInitializationError;
+  }
+  return launch_regular<Fp8BackwardWgradGemm>(
+      Fp8BackwardWgradGemm::to_underlying_arguments(args, nullptr), stream);
 }
 
 BackwardGemmPolicy backward_policy_from_qkv_policy(QkvGemmPolicy policy) {
@@ -5009,6 +5774,235 @@ cudaError_t launch_qkv_backward(
   return launch_qkv_backward_weight(weight, stream);
 }
 
+namespace {
+
+QkvBackwardDataParams fp8_qkv_backward_shape_view(
+    const Fp8QkvBackwardDataParams& params) {
+  QkvBackwardDataParams view{};
+  view.local_tokens = params.local_tokens;
+  view.hidden = params.hidden;
+  view.batch = params.batch;
+  view.q_heads = params.q_heads;
+  view.kv_heads = params.kv_heads;
+  view.head_dim = params.head_dim;
+  view.world_size = params.world_size;
+  view.rank = params.rank;
+  view.num_comm_ctas = params.num_comm_ctas;
+  view.gemm_policy = params.gemm_policy;
+  view.epoch = params.epoch;
+  view.causal_load_balanced = params.causal_load_balanced;
+  view.alpha = params.alpha;
+  return view;
+}
+
+cudaError_t prepare_qkv_backward_fp8_data_launch(
+    const Fp8QkvBackwardDataParams& params,
+    Fp8QkvBackwardKernelParams* launch,
+    int32_t* sm_count,
+    int32_t* device) {
+  if (launch == nullptr || sm_count == nullptr || device == nullptr ||
+      !params.grad_q || !params.grad_k || !params.grad_v ||
+      !params.weight_nt ||
+      !params.grad_input || params.local_tokens <= 0 || params.hidden <= 0 ||
+      params.batch <= 0 || params.local_tokens % params.batch != 0 ||
+      params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.head_dim % kFp8Alignment != 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.rank < 0 || params.rank >= params.world_size ||
+      params.q_heads % params.kv_heads != 0 ||
+      params.q_heads % params.world_size != 0 ||
+      params.kv_heads % params.world_size != 0 || params.epoch == 0 ||
+      (params.gemm_policy != BackwardGemmPolicy::kAuto &&
+       params.gemm_policy != BackwardGemmPolicy::kM128N128) ||
+      (params.causal_load_balanced &&
+       (params.local_tokens / params.batch) % 2 != 0)) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int32_t comm_ctas = params.num_comm_ctas == 0
+      ? recommended_qkv_backward_comm_ctas(
+            fp8_qkv_backward_shape_view(params))
+      : params.num_comm_ctas;
+  if (comm_ctas <= 0 || comm_ctas >= device_info.sm_count ||
+      comm_ctas % 2 != 0) {
+    return cudaErrorInvalidConfiguration;
+  }
+
+  *launch = {};
+  launch->local_q = params.grad_q;
+  launch->local_k = params.grad_k;
+  launch->local_v = params.grad_v;
+  for (int32_t peer = 0; peer < params.world_size; ++peer) {
+    launch->peer_staging[peer] = params.peer_dqkv_staging[peer];
+    launch->peer_ready[peer] = params.peer_ready[peer];
+    launch->peer_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  launch->weight = params.weight_nt;
+  launch->grad_input = params.grad_input;
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  launch->gemm = {
+      params.local_tokens, params.hidden, packed_width, 1};
+  launch->gemm.input_dtype = DType::kFloat8E4M3;
+  launch->gemm.weight_dtype = DType::kFloat8E4M3;
+  launch->gemm.output_dtype = DType::kFloat8E4M3;
+  launch->gemm.transpose_b = false;
+  launch->gemm.stride_b.row = packed_width;
+  launch->gemm.raster = GemmRaster::kAlongN;
+  launch->gemm.max_swizzle_size = 1;
+  launch->route.world_size = params.world_size;
+  launch->route.rank = params.rank;
+  launch->route.batch = params.batch;
+  launch->route.seq_local = params.local_tokens / params.batch;
+  launch->route.global_seq = launch->route.seq_local * params.world_size;
+  launch->route.q_heads = params.q_heads;
+  launch->route.kv_heads = params.kv_heads;
+  launch->route.local_heads = params.q_heads / params.world_size;
+  launch->route.head_dim = params.head_dim;
+  launch->route.causal_load_balanced = params.causal_load_balanced;
+  launch->route.kind = RouteKind::kQkvGqaPack;
+  launch->route.direction = RouteDirection::kInverse;
+  launch->num_comm_ctas = comm_ctas;
+  launch->gemm_policy = BackwardGemmPolicy::kM128N128;
+  launch->epoch = params.epoch;
+  launch->alpha = params.alpha;
+  *sm_count = device_info.sm_count;
+  *device = device_info.device;
+  return cudaSuccess;
+}
+
+}  // namespace
+
+int64_t qkv_backward_fp8_ready_elements(
+    const Fp8QkvBackwardDataParams& params) {
+  if (params.local_tokens <= 0 || params.q_heads <= 0 ||
+      params.kv_heads <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(ceil_div(params.local_tokens, kBlockM)) *
+      (params.q_heads + 2LL * params.kv_heads) * kReadyFlagStride;
+}
+
+int32_t recommended_qkv_backward_fp8_comm_ctas(
+    const Fp8QkvBackwardDataParams& params) {
+  return recommended_qkv_backward_comm_ctas(
+      fp8_qkv_backward_shape_view(params));
+}
+
+KernelTraits qkv_backward_fp8_kernel_traits(
+    const Fp8QkvBackwardDataParams&,
+    int32_t,
+    int32_t) {
+  return {
+      128,
+      128,
+      128,
+      static_cast<int32_t>(Fp8BackwardReadyGemm::get_block_shape().x),
+      static_cast<int32_t>(
+          sizeof(typename Fp8QkvBackwardDataKernel::SharedStorage))};
+}
+
+cudaError_t launch_qkv_backward_fp8_data(
+    const Fp8QkvBackwardDataParams& params,
+    cudaStream_t stream) {
+  Fp8QkvBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_qkv_backward_fp8_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_fp8_data_impl(
+      launch, stream, sm_count, device);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_qkv_backward_fp8_data_role_telemetry(
+    const Fp8QkvBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  Fp8QkvBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_qkv_backward_fp8_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_fp8_data_telemetry_impl(
+      launch,
+      timeline,
+      timeline_capacity,
+      stream,
+      sm_count,
+      device);
+}
+#endif
+
+cudaError_t launch_qkv_backward_fp8_weight(
+    const Fp8QkvBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.q_heads % params.kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  return launch_backward_fp8_wgrad_impl(
+      params.dqkv_t,
+      params.saved_input_t,
+      params.grad_weight,
+      packed_width,
+      params.hidden,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_qkv_backward_fp8(
+    const Fp8QkvBackwardParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = launch_qkv_backward_fp8_data(params.data, stream);
+  if (status != cudaSuccess ||
+      params.weight_mode == WeightGradientMode::kDeferred) {
+    return status;
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate) {
+    return cudaErrorInvalidValue;
+  }
+  Fp8QkvBackwardWeightParams weight = params.weight;
+  if (!weight.dqkv_t || !weight.saved_input_t) {
+    return cudaErrorInvalidValue;
+  }
+  if (weight.local_tokens == 0) weight.local_tokens = params.data.local_tokens;
+  if (weight.hidden == 0) weight.hidden = params.data.hidden;
+  if (weight.q_heads == 0) weight.q_heads = params.data.q_heads;
+  if (weight.kv_heads == 0) weight.kv_heads = params.data.kv_heads;
+  if (weight.head_dim == 0) weight.head_dim = params.data.head_dim;
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.kv_heads != params.data.kv_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_qkv_backward_fp8_weight(weight, stream);
+}
+
 int64_t oproj_backward_ready_elements(
     const OprojBackwardDataParams& params) {
   if (params.local_tokens <= 0 || params.q_heads <= 0 ||
@@ -5428,6 +6422,223 @@ cudaError_t launch_oproj_backward(
   return launch_oproj_backward_weight(weight, stream);
 }
 
+namespace {
+
+OprojBackwardDataParams fp8_oproj_backward_shape_view(
+    const Fp8OprojBackwardDataParams& params) {
+  OprojBackwardDataParams view{};
+  view.local_tokens = params.local_tokens;
+  view.hidden = params.hidden;
+  view.batch = params.batch;
+  view.q_heads = params.q_heads;
+  view.head_dim = params.head_dim;
+  view.world_size = params.world_size;
+  view.rank = params.rank;
+  view.num_comm_ctas = params.num_comm_ctas;
+  view.gemm_policy = params.gemm_policy;
+  view.epoch = params.epoch;
+  view.causal_load_balanced = params.causal_load_balanced;
+  view.alpha = params.alpha;
+  return view;
+}
+
+cudaError_t prepare_oproj_backward_fp8_data_launch(
+    const Fp8OprojBackwardDataParams& params,
+    Fp8OprojBackwardKernelParams* launch,
+    int32_t* sm_count,
+    int32_t* device) {
+  if (launch == nullptr || sm_count == nullptr || device == nullptr ||
+      !params.grad_output || !params.weight_nt ||
+      !params.local_grad_attention || !params.ready ||
+      params.local_tokens <= 0 || params.hidden <= 0 || params.batch <= 0 ||
+      params.local_tokens % params.batch != 0 || params.q_heads <= 0 ||
+      params.head_dim <= 0 || params.head_dim % kFp8Alignment != 0 ||
+      params.world_size <= 1 || params.world_size > kMaxWorldSize ||
+      params.rank < 0 || params.rank >= params.world_size ||
+      params.q_heads % params.world_size != 0 || params.epoch == 0 ||
+      (params.gemm_policy != BackwardGemmPolicy::kAuto &&
+       params.gemm_policy != BackwardGemmPolicy::kM128N128) ||
+      (params.causal_load_balanced &&
+       (params.local_tokens / params.batch) % 2 != 0)) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int32_t comm_ctas = params.num_comm_ctas == 0
+      ? recommended_oproj_backward_comm_ctas(
+            fp8_oproj_backward_shape_view(params))
+      : params.num_comm_ctas;
+  if (comm_ctas <= 0 || comm_ctas >= device_info.sm_count ||
+      comm_ctas % 2 != 0) {
+    return cudaErrorInvalidConfiguration;
+  }
+
+  *launch = {};
+  launch->lhs = params.grad_output;
+  launch->rhs_nt = params.weight_nt;
+  launch->local_output = params.local_grad_attention;
+  for (int32_t peer = 0; peer < params.world_size; ++peer) {
+    launch->peer_output[peer] = params.peer_grad_attention[peer];
+    launch->peer_route_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  launch->ready = params.ready;
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  launch->gemm = {
+      params.local_tokens, attention_width, params.hidden, 1};
+  launch->gemm.input_dtype = DType::kFloat8E4M3;
+  launch->gemm.weight_dtype = DType::kFloat8E4M3;
+  launch->gemm.output_dtype = DType::kFloat8E4M3;
+  launch->gemm.transpose_b = false;
+  launch->gemm.stride_b.row = params.hidden;
+  launch->gemm.raster = GemmRaster::kAlongN;
+  launch->gemm.max_swizzle_size = 1;
+  launch->route.world_size = params.world_size;
+  launch->route.rank = params.rank;
+  launch->route.batch = params.batch;
+  launch->route.seq_local = params.local_tokens / params.batch;
+  launch->route.global_seq = launch->route.seq_local * params.world_size;
+  launch->route.q_heads = params.q_heads;
+  launch->route.kv_heads = 0;
+  launch->route.local_heads = params.q_heads / params.world_size;
+  launch->route.head_dim = params.head_dim;
+  launch->route.causal_load_balanced = params.causal_load_balanced;
+  launch->route.kind = RouteKind::kHeadToSequence;
+  launch->route.direction = RouteDirection::kForward;
+  launch->num_comm_ctas = comm_ctas;
+  launch->epoch = params.epoch;
+  launch->alpha = params.alpha;
+  *sm_count = device_info.sm_count;
+  *device = device_info.device;
+  return cudaSuccess;
+}
+
+}  // namespace
+
+int32_t recommended_oproj_backward_fp8_comm_ctas(
+    const Fp8OprojBackwardDataParams& params) {
+  return recommended_oproj_backward_comm_ctas(
+      fp8_oproj_backward_shape_view(params));
+}
+
+KernelTraits oproj_backward_fp8_kernel_traits(
+    const Fp8OprojBackwardDataParams&,
+    int32_t,
+    int32_t) {
+  return {
+      128,
+      128,
+      128,
+      static_cast<int32_t>(Fp8BackwardSignalingGemm::get_block_shape().x),
+      static_cast<int32_t>(
+          sizeof(typename Fp8OprojBackwardDataKernel::SharedStorage))};
+}
+
+int64_t oproj_backward_fp8_ready_elements(
+    const Fp8OprojBackwardDataParams& params) {
+  if (params.local_tokens <= 0 || params.q_heads <= 0 ||
+      params.head_dim <= 0) {
+    return 0;
+  }
+  const int32_t attention_width = params.q_heads * params.head_dim;
+  return static_cast<int64_t>(ceil_div(params.local_tokens, kBlockM)) *
+      ceil_div(attention_width, kBlockN) * kReadyFlagStride;
+}
+
+cudaError_t launch_oproj_backward_fp8_data(
+    const Fp8OprojBackwardDataParams& params,
+    cudaStream_t stream) {
+  Fp8OprojBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_oproj_backward_fp8_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_oproj_backward_fp8_data_impl(
+      launch, stream, sm_count, device);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_oproj_backward_fp8_data_role_telemetry(
+    const Fp8OprojBackwardDataParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  Fp8OprojBackwardKernelParams launch{};
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = prepare_oproj_backward_fp8_data_launch(
+      params, &launch, &sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_oproj_backward_fp8_data_telemetry_impl(
+      launch,
+      timeline,
+      timeline_capacity,
+      stream,
+      sm_count,
+      device);
+}
+#endif
+
+cudaError_t launch_oproj_backward_fp8_weight(
+    const Fp8OprojBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_backward_fp8_wgrad_impl(
+      params.grad_output_t,
+      params.saved_attention_t,
+      params.grad_weight,
+      params.hidden,
+      params.q_heads * params.head_dim,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_oproj_backward_fp8(
+    const Fp8OprojBackwardParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = launch_oproj_backward_fp8_data(params.data, stream);
+  if (status != cudaSuccess ||
+      params.weight_mode == WeightGradientMode::kDeferred) {
+    return status;
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate) {
+    return cudaErrorInvalidValue;
+  }
+  Fp8OprojBackwardWeightParams weight = params.weight;
+  if (!weight.grad_output_t || !weight.saved_attention_t) {
+    return cudaErrorInvalidValue;
+  }
+  if (weight.local_tokens == 0) weight.local_tokens = params.data.local_tokens;
+  if (weight.hidden == 0) weight.hidden = params.data.hidden;
+  if (weight.q_heads == 0) weight.q_heads = params.data.q_heads;
+  if (weight.head_dim == 0) weight.head_dim = params.data.head_dim;
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_oproj_backward_fp8_weight(weight, stream);
+}
+
 KernelTraits qkv_cutlass_kernel_traits(const GemmProblem& problem) {
   (void)problem;
   // This overload has no route, communication split or SM count, so it
@@ -5494,12 +6705,49 @@ KernelTraits qkv_cutlass_kernel_traits(
 }
 
 KernelTraits fp8_cutlass_kernel_traits() {
+  // N64 is both the finest ready-flag geometry and the largest production
+  // shared-storage footprint, so it safely sizes callers that do not yet know
+  // the resolved route/communication plan.
+  return {
+      128,
+      64,
+      128,
+      static_cast<int32_t>(Fp8N64OutputGemm::get_block_shape().x),
+      static_cast<int32_t>(
+          sizeof(typename Fp8N64GemmA2AKernel::SharedStorage))};
+}
+
+KernelTraits fp8_cutlass_kernel_traits(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count) {
+  int32_t device = 0;
+  if (num_comm_ctas <= 0 || cudaGetDevice(&device) != cudaSuccess) {
+    return fp8_cutlass_kernel_traits();
+  }
+  const Fp8TilePolicy tile = select_fp8_qkv_tile(
+      problem, route, num_comm_ctas, sm_count, device);
+  if (tile == Fp8TilePolicy::kM128N64) {
+    return fp8_cutlass_kernel_traits();
+  }
+  if (tile == Fp8TilePolicy::kM128N256ClusterM2) {
+    return {
+        128,
+        256,
+        128,
+        static_cast<int32_t>(Fp8WideOutputGemm::get_block_shape().x),
+        static_cast<int32_t>(
+            sizeof(typename Fp8WideGemmA2AKernel::SharedStorage))};
+  }
   return {
       kBlockM,
       kBlockN,
       128,
       static_cast<int32_t>(Fp8OutputGemm::get_block_shape().x),
-      static_cast<int32_t>(sizeof(typename Fp8GemmA2AKernel::SharedStorage))};
+      static_cast<int32_t>(std::max(
+          sizeof(typename Fp8GemmA2AKernel::SharedStorage),
+          sizeof(typename Fp8CooperativeGemmA2AKernel::SharedStorage)))};
 }
 
 int64_t a2a_lhs_gemm_ready_elements(
@@ -5603,6 +6851,111 @@ double a2a_lhs_nvlink_bidirectional_gbps(int32_t device) {
   last_value = bandwidth;
   return bandwidth;
 }
+
+namespace {
+
+constexpr std::array<Fp8TilePolicy, 3> kFp8QkvTileCandidates{
+    Fp8TilePolicy::kM128N64,
+    Fp8TilePolicy::kM128N128,
+    Fp8TilePolicy::kM128N256ClusterM2};
+
+double fp8_qkv_pipeline_score_ns(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    int32_t device,
+    Fp8TilePolicy policy) {
+  const auto compute = estimate_fp8_qkv_compute(
+      problem, num_comm_ctas, sm_count, policy);
+  if (!compute.valid || route.world_size <= 1 || route.head_dim <= 0 ||
+      route.q_heads <= 0 || route.kv_heads <= 0 ||
+      route.q_heads % route.world_size != 0 ||
+      route.kv_heads % route.world_size != 0) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  const int32_t q_local_heads = route.q_heads / route.world_size;
+  const int32_t kv_local_heads = route.kv_heads / route.world_size;
+  const int32_t routed_local_heads = q_local_heads +
+      (route.defer_v_a2a ? 1 : 2) * kv_local_heads;
+  const int64_t m_chunks = ceil_div(problem.m, kQkvBulkRows);
+  const int64_t route_tasks =
+      static_cast<int64_t>(route.world_size) * m_chunks *
+      routed_local_heads;
+  const int64_t route_slots =
+      static_cast<int64_t>(num_comm_ctas) * kQkvBulkSlots;
+  const int64_t route_waves = ceil_div(route_tasks, route_slots);
+  const double route_task_ns =
+      route_waves * static_cast<double>(kFp8QkvRouteTaskWaveNs);
+
+  const int64_t routed_global_width =
+      static_cast<int64_t>(route.q_heads +
+          (route.defer_v_a2a ? 1 : 2) * route.kv_heads) *
+      route.head_dim;
+  const double remote_bytes =
+      static_cast<double>(problem.m) * routed_global_width *
+      sizeof(Fp8Element) * (route.world_size - 1) / route.world_size;
+  const double one_way_nvlink_gbps =
+      0.5 * a2a_lhs_nvlink_bidirectional_gbps(device);
+  const double comm_fraction = std::min(
+      1.0,
+      static_cast<double>(num_comm_ctas) /
+          kFp8QkvFabricSaturationCommCtas);
+  if (!(one_way_nvlink_gbps > 0.0) || !(comm_fraction > 0.0)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double route_link_ns =
+      remote_bytes / (one_way_nvlink_gbps * comm_fraction);
+  const double route_ns = std::max(route_task_ns, route_link_ns);
+  // Producer and route run as one dependency pipeline. Route can consume an
+  // early ready tile while later GEMM waves continue, leaving one measured
+  // 16-KiB task wave as the irreducible drain after compute.
+  const double exposed_route_ns = std::max(
+      static_cast<double>(kFp8QkvRouteTaskWaveNs),
+      route_ns - compute.total_ns);
+  return compute.total_ns + exposed_route_ns;
+}
+
+int32_t fp8_tile_tie_rank(Fp8TilePolicy policy) {
+  // When the calibrated model cannot distinguish two choices, retain N128:
+  // it uses fewer ready flags than N64 and does not couple two CTAs like N256.
+  if (policy == Fp8TilePolicy::kM128N128) {
+    return 0;
+  }
+  return policy == Fp8TilePolicy::kM128N64 ? 1 : 2;
+}
+
+Fp8TilePolicy select_fp8_qkv_tile(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count,
+    int32_t device) {
+  Fp8TilePolicy requested{};
+  if (requested_fp8_tile_override(&requested)) {
+    return requested;
+  }
+  Fp8TilePolicy best = Fp8TilePolicy::kM128N128;
+  double best_score_ns = std::numeric_limits<double>::infinity();
+  int32_t best_tie_rank = fp8_tile_tie_rank(best);
+  for (Fp8TilePolicy candidate : kFp8QkvTileCandidates) {
+    const double score_ns = fp8_qkv_pipeline_score_ns(
+        problem, route, num_comm_ctas, sm_count, device, candidate);
+    const int32_t tie_rank = fp8_tile_tie_rank(candidate);
+    constexpr double kTieToleranceNs = 1.0e-6;
+    if (score_ns + kTieToleranceNs < best_score_ns ||
+        (std::abs(score_ns - best_score_ns) <= kTieToleranceNs &&
+         tie_rank < best_tie_rank)) {
+      best = candidate;
+      best_score_ns = score_ns;
+      best_tie_rank = tie_rank;
+    }
+  }
+  return best;
+}
+
+}  // namespace
 
 double a2a_lhs_compute_time_us(
     const A2ALhsPolicyInfo& policy,
@@ -5812,7 +7165,7 @@ struct QkvCommRecommendationKey {
   // Keep every scalar problem/route input so future policy changes cannot
   // accidentally reuse an older result. Device pointers are deliberately
   // excluded: they do not affect the communication split.
-  std::array<uint64_t, 41> words{};
+  std::array<uint64_t, 42> words{};
 
   bool operator==(const QkvCommRecommendationKey& other) const {
     return words == other.words;
@@ -5836,6 +7189,8 @@ QkvCommRecommendationKey make_qkv_comm_recommendation_key(
     int32_t device) {
   const auto comm_policy = normalized_qkv_comm_policy_request();
   const auto nvlink_override = normalized_qkv_nvlink_override();
+  Fp8TilePolicy fp8_tile{};
+  const bool has_fp8_tile_override = requested_fp8_tile_override(&fp8_tile);
   return {{
       static_cast<uint64_t>(device),
       static_cast<uint64_t>(p.m),
@@ -5878,6 +7233,9 @@ QkvCommRecommendationKey make_qkv_comm_recommendation_key(
       static_cast<uint64_t>(comm_policy),
       static_cast<uint64_t>(nvlink_override.present),
       nvlink_override.bits,
+      has_fp8_tile_override
+          ? static_cast<uint64_t>(fp8_tile) + 1
+          : 0,
   }};
 }
 
@@ -5955,12 +7313,19 @@ int32_t recommended_gemm_a2a_comm_ctas(
   if (route.kind != RouteKind::kQkvGqaPack) {
     return 0;
   }
+  const bool fp8_problem =
+      problem.input_dtype == DType::kFloat8E4M3 &&
+      problem.weight_dtype == DType::kFloat8E4M3 &&
+      problem.output_dtype == DType::kFloat8E4M3;
+  const bool bf16_problem =
+      problem.input_dtype == DType::kBfloat16 &&
+      problem.weight_dtype == DType::kBfloat16 &&
+      problem.output_dtype == DType::kBfloat16;
+  const int32_t output_element_bytes = fp8_problem
+      ? static_cast<int32_t>(sizeof(Fp8Element))
+      : static_cast<int32_t>(sizeof(Bf16));
   const int64_t output_bytes =
-      static_cast<int64_t>(problem.m) * problem.n * sizeof(Bf16);
-  if (problem.input_dtype == DType::kFloat8E4M3 &&
-      output_bytes >= 64ll * 1024 * 1024) {
-    return 40;
-  }
+      static_cast<int64_t>(problem.m) * problem.n * output_element_bytes;
   const int32_t legacy_comm_ctas =
       output_bytes >= 32ll * 1024 * 1024
       ? 32
@@ -5968,7 +7333,14 @@ int32_t recommended_gemm_a2a_comm_ctas(
 
   const bool pipeline_policy = qkv_pipeline_policy_enabled();
   if (!pipeline_policy ||
-      problem.input_dtype != DType::kBfloat16 || route.world_size <= 1) {
+      (!bf16_problem && !fp8_problem) || route.world_size <= 1) {
+    return legacy_comm_ctas;
+  }
+  if (fp8_problem &&
+      selected_fp8_pipeline(problem) == Fp8PipelinePolicy::kCooperative) {
+    // The independent comm model below is calibrated for ping-pong. Manual
+    // cooperative experiments must request an explicit split until they have
+    // their own wave table.
     return legacy_comm_ctas;
   }
 
@@ -6044,6 +7416,39 @@ int32_t recommended_gemm_a2a_comm_ctas(
       static_cast<int64_t>(route.q_heads +
           (route.defer_v_a2a ? 1 : 2) * route.kv_heads) *
       route.head_dim;
+  if (fp8_problem) {
+    int32_t best_comm_ctas = legacy_comm_ctas;
+    int32_t best_tie_rank = std::numeric_limits<int32_t>::max();
+    double best_score_ns = std::numeric_limits<double>::infinity();
+    for (int32_t comm_ctas = kMinCommCtas;
+         comm_ctas <= kMaxCommCtas && comm_ctas < sm_count;
+         comm_ctas += 2) {
+      const Fp8TilePolicy tile = select_fp8_qkv_tile(
+          problem, route, comm_ctas, sm_count, device);
+      const double score_ns = fp8_qkv_pipeline_score_ns(
+          problem, route, comm_ctas, sm_count, device, tile);
+      if (!std::isfinite(score_ns)) {
+        continue;
+      }
+      // An exact model tie means extra route CTAs do not change the predicted
+      // compute waves or exposed communication. Prefer the measured FP8 route
+      // saturation point, rather than starving route issue or consuming extra
+      // compute headroom for no modeled benefit.
+      constexpr double kTieToleranceNs = 1.0e-6;
+      const int32_t tie_rank =
+          std::abs(comm_ctas - kFp8QkvLatencySaturationCommCtas);
+      if (score_ns + kTieToleranceNs < best_score_ns ||
+          (std::abs(score_ns - best_score_ns) <= kTieToleranceNs &&
+           (tie_rank < best_tie_rank ||
+            (tie_rank == best_tie_rank && comm_ctas < best_comm_ctas)))) {
+        best_score_ns = score_ns;
+        best_tie_rank = tie_rank;
+        best_comm_ctas = comm_ctas;
+      }
+    }
+    store_qkv_comm_recommendation(cache_key, best_comm_ctas);
+    return best_comm_ctas;
+  }
   const double remote_bytes =
       static_cast<double>(problem.m) * routed_global_width * sizeof(Bf16) *
       (route.world_size - 1) / route.world_size;
@@ -6937,6 +8342,41 @@ cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t st
       launch_params, stream, sm_count, device);
 }
 
+cudaError_t launch_a2a_gemm_fp8_cutlass(
+    const Fp8A2AGemmParams& params,
+    cudaStream_t stream) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  Fp8A2AGemmParams launch_params = params;
+  if (launch_params.num_comm_ctas == 0) {
+    launch_params.num_comm_ctas = recommended_a2a_lhs_gemm_comm_ctas_impl(
+        params.gemm, params.route, sm_count, device);
+  }
+  if (launch_params.num_comm_ctas <= 0 ||
+      launch_params.num_comm_ctas >= sm_count ||
+      (launch_params.lhs_policy != A2ALhsGemmPolicy::kAuto &&
+       launch_params.lhs_policy != A2ALhsGemmPolicy::kM128N128)) {
+    return cudaErrorInvalidValue;
+  }
+  if (selected_fp8_pipeline(launch_params.gemm) ==
+      Fp8PipelinePolicy::kCooperative) {
+    return launch_a2a_lhs_gemm_policy<
+        Fp8CooperativeA2ALhsGemm,
+        Fp8CooperativeA2ALhsGemmKernel,
+        Fp8A2ALhsInputComm>(
+            launch_params, stream, sm_count, device);
+  }
+  return launch_a2a_lhs_gemm_policy<
+      Fp8A2ALhsGemm,
+      Fp8A2ALhsGemmKernel,
+      Fp8A2ALhsInputComm>(
+          launch_params, stream, sm_count, device);
+}
+
 #if FUSE_ENABLE_PROFILING
 cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     const A2AGemmParams& params,
@@ -7454,14 +8894,130 @@ cudaError_t launch_gemm_a2a_fp8_cutlass(
       launch_params.route.direction != RouteDirection::kForward) {
     return cudaErrorNotSupported;
   }
+  const Fp8TilePolicy tile = select_fp8_qkv_tile(
+      launch_params.gemm,
+      launch_params.route,
+      launch_params.num_comm_ctas,
+      sm_count,
+      device);
+  if (tile == Fp8TilePolicy::kM128N64) {
+    Fp8QkvGqaPackCommN64::Arguments comm_args{};
+    comm_args.params = launch_params;
+    if (!Fp8QkvGqaPackCommN64::can_implement(comm_args)) {
+      return cudaErrorNotSupported;
+    }
+    return launch_gemm_a2a_impl<
+        Fp8N64OutputGemm, Fp8QkvGqaPackCommN64>(
+            launch_params, stream, sm_count, device);
+  }
+  if (tile == Fp8TilePolicy::kM128N256ClusterM2) {
+    Fp8QkvGqaPackCommWide::Arguments comm_args{};
+    comm_args.params = launch_params;
+    if (!Fp8QkvGqaPackCommWide::can_implement(comm_args)) {
+      return cudaErrorNotSupported;
+    }
+    return launch_gemm_a2a_impl<
+        Fp8WideOutputGemm, Fp8QkvGqaPackCommWide>(
+            launch_params, stream, sm_count, device);
+  }
   Fp8QkvGqaPackComm::Arguments comm_args{};
   comm_args.params = launch_params;
   if (!Fp8QkvGqaPackComm::can_implement(comm_args)) {
     return cudaErrorNotSupported;
   }
+  if (selected_fp8_pipeline(launch_params.gemm) ==
+      Fp8PipelinePolicy::kCooperative) {
+    return launch_gemm_a2a_impl<
+        Fp8CooperativeOutputGemm, Fp8QkvGqaPackComm>(
+            launch_params, stream, sm_count, device);
+  }
   return launch_gemm_a2a_impl<Fp8OutputGemm, Fp8QkvGqaPackComm>(
       launch_params, stream, sm_count, device);
 }
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_gemm_a2a_fp8_role_telemetry(
+    const Fp8GemmA2AParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  Fp8GemmA2AParams launch_params = params;
+  if (launch_params.num_comm_ctas == 0) {
+    launch_params.num_comm_ctas =
+        recommended_gemm_a2a_comm_ctas(params.gemm, params.route);
+  }
+  if (timeline == nullptr || timeline_capacity < sm_count ||
+      launch_params.num_comm_ctas <= 0 ||
+      launch_params.num_comm_ctas >= sm_count ||
+      launch_params.route.kind != RouteKind::kQkvGqaPack ||
+      launch_params.route.direction != RouteDirection::kForward) {
+    return cudaErrorInvalidValue;
+  }
+  const Fp8TilePolicy tile = select_fp8_qkv_tile(
+      launch_params.gemm,
+      launch_params.route,
+      launch_params.num_comm_ctas,
+      sm_count,
+      device);
+  if (tile == Fp8TilePolicy::kM128N64) {
+    return launch_gemm_a2a_impl<
+        Fp8N64OutputGemm,
+        Fp8QkvGqaPackCommN64,
+        Fp8GemmA2AParams,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity);
+  }
+  if (tile == Fp8TilePolicy::kM128N256ClusterM2) {
+    return launch_gemm_a2a_impl<
+        Fp8WideOutputGemm,
+        Fp8QkvGqaPackCommWide,
+        Fp8GemmA2AParams,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity);
+  }
+  if (selected_fp8_pipeline(launch_params.gemm) ==
+      Fp8PipelinePolicy::kCooperative) {
+    return launch_gemm_a2a_impl<
+        Fp8CooperativeOutputGemm,
+        Fp8QkvGqaPackComm,
+        Fp8GemmA2AParams,
+        true>(
+            launch_params,
+            stream,
+            sm_count,
+            device,
+            timeline,
+            timeline_capacity);
+  }
+  return launch_gemm_a2a_impl<
+      Fp8OutputGemm,
+      Fp8QkvGqaPackComm,
+      Fp8GemmA2AParams,
+      true>(
+          launch_params,
+          stream,
+          sm_count,
+          device,
+          timeline,
+          timeline_capacity);
+}
+#endif
 
 cudaError_t launch_batched_cutlass_reference(
     const GemmA2AParams& params,
@@ -7566,8 +9122,8 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
   }
 }
 
-cudaError_t launch_dense_fp8_cutlass_reference(
-    const Fp8GemmA2AParams& params,
+cudaError_t launch_a2a_gemm_fp8_cutlass_reference(
+    const Fp8A2AGemmParams& params,
     cudaStream_t stream,
     int32_t reserved_comm_ctas) {
   int32_t sm_count = 0;
@@ -7577,12 +9133,27 @@ cudaError_t launch_dense_fp8_cutlass_reference(
     return status;
   }
   if (reserved_comm_ctas < 0 || reserved_comm_ctas >= sm_count ||
-      !params.lhs || !params.rhs_nt || !params.local_output ||
+      !params.input_staging || !params.rhs_nt || !params.output ||
       !supported_fp8_problem(params.gemm)) {
     return cudaErrorInvalidValue;
   }
+  if (selected_fp8_pipeline(params.gemm) ==
+      Fp8PipelinePolicy::kCooperative) {
+    return launch_a2a_lhs_reference_impl<Fp8CooperativePureGemm>(
+        params, stream, sm_count, device, reserved_comm_ctas);
+  }
+  return launch_a2a_lhs_reference_impl<Fp8PureGemm>(
+      params, stream, sm_count, device, reserved_comm_ctas);
+}
 
-  typename Fp8PureGemm::Arguments args{};
+template <class Gemm>
+cudaError_t launch_dense_fp8_reference_impl(
+    const Fp8GemmA2AParams& params,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device,
+    int32_t reserved_comm_ctas) {
+  typename Gemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.problem_shape =
       make_shape(params.gemm.m, params.gemm.n, params.gemm.k, params.gemm.l);
@@ -7605,20 +9176,59 @@ cudaError_t launch_dense_fp8_cutlass_reference(
   args.scheduler.max_swizzle_size = params.gemm.max_swizzle_size;
   args.scheduler.raster_order =
       raster_option(params.gemm.raster, RasterOptions::AlongM);
-  if (!Fp8PureGemm::can_implement(args) || Fp8PureGemm::get_workspace_size(args) != 0) {
+  if (!Gemm::can_implement(args) || Gemm::get_workspace_size(args) != 0) {
     return cudaErrorNotSupported;
   }
-  if (Fp8PureGemm::initialize_workspace(args, nullptr, stream) !=
+  if (Gemm::initialize_workspace(args, nullptr, stream) !=
       cutlass::Status::kSuccess) {
     return cudaErrorInitializationError;
   }
-  return launch_regular<Fp8PureGemm>(
-      Fp8PureGemm::to_underlying_arguments(args, nullptr), stream);
+  return launch_regular<Gemm>(
+      Gemm::to_underlying_arguments(args, nullptr), stream);
 }
 
-template <class Comm>
+cudaError_t launch_dense_fp8_cutlass_reference(
+    const Fp8GemmA2AParams& params,
+    cudaStream_t stream,
+    int32_t reserved_comm_ctas) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  if (reserved_comm_ctas < 0 || reserved_comm_ctas >= sm_count ||
+      !params.lhs || !params.rhs_nt || !params.local_output ||
+      !supported_fp8_problem(params.gemm)) {
+    return cudaErrorInvalidValue;
+  }
+
+  const Fp8TilePolicy tile = select_fp8_qkv_tile(
+      params.gemm,
+      params.route,
+      reserved_comm_ctas,
+      sm_count,
+      device);
+  if (tile == Fp8TilePolicy::kM128N64) {
+    return launch_dense_fp8_reference_impl<Fp8N64PureGemm>(
+        params, stream, sm_count, device, reserved_comm_ctas);
+  }
+  if (tile == Fp8TilePolicy::kM128N256ClusterM2) {
+    return launch_dense_fp8_reference_impl<Fp8WidePureGemm>(
+        params, stream, sm_count, device, reserved_comm_ctas);
+  }
+  if (selected_fp8_pipeline(params.gemm) ==
+      Fp8PipelinePolicy::kCooperative) {
+    return launch_dense_fp8_reference_impl<Fp8CooperativePureGemm>(
+        params, stream, sm_count, device, reserved_comm_ctas);
+  }
+  return launch_dense_fp8_reference_impl<Fp8PureGemm>(
+      params, stream, sm_count, device, reserved_comm_ctas);
+}
+
+template <class Comm, class ParamsType>
 cudaError_t launch_a2a_lhs_copy_reference_impl(
-    const A2AGemmParams& params, cudaStream_t stream) {
+    const ParamsType& params, cudaStream_t stream) {
     typename Comm::Arguments args{};
     args.params = params;
     cudaError_t status = Comm::initialize(args);
@@ -7665,6 +9275,16 @@ cudaError_t launch_a2a_gemm_copy_reference(
         params, stream);
   }
   return launch_a2a_lhs_copy_reference_impl<A2ALhsInputComm>(
+      params, stream);
+}
+
+cudaError_t launch_a2a_gemm_fp8_copy_reference(
+    const Fp8A2AGemmParams& params,
+    cudaStream_t stream) {
+  if (params.num_comm_ctas <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_a2a_lhs_copy_reference_impl<Fp8A2ALhsInputComm>(
       params, stream);
 }
 
@@ -7740,6 +9360,30 @@ cudaError_t launch_gemm_a2a_fp8_copy_reference(
       params.route.kind != RouteKind::kQkvGqaPack ||
       params.route.direction != RouteDirection::kForward) {
     return cudaErrorInvalidValue;
+  }
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const Fp8TilePolicy tile = select_fp8_qkv_tile(
+      params.gemm,
+      params.route,
+      params.num_comm_ctas,
+      sm_count,
+      device);
+  if (tile == Fp8TilePolicy::kM128N64) {
+    Fp8QkvGqaPackCommN64::Arguments args{};
+    args.params = params;
+    return launch_qkv_gqa_copy_reference<Fp8QkvGqaPackCommN64>(
+        args, params.num_comm_ctas, stream);
+  }
+  if (tile == Fp8TilePolicy::kM128N256ClusterM2) {
+    Fp8QkvGqaPackCommWide::Arguments args{};
+    args.params = params;
+    return launch_qkv_gqa_copy_reference<Fp8QkvGqaPackCommWide>(
+        args, params.num_comm_ctas, stream);
   }
   Fp8QkvGqaPackComm::Arguments args{};
   args.params = params;

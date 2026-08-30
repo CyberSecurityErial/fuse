@@ -77,6 +77,13 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
+add_executable(fp8_smoke "benchmarks/fp8/fp8_smoke.cu")
+target_link_libraries(fp8_smoke PRIVATE fuse_kernels CUDA::cudart)
+target_compile_options(
+  fp8_smoke
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+
 # Benchmark-only raw-pointer bridge for the PyTorch autograd conformance test.
 # It deliberately has no Torch dependency and does not change the production
 # ABI; Python owns all tensors and passes their current CUDA stream addresses.

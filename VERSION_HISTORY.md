@@ -570,3 +570,27 @@ Qwen 128K 的融合路径需要在不会并发使用的层之间复用临时通�
 该复用不跳过计算或改变依赖。完整逐点结果、测试边界与二进制指纹见
 [`benchmarks/e2e/BENCHMARK.md`](benchmarks/e2e/BENCHMARK.md) 和
 [`results/e2e`](results/e2e)。
+
+## v12.0：四条融合边界的纯 E4M3 版本
+
+状态：已发布。
+
+v12.0 为 QKV Projection+A2A、A2A+OProj 以及两条 backward 增加独立 FP8
+参数和入口，原有 BF16 类型、函数和布局保持不变。四条 FP8 路径的输入、权重、
+通信数据和输出都是 E4M3，Tensor Core 使用 FP32 累加，`alpha` 在写回 E4M3 前
+生效。amax、scale 和 BF16→FP8 量化由调用方负责，不属于本次 kernel 计时边界。
+
+QKV FP8 自动策略联合选择通信 CTA 与 N64/N128/N256 tile。代价模型使用 shape、
+CP/head 几何、通信字节、SM 数和 H200 FP8 wave 标定，不使用模型名、BF16 结果或
+逐 shape winner。N64 只在标定覆盖的物理 wave 范围内参与自动选择；超出 8 wave
+后回到较宽 tile，避免把短矩阵的细粒度收益错误外推到长序列。
+
+正式 QKV 使用 MPI 一进程一卡、CP4/CP8、10 warmup + 50 samples 和预上传 CUDA
+Graph。最终 96 点相对同 shape BF16 Graph 的 p50 几何平均为 `1.763×`，其中
+`85/96` 达到 `1.5×`。最终策略的机器可读 96 点汇总归档在
+[`results/fp8`](results/fp8)；未达到 1.5× 的短点如实保留，不做模型特判。
+
+`fp8_smoke` 对四条路径做确定性 E4M3 参考，检查 routed 输出、dX、dW、普通写入和
+ZeroBubble `beta=1` 累加。普通反向仍在同一 stream 内执行 B→W；ZeroBubble 仍由
+调用方在 B/W 间保留 W 所需输入。完整口径和复现命令见
+[`benchmarks/fp8/BENCHMARK.md`](benchmarks/fp8/BENCHMARK.md)。

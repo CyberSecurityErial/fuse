@@ -128,7 +128,15 @@ CUDA_VISIBLE_DEVICES=<devices> mpirun --bind-to none -np <CP> \
 
 所有设备端时间戳来自 SM90 `%globaltimer`，原始单位为 ns；JSON 中 `ts` 和 `dur` 按 Perfetto/Chrome trace 约定写成 μs。
 
-协议版本：9（对应 v11.0）
+协议版本：10（对应 v12.0）
+
+### v12 FP8 边界
+
+v12 的四条 FP8 路径沿用同一组通信、ready、compute、finalize 和 B→W 条带，
+但数据口径是纯 E4M3：输入、权重、通信数据和输出都已经量化为 E4M3，矩阵乘在
+FP32 中累加。profile 不包含 BF16→FP8 转换、amax 或 scale 计算；这些步骤由调用方
+在算子外完成。比较 FP8 与 BF16 trace 时，必须使用相同的 M/N/K、CP、Graph
+边界和 rank 启动方式，不能把量化准备时间只计在其中一侧。
 
 ### v10 反向算子的对应关系
 

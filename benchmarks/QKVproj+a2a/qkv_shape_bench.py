@@ -147,6 +147,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument("--seqs", type=parse_csv_ints, default=SEQUENCES)
     parser.add_argument("--cps", type=parse_csv_ints, default=CONTEXT_PARALLEL)
+    parser.add_argument(
+        "--precision",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="fused MPI precision; FP8 is pure E4M3 input/weight/route/output",
+    )
     parser.add_argument("--nccl-channels", type=parse_csv_ints, default=NCCL_CHANNELS)
     parser.add_argument("--nccl-chunk-kib", type=parse_csv_ints, default=NCCL_CHUNK_KIB)
     parser.add_argument("--nccl-ll-kib", type=parse_csv_ints, default=NCCL_LL_KIB)
@@ -470,6 +476,7 @@ def mpi_fuse_command(
         "--raster", str(config["raster"]),
         "--swizzle", str(config["swizzle"]),
         "--launch", launch,
+        "--precision", args.precision,
         "--warmup", str(args.formal_warmup),
         "--iterations", str(args.formal_iters),
         "--json-out", str(output.resolve()),
@@ -491,6 +498,7 @@ def mpi_result_matches(
     warmup: int,
     iters: int,
     auto_comm: bool,
+    precision: str,
 ) -> bool:
     if not path.exists():
         return False
@@ -499,11 +507,21 @@ def mpi_result_matches(
         shape = result["shape"]
         geometry = result.get("head_geometry", {})
         samples = result.get("samples_ms")
-        gemm_request, comm_request, policy_model = (
-            expected_qkv_policy_metadata()
-        )
+        if precision == "fp8":
+            gemm_request = "auto"
+            comm_request = "auto"
+            policy_model = "fp8_joint_tile_comm_signaling_wave_v4"
+            plan_cache = "comm_recommendation_only_v1"
+            result_precision = "fp8_e4m3"
+        else:
+            gemm_request, comm_request, policy_model = (
+                expected_qkv_policy_metadata()
+            )
+            plan_cache = "per_process_v1"
+            result_precision = "bf16"
         return (
             result["mode"] == "qkv_gemm_a2a_mpi"
+            and result.get("precision") == result_precision
             and result["launch"] == launch
             and result["world_size"] == cp
             and result["warmup"] == warmup
@@ -547,7 +565,7 @@ def mpi_result_matches(
             and result.get("qkv_policy_request") == gemm_request
             and result.get("qkv_comm_policy_request") == comm_request
             and result.get("qkv_policy_model") == policy_model
-            and result.get("launch_plan_cache") == "per_process_v1"
+            and result.get("launch_plan_cache") == plan_cache
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -1024,14 +1042,21 @@ def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
                 warmup=args.formal_warmup,
                 iters=args.formal_iters,
                 auto_comm=args.mpi_auto_comm,
+                precision=args.precision,
             ):
                 continue
             output.parent.mkdir(parents=True, exist_ok=True)
+            environment = gpu_env(cp)
+            if args.precision == "fp8":
+                # Formal FP8 results always exercise the production auto
+                # selector; manual tile/pipeline knobs are profile-only.
+                environment.pop("FUSE_FP8_GEMM_TILE", None)
+                environment.pop("FUSE_FP8_GEMM_PIPELINE", None)
             run(
                 mpi_fuse_command(
                     args, model, seq, cp, launch, config, output
                 ),
-                env=gpu_env(cp),
+                env=environment,
                 output=output,
                 resume=False,
             )
@@ -1045,6 +1070,7 @@ def run_fuse_mpi_formal(args: argparse.Namespace) -> None:
                 warmup=args.formal_warmup,
                 iters=args.formal_iters,
                 auto_comm=args.mpi_auto_comm,
+                precision=args.precision,
             ):
                 output.unlink(missing_ok=True)
                 raise RuntimeError(f"invalid MPI benchmark output: {output}")
@@ -1063,6 +1089,12 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
         config = configs[case_key]
         eager = load(mpi_fuse_path(args, model, seq, cp, "eager"))
         graph = load(mpi_fuse_path(args, model, seq, cp, "graph"))
+        expected_precision = "fp8_e4m3" if args.precision == "fp8" else "bf16"
+        if eager.get("precision") != expected_precision or \
+                graph.get("precision") != expected_precision:
+            raise ValueError(f"precision mismatch for {case_key}")
+        if eager.get("fp8_pipeline") != graph.get("fp8_pipeline"):
+            raise ValueError(f"eager/graph FP8 pipeline mismatch for {case_key}")
         if eager["shape"] != graph["shape"]:
             raise ValueError(f"eager/graph shape mismatch for {case_key}")
         if eager["kernel_traits"] != graph["kernel_traits"]:
@@ -1087,7 +1119,12 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
         graph_plan_cache = graph.get("launch_plan_cache")
         if eager_plan_cache != graph_plan_cache:
             raise ValueError(f"eager/graph launch-plan cache mismatch for {case_key}")
-        if eager_plan_cache != "per_process_v1":
+        expected_plan_cache = (
+            "comm_recommendation_only_v1"
+            if args.precision == "fp8"
+            else "per_process_v1"
+        )
+        if eager_plan_cache != expected_plan_cache:
             raise ValueError(f"unknown launch-plan cache for {case_key}")
         eager_requested_comm = eager.get("requested_comm_ctas")
         graph_requested_comm = graph.get("requested_comm_ctas")
@@ -1105,6 +1142,8 @@ def fuse_mpi_aggregate(args: argparse.Namespace) -> None:
         old = serial_by_key.get((model.name, seq, cp))
         rows.append({
             "model": model.name,
+            "precision": expected_precision,
+            "fp8_pipeline": eager.get("fp8_pipeline"),
             "suite": model.suite,
             "aliases": model.aliases,
             "global_seq": seq,

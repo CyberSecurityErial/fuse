@@ -115,6 +115,17 @@ const char* lhs_policy_name(fuse::A2ALhsGemmPolicy policy) {
   }
 }
 
+const char* fp8_pipeline_name(const Options& options) {
+  if (options.mode != "a2a_gemm_fp8" &&
+      options.mode != "qkv_gemm_a2a_fp8") {
+    return "not_applicable";
+  }
+  const char* value = std::getenv("FUSE_FP8_GEMM_PIPELINE");
+  return value != nullptr && std::strcmp(value, "cooperative") == 0
+      ? "cooperative"
+      : "pingpong";
+}
+
 fuse::A2ALhsGemmPolicy parse_lhs_policy(const std::string& value) {
   if (value == "auto") return fuse::A2ALhsGemmPolicy::kAuto;
   if (value == "m64n128") return fuse::A2ALhsGemmPolicy::kM64N128;
@@ -572,6 +583,22 @@ __global__ void count_u16_mismatch_kernel(
   }
   if (local) {
     atomicAdd(mismatches, local);
+  }
+}
+
+__global__ void count_u8_mismatch_kernel(
+    const uint8_t* lhs,
+    const uint8_t* rhs,
+    int64_t elements,
+    unsigned long long* count) {
+  unsigned long long local = 0;
+  for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    local += lhs[index] != rhs[index];
+  }
+  if (local != 0) {
+    atomicAdd(count, local);
   }
 }
 
@@ -1195,8 +1222,10 @@ void write_json(
          << "  \"dtype\": \""
          << (options.mode == "qkv_gemm_a2a_fp8" ||
                      options.mode == "a2a_gemm_fp8"
-                 ? "e4m3xe4m3_fp32acc_bfloat16out"
+                 ? "e4m3xe4m3_fp32acc_e4m3out"
                  : "bfloat16")
+         << "\",\n"
+         << "  \"fp8_pipeline\": \"" << fp8_pipeline_name(options)
          << "\",\n"
          << "  \"timing\": \"max-rank critical path\",\n"
          << "  \"overlap_ratio\": " << overlap << ",\n";
@@ -1607,6 +1636,258 @@ void benchmark_a2a_lhs_gemm(
   destroy_cublaslt_plan(cublaslt_plan);
 }
 
+void benchmark_fp8_a2a_lhs_gemm(
+    const Options& options,
+    int world,
+    const std::vector<Runtime>& runtime) {
+  const int m = options.m;
+  const int n = options.n;
+  const int k = options.k;
+  if (m % options.batch != 0 || options.q_heads % world != 0 ||
+      k != options.q_heads * options.head_dim) {
+    throw std::runtime_error(
+        "a2a_gemm_fp8 requires M divisible by B, Hq divisible by CP, "
+        "and K=Hq*D");
+  }
+  const int seq_local = m / options.batch;
+  if (seq_local % 2 != 0) {
+    throw std::runtime_error(
+        "a2a_gemm_fp8 causal load-balanced mapping requires even S_local");
+  }
+  const int global_seq = seq_local * world;
+  const int local_heads = options.q_heads / world;
+  const int64_t peer_input_elements =
+      static_cast<int64_t>(options.batch) * global_seq * local_heads *
+      options.head_dim;
+  const int64_t staging_elements = static_cast<int64_t>(m) * k;
+  const int64_t weight_elements = static_cast<int64_t>(n) * k;
+  const int64_t output_elements = static_cast<int64_t>(m) * n;
+
+  fuse::UlyssesRoute route{};
+  route.world_size = world;
+  route.batch = options.batch;
+  route.global_seq = global_seq;
+  route.seq_local = seq_local;
+  route.q_heads = options.q_heads;
+  route.local_heads = local_heads;
+  route.head_dim = options.head_dim;
+  route.causal_load_balanced = true;
+  route.cyclic_peer_order = true;
+  route.kind = fuse::RouteKind::kHeadToSequence;
+  route.direction = fuse::RouteDirection::kInverse;
+  fuse::GemmProblem problem{m, n, k, 1};
+  problem.input_dtype = fuse::DType::kFloat8E4M3;
+  problem.weight_dtype = fuse::DType::kFloat8E4M3;
+  problem.output_dtype = fuse::DType::kFloat8E4M3;
+  problem.raster = options.raster;
+  problem.max_swizzle_size = options.swizzle;
+  Options launch_options = options;
+  if (launch_options.comm_ctas == 0) {
+    launch_options.comm_ctas =
+        fuse::recommended_a2a_lhs_gemm_comm_ctas(problem, route);
+  }
+  const int64_t ready_count =
+      fuse::a2a_lhs_gemm_ready_elements(problem, route);
+
+  std::vector<Fp8E4m3*> peer_input(world);
+  std::vector<Fp8E4m3*> staging(world);
+  std::vector<Fp8E4m3*> weight(world);
+  std::vector<Fp8E4m3*> fused_output(world);
+  std::vector<Fp8E4m3*> reference_output(world);
+  std::vector<uint32_t*> ready(world);
+  std::vector<unsigned long long*> mismatch_count(world);
+  std::vector<fuse::Fp8A2AGemmParams> params(world);
+  for (int rank = 0; rank < world; ++rank) {
+    peer_input[rank] = allocate<Fp8E4m3>(rank, peer_input_elements);
+    staging[rank] = allocate<Fp8E4m3>(rank, staging_elements);
+    weight[rank] = allocate<Fp8E4m3>(rank, weight_elements);
+    fused_output[rank] = allocate<Fp8E4m3>(rank, output_elements);
+    reference_output[rank] = allocate<Fp8E4m3>(rank, output_elements);
+    ready[rank] = allocate<uint32_t>(rank, ready_count);
+    mismatch_count[rank] = allocate<unsigned long long>(rank, 1);
+    fill_fp8(
+        rank,
+        runtime[rank].stream,
+        peer_input[rank],
+        peer_input_elements,
+        2901 + rank);
+    fill_fp8(
+        rank,
+        runtime[rank].stream,
+        weight[rank],
+        weight_elements,
+        3003);
+    CUDA_CHECK(cudaMemsetAsync(
+        staging[rank],
+        0,
+        static_cast<size_t>(staging_elements) * sizeof(Fp8E4m3),
+        runtime[rank].stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        ready[rank],
+        0,
+        static_cast<size_t>(ready_count) * sizeof(uint32_t),
+        runtime[rank].stream));
+  }
+  synchronize(runtime);
+
+  for (int rank = 0; rank < world; ++rank) {
+    auto& p = params[rank];
+    for (int peer = 0; peer < world; ++peer) {
+      p.peer_input[peer] = peer_input[peer];
+    }
+    p.input_staging = staging[rank];
+    p.rhs_nt = weight[rank];
+    p.output = fused_output[rank];
+    p.ready = ready[rank];
+    p.gemm = problem;
+    p.route = route;
+    p.route.rank = rank;
+    p.num_comm_ctas = launch_options.comm_ctas;
+    p.lhs_policy = fuse::A2ALhsGemmPolicy::kM128N128;
+  }
+
+  uint32_t fused_epoch = 0;
+  const Launch fused_launch = [&](int rank, uint32_t epoch) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    params[rank].epoch = epoch;
+    params[rank].output = fused_output[rank];
+    CUDA_CHECK(fuse::launch_a2a_gemm_fp8_cutlass(
+        params[rank], runtime[rank].stream));
+  };
+  const auto fused = options.cuda_graph
+      ? time_all_ranks_graph_sequence(
+            runtime,
+            options.warmup,
+            options.iterations,
+            fused_epoch,
+            fused_launch)
+      : time_all_ranks(
+            runtime,
+            options.warmup,
+            options.iterations,
+            fused_epoch,
+            fused_launch);
+
+  uint32_t compute_epoch = 0;
+  const auto compute = time_all_ranks(
+      runtime,
+      options.warmup,
+      options.iterations,
+      compute_epoch,
+      [&](int rank, uint32_t) {
+        CUDA_CHECK(cudaSetDevice(rank));
+        params[rank].output = reference_output[rank];
+        CUDA_CHECK(fuse::launch_a2a_gemm_fp8_cutlass_reference(
+            params[rank], runtime[rank].stream, launch_options.comm_ctas));
+      });
+  uint32_t route_epoch = fused_epoch;
+  const auto inverse_route = time_all_ranks(
+      runtime,
+      options.warmup,
+      options.iterations,
+      route_epoch,
+      [&](int rank, uint32_t epoch) {
+        CUDA_CHECK(cudaSetDevice(rank));
+        params[rank].epoch = epoch;
+        CUDA_CHECK(fuse::launch_a2a_gemm_fp8_copy_reference(
+            params[rank], runtime[rank].stream));
+      });
+  uint32_t sequential_epoch = route_epoch;
+  const auto sequential = time_all_ranks(
+      runtime,
+      options.warmup,
+      options.iterations,
+      sequential_epoch,
+      [&](int rank, uint32_t epoch) {
+        CUDA_CHECK(cudaSetDevice(rank));
+        params[rank].epoch = epoch;
+        params[rank].output = reference_output[rank];
+        CUDA_CHECK(fuse::launch_a2a_gemm_fp8_copy_reference(
+            params[rank], runtime[rank].stream));
+        CUDA_CHECK(fuse::launch_a2a_gemm_fp8_cutlass_reference(
+            params[rank], runtime[rank].stream, launch_options.comm_ctas));
+      });
+
+  unsigned long long exact_mismatches = 0;
+  for (int rank = 0; rank < world; ++rank) {
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaMemsetAsync(
+        mismatch_count[rank],
+        0,
+        sizeof(unsigned long long),
+        runtime[rank].stream));
+    const int blocks = static_cast<int>(
+        std::min<int64_t>((output_elements + 255) / 256, 4096));
+    count_u8_mismatch_kernel<<<blocks, 256, 0, runtime[rank].stream>>>(
+        reinterpret_cast<const uint8_t*>(fused_output[rank]),
+        reinterpret_cast<const uint8_t*>(reference_output[rank]),
+        output_elements,
+        mismatch_count[rank]);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  synchronize(runtime);
+  for (int rank = 0; rank < world; ++rank) {
+    unsigned long long rank_mismatches = 0;
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaMemcpy(
+        &rank_mismatches,
+        mismatch_count[rank],
+        sizeof(rank_mismatches),
+        cudaMemcpyDeviceToHost));
+    exact_mismatches += rank_mismatches;
+  }
+  if (exact_mismatches != 0) {
+    throw std::runtime_error("FP8 fused A2A->GEMM output mismatch");
+  }
+
+  const double flops = 2.0 * m * n * k;
+  const double payload_bytes = static_cast<double>(m) * k * sizeof(Fp8E4m3);
+  const double compute_mean = summarize(compute).mean;
+  const double overlap = overlap_ratio(
+      summarize(fused).mean,
+      compute_mean,
+      summarize(inverse_route).mean);
+  std::cout << "FP8 HeadToSequence A2A->GEMM shape M=" << m
+            << " N=" << n << " K=" << k << " L=1 CP=" << world
+            << " B=" << options.batch << " S_global=" << global_seq
+            << " Hq=" << options.q_heads << " D=" << options.head_dim
+            << " comm_ctas=" << launch_options.comm_ctas
+            << " policy=m128n128 tile=128x128"
+            << " exact_mismatches=" << exact_mismatches << "\n";
+  print_result("same-policy FP8 CUTLASS", compute, flops, world, compute_mean);
+  print_copy_result("inverse FP8 A2A route", inverse_route, payload_bytes, world);
+  print_result(
+      "FP8 sequential",
+      sequential,
+      flops,
+      world,
+      compute_mean,
+      compute_mean);
+  print_result(
+      "fused FP8 A2A->GEMM",
+      fused,
+      flops,
+      world,
+      compute_mean,
+      compute_mean);
+  std::cout << "overlap_ratio=" << std::fixed << std::setprecision(1)
+            << overlap * 100.0 << "%\n";
+  write_json(
+      launch_options,
+      world,
+      1,
+      flops,
+      payload_bytes,
+      "inverse_fp8_a2a_route",
+      overlap,
+      {{"same_policy_cutlass", &compute},
+       {"inverse_fp8_a2a_route", &inverse_route},
+       {"same_policy_sequential", &sequential},
+       {"fused", &fused}},
+      nullptr,
+      static_cast<long long>(exact_mismatches));
+}
+
 void benchmark_qkv_gemm_a2a(
     const Options& options, int world, const std::vector<Runtime>& runtime) {
   const int m = options.m;
@@ -1867,16 +2148,17 @@ void benchmark_fp8_qkv_gemm_a2a(
 
   std::vector<Fp8E4m3*> lhs(world);
   std::vector<Fp8E4m3*> rhs_nt(world);
-  std::vector<Bf16*> local_output(world);
-  std::vector<Bf16*> peer_output(world);
+  std::vector<Fp8E4m3*> local_output(world);
+  std::vector<Fp8E4m3*> peer_output(world);
   std::vector<uint32_t*> ready(world);
   std::vector<uint32_t*> consumed_epoch(world);
   std::vector<fuse::Fp8GemmA2AParams> params(world);
   for (int rank = 0; rank < world; ++rank) {
     lhs[rank] = allocate<Fp8E4m3>(rank, static_cast<int64_t>(m) * k);
     rhs_nt[rank] = allocate<Fp8E4m3>(rank, static_cast<int64_t>(n) * k);
-    local_output[rank] = allocate<Bf16>(rank, static_cast<int64_t>(m) * n);
-    peer_output[rank] = allocate<Bf16>(
+    local_output[rank] =
+        allocate<Fp8E4m3>(rank, static_cast<int64_t>(m) * n);
+    peer_output[rank] = allocate<Fp8E4m3>(
         rank, static_cast<int64_t>(options.batch) * global_seq * local_width);
     ready[rank] = allocate<uint32_t>(rank, ready_count);
     consumed_epoch[rank] = allocate<uint32_t>(
@@ -1909,6 +2191,7 @@ void benchmark_fp8_qkv_gemm_a2a(
     params[rank].gemm = {m, n, k, 1};
     params[rank].gemm.input_dtype = fuse::DType::kFloat8E4M3;
     params[rank].gemm.weight_dtype = fuse::DType::kFloat8E4M3;
+    params[rank].gemm.output_dtype = fuse::DType::kFloat8E4M3;
     params[rank].gemm.raster = options.raster;
     params[rank].gemm.max_swizzle_size = options.swizzle;
     params[rank].route.world_size = world;
@@ -1992,7 +2275,8 @@ void benchmark_fp8_qkv_gemm_a2a(
   const double cutlass_mean = summarize(cutlass).mean;
   const double reserved_mean = summarize(reserved_cutlass).mean;
   const double qk_a2a_bytes = static_cast<double>(m) *
-      (options.q_heads + options.kv_heads) * options.head_dim * sizeof(Bf16);
+      (options.q_heads + options.kv_heads) * options.head_dim *
+      sizeof(Fp8E4m3);
   const double copy_payload_bytes = qk_a2a_bytes;
   std::cout << "FP8 QKV-GQA GEMM->A2A shape M=" << m << " N=" << n
             << " K=" << k << " Hq=" << options.q_heads
@@ -2006,7 +2290,7 @@ void benchmark_fp8_qkv_gemm_a2a(
       world,
       0.0,
       cutlass_mean);
-  print_copy_result("Q/K BF16 A2A route", copy, copy_payload_bytes, world);
+  print_copy_result("Q/K FP8 A2A route", copy, copy_payload_bytes, world);
   print_result("FP8 GEMM+A2A seq", sequential, flops, world, 0.0, cutlass_mean);
   print_result("fused FP8 QKV+A2A", fused, flops, world, 0.0, cutlass_mean);
   std::cout << "fused_vs_compute_subgrid=" << std::fixed << std::setprecision(1)
@@ -2014,7 +2298,7 @@ void benchmark_fp8_qkv_gemm_a2a(
   const double overlap =
       overlap_ratio(summarize(fused).mean, cutlass_mean, summarize(copy).mean);
   std::cout << "overlap_ratio=" << std::fixed << std::setprecision(1)
-            << overlap * 100.0 << "% (FP8 CUTLASS + BF16 QKV route)\n";
+            << overlap * 100.0 << "% (FP8 CUTLASS + FP8 QKV route)\n";
   Options resolved = options;
   resolved.n = n;
   write_json(
@@ -2036,7 +2320,8 @@ void validate_fast_path(const Options& options, int world) {
   const auto traits = fuse::cutlass_kernel_traits();
   const bool qkv = options.mode == "qkv_gemm_a2a" ||
       options.mode == "qkv_gemm_a2a_fp8";
-  const bool lhs_input = options.mode == "a2a_gemm_lhs";
+  const bool lhs_input = options.mode == "a2a_gemm_lhs" ||
+      options.mode == "a2a_gemm_fp8";
   const int n = qkv
       ? (options.q_heads + 2 * options.kv_heads) * options.head_dim
       : options.n;
@@ -2068,7 +2353,8 @@ void validate_fast_path(const Options& options, int world) {
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
-    if (options.cuda_graph && options.mode != "a2a_gemm_lhs") {
+    if (options.cuda_graph && options.mode != "a2a_gemm_lhs" &&
+        options.mode != "a2a_gemm_fp8") {
       throw std::runtime_error(
           "--cuda-graph currently supports only --mode a2a_gemm_lhs");
     }
@@ -2086,14 +2372,16 @@ int main(int argc, char** argv) {
     const auto runtime = initialize_runtime(world);
     if (options.mode == "a2a_gemm_lhs") {
       benchmark_a2a_lhs_gemm(options, world, runtime);
+    } else if (options.mode == "a2a_gemm_fp8") {
+      benchmark_fp8_a2a_lhs_gemm(options, world, runtime);
     } else if (options.mode == "qkv_gemm_a2a") {
       benchmark_qkv_gemm_a2a(options, world, runtime);
     } else if (options.mode == "qkv_gemm_a2a_fp8") {
       benchmark_fp8_qkv_gemm_a2a(options, world, runtime);
     } else {
       throw std::runtime_error(
-          "--mode must be a2a_gemm_lhs, qkv_gemm_a2a, or "
-          "qkv_gemm_a2a_fp8");
+          "--mode must be a2a_gemm_lhs, a2a_gemm_fp8, "
+          "qkv_gemm_a2a, or qkv_gemm_a2a_fp8");
     }
     return 0;
   } catch (const std::exception& error) {

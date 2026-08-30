@@ -180,7 +180,8 @@ void cublas_nt(
       CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-float max_abs_diff(const std::vector<Bf16>& lhs, const std::vector<Bf16>& rhs) {
+template <class T>
+float max_abs_diff(const std::vector<T>& lhs, const std::vector<T>& rhs) {
   if (lhs.size() != rhs.size()) {
     throw std::runtime_error("comparison size mismatch");
   }
@@ -197,9 +198,10 @@ struct ErrorMetrics {
   double relative_l2 = 0.0;
 };
 
+template <class T>
 ErrorMetrics error_metrics(
-    const std::vector<Bf16>& actual,
-    const std::vector<Bf16>& expected) {
+    const std::vector<T>& actual,
+    const std::vector<T>& expected) {
   if (actual.size() != expected.size()) {
     throw std::runtime_error("comparison size mismatch");
   }
@@ -366,7 +368,8 @@ void smoke_qkv_gqa_pack(
     lhs[rank] = device_alloc<Bf16>(rank, host_lhs.size());
     rhs_nt[rank] = device_alloc<Bf16>(rank, host_rhs.size());
     local_output[rank] = device_alloc<Bf16>(rank, static_cast<size_t>(d_batch));
-    reference_local[rank] = device_alloc<Bf16>(rank, static_cast<size_t>(d_batch));
+    reference_local[rank] =
+        device_alloc<Bf16>(rank, static_cast<size_t>(d_batch));
     peer_output[rank] = device_alloc<Bf16>(rank, peer_elements);
     ready[rank] = device_alloc<uint32_t>(rank, ready_count);
     consumed_epoch[rank] = device_alloc<uint32_t>(
@@ -595,9 +598,9 @@ void smoke_fp8_qkv_gqa_pack(
 
   std::vector<Fp8E4m3*> lhs(world);
   std::vector<Fp8E4m3*> rhs_nt(world);
-  std::vector<Bf16*> local_output(world);
-  std::vector<Bf16*> reference_local(world);
-  std::vector<Bf16*> peer_output(world);
+  std::vector<Fp8E4m3*> local_output(world);
+  std::vector<Fp8E4m3*> reference_local(world);
+  std::vector<Fp8E4m3*> peer_output(world);
   std::vector<uint32_t*> ready(world);
   std::vector<uint32_t*> consumed_epoch(world);
   std::vector<fuse::Fp8GemmA2AParams> params(world);
@@ -621,9 +624,11 @@ void smoke_fp8_qkv_gqa_pack(
     }
     lhs[rank] = device_alloc<Fp8E4m3>(rank, host_lhs.size());
     rhs_nt[rank] = device_alloc<Fp8E4m3>(rank, host_rhs.size());
-    local_output[rank] = device_alloc<Bf16>(rank, static_cast<size_t>(d_batch));
-    reference_local[rank] = device_alloc<Bf16>(rank, static_cast<size_t>(d_batch));
-    peer_output[rank] = device_alloc<Bf16>(rank, peer_elements);
+    local_output[rank] =
+        device_alloc<Fp8E4m3>(rank, static_cast<size_t>(d_batch));
+    reference_local[rank] =
+        device_alloc<Fp8E4m3>(rank, static_cast<size_t>(d_batch));
+    peer_output[rank] = device_alloc<Fp8E4m3>(rank, peer_elements);
     ready[rank] = device_alloc<uint32_t>(rank, ready_count);
     consumed_epoch[rank] = device_alloc<uint32_t>(
         rank, world * fuse::kReadyFlagStride);
@@ -632,17 +637,17 @@ void smoke_fp8_qkv_gqa_pack(
     CUDA_CHECK(cudaMemsetAsync(
         local_output[rank],
         0,
-        static_cast<size_t>(d_batch) * sizeof(Bf16),
+        static_cast<size_t>(d_batch) * sizeof(Fp8E4m3),
         runtimes[rank].stream));
     CUDA_CHECK(cudaMemsetAsync(
         reference_local[rank],
         0,
-        static_cast<size_t>(d_batch) * sizeof(Bf16),
+        static_cast<size_t>(d_batch) * sizeof(Fp8E4m3),
         runtimes[rank].stream));
     CUDA_CHECK(cudaMemsetAsync(
         peer_output[rank],
         0,
-        peer_elements * sizeof(Bf16),
+        peer_elements * sizeof(Fp8E4m3),
         runtimes[rank].stream));
     CUDA_CHECK(cudaMemsetAsync(
         ready[rank],
@@ -668,6 +673,7 @@ void smoke_fp8_qkv_gqa_pack(
     params[rank].gemm.stride_d = {d_row, 1, d_batch};
     params[rank].gemm.input_dtype = fuse::DType::kFloat8E4M3;
     params[rank].gemm.weight_dtype = fuse::DType::kFloat8E4M3;
+    params[rank].gemm.output_dtype = fuse::DType::kFloat8E4M3;
     params[rank].route.world_size = world;
     params[rank].route.rank = rank;
     params[rank].route.batch = batch;
@@ -708,8 +714,8 @@ void smoke_fp8_qkv_gqa_pack(
     sync_all(runtimes);
   }
 
-  std::vector<std::vector<Bf16>> host_reference_local(world);
-  std::vector<Bf16> rank0_actual_local;
+  std::vector<std::vector<Fp8E4m3>> host_reference_local(world);
+  std::vector<Fp8E4m3> rank0_actual_local;
   float local_worst = 0.0f;
   for (int rank = 0; rank < world; ++rank) {
     host_reference_local[rank] =
@@ -729,7 +735,7 @@ void smoke_fp8_qkv_gqa_pack(
         download(0, lhs[0], static_cast<size_t>(a_batch));
     const auto host_rhs =
         download(0, rhs_nt[0], static_cast<size_t>(b_batch));
-    std::vector<Bf16> cpu_output(static_cast<size_t>(d_batch));
+    std::vector<Fp8E4m3> cpu_output(static_cast<size_t>(d_batch));
     for (int row = 0; row < m; ++row) {
       for (int column = 0; column < n; ++column) {
         float accumulator = 0.0f;
@@ -739,7 +745,7 @@ void smoke_fp8_qkv_gqa_pack(
               static_cast<float>(host_rhs[static_cast<size_t>(column) * b_row + inner]);
         }
         cpu_output[static_cast<size_t>(row) * d_row + column] =
-            Bf16(params[0].alpha * accumulator);
+            Fp8E4m3(params[0].alpha * accumulator);
       }
     }
     cpu_gemm_error = error_metrics(rank0_actual_local, cpu_output);
@@ -747,7 +753,7 @@ void smoke_fp8_qkv_gqa_pack(
 
   ErrorMetrics worst{};
   for (int destination = 0; destination < world; ++destination) {
-    std::vector<Bf16> expected(peer_elements);
+    std::vector<Fp8E4m3> expected(peer_elements);
     for (int source = 0; source < world; ++source) {
       for (int batch_index = 0; batch_index < batch; ++batch_index) {
         for (int sequence = 0; sequence < seq_local; ++sequence) {
@@ -761,11 +767,11 @@ void smoke_fp8_qkv_gqa_pack(
             const int local_feature_base = segment == 0 ? 0 : q_local_width;
             for (int local_head = 0; local_head < heads_per_rank; ++local_head) {
               const int global_head = destination * heads_per_rank + local_head;
-              const Bf16* source_feature =
+              const Fp8E4m3* source_feature =
                   host_reference_local[source].data() +
                   static_cast<size_t>(source_row) * d_row + global_feature_base +
                   global_head * head_dim;
-              Bf16* destination_feature =
+              Fp8E4m3* destination_feature =
                   expected.data() +
                   (static_cast<size_t>(batch_index) * global_seq + global_sequence) *
                       local_width +

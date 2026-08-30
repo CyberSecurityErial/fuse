@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益；v12.0 为这四条边界增加纯 E4M3 FP8 版本。
 
 Attention 输出按 head 分片：
 
@@ -145,7 +145,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v11.2（生产 kernel 不变；新增四算子完整训练 E2E 验证）
+当前版本：v12.0（四条投影/通信边界新增纯 E4M3 FP8 版本）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -196,6 +196,13 @@ geometry 的 1K–128K 共 15 个 setting 全部提速，完整 step 吞吐几�
 `2.09%`，最大提升为 Nanbeige 16K 的 `4.26%`。该时间包含前向、激活重计算、
 反向与优化器，不是把四个 microbenchmark 的收益简单相加。
 
+v12.0 的 FP8 benchmark 使用纯 E4M3 输入、权重、通信数据和输出，FP32 累加；
+量化、amax 和 scale 由调用方负责。最终 QKV CUDA Graph 96 点相对同 shape BF16
+Graph 的 p50 几何平均为 `1.763×`，`85/96` 达到 `1.5×`。没有达到 1.5× 的
+短矩阵继续保留，因为固定通信与同步成本不会随 Tensor Core FLOPS 同比例下降。
+最终机器可读结果与四条路径的确定性正确性入口见
+[`四算子 FP8 benchmark`](benchmarks/fp8/BENCHMARK.md)。
+
 完整数据与复现流程：
 
 - [A2A + O-projection benchmark](benchmarks/a2a+Oproj/BENCHMARK.md)
@@ -204,4 +211,5 @@ geometry 的 1K–128K 共 15 个 setting 全部提速，完整 step 吞吐几�
 - [QKV Projection backward benchmark](benchmarks/QKVproj-backward/BENCHMARK.md)
 - [Output Projection backward benchmark](benchmarks/Oproj-backward/BENCHMARK.md)
 - [四算子完整训练 E2E benchmark](benchmarks/e2e/BENCHMARK.md)
+- [四算子 FP8 benchmark](benchmarks/fp8/BENCHMARK.md)
 - [版本演进](VERSION_HISTORY.md)

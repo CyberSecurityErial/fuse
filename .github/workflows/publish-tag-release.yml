@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v11.2
+        default: v12.0
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v11.2");
+              : (process.env.REQUESTED_TAG || "v12.0");
 
             const releases = {
               "v1.0": {
@@ -234,6 +234,20 @@ jobs:
                   "🩵 **Nanbeige4.2-3B、Llama-3 8B geometry、Qwen2.5 7B geometry 各覆盖 1K/4K/16K/64K/128K，共 15 个 setting，融合侧 15/15 全部获胜；全部点的 E2E 吞吐几何平均提升 2.09%，最大提升为 Nanbeige 16K 的 4.26%。**",
                   "",
                   "Qwen 128K 通过在不会并发使用的层之间复用融合算子临时工作区装入显存；该复用不跳过计算、不改变数据依赖。生产 kernel 与 v11.0/v11.1 保持一致。",
+                ].join("\n"),
+              },
+              "v12.0": {
+                name: "v12.0 — 四算子纯 E4M3 融合",
+                body: [
+                  "v12.0 为 QKV Projection+A2A、A2A+OProj 以及两条 backward 增加纯 E4M3 路径，原有 BF16 接口保持不变。",
+                  "",
+                  "输入、权重、通信数据和输出均为 E4M3，Tensor Core 使用 FP32 累加。调用方负责 amax、scale 和 BF16→FP8 量化；这些准备工作不在本轮 kernel benchmark 的计时边界内。",
+                  "",
+                  "QKV 自动策略在 N64/N128/N256 中联合选择 tile 与通信 CTA，只读取 shape、CP/head 几何、通信量、SM 数和 H200 FP8 wave 标定，不读取模型名或逐点赢家。N64 超出 8 个标定 wave 后回到较宽 tile。",
+                  "",
+                  "🩵 **最终 96 点 CUDA Graph 相对同 shape BF16 Graph 的 p50 几何平均为 1.763×，85/96 达到 1.5×。未过 1.5× 的短点如实保留，没有按模型特判。**",
+                  "",
+                  "两条 backward 保持普通同流 B→W 和 ZeroBubble 分离 B/W 两种语义；确定性 smoke 检查 routed 输出、dX、dW、普通写入和 beta=1 累加。正式 QKV 口径为 MPI 一进程一卡、CP4/CP8、10 warmup + 50 samples 和预上传 CUDA Graph。",
                 ].join("\n"),
               },
             };

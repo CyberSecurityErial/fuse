@@ -2281,16 +2281,17 @@ void benchmark_fp8_qkv_gemm_a2a(
 
   std::vector<Fp8E4m3*> lhs(world);
   std::vector<Fp8E4m3*> rhs_nt(world);
-  std::vector<Bf16*> local_output(world);
-  std::vector<Bf16*> peer_output(world);
+  std::vector<Fp8E4m3*> local_output(world);
+  std::vector<Fp8E4m3*> peer_output(world);
   std::vector<uint32_t*> ready(world);
   std::vector<uint32_t*> consumed_epoch(world);
   std::vector<fuse::Fp8GemmA2AParams> params(world);
   for (int rank = 0; rank < world; ++rank) {
     lhs[rank] = allocate<Fp8E4m3>(rank, static_cast<int64_t>(m) * k);
     rhs_nt[rank] = allocate<Fp8E4m3>(rank, static_cast<int64_t>(n) * k);
-    local_output[rank] = allocate<Bf16>(rank, static_cast<int64_t>(m) * n);
-    peer_output[rank] = allocate<Bf16>(
+    local_output[rank] =
+        allocate<Fp8E4m3>(rank, static_cast<int64_t>(m) * n);
+    peer_output[rank] = allocate<Fp8E4m3>(
         rank, static_cast<int64_t>(options.batch) * global_seq * local_width);
     ready[rank] = allocate<uint32_t>(rank, ready_count);
     consumed_epoch[rank] = allocate<uint32_t>(
@@ -2323,6 +2324,7 @@ void benchmark_fp8_qkv_gemm_a2a(
     params[rank].gemm = {m, n, k, 1};
     params[rank].gemm.input_dtype = fuse::DType::kFloat8E4M3;
     params[rank].gemm.weight_dtype = fuse::DType::kFloat8E4M3;
+    params[rank].gemm.output_dtype = fuse::DType::kFloat8E4M3;
     params[rank].gemm.raster = options.raster;
     params[rank].gemm.max_swizzle_size = options.swizzle;
     params[rank].route.world_size = world;
@@ -2406,7 +2408,8 @@ void benchmark_fp8_qkv_gemm_a2a(
   const double cutlass_mean = summarize(cutlass).mean;
   const double reserved_mean = summarize(reserved_cutlass).mean;
   const double qk_a2a_bytes = static_cast<double>(m) *
-      (options.q_heads + options.kv_heads) * options.head_dim * sizeof(Bf16);
+      (options.q_heads + options.kv_heads) * options.head_dim *
+      sizeof(Fp8E4m3);
   const double copy_payload_bytes = qk_a2a_bytes;
   std::cout << "FP8 QKV-GQA GEMM->A2A shape M=" << m << " N=" << n
             << " K=" << k << " Hq=" << options.q_heads
@@ -2420,7 +2423,7 @@ void benchmark_fp8_qkv_gemm_a2a(
       world,
       0.0,
       cutlass_mean);
-  print_copy_result("Q/K BF16 A2A route", copy, copy_payload_bytes, world);
+  print_copy_result("Q/K FP8 A2A route", copy, copy_payload_bytes, world);
   print_result("FP8 GEMM+A2A seq", sequential, flops, world, 0.0, cutlass_mean);
   print_result("fused FP8 QKV+A2A", fused, flops, world, 0.0, cutlass_mean);
   std::cout << "fused_vs_compute_subgrid=" << std::fixed << std::setprecision(1)
@@ -2428,7 +2431,7 @@ void benchmark_fp8_qkv_gemm_a2a(
   const double overlap =
       overlap_ratio(summarize(fused).mean, cutlass_mean, summarize(copy).mean);
   std::cout << "overlap_ratio=" << std::fixed << std::setprecision(1)
-            << overlap * 100.0 << "% (FP8 CUTLASS + BF16 QKV route)\n";
+            << overlap * 100.0 << "% (FP8 CUTLASS + FP8 QKV route)\n";
   Options resolved = options;
   resolved.n = n;
   write_json(

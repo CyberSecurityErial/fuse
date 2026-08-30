@@ -29,12 +29,17 @@ struct GemmA2AParams {
   float alpha = 1.0f;
 };
 
-// E4M3 projection with FP32 accumulation and BF16 routed output.
+// Explicit precision name for new integrations.  GemmA2AParams remains the
+// source-compatible BF16 spelling used by existing callers.
+using Bf16GemmA2AParams = GemmA2AParams;
+
+// E4M3 projection with FP32 accumulation and E4M3 routed output. The caller
+// owns quantization scales/amax; alpha is applied before E4M3 rounding.
 struct Fp8GemmA2AParams {
   const Fp8E4m3* lhs;
   const Fp8E4m3* rhs_nt;
-  Bf16* local_output;
-  Bf16* peer_output[kMaxWorldSize];
+  Fp8E4m3* local_output;
+  Fp8E4m3* peer_output[kMaxWorldSize];
   uint32_t* peer_route_done_epoch[kMaxWorldSize]{};
   uint32_t* ready;
   uint32_t* completion_epoch = nullptr;
@@ -57,7 +62,16 @@ KernelTraits qkv_cutlass_kernel_traits(
     const UlyssesRoute& route,
     int32_t num_comm_ctas,
     int32_t sm_count);
+// Conservative FP8 capacity/resource query. The N64 geometry has the finest
+// ready-flag granularity and the largest production shared-storage footprint;
+// this overload does not claim that auto will launch N64.
 KernelTraits fp8_cutlass_kernel_traits();
+// Actual FP8 auto geometry for a resolved positive communication-CTA count.
+KernelTraits fp8_cutlass_kernel_traits(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    int32_t num_comm_ctas,
+    int32_t sm_count);
 
 int32_t recommended_gemm_a2a_comm_ctas(
     const GemmProblem& problem,
@@ -78,6 +92,14 @@ cudaError_t launch_gemm_a2a_role_telemetry(
 cudaError_t launch_gemm_a2a_fp8_cutlass(
     const Fp8GemmA2AParams& params,
     cudaStream_t stream);
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_gemm_a2a_fp8_role_telemetry(
+    const Fp8GemmA2AParams& params,
+    A2AGemmCtaTimeline* timeline,
+    int32_t timeline_capacity,
+    cudaStream_t stream);
+#endif
 
 cudaError_t launch_batched_cutlass_reference(
     const GemmA2AParams& params,
