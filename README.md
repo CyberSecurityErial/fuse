@@ -1,6 +1,6 @@
 # Ulysses GEMM + All-to-All Fusion
 
-单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace，原有前向热路径不变。
+单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益。
 
 Attention 输出按 head 分片：
 
@@ -145,7 +145,7 @@ python3 'benchmarks/QKVproj+a2a/qkv_shape_bench.py' \
 
 实验设置：单机 8×H200、NVLink、每卡 132 SM、BF16、CUDA 12.8；10 次 warmup + 50 次采样，表内延迟为跨 rank 最大值的 p50。最优分离实现取调优后的 TE+NCCL 与 cuBLASLt+NCCL 中较快者；纯 GEMM 百分比固定对比经典 cuBLAS。吞吐只计算 GEMM FLOPs，延迟包含通信。
 
-当前版本：v11.0（v10.0 反向语义不变；补齐 autograd、TE 强基线与前后向 trace）
+当前版本：v11.2（生产 kernel 不变；新增四算子完整训练 E2E 验证）
 
 | 启动口径 | CP4 对最强外部 | CP8 对最强外部 | 总胜场 | 纯 GEMM 中位数（CP4 / CP8） |
 |---|---:|---:|---:|---:|
@@ -190,6 +190,12 @@ backward 对照覆盖两种布局、CP4/CP8、batch=2、宽 GQA、普通与 Zero
 16 组，全部通过；ZeroBubble 连续两次 `beta=1` 累加的最大绝对误差为
 `0.0009765625`。
 
+v11.2 的完整训练对照同时替换 QKV/OProj 前向和反向，原生侧与融合侧均开启
+full-iteration CUDA Graph。Nanbeige、Llama-3 8B geometry、Qwen2.5 7B
+geometry 的 1K–128K 共 15 个 setting 全部提速，完整 step 吞吐几何平均提升
+`2.09%`，最大提升为 Nanbeige 16K 的 `4.26%`。该时间包含前向、激活重计算、
+反向与优化器，不是把四个 microbenchmark 的收益简单相加。
+
 完整数据与复现流程：
 
 - [A2A + O-projection benchmark](benchmarks/a2a+Oproj/BENCHMARK.md)
@@ -197,4 +203,5 @@ backward 对照覆盖两种布局、CP4/CP8、batch=2、宽 GQA、普通与 Zero
 - [锁频异构 CP benchmark](benchmarks/heterogeneous_cp/BENCHMARK.md)
 - [QKV Projection backward benchmark](benchmarks/QKVproj-backward/BENCHMARK.md)
 - [Output Projection backward benchmark](benchmarks/Oproj-backward/BENCHMARK.md)
+- [四算子完整训练 E2E benchmark](benchmarks/e2e/BENCHMARK.md)
 - [版本演进](VERSION_HISTORY.md)

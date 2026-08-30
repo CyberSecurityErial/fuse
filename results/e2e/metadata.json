@@ -1,0 +1,29 @@
+{
+  "release": "v11.2",
+  "scope": "four fused projection/A2A boundaries in full training",
+  "dtype": "bfloat16",
+  "cuda_graph": "full_iteration",
+  "train_iterations": 10,
+  "capture_iteration": 4,
+  "measured_iterations": [5, 6, 7, 8, 9, 10],
+  "megatron_core": "0.16.1",
+  "transformer_engine_revision": "a7aec214eb5c3969984a40c3accb6d66987d8f25",
+  "weaveop_base_revision": "4fb4ad5e0d7988b4e65eae64baf3aee05ab3807b",
+  "fused_extension_sha256": "7c945ed1ed496beac77ce932ac5b9847a7bbd1f5679d53f753757f4be70eb886",
+  "data": "mock tokens",
+  "initialization": "random, identical configuration and seed per A/B",
+  "cp8_devices": [0, 1, 2, 3, 4, 5, 6, 7],
+  "cp4_devices": [0, 1, 2, 3],
+  "sm_clock_mhz": [1980, 1500, 1980, 1500, 1980, 1980, 1500, 1980],
+  "memory_clock_mhz": 3201,
+  "optional_checkpoint_forward_reuse": false,
+  "optional_attention_state_reuse": false,
+  "optional_wgrad_stream_overlap": false,
+  "qwen_128k_shared_operator_workspace": true,
+  "speedup_definition": "native_graph_ms / fused_graph_ms",
+  "notes": [
+    "The table reports complete training-step time including forward, recompute, backward, and optimizer.",
+    "The first Nanbeige 128K native run overlapped an external bwtest and was discarded; the published row uses an exclusive rerun.",
+    "Qwen 128K reuses temporary operator workspaces across non-overlapping layers to fit memory; no computation is skipped."
+  ]
+}

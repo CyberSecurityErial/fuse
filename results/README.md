@@ -56,6 +56,10 @@ Committed directories:
   TE+NCCL 对照。两个算子的生产接口与自动策略仍独立。
 - `backward_autograd_validation.json`: PyTorch forward→autograd backward 的逐张量
   正确性记录，覆盖 CP4/CP8、两种布局、batch=2、宽 GQA、普通与 ZeroBubble。
+- `e2e/four_operator_graph_summary.csv` 与 `e2e/metadata.json`: v11.2 的完整训练
+  CUDA Graph 对照。它同时替换 QKV/OProj 前向和反向，覆盖三种模型 geometry、
+  五档序列长度和 CP4/CP8，保存原生/融合完整 step 时间、加速比、采样步骤和
+  Qwen 128K 的临时工作区复用说明。
 - `heterogeneous-cp/locked_frequency_summary.csv`: v9.0 两个独立 weighted 算子的22点锁频矩阵。它覆盖CP2/4/6/8、不同慢卡数量和本地M=2048/16384，保存实际设备组合、连续行分区、通信CTA、uniform/weighted p50及加速比。该矩阵为BF16、5次warmup + 30次采样、逐样本max-rank，并启用逐元素完全一致检查；它不覆盖自动DVFS或未经实测的HBM/NVLink降频。
 - `heterogeneous-cp/shape_generalization_summary.csv`: v9.1 选取五种真实模型宽度与原v9控制shape的18点复核，覆盖CP4/CP8和本地M=2048/16384。启用weighted的19个算子点全部提升并通过exact BF16检查，17个点安全回退；该复核用于限定功耗安全域，不宣称全量MNK覆盖。
 
