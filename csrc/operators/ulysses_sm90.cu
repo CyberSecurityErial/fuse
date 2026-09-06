@@ -41,9 +41,11 @@
 #include "ulysses_sm90/detail/backward.cuh"
 #include "ulysses_sm90/detail/gemm_a2a.cuh"
 #include "ulysses_sm90/detail/launch.cuh"
+#include "ulysses_sm90/detail/mxfp8.cuh"
 
 // Public API implementations, grouped by responsibility rather than appended
 // behind the device code that they launch.
+#include "ulysses_sm90/api/mxfp8.cuh"
 #include "ulysses_sm90/api/backward.cuh"
 #include "ulysses_sm90/api/policy.cuh"
 #include "ulysses_sm90/api/heterogeneous.cuh"

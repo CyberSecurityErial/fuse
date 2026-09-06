@@ -508,4 +508,92 @@ cudaError_t launch_gemm_a2a_fp8_role_telemetry(
 }
 #endif
 
+cudaError_t launch_gemm_a2a_mxfp8_cutlass(
+    const Mxfp8GemmA2AParams& params,
+    cudaStream_t stream) {
+  // Only weight storage changes. The existing BF16 launch owns all route,
+  // epoch, alignment and policy validation; no second communication path.
+  // QKV forward, unlike OProj backward, only implements rank-major rows
+  // in the existing BF16/FP8 route. Never silently accept a causal request.
+  if (params.route.causal_load_balanced || params.route.qkv_peer_interleaved ||
+      params.route.batch != 1 ||
+      params.gemm.l != 1 || params.gemm.transpose_b ||
+      params.gemm.weight_dtype != DType::kBfloat16 ||
+      (params.gemm.stride_b.row != -1 &&
+       params.gemm.stride_b.row != params.gemm.k) ||
+      (params.gemm.stride_b.column != -1 && params.gemm.stride_b.column != 1)) {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t status = validate_mxfp8_weight(
+      params.weight, params.weight_workspace, params.gemm.n, params.gemm.k);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  GemmA2AParams launch{};
+  launch.lhs = params.lhs;
+  launch.local_output = params.local_output;
+  launch.ready = params.ready;
+  launch.completion_epoch = params.completion_epoch;
+  launch.gemm = params.gemm;
+  launch.route = params.route;
+  launch.num_comm_ctas = params.num_comm_ctas;
+  launch.epoch = params.epoch;
+  launch.alpha = params.alpha;
+  launch.rhs_nt = params.weight_workspace.data;
+  for (int peer = 0; peer < kMaxWorldSize; ++peer) {
+    launch.peer_output[peer] = params.peer_output[peer];
+    launch.peer_route_done_epoch[peer] = params.peer_route_done_epoch[peer];
+  }
+  status = launch_mxfp8_weight_dequant(
+      params.weight, params.weight_workspace, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_gemm_a2a_cutlass(launch, stream);
+}
+
+cudaError_t launch_a2a_gemm_mxfp8_cutlass(
+    const Mxfp8A2AGemmParams& params,
+    cudaStream_t stream) {
+  // Only weight storage changes. The existing BF16 launch owns all route,
+  // epoch, alignment and policy validation; no second communication path.
+  // Cyclic K prepacking would need a matching inverse transform in B; this
+  // baseline deliberately shares one canonical forward weight with backward.
+  if (params.route.cyclic_peer_order || params.route.batch != 1 ||
+      params.gemm.l != 1 || params.gemm.transpose_b ||
+      params.gemm.weight_dtype != DType::kBfloat16 ||
+      (params.gemm.stride_b.row != -1 &&
+       params.gemm.stride_b.row != params.gemm.k) ||
+      (params.gemm.stride_b.column != -1 && params.gemm.stride_b.column != 1)) {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t status = validate_mxfp8_weight(
+      params.weight, params.weight_workspace, params.gemm.n, params.gemm.k);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  A2AGemmParams launch{};
+  launch.input_staging = params.input_staging;
+  launch.output = params.output;
+  launch.ready = params.ready;
+  launch.gemm = params.gemm;
+  launch.route = params.route;
+  launch.num_comm_ctas = params.num_comm_ctas;
+  launch.lhs_policy = params.lhs_policy;
+  launch.epoch = params.epoch;
+  launch.input_epoch = params.input_epoch;
+  launch.alpha = params.alpha;
+  launch.rhs_nt = params.weight_workspace.data;
+  for (int peer = 0; peer < kMaxWorldSize; ++peer) {
+    launch.peer_input[peer] = params.peer_input[peer];
+    launch.peer_input_ready[peer] = params.peer_input_ready[peer];
+  }
+  status = launch_mxfp8_weight_dequant(
+      params.weight, params.weight_workspace, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_a2a_gemm_cutlass(launch, stream);
+}
+
 }  // namespace fuse

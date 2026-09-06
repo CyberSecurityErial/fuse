@@ -47,6 +47,32 @@ v10 的两条反向算子沿用这两个物理方向，但不沿用前向 shape�
   回答融合总吞吐达到同语义纯计算上限的百分之多少。总时间按相同样本编号，把
   B 与匹配 beta 的 W 两个独立 max-rank 时间相加，不能误写成同一个组合 kernel。
 
+### 本分支 MXFP8-weight benchmark 的独立计时边界
+
+`benchmarks/mxfp8_weight/` 使用新 MXFP8-weight 基线的计时器；它保持上述
+profiling OFF、一进程一卡、10 warmup/50 sample-wise rank-max 原则，**不是**
+旧 BF16/FP8 MPI runner 的 60-epoch 单 replay 协议。Eager 每样本调用一次完整
+边界；Graph 每个边界捕获一次，再逐样本 replay 一次。ready/done 重置、CPU
+Gloo barrier、capture/分配/参考与 correctness 在 CUDA event 区间之外。
+同一 MXFP8 比较中 Fuse、TEUB/cuBLASLt 基线必须保持各自已归档的同边界计时
+合同，不得仅更改 Fuse 的采样协议后把差值称作优化收益。旧 BF16/FP8 表仅有
+相同 shape/CP 不足以证明跨精度性能比较的计时协议完全相同。
+
+本语义为离线 MXFP8 权重、运行时软件 DQ→BF16、BF16 激活/通信和 GEMM，
+FP32 累加；WGrad 的 main_grad 是 FP32，beta0/1 分别记录。完整反向 total
+必须实测同流 B→W，不能把孤立 B/W 分位数相加冒充 total。量化准备不计入，
+F/B 使用权重时的 DQ 计入。这些约定不修改上文旧 v10/v12 路径。
+
+冻结策略 A/B 复用同一配置的 storage/IPC/reference，每臂一次 Graph capture，
+每轮每臂仍 10+50；两种臂顺序各三轮等权合并 arm p50，明确标为 p50 的几何
+平均而非 pooled median。宏 profile 则只采独立诊断执行，优先保存紧凑 rank
+角色摘要。完整合同见 `benchmarks/mxfp8_weight/BENCHMARK.md`。
+
+若在外部 Nsight Systems 下观察 `operator_policy_ab.py` 的真实 A/B 执行流程，
+必须传 `--diagnostic-trace`。它不改变三轮 10+50、capture 或 reset 时序，
+只把输出标为 `formal_ab_protocol=false`；正式汇总器拒绝此类结果。外部采样
+即使使用 profiling OFF 库也不等于无观测开销的正式测试，须另存 profile 目录。
+
 ## 构建开关
 
 `FUSE_ENABLE_PROFILING` 默认关闭。关闭时不会实例化 diagnostic kernel，生产 kernel 的参数、类型和热路径均不含打点。
@@ -153,6 +179,12 @@ PyTorch `cat/index_select/permute/contiguous` 重新造一份 `[M,QKV]`，否则
 QKV backward 和 OProj backward 都提供 profiling-only 的 role telemetry，覆盖各自
 自动策略能够选择的全部 tile。它与模型名称无关，生产 kernel 和自动策略不读取
 profile 参数。profile 构建仍不得进入正式表。
+
+BF16/MXFP8 QKV B 的 diagnostic mainloop 另接入首个 system-scope ready
+acquire 时间戳，覆盖 N64/C2、N64/N128/N160/N192 和 N256/C2；生产 mainloop
+保持原类型。`first_ready_wait` 是 CTA entry 到首次 acquire 的跨度，包含启动
+工作，不是纯等待，更不是全部 K/head 或后续 persistent tile 的累计等待。
+旧数据的 observed=0/null 表示未接入观测，不能与新版混称零等待。
 
 ### v10 backward B→W Perfetto
 

@@ -244,6 +244,22 @@ cudaError_t launch_a2a_lhs_reference_impl(
       Kernel::to_underlying_arguments(args, nullptr), stream);
 }
 
+// Number of ready-M groups covered by the first compute-CTA frontier. Keep
+// the production route order and matched copy reference on one calculation.
+int32_t a2a_lhs_comm_m_window(
+    int32_t m,
+    int32_t n_tiles,
+    int32_t tile_m,
+    int32_t ready_block_m,
+    int32_t compute_ctas) {
+  const int32_t m_tiles_per_ready = ready_block_m / tile_m;
+  const int32_t ready_m_tiles = ceil_div(m, ready_block_m);
+  const int32_t compute_m_frontier = ceil_div(compute_ctas, n_tiles);
+  return min(
+      ready_m_tiles,
+      max(1, ceil_div(compute_m_frontier, m_tiles_per_ready)));
+}
+
 template <
     class InputGemm,
     class Kernel,
@@ -285,13 +301,9 @@ cudaError_t launch_a2a_lhs_gemm_policy(
   const int32_t m_tiles = ceil_div(params.gemm.m, tile_m);
   const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
   static_assert(Comm::kReadyBlockM % tile_m == 0);
-  constexpr int32_t m_tiles_per_ready = Comm::kReadyBlockM / tile_m;
-  const int32_t ready_m_tiles = ceil_div(params.gemm.m, Comm::kReadyBlockM);
-  const int32_t compute_m_frontier =
-      ceil_div(sm_count - params.num_comm_ctas, n_tiles);
-  comm_args.m_window = min(
-      ready_m_tiles,
-      max(1, ceil_div(compute_m_frontier, m_tiles_per_ready)));
+  comm_args.m_window = a2a_lhs_comm_m_window(
+      params.gemm.m, n_tiles, tile_m, Comm::kReadyBlockM,
+      sm_count - params.num_comm_ctas);
   const int32_t k_per_peer = params.gemm.k / params.route.world_size;
   if (params.gemm.k % params.route.world_size != 0 ||
       k_per_peer % tile_k != 0) {
@@ -834,6 +846,32 @@ cudaError_t launch_qkv_forward_policy(
       policy, params.route.qkv_peer_interleaved, launch);
 }
 
+#if FUSE_ENABLE_PROFILING
+using QkvBackwardN64ClusterM2Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardN64ClusterM2ReadyGemm, QkvBackwardPushComm, void,
+    BackwardN64ClusterM2TelemetryGemm>;
+using QkvBackwardN64Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardN64ReadyGemm, QkvBackwardPushComm, void,
+    BackwardN64TelemetryGemm>;
+using QkvBackwardN128Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardN128ReadyGemm, QkvBackwardPushComm, void,
+    BackwardN128TelemetryGemm>;
+using QkvBackwardN160Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardN160ReadyGemm, QkvBackwardPushComm, void,
+    BackwardN160TelemetryGemm>;
+using QkvBackwardN192Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardN192ReadyGemm, QkvBackwardPushComm, void,
+    BackwardN192TelemetryGemm>;
+using QkvBackwardN256Binding = A2AGemmKernelBinding<
+    ulysses::QkvBackwardSpec,
+    BackwardA2ALhsGemm, QkvBackwardPushComm, BackwardA2ALhsBareGemm,
+    BackwardA2ALhsTelemetryGemm>;
+#else
 using QkvBackwardN64ClusterM2Binding = A2AGemmKernelBinding<
     ulysses::QkvBackwardSpec,
     BackwardN64ClusterM2ReadyGemm, QkvBackwardPushComm>;
@@ -851,7 +889,8 @@ using QkvBackwardN192Binding = A2AGemmKernelBinding<
     BackwardN192ReadyGemm, QkvBackwardPushComm>;
 using QkvBackwardN256Binding = A2AGemmKernelBinding<
     ulysses::QkvBackwardSpec,
-    BackwardA2ALhsGemm, QkvBackwardPushComm>;
+    BackwardA2ALhsGemm, QkvBackwardPushComm, BackwardA2ALhsBareGemm>;
+#endif
 
 template <class Visitor>
 cudaError_t visit_qkv_backward_policy(
@@ -909,6 +948,61 @@ cudaError_t visit_oproj_backward_policy(
   }
 }
 
+// Shared dgrad argument construction for production and service references.
+// The reference changes the SM budget/block offset, never the tensor layouts.
+template <class Gemm, bool WithReady = true, class KernelParamsType>
+typename Gemm::Arguments make_qkv_backward_gemm_arguments(
+    const KernelParamsType& params,
+    int32_t compute_ctas,
+    int32_t device,
+    int32_t block_offset) {
+  typename Gemm::Arguments args{};
+  args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+  args.problem_shape = make_shape(
+      params.gemm.m, params.gemm.n, params.gemm.k, 1);
+  args.mainloop.ptr_A = params.peer_staging[params.route.rank];
+  args.mainloop.dA = make_stride(
+      static_cast<int64_t>(params.gemm.k), _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.k);
+  args.mainloop.ptr_B = params.weight;
+  if constexpr (std::is_same_v<
+                    KernelParamsType, Fp8QkvBackwardKernelParams>) {
+    // FP8 uses the TN-friendly quantized transpose copy [N,K].
+    args.mainloop.dB = make_stride(
+        static_cast<int64_t>(params.gemm.k), _1{},
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  } else {
+    // BF16 uses the original row-major forward weight [K,N].
+    args.mainloop.dB = make_stride(
+        _1{}, static_cast<int64_t>(params.gemm.n),
+        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  }
+  if constexpr (WithReady) {
+    constexpr int32_t tile_m = cute::size<0>(typename Gemm::TileShape{});
+    constexpr int32_t tile_k = cute::size<2>(typename Gemm::TileShape{});
+    args.mainloop.ready = params.peer_ready[params.route.rank];
+    args.mainloop.world_size = params.route.q_heads + 2 * params.route.kv_heads;
+    args.mainloop.m_tiles = ceil_div(params.gemm.m, tile_m);
+    args.mainloop.arrivals_per_peer = 1;
+    args.mainloop.k_tiles_per_peer = params.route.head_dim / tile_k;
+    args.mainloop.epoch = params.epoch;
+  }
+  args.epilogue.thread.alpha = params.alpha;
+  args.epilogue.thread.beta = 0.0f;
+  args.epilogue.ptr_C = nullptr;
+  args.epilogue.dC = make_stride(
+      static_cast<int64_t>(params.gemm.n), _1{},
+      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
+  args.epilogue.ptr_D = params.grad_input;
+  args.epilogue.dD = args.epilogue.dC;
+  args.hw_info.device_id = device;
+  args.hw_info.sm_count = compute_ctas;
+  args.scheduler.max_swizzle_size = 1;
+  args.scheduler.block_offset = block_offset;
+  args.scheduler.raster_order = RasterOptions::AlongN;
+  return args;
+}
+
 template <
     class Gemm,
     class BaseKernel,
@@ -946,12 +1040,8 @@ cudaError_t launch_qkv_backward_data_policy(
     return status != cudaSuccess ? status : cudaErrorNotSupported;
   }
 
-  constexpr int32_t tile_m = static_cast<int32_t>(
-      cute::size<0>(typename Gemm::TileShape{}));
   constexpr int32_t tile_k = static_cast<int32_t>(
       cute::size<2>(typename Gemm::TileShape{}));
-  const int32_t packed_heads =
-      params.route.q_heads + 2 * params.route.kv_heads;
   if (params.route.head_dim % tile_k != 0) {
     return cudaErrorNotSupported;
   }
@@ -965,52 +1055,17 @@ cudaError_t launch_qkv_backward_data_policy(
 #endif
   args.num_comm_ctas = params.num_comm_ctas;
   args.comm = comm_args;
-  args.gemm.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-  args.gemm.problem_shape = make_shape(
-      params.gemm.m, params.gemm.n, params.gemm.k, 1);
-  args.gemm.mainloop.ptr_A = params.peer_staging[params.route.rank];
-  args.gemm.mainloop.dA = make_stride(
-      static_cast<int64_t>(params.gemm.k),
-      _1{},
-      static_cast<int64_t>(params.gemm.m) * params.gemm.k);
-  args.gemm.mainloop.ptr_B = params.weight;
-  if constexpr (std::is_same_v<
-                    KernelParamsType, Fp8QkvBackwardKernelParams>) {
-    // FP8 dgrad consumes the TN-friendly [N,K] quantized transpose copy.
-    args.gemm.mainloop.dB = make_stride(
-        static_cast<int64_t>(params.gemm.k),
-        _1{},
-        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
-  } else {
-    // BF16 consumes the original row-major forward weight [K,N].
-    args.gemm.mainloop.dB = make_stride(
-        _1{},
-        static_cast<int64_t>(params.gemm.n),
-        static_cast<int64_t>(params.gemm.k) * params.gemm.n);
+  args.gemm = make_qkv_backward_gemm_arguments<Gemm>(
+      params, sm_count - params.num_comm_ctas, device, params.num_comm_ctas);
+#if FUSE_ENABLE_PROFILING
+  // The FP8 telemetry entry shares this launcher but retains its original
+  // role-only mainloop. First-ready observations are BF16/MXFP8-only here.
+  if constexpr (Instrumented &&
+                std::is_same_v<KernelParamsType, QkvBackwardKernelParams>) {
+    args.gemm.mainloop.timeline = timeline;
+    args.gemm.mainloop.timeline_capacity = timeline_capacity;
   }
-  args.gemm.mainloop.ready = params.peer_ready[params.route.rank];
-  args.gemm.mainloop.world_size = packed_heads;
-  args.gemm.mainloop.m_tiles = ceil_div(params.gemm.m, tile_m);
-  args.gemm.mainloop.arrivals_per_peer = 1;
-  args.gemm.mainloop.k_tiles_per_peer = params.route.head_dim / tile_k;
-  args.gemm.mainloop.epoch = params.epoch;
-  args.gemm.epilogue.thread.alpha = params.alpha;
-  args.gemm.epilogue.thread.beta = 0.0f;
-  args.gemm.epilogue.ptr_C = nullptr;
-  args.gemm.epilogue.dC = make_stride(
-      static_cast<int64_t>(params.gemm.n),
-      _1{},
-      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
-  args.gemm.epilogue.ptr_D = params.grad_input;
-  args.gemm.epilogue.dD = make_stride(
-      static_cast<int64_t>(params.gemm.n),
-      _1{},
-      static_cast<int64_t>(params.gemm.m) * params.gemm.n);
-  args.gemm.hw_info.device_id = device;
-  args.gemm.hw_info.sm_count = sm_count - params.num_comm_ctas;
-  args.gemm.scheduler.max_swizzle_size = 1;
-  args.gemm.scheduler.block_offset = params.num_comm_ctas;
-  args.gemm.scheduler.raster_order = RasterOptions::AlongN;
+#endif
   if (!Kernel::can_implement(args) || Kernel::get_workspace_size(args) != 0) {
     return cudaErrorNotSupported;
   }
@@ -1036,7 +1091,7 @@ cudaError_t launch_qkv_backward_data_telemetry_impl(
   auto launch = [&](auto binding_tag) {
     using Binding = typename decltype(binding_tag)::type;
     return launch_qkv_backward_data_policy<
-        typename Binding::Gemm,
+        typename Binding::TelemetryGemm,
         typename Binding::Kernel,
         QkvBackwardKernelParams,
         true>(
@@ -1281,10 +1336,12 @@ cudaError_t launch_oproj_backward_fp8_data_telemetry_impl(
 }
 #endif
 
+template <class OutputElement,
+          class WgradGemm = BackwardWgradGemmT<OutputElement>>
 cudaError_t launch_backward_wgrad_impl(
     const Bf16* output_gradient,
     const Bf16* saved_input,
-    Bf16* grad_weight,
+    OutputElement* grad_weight,
     int32_t weight_rows,
     int32_t weight_columns,
     int32_t tokens,
@@ -1299,7 +1356,7 @@ cudaError_t launch_backward_wgrad_impl(
       weight_columns % kAlignment != 0 || tokens % kAlignment != 0) {
     return cudaErrorInvalidValue;
   }
-  typename BackwardWgradGemm::Arguments args{};
+  typename WgradGemm::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
   args.problem_shape = make_shape(
       weight_rows, weight_columns, tokens, 1);
@@ -1332,16 +1389,64 @@ cudaError_t launch_backward_wgrad_impl(
   args.hw_info.sm_count = sm_count;
   args.scheduler.max_swizzle_size = 1;
   args.scheduler.raster_order = RasterOptions::AlongN;
-  if (!BackwardWgradGemm::can_implement(args) ||
-      BackwardWgradGemm::get_workspace_size(args) != 0) {
+  if (!WgradGemm::can_implement(args) ||
+      WgradGemm::get_workspace_size(args) != 0) {
     return cudaErrorNotSupported;
   }
-  if (BackwardWgradGemm::initialize_workspace(args, nullptr, stream) !=
+  if (WgradGemm::initialize_workspace(args, nullptr, stream) !=
       cutlass::Status::kSuccess) {
     return cudaErrorInitializationError;
   }
-  return launch_regular<BackwardWgradGemm>(
-      BackwardWgradGemm::to_underlying_arguments(args, nullptr), stream);
+  return launch_regular<WgradGemm>(
+      WgradGemm::to_underlying_arguments(args, nullptr), stream);
+}
+
+// Keep one binding for launch and resource reporting. Auto deliberately uses
+// the baseline; explicit candidates do not imply a new production policy.
+template <class Visitor>
+cudaError_t visit_mxfp8_wgrad_policy(
+    Mxfp8WgradPolicy policy, Visitor& visitor) {
+  switch (policy) {
+    case Mxfp8WgradPolicy::kAuto:
+    case Mxfp8WgradPolicy::kM128N256K64ClusterM2:
+      return visitor(TypeTag<Mxfp8BackwardWgradGemm>{},
+                     Mxfp8WgradPolicy::kM128N256K64ClusterM2);
+    case Mxfp8WgradPolicy::kM128N128K64ClusterM2:
+      return visitor(TypeTag<Mxfp8BackwardWgradN128ClusterM2Gemm>{}, policy);
+    case Mxfp8WgradPolicy::kM128N128K128ClusterM2:
+      return visitor(TypeTag<Mxfp8BackwardWgradN128K128ClusterM2Gemm>{}, policy);
+    case Mxfp8WgradPolicy::kM128N256K64ClusterM1:
+      return visitor(TypeTag<Mxfp8BackwardWgradN256ClusterM1Gemm>{}, policy);
+    case Mxfp8WgradPolicy::kM128N192K64ClusterM2:
+      return visitor(TypeTag<Mxfp8BackwardWgradN192ClusterM2Gemm>{}, policy);
+    case Mxfp8WgradPolicy::kM128N256K32ClusterM2:
+      return visitor(TypeTag<Mxfp8BackwardWgradN256K32ClusterM2Gemm>{}, policy);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
+cudaError_t launch_mxfp8_backward_wgrad_impl(
+    Mxfp8WgradPolicy policy,
+    const Bf16* output_gradient,
+    const Bf16* saved_input,
+    float* grad_weight,
+    int32_t weight_rows,
+    int32_t weight_columns,
+    int32_t tokens,
+    float alpha,
+    float beta,
+    cudaStream_t stream,
+    int32_t sm_count,
+    int32_t device) {
+  auto launch = [&](auto gemm_tag, Mxfp8WgradPolicy) {
+    using Gemm = typename decltype(gemm_tag)::type;
+    return launch_backward_wgrad_impl<float, Gemm>(
+        output_gradient, saved_input, grad_weight,
+        weight_rows, weight_columns, tokens, alpha, beta,
+        stream, sm_count, device);
+  };
+  return visit_mxfp8_wgrad_policy(policy, launch);
 }
 
 cudaError_t launch_backward_fp8_wgrad_impl(

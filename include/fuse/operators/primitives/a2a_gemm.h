@@ -2,6 +2,7 @@
 #pragma once
 
 #include "fuse/types.h"
+#include "fuse/layout/mxfp8.h"
 #include "fuse/layout/gemm.h"
 #include "fuse/layout/ulysses.h"
 #if FUSE_ENABLE_PROFILING
@@ -93,6 +94,27 @@ int32_t recommended_a2a_lhs_gemm_comm_ctas(
     const GemmProblem& problem,
     const UlyssesRoute& route);
 
+// Optional, explicitly calibrated host-side model for MXFP8-weight OProj.
+// These are service-model coefficients, not universal hardware constants.
+// A zero-initialized model leaves the existing production policy unchanged.
+struct Mxfp8OprojCommModel {
+  int32_t world_size = 0;
+  int32_t sm_count = 0;
+  double compute_flop_us = 0.0;       // per tile TFLOP, per persistent wave
+  double compute_tile_us = 0.0;       // per 128x256 output tile, per wave
+  double copy_mib_us = 0.0;           // per MiB of remote payload
+  double copy_task_wave_us = 0.0;     // per four-issuer communication wave
+  double launch_prior_us = 5.0;      // modeling prior, not measured launch time
+  double minimum_gain = 0.10;        // predicted time reduction, not speedup
+};
+
+// Only the measured bulk/tile family is eligible. Unsupported calibration or
+// less than minimum_gain predicted improvement retains the existing policy.
+int32_t select_mxfp8_oproj_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    const Mxfp8OprojCommModel& model);
+
 A2ALhsPolicyInfo select_a2a_lhs_gemm_policy(
     const GemmProblem& problem,
     int32_t num_comm_ctas,
@@ -133,8 +155,44 @@ cudaError_t launch_a2a_gemm_copy_reference(
     const A2AGemmParams& params,
     cudaStream_t stream);
 
+// Opt-in copy service with the fused path's selected ready-M window. The
+// original two-argument reference retains its fixed-window scheduling.
+cudaError_t launch_a2a_gemm_copy_reference(
+    const A2AGemmParams& params,
+    cudaStream_t stream,
+    bool match_fused_schedule);
+
+// Query the same resolved fused window without launching a kernel.
+cudaError_t a2a_gemm_comm_window(
+    const A2AGemmParams& params,
+    int32_t* m_window);
+
 cudaError_t launch_a2a_gemm_fp8_copy_reference(
     const Fp8A2AGemmParams& params,
+    cudaStream_t stream);
+
+// MXFP8-weight baseline: BF16 activations/communication/dX; FP32 dW.
+// Offline original-axis weights are dequantized on every forward/B launch.
+// Workspace and B-to-W input leases remain caller-owned. W does not read Wq.
+struct Mxfp8A2AGemmParams {
+  const Bf16* peer_input[kMaxWorldSize]{};
+  Bf16* input_staging = nullptr;
+  const uint32_t* peer_input_ready[kMaxWorldSize]{};
+  Mxfp8Weight weight{};
+  Mxfp8WeightWorkspace weight_workspace{};
+  Bf16* output = nullptr;
+  uint32_t* ready = nullptr;
+  GemmShape4D gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  A2ALhsGemmPolicy lhs_policy = A2ALhsGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  uint32_t input_epoch = 0;
+  float alpha = 1.0f;
+};
+
+cudaError_t launch_a2a_gemm_mxfp8_cutlass(
+    const Mxfp8A2AGemmParams& params,
     cudaStream_t stream);
 
 }  // namespace fuse

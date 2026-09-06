@@ -1,0 +1,1252 @@
+{
+  "schema": "mxfp8-qkv-backward-ready-grid-correctness-v1",
+  "complete": true,
+  "kind": "correctness_not_performance",
+  "short_diagnostic_timings_discarded": true,
+  "args": {
+    "cp": 4,
+    "operators": "qkv_backward",
+    "model": "artificial_small,production_qwen_dense",
+    "seqs": "1024,16384",
+    "case_ids": null,
+    "launch": "eager",
+    "warmup": 2,
+    "comm_ctas": [
+      0
+    ],
+    "oproj_comm_model": null,
+    "qkv_comm_model": null,
+    "weight_mode": "deferred",
+    "max_cases": 4,
+    "aggregate_only": true,
+    "library": "/home/chen/workspace/fuse-mxfp8-sm90/build-mxfp8-profile/libfuse_mxfp8_torch_bridge.so",
+    "output": "results/mxfp8_weight/profile/qkv_backward_ready_grid_check_v1"
+  },
+  "sources": {
+    "benchmarks/QKVproj+a2a/qkv_shape_bench.py": "b149544c73328aff534c648a14729f7d74fff7fa86c7093d02e252c5041a6177",
+    "benchmarks/a2a+Oproj/oproj_shape_bench.py": "b947546adcc875348545e1f0739810370f346168c88874d6ffb9d162f9909e4e",
+    "benchmarks/backward/backward_shape_bench.py": "a722c7b80221030c04eb6636d57388518cab8205f480b48b04ea91bb0c8ae72a",
+    "benchmarks/mxfp8_weight/backward_matrix.py": "9889174b3a95f3e055be5acf83cb018b466d39ff7825f1159a3178d961f4b522",
+    "benchmarks/mxfp8_weight/matrix.py": "0a93b236190a63a065c6e0674b353a495304de2128630e8bbc8bf2a53c1dfb2c",
+    "benchmarks/mxfp8_weight/operator_bench.py": "2d6e16b083835826d86c4ab4a740fbf16ab291d3c9980b765ed4ebb8ee3aa8ad",
+    "benchmarks/mxfp8_weight/operator_bridge.cu": "e2d27d0aa20a3748598f762110a5d8a4ee739566cdee0077e8b07b3813dfb242",
+    "benchmarks/mxfp8_weight/operator_perf_runtime.py": "cfaca593e0566f41fab229e2a377c5caf9f08b610b99df15ceda30e431d0073f",
+    "benchmarks/mxfp8_weight/operator_profile.cuh": "4865a3a5626d0bc8e60af4d7ba0440bb7766ae06063c42f31c2e9d9b30acd893",
+    "benchmarks/mxfp8_weight/operator_reference.cuh": "6b25dca7030b38105a8e7875cb9a001ae67c25fa425157e5128e35cfff39bc47",
+    "benchmarks/mxfp8_weight/test_operators.py": "0b2f3e4a05af26b01a0728a6b82f22317da7e6e2718dd4cab74d4549cb45f766",
+    "build-mxfp8-profile/libfuse_mxfp8_torch_bridge.so": "06e9b9ad0901c3047e12be8e917821345ac818d0ca87413e124e0201a9c14d01",
+    "csrc/operators/ulysses_sm90/api/backward.cuh": "f2f6d807b1a79d26fc31cff6f9ca7946d5e79ebfb4617c6e6c2b3c78c3321f30",
+    "csrc/operators/ulysses_sm90/api/backward_reference.cuh": "b2453fa73ae799118d319c60e824d6ec2fd3f4d1ddf761434d9020ba3918524c",
+    "csrc/operators/ulysses_sm90/api/forward.cuh": "ad24346e0b1b27b37e3e819189d6b115ffde390f4eaacb934abf5e0ae1c8de97",
+    "csrc/operators/ulysses_sm90/api/forward_reference.cuh": "fb1ac95c8867365d70f5d779ffeeb1ae6276f1bad419f43d50e597f45cc3e1f7",
+    "csrc/operators/ulysses_sm90/api/heterogeneous.cuh": "959dad97316f70f4a377ee72ffc04b7f393f5914986f0430c95bd9b543354fc5",
+    "csrc/operators/ulysses_sm90/api/mxfp8.cuh": "fcc6a725638edd33a0688eb96eb736863a053a99f488fd079e6567d1375e97a0",
+    "csrc/operators/ulysses_sm90/api/policy.cuh": "57a66851243108c04913f02ed0044bdd587e35bdd774f1f7bbcfd481f8bac16e",
+    "csrc/operators/ulysses_sm90/api/reference.cuh": "ce1051786c5cf765d710ebb659b8dd4eacf4e1e254dea4a54068b327ef93857a",
+    "csrc/operators/ulysses_sm90/detail/a2a_gemm.cuh": "3525361d44264deab5d816c2788b7872b5168b8def8eeef64f447be640eb3ddc",
+    "csrc/operators/ulysses_sm90/detail/backward.cuh": "f28726dd59859ffed1478ecc5946553b47e9bf4fcef8d14344e75c0af306920d",
+    "csrc/operators/ulysses_sm90/detail/core.cuh": "93247e1e5adf2086a6205374ec72c993fbaae3e3438b66152b9b3ddae02166a1",
+    "csrc/operators/ulysses_sm90/detail/gemm_a2a.cuh": "8709bbfe374715674758c051fdf17e29be5aad9dc38e778723a3149d5a5c7790",
+    "csrc/operators/ulysses_sm90/detail/launch.cuh": "ad90fe45df4fbc1919a1b4f97370fd37c72f8d85b2dd9bb5a181df7904318b90",
+    "csrc/operators/ulysses_sm90/detail/mxfp8.cuh": "c741dcc074e147565baa045b97b80ed982f64985b7c6abfda57e846d064b3093",
+    "csrc/operators/ulysses_sm90.cu": "6ab62d3adabe490210875fd7121f2a2a4abd7785bc1341aaf02181a5010f711d",
+    "include/fuse/arch/sm90.cuh": "4366f4757ec60611505ebdac6b39be5a157513e3643c148b2493abc7efba0807",
+    "include/fuse/fuse.h": "db9db135e8c53626c03854a8907a848d53a74bee13a900f8320b2a6b01665a68",
+    "include/fuse/layout/gemm.h": "b59497880d9545d9acda853012a365bbad3db292fa932deccf8fe595c1ba5559",
+    "include/fuse/layout/mxfp8.h": "085e8bd730ee93f66ebde6f9133fb50b3b85f0cd38e3b924c5ed2667d58b3887",
+    "include/fuse/layout/ulysses.h": "bc8f15b143d5d7c505a3d2e21d192aa0d6a94361202da5ad7c453ce2d28c01b1",
+    "include/fuse/operators/a2a_gemm.h": "477ff0141311141d508a8ac13eda030e488a28698043c614d0f44151540b0460",
+    "include/fuse/operators/backward_common.h": "fe737d3e10279c927f59a4b0450f6054a628db99833c7ce3ef3302356a1b1009",
+    "include/fuse/operators/gemm_a2a.h": "6997eed81c761c52b51dac8c8e15daecd58fd129c77074c88bf3f3719541887c",
+    "include/fuse/operators/heterogeneous_cp.h": "daa4e59d7b456d30ebebc300fc5e63caf5611613675ac1772d1c87b897cefc5d",
+    "include/fuse/operators/mega_moe.h": "e2cbdf9357eb118267fcb7ed70109dbfaf9c16ac0636be4688b04ed19b474bf4",
+    "include/fuse/operators/oproj_backward.h": "21c78ea2a7c647203917d426981ea9347858f60e22948d734af11bc5b15abee4",
+    "include/fuse/operators/primitives/a2a_gemm.h": "adbac743a4f65f84f4ddb170b1869fb2bfed854860fef6a9ef2a29e045f3e78c",
+    "include/fuse/operators/primitives/gemm_a2a.h": "14e998ebd108f34f18808bf822208c4aaa1bf6d531aa865ed62fefdf23045e0c",
+    "include/fuse/operators/qkv_backward.h": "4257966884f347e46b11affef45513d11aa033f2668a8c6776cee975418293cf",
+    "include/fuse/operators/semantics/operator.h": "285c3077c8c60105f349e807432ce0af8125a4fe7bd77abc7383fcd2190c99cb",
+    "include/fuse/operators/semantics/ulysses/projection.h": "71a45dfae7a1ab68c83f74491c88dba6f1dfd06ecae8a255ac410fbd37cb0362",
+    "include/fuse/operators/ulysses/backward_common.h": "50dc868397f14a9cf54784639d4e1ad5b0d746e6e226ebdd446c427caf00c7d1",
+    "include/fuse/operators/ulysses/heterogeneous_cp.h": "528a7045bb7e463702c9271da3fe4894eceffb7b6dbd20aa3b969fd7041950f2",
+    "include/fuse/operators/ulysses/oproj_backward.h": "cc7ade7140cbf7eef40f2e284388c5d9fe7cca083c595ddba14e7184e43fe075",
+    "include/fuse/operators/ulysses/projection_dataflow.h": "3a7277ad04e0b31a6c166701ac4bab6540c87d0646c59265bc75fe93e24c3ac8",
+    "include/fuse/operators/ulysses/qkv_backward.h": "dac2e68118c80b40786be7b494763a1487d8461ba04b2e8fffd66e2766a91a5d",
+    "include/fuse/profiling/timeline.cuh": "0272632bc8f6390a875985aa62e8b392c07cd5842f105de223b5e33143146edb",
+    "include/fuse/schedule/cutlass_pipeline.cuh": "cb3ebe1e03b4edd25fcc8bb090a6928c5464c5723c242c49618c7b5d561d9f3c",
+    "include/fuse/schedule/persistent_gemm.cuh": "7b8abc123fdffbdc2838c1858db525a096b633b245bc3408d630bf2a46d1434e",
+    "include/fuse/types.h": "8a25e010fe340c3321e45a83b7932237a300d2647a669eeb2f230dd746f85334",
+    "benchmarks/mxfp8_weight/profile_operators.py": "e3ad9040b69ffb52058c02fe391645e93e56c2b200ed46e618cb079a831d4e4f",
+    "benchmarks/mxfp8_weight/profile_report.py": "5f2d4d74421b540b1b036097d9deb8d80cb722a03e2563a0763b20affe0acc36"
+  },
+  "source_hashes_match_at_audit": true,
+  "rows": [
+    {
+      "case": {
+        "id": "qkv_backward/artificial_small/s1024/cp4",
+        "operator": "qkv",
+        "model": "artificial_small",
+        "global_seq": 1024,
+        "cp": 4,
+        "batch": 1,
+        "m": 256,
+        "hidden": 4096,
+        "q_heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "projection": 4096,
+        "weight_shape": [
+          4096,
+          4096
+        ],
+        "b_mnk": [
+          256,
+          4096,
+          4096
+        ],
+        "w_mnk": [
+          4096,
+          4096,
+          256
+        ],
+        "layout": "causal_paired",
+        "visible_devices": "0,2,4,5",
+        "registry": "benchmarks/backward/backward_shape_bench.py"
+      },
+      "correctness": {
+        "weight_dequant": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "output": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "route": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "weight_gradient": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              256,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "cluster_m": 1,
+            "sm_count": 132,
+            "policy_enum": 2,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 1,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              256,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "cluster_m": 1,
+            "sm_count": 132,
+            "policy_enum": 2,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 2,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              256,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "cluster_m": 1,
+            "sm_count": 132,
+            "policy_enum": 2,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 3,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              256,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 64,
+            "cluster_m": 1,
+            "sm_count": 132,
+            "policy_enum": 2,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        }
+      ]
+    },
+    {
+      "case": {
+        "id": "qkv_backward/artificial_small/s16384/cp4",
+        "operator": "qkv",
+        "model": "artificial_small",
+        "global_seq": 16384,
+        "cp": 4,
+        "batch": 1,
+        "m": 4096,
+        "hidden": 4096,
+        "q_heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "projection": 4096,
+        "weight_shape": [
+          4096,
+          4096
+        ],
+        "b_mnk": [
+          4096,
+          4096,
+          4096
+        ],
+        "w_mnk": [
+          4096,
+          4096,
+          4096
+        ],
+        "layout": "causal_paired",
+        "visible_devices": "0,2,4,5",
+        "registry": "benchmarks/backward/backward_shape_bench.py"
+      },
+      "correctness": {
+        "weight_dequant": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "output": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "route": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "weight_gradient": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 1,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 2,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 3,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 33554432,
+            "forward_or_data_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              4096,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        }
+      ]
+    },
+    {
+      "case": {
+        "id": "qkv_backward/production_qwen_dense/s1024/cp4",
+        "operator": "qkv",
+        "model": "production_qwen_dense",
+        "global_seq": 1024,
+        "cp": 4,
+        "batch": 1,
+        "m": 256,
+        "hidden": 2048,
+        "q_heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "projection": 4096,
+        "weight_shape": [
+          4096,
+          2048
+        ],
+        "b_mnk": [
+          256,
+          2048,
+          4096
+        ],
+        "w_mnk": [
+          4096,
+          2048,
+          256
+        ],
+        "layout": "causal_paired",
+        "visible_devices": "0,2,4,5",
+        "registry": "benchmarks/backward/backward_shape_bench.py"
+      },
+      "correctness": {
+        "weight_dequant": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "output": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "route": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "weight_gradient": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              256,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 64,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 6,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 1,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              256,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 64,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 6,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 2,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              256,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 64,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 6,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        },
+        {
+          "rank": 3,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 16384,
+            "peer_arena_bytes": 2163200,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              256,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              256
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 10,
+            "tile_m": 128,
+            "tile_n": 64,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 6,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 74
+          },
+          "observed_ctas": 74,
+          "observed_compute_ctas": 64
+        }
+      ]
+    },
+    {
+      "case": {
+        "id": "qkv_backward/production_qwen_dense/s16384/cp4",
+        "operator": "qkv",
+        "model": "production_qwen_dense",
+        "global_seq": 16384,
+        "cp": 4,
+        "batch": 1,
+        "m": 4096,
+        "hidden": 2048,
+        "q_heads": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "projection": 4096,
+        "weight_shape": [
+          4096,
+          2048
+        ],
+        "b_mnk": [
+          4096,
+          2048,
+          4096
+        ],
+        "w_mnk": [
+          4096,
+          2048,
+          4096
+        ],
+        "layout": "causal_paired",
+        "visible_devices": "0,2,4,5",
+        "registry": "benchmarks/backward/backward_shape_bench.py"
+      },
+      "correctness": {
+        "weight_dequant": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "output": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "route": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        },
+        "weight_gradient": {
+          "max_abs": 0,
+          "relative_rmse": 0,
+          "all_ranks_finite": true
+        }
+      },
+      "ranks": [
+        {
+          "rank": 0,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 1,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 2,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        },
+        {
+          "rank": 3,
+          "config": {
+            "dispatch": "existing_bf16_production_auto",
+            "weight_block_size": 32,
+            "payload": "e4m3",
+            "scale": "e8m0",
+            "weight_axis": "original_forward_K",
+            "gemm_input": "bf16",
+            "gemm_accumulator": "fp32",
+            "alpha": 1,
+            "route_layout": "causal_paired",
+            "epoch": 1,
+            "ready_elements": 262144,
+            "peer_arena_bytes": 34603520,
+            "weight_workspace_bytes": 16777216,
+            "forward_or_data_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "weight_mnk": [
+              4096,
+              2048,
+              4096
+            ],
+            "requested_comm_ctas": 0,
+            "comm_ctas": 12,
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 64,
+            "cluster_m": 2,
+            "sm_count": 132,
+            "policy_enum": 5,
+            "raster": "n",
+            "swizzle": 1,
+            "gemm_policy_request": "auto",
+            "weight_gemm": {
+              "policy_enum": 1,
+              "tile_m": 128,
+              "tile_n": 256,
+              "tile_k": 64,
+              "cluster_m": 2,
+              "stages": 3,
+              "dynamic_smem_bytes": 215040,
+              "registers_per_thread": 168,
+              "raster": "n",
+              "swizzle": 1,
+              "output_dtype": "fp32"
+            },
+            "world_size": 4,
+            "beta": 1,
+            "grid_ctas": 132
+          },
+          "observed_ctas": 132,
+          "observed_compute_ctas": 120
+        }
+      ]
+    }
+  ],
+  "previous_failure": {
+    "error": "rank 0 CTA 74: missing or nonpositive CTA lifetime",
+    "cause": "Report assumed SM capacity equals launched CTA count; actual cluster-aligned problem-limited grid has 74 CTAs.",
+    "correctness_was_checked_before_report": true,
+    "repair": "Derive expected grid from supported native scheduler geometry, require zero capacity suffix and reject holes in launched grid."
+  },
+  "superseded_files": [
+    {
+      "path": "results/mxfp8_weight/profile/qkv_backward_ready_grid_check_v1/calibration_summary.json",
+      "bytes": 58815,
+      "sha256": "ee2892856b3bd3b89b0a5f51122f7ceec0f899e870d65e439f0a8e101d9b71c8"
+    },
+    {
+      "path": "results/mxfp8_weight/profile/qkv_backward_ready_check_v1/calibration_summary.json",
+      "bytes": 9423,
+      "sha256": "162cd7b376d9588788fad4e73d3a88d08065475f474a54d18f0209951e4c53ff"
+    },
+    {
+      "path": "results/mxfp8_weight/validation/qkv_backward_ready_v1/cpu_checks.json",
+      "bytes": 1092,
+      "sha256": "2ab593a7976fd705727797f288d45ce9c2842d5a614482132679df9647d5c716"
+    },
+    {
+      "path": "results/mxfp8_weight/validation/qkv_backward_ready_v1/cpu.log",
+      "bytes": 32019,
+      "sha256": "33e5f1501f8f1bc1c4693aab9f1414b09c5d1786a6c8cda85b284c4c9397cf59"
+    }
+  ]
+}

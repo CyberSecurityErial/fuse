@@ -52,6 +52,7 @@ struct QkvForwardSpec {
   using Completion = semantic::CrossRankEpochCompletion;
   using Bf16Params = ::fuse::Bf16GemmA2AParams;
   using Fp8Params = ::fuse::Fp8GemmA2AParams;
+  using Mxfp8Params = ::fuse::Mxfp8GemmA2AParams;
   static constexpr bool kWeightGradientIsSeparate = false;
 
   static cudaError_t launch(const Bf16Params& params, cudaStream_t stream) {
@@ -60,6 +61,10 @@ struct QkvForwardSpec {
 
   static cudaError_t launch(const Fp8Params& params, cudaStream_t stream) {
     return ::fuse::launch_gemm_a2a_fp8_cutlass(params, stream);
+  }
+
+  static cudaError_t launch(const Mxfp8Params& params, cudaStream_t stream) {
+    return ::fuse::launch_gemm_a2a_mxfp8_cutlass(params, stream);
   }
 };
 
@@ -73,6 +78,7 @@ struct QkvBackwardSpec {
   using Completion = semantic::CrossRankEpochCompletion;
   using Bf16Params = ::fuse::Bf16QkvBackwardDataParams;
   using Fp8Params = ::fuse::Fp8QkvBackwardDataParams;
+  using Mxfp8Params = ::fuse::Mxfp8QkvBackwardDataParams;
   static constexpr bool kWeightGradientIsSeparate = true;
 
   static cudaError_t launch(const Bf16Params& params, cudaStream_t stream) {
@@ -81,6 +87,10 @@ struct QkvBackwardSpec {
 
   static cudaError_t launch(const Fp8Params& params, cudaStream_t stream) {
     return ::fuse::launch_qkv_backward_fp8_data(params, stream);
+  }
+
+  static cudaError_t launch(const Mxfp8Params& params, cudaStream_t stream) {
+    return ::fuse::launch_qkv_backward_mxfp8_data(params, stream);
   }
 };
 
@@ -94,6 +104,7 @@ struct OprojForwardSpec {
   using Completion = semantic::CrossRankEpochCompletion;
   using Bf16Params = ::fuse::Bf16A2AGemmParams;
   using Fp8Params = ::fuse::Fp8A2AGemmParams;
+  using Mxfp8Params = ::fuse::Mxfp8A2AGemmParams;
   static constexpr bool kWeightGradientIsSeparate = false;
 
   static cudaError_t launch(const Bf16Params& params, cudaStream_t stream) {
@@ -102,6 +113,10 @@ struct OprojForwardSpec {
 
   static cudaError_t launch(const Fp8Params& params, cudaStream_t stream) {
     return ::fuse::launch_a2a_gemm_fp8_cutlass(params, stream);
+  }
+
+  static cudaError_t launch(const Mxfp8Params& params, cudaStream_t stream) {
+    return ::fuse::launch_a2a_gemm_mxfp8_cutlass(params, stream);
   }
 };
 
@@ -115,6 +130,7 @@ struct OprojBackwardSpec {
   using Completion = semantic::CrossRankEpochCompletion;
   using Bf16Params = ::fuse::Bf16OprojBackwardDataParams;
   using Fp8Params = ::fuse::Fp8OprojBackwardDataParams;
+  using Mxfp8Params = ::fuse::Mxfp8OprojBackwardDataParams;
   static constexpr bool kWeightGradientIsSeparate = true;
 
   static cudaError_t launch(const Bf16Params& params, cudaStream_t stream) {
@@ -123,6 +139,10 @@ struct OprojBackwardSpec {
 
   static cudaError_t launch(const Fp8Params& params, cudaStream_t stream) {
     return ::fuse::launch_oproj_backward_fp8_data(params, stream);
+  }
+
+  static cudaError_t launch(const Mxfp8Params& params, cudaStream_t stream) {
+    return ::fuse::launch_oproj_backward_mxfp8_data(params, stream);
   }
 };
 

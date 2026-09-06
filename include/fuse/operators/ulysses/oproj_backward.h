@@ -3,6 +3,7 @@
 
 #include "fuse/operators/ulysses/backward_common.h"
 #include "fuse/types.h"
+#include "fuse/layout/mxfp8.h"
 #if FUSE_ENABLE_PROFILING
 #include "fuse/profiling/timeline.cuh"
 #endif
@@ -169,6 +170,59 @@ cudaError_t launch_oproj_backward_fp8_weight(
     cudaStream_t stream);
 cudaError_t launch_oproj_backward_fp8(
     const Fp8OprojBackwardParams& params,
+    cudaStream_t stream);
+
+// MXFP8-weight baseline: BF16 activations/communication/dX; FP32 dW.
+// Offline original-axis weights are dequantized on every forward/B launch.
+// Workspace and B-to-W input leases remain caller-owned. W does not read Wq.
+struct Mxfp8OprojBackwardDataParams {
+  const Bf16* grad_output = nullptr;  // dY [M, H].
+  Mxfp8Weight weight{};
+  Mxfp8WeightWorkspace weight_workspace{};
+  Bf16* local_grad_attention = nullptr;  // GEMM staging dA [M, A].
+  Bf16* peer_grad_attention[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  uint32_t* ready = nullptr;
+  int32_t local_tokens = 0;  // M on this CP rank.
+  int32_t hidden = 0;        // H.
+  int32_t q_heads = 0;
+  int32_t head_dim = 0;
+  int32_t world_size = 1;
+  int32_t rank = 0;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  bool causal_load_balanced = false;
+  float alpha = 1.0f;
+};
+
+struct Mxfp8OprojBackwardWeightParams {
+  const Bf16* grad_output = nullptr;       // dY [M, H].
+  const Bf16* saved_attention = nullptr;   // Forward A [M, A].
+  float* grad_weight = nullptr;             // [H, A].
+  int32_t local_tokens = 0;
+  int32_t hidden = 0;
+  int32_t q_heads = 0;
+  int32_t head_dim = 0;
+  float alpha = 1.0f;
+  float beta = 0.0f;
+  Mxfp8WgradPolicy gemm_policy = Mxfp8WgradPolicy::kAuto;
+};
+
+struct Mxfp8OprojBackwardParams {
+  Mxfp8OprojBackwardDataParams data;
+  Mxfp8OprojBackwardWeightParams weight;
+  WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
+};
+
+cudaError_t launch_oproj_backward_mxfp8_data(
+    const Mxfp8OprojBackwardDataParams& params,
+    cudaStream_t stream);
+cudaError_t launch_oproj_backward_mxfp8_weight(
+    const Mxfp8OprojBackwardWeightParams& params,
+    cudaStream_t stream);
+cudaError_t launch_oproj_backward_mxfp8(
+    const Mxfp8OprojBackwardParams& params,
     cudaStream_t stream);
 
 }  // namespace fuse

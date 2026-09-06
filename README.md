@@ -218,4 +218,5 @@ Graph 的 p50 几何平均为 `1.763×`，`85/96` 达到 `1.5×`。没有达到 
 - [Output Projection backward benchmark](benchmarks/Oproj-backward/BENCHMARK.md)
 - [四算子完整训练 E2E benchmark](benchmarks/e2e/BENCHMARK.md)
 - [四算子 FP8 benchmark](benchmarks/fp8/BENCHMARK.md)
+- [SM90 MXFP8 权重四算子基线、复现脚本与最优配置](benchmarks/mxfp8_weight/BENCHMARK.md)
 - [版本演进](VERSION_HISTORY.md)

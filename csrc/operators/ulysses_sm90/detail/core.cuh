@@ -1259,26 +1259,64 @@ using BackwardA2ALhsGemm = cutlass::gemm::kernel::GemmUniversal<
     ProjectionEpilogue,
     detail::MonolithicPersistentScheduler>;
 
+// Independent dgrad service reference: keep the original row-major weight,
+// epilogue and monolithic tile mapping; remove only the ready adapter.
+using BackwardA2ALhsBareGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    BackwardProjectionMainloop,
+    ProjectionEpilogue,
+    detail::MonolithicPersistentScheduler>;
+
+#if FUSE_ENABLE_PROFILING
+// Match the production dgrad mainloop/layout/scheduler. Only the elected
+// producer records its first ready acquire; this is not total ready wait.
+template <class Mainloop, class Epilogue>
+using BackwardReadyTelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int32_t, int32_t, int32_t, int32_t>,
+    detail::A2ALhsReadyMainloop<Mainloop, 1, true, true>,
+    Epilogue,
+    detail::MonolithicPersistentScheduler>;
+
+using BackwardN64ClusterM2TelemetryGemm = BackwardReadyTelemetryGemm<
+    BackwardN64ClusterM2Mainloop, BackwardN64ClusterM2Epilogue>;
+using BackwardN64TelemetryGemm =
+    BackwardReadyTelemetryGemm<BackwardN64Mainloop, N64Epilogue>;
+using BackwardN128TelemetryGemm =
+    BackwardReadyTelemetryGemm<BackwardN128Mainloop, BaseEpilogue>;
+using BackwardN160TelemetryGemm =
+    BackwardReadyTelemetryGemm<BackwardN160Mainloop, N160Epilogue>;
+using BackwardN192TelemetryGemm =
+    BackwardReadyTelemetryGemm<BackwardN192Mainloop, N192Epilogue>;
+using BackwardA2ALhsTelemetryGemm =
+    BackwardReadyTelemetryGemm<BackwardProjectionMainloop, ProjectionEpilogue>;
+#endif
+
 // Shared QKV/OProj wgrad geometry. Logical A is the transpose view of the
 // row-major output gradient, logical B is the saved row-major forward input:
 // [weight_rows,M] * [M,weight_columns] -> [weight_rows,weight_columns].
-using BackwardWgradEpilogue =
+template <class OutputElement,
+          class WgradTileShape = ProjectionTileShape,
+          class WgradClusterShape = ProjectionClusterShape>
+using BackwardWgradEpilogueT =
     typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm90,
         cutlass::arch::OpClassTensorOp,
-        ProjectionTileShape,
-        ProjectionClusterShape,
+        WgradTileShape,
+        WgradClusterShape,
         cutlass::epilogue::collective::EpilogueTileAuto,
         Accumulator,
         Accumulator,
-        Element,
+        OutputElement,
         LayoutD,
         kAlignment,
-        Element,
+        OutputElement,
         LayoutD,
         kAlignment,
         cutlass::epilogue::TmaWarpSpecializedCooperative>::CollectiveOp;
-using BackwardWgradMainloop =
+template <class OutputElement,
+          class WgradTileShape = ProjectionTileShape,
+          class WgradClusterShape = ProjectionClusterShape>
+using BackwardWgradMainloopT =
     typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm90,
         cutlass::arch::OpClassTensorOp,
@@ -1289,15 +1327,68 @@ using BackwardWgradMainloop =
         LayoutBRow,
         kAlignment,
         Accumulator,
-        ProjectionTileShape,
-        ProjectionClusterShape,
-        cutlass::gemm::collective::StageCount<4>,
+        WgradTileShape,
+        WgradClusterShape,
+        // Keep the original BF16 four-stage kernel exactly. FP32 main_grad
+        // needs a larger epilogue; carve out its storage as the FP8 path does
+        // instead of exceeding SM90's per-CTA shared-memory limit.
+        std::conditional_t<
+            std::is_same_v<OutputElement, Element>,
+            cutlass::gemm::collective::StageCount<4>,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(
+                    typename BackwardWgradEpilogueT<
+                        OutputElement, WgradTileShape,
+                        WgradClusterShape>::SharedStorage))>>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
-using BackwardWgradGemm = cutlass::gemm::kernel::GemmUniversal<
+template <class OutputElement,
+          class WgradTileShape = ProjectionTileShape,
+          class WgradClusterShape = ProjectionClusterShape>
+using BackwardWgradGemmT = cutlass::gemm::kernel::GemmUniversal<
     Shape<int32_t, int32_t, int32_t, int32_t>,
-    BackwardWgradMainloop,
-    BackwardWgradEpilogue,
+    BackwardWgradMainloopT<OutputElement, WgradTileShape, WgradClusterShape>,
+    BackwardWgradEpilogueT<OutputElement, WgradTileShape, WgradClusterShape>,
     cutlass::gemm::PersistentScheduler>;
+
+// Existing BF16 ABI and geometry are unchanged. MXFP8-weight training
+// writes FP32 main_grad without a lossy BF16 intermediate.
+using BackwardWgradGemm = BackwardWgradGemmT<Element>;
+using Mxfp8BackwardWgradGemm = BackwardWgradGemmT<float>;
+using Mxfp8BackwardWgradN128ClusterM2Gemm =
+    BackwardWgradGemmT<float, TileShape, ProjectionClusterShape>;
+using Mxfp8BackwardWgradN128K128ClusterM2Gemm =
+    BackwardWgradGemmT<float, Shape<_128, _128, _128>, ProjectionClusterShape>;
+using Mxfp8BackwardWgradN256ClusterM1Gemm =
+    BackwardWgradGemmT<float, ProjectionTileShape, ClusterShape>;
+using Mxfp8BackwardWgradN192ClusterM2Gemm =
+    BackwardWgradGemmT<float, N192TileShape, ProjectionClusterShape>;
+using Mxfp8BackwardWgradN256K32ClusterM2Gemm =
+    BackwardWgradGemmT<float, Shape<_128, _256, _32>, ProjectionClusterShape>;
+
+template <class Gemm, int32_t ExpectedStages>
+constexpr bool valid_mxfp8_wgrad_resources() {
+  return Gemm::CollectiveMainloop::DispatchPolicy::Stages == ExpectedStages &&
+      ExpectedStages >= 2 &&
+      sizeof(typename Gemm::SharedStorage) <=
+          cutlass::gemm::collective::detail::sm90_smem_capacity_bytes;
+}
+
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradGemm, 3>(),
+              "FP32 wgrad N256/C2 must fit SM90 with three stages");
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradN128ClusterM2Gemm, 5>(),
+              "FP32 wgrad N128/C2 must fit SM90 with five stages");
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradN128K128ClusterM2Gemm, 2>(),
+              "FP32 wgrad N128/K128/C2 must fit SM90 with two stages");
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradN256ClusterM1Gemm, 3>(),
+              "FP32 wgrad N256/C1 must fit SM90 with three stages");
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradN192ClusterM2Gemm, 4>(),
+              "FP32 wgrad N192/C2 must fit SM90 with four stages");
+static_assert(sizeof(Mxfp8BackwardWgradN192ClusterM2Gemm::SharedStorage) == 231424,
+              "FP32 wgrad N192/C2 shared-storage contract changed");
+static_assert(valid_mxfp8_wgrad_resources<Mxfp8BackwardWgradN256K32ClusterM2Gemm, 6>(),
+              "FP32 wgrad N256/K32/C2 must fit SM90 with six stages");
+static_assert(sizeof(Mxfp8BackwardWgradN256K32ClusterM2Gemm::SharedStorage) == 215040,
+              "FP32 wgrad N256/K32/C2 shared-storage contract changed");
 
 using A2ALhsProjectionMainloop =
     detail::A2ALhsReadyMainloop<ProjectionMainloop>;

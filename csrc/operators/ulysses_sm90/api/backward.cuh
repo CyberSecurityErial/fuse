@@ -1274,4 +1274,276 @@ cudaError_t launch_oproj_backward_fp8(
   return launch_oproj_backward_fp8_weight(weight, stream);
 }
 
+cudaError_t launch_qkv_backward_mxfp8_data(
+    const Mxfp8QkvBackwardDataParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = validate_mxfp8_weight(
+      params.weight, params.weight_workspace,
+      (int64_t(params.q_heads) + 2LL * params.kv_heads) * params.head_dim, params.hidden);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  QkvBackwardDataParams launch{};
+  launch.grad_q = params.grad_q;
+  launch.grad_k = params.grad_k;
+  launch.grad_v = params.grad_v;
+  launch.grad_input = params.grad_input;
+  launch.local_tokens = params.local_tokens;
+  launch.hidden = params.hidden;
+  // Flattened token API; the legacy route has one logical token extent.
+  launch.batch = 1;
+  launch.q_heads = params.q_heads;
+  launch.kv_heads = params.kv_heads;
+  launch.head_dim = params.head_dim;
+  launch.world_size = params.world_size;
+  launch.rank = params.rank;
+  launch.num_comm_ctas = params.num_comm_ctas;
+  launch.gemm_policy = params.gemm_policy;
+  launch.epoch = params.epoch;
+  launch.causal_load_balanced = params.causal_load_balanced;
+  launch.alpha = params.alpha;
+  launch.weight = params.weight_workspace.data;
+  for (int peer = 0; peer < kMaxWorldSize; ++peer) {
+    launch.peer_dqkv_staging[peer] = params.peer_dqkv_staging[peer];
+    launch.peer_ready[peer] = params.peer_ready[peer];
+    launch.peer_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  // Reuse the ORIGINAL forward quantization axis. BF16 dgrad consumes a
+  // logical transpose; no transposed FP8 copy or requantization is needed.
+  status = launch_mxfp8_weight_dequant(
+      params.weight, params.weight_workspace, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_data(launch, stream);
+}
+
+cudaError_t mxfp8_wgrad_kernel_traits(
+    Mxfp8WgradPolicy policy,
+    Mxfp8WgradKernelTraits* traits) {
+  if (traits == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  *traits = Mxfp8WgradKernelTraits{};
+  auto read_traits = [&](auto gemm_tag, Mxfp8WgradPolicy actual) {
+    using Gemm = typename decltype(gemm_tag)::type;
+    cudaFuncAttributes attributes{};
+    cudaError_t status = cudaFuncGetAttributes(
+        &attributes, cutlass::device_kernel<Gemm>);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    *traits = {
+        actual,
+        static_cast<int32_t>(cute::size<0>(typename Gemm::TileShape{})),
+        static_cast<int32_t>(cute::size<1>(typename Gemm::TileShape{})),
+        static_cast<int32_t>(cute::size<2>(typename Gemm::TileShape{})),
+        static_cast<int32_t>(cute::size<0>(typename Gemm::ClusterShape{})),
+        Gemm::CollectiveMainloop::DispatchPolicy::Stages,
+        static_cast<int32_t>(sizeof(typename Gemm::SharedStorage)),
+        attributes.numRegs};
+    return cudaSuccess;
+  };
+  return visit_mxfp8_wgrad_policy(policy, read_traits);
+}
+
+cudaError_t launch_qkv_backward_mxfp8_weight(
+    const Mxfp8QkvBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.kv_heads <= 0 ||
+      params.head_dim <= 0 || params.q_heads % params.kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (!std::isfinite(params.alpha) || !std::isfinite(params.beta)) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int32_t packed_width =
+      (params.q_heads + 2 * params.kv_heads) * params.head_dim;
+  return launch_mxfp8_backward_wgrad_impl(
+      params.gemm_policy,
+      params.dqkv_staging,
+      params.saved_input,
+      params.grad_weight,
+      packed_width,
+      params.hidden,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_qkv_backward_mxfp8(
+    const Mxfp8QkvBackwardParams& params,
+    cudaStream_t stream) {
+  if (params.weight_mode == WeightGradientMode::kDeferred) {
+    return launch_qkv_backward_mxfp8_data(params.data, stream);
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate ||
+      params.data.rank < 0 || params.data.rank >= params.data.world_size ||
+      params.data.world_size > kMaxWorldSize) {
+    return cudaErrorInvalidValue;
+  }
+  Mxfp8QkvBackwardWeightParams weight = params.weight;
+  if (!weight.dqkv_staging) {
+    weight.dqkv_staging =
+        params.data.peer_dqkv_staging[params.data.rank];
+  }
+  if (weight.local_tokens == 0) {
+    weight.local_tokens = params.data.local_tokens;
+  }
+  if (weight.hidden == 0) {
+    weight.hidden = params.data.hidden;
+  }
+  if (weight.q_heads == 0) {
+    weight.q_heads = params.data.q_heads;
+  }
+  if (weight.kv_heads == 0) {
+    weight.kv_heads = params.data.kv_heads;
+  }
+  if (weight.head_dim == 0) {
+    weight.head_dim = params.data.head_dim;
+  }
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.kv_heads != params.data.kv_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  if (!weight.dqkv_staging || !weight.saved_input || !weight.grad_weight ||
+      weight.local_tokens <= 0 || weight.local_tokens % kAlignment != 0 ||
+      weight.hidden <= 0 || weight.hidden % kAlignment != 0 ||
+      !std::isfinite(weight.alpha) || !std::isfinite(weight.beta)) {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t status = launch_qkv_backward_mxfp8_data(params.data, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_qkv_backward_mxfp8_weight(weight, stream);
+}
+
+cudaError_t launch_oproj_backward_mxfp8_data(
+    const Mxfp8OprojBackwardDataParams& params,
+    cudaStream_t stream) {
+  cudaError_t status = validate_mxfp8_weight(
+      params.weight, params.weight_workspace,
+      params.hidden, int64_t(params.q_heads) * params.head_dim);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  OprojBackwardDataParams launch{};
+  launch.grad_output = params.grad_output;
+  launch.local_grad_attention = params.local_grad_attention;
+  launch.ready = params.ready;
+  launch.local_tokens = params.local_tokens;
+  launch.hidden = params.hidden;
+  // Flattened token API; the legacy route has one logical token extent.
+  launch.batch = 1;
+  launch.q_heads = params.q_heads;
+  launch.head_dim = params.head_dim;
+  launch.world_size = params.world_size;
+  launch.rank = params.rank;
+  launch.num_comm_ctas = params.num_comm_ctas;
+  launch.gemm_policy = params.gemm_policy;
+  launch.epoch = params.epoch;
+  launch.causal_load_balanced = params.causal_load_balanced;
+  launch.alpha = params.alpha;
+  launch.weight = params.weight_workspace.data;
+  for (int peer = 0; peer < kMaxWorldSize; ++peer) {
+    launch.peer_grad_attention[peer] = params.peer_grad_attention[peer];
+    launch.peer_done_epoch[peer] = params.peer_done_epoch[peer];
+  }
+  // Reuse the ORIGINAL forward quantization axis. BF16 dgrad consumes a
+  // logical transpose; no transposed FP8 copy or requantization is needed.
+  status = launch_mxfp8_weight_dequant(
+      params.weight, params.weight_workspace, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_oproj_backward_data(launch, stream);
+}
+
+cudaError_t launch_oproj_backward_mxfp8_weight(
+    const Mxfp8OprojBackwardWeightParams& params,
+    cudaStream_t stream) {
+  if (params.q_heads <= 0 || params.head_dim <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (!std::isfinite(params.alpha) || !std::isfinite(params.beta)) {
+    return cudaErrorInvalidValue;
+  }
+  BackwardDeviceInfo device_info{};
+  cudaError_t status = cached_backward_device_info(&device_info);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_mxfp8_backward_wgrad_impl(
+      params.gemm_policy,
+      params.grad_output,
+      params.saved_attention,
+      params.grad_weight,
+      params.hidden,
+      params.q_heads * params.head_dim,
+      params.local_tokens,
+      params.alpha,
+      params.beta,
+      stream,
+      device_info.sm_count,
+      device_info.device);
+}
+
+cudaError_t launch_oproj_backward_mxfp8(
+    const Mxfp8OprojBackwardParams& params,
+    cudaStream_t stream) {
+  if (params.weight_mode == WeightGradientMode::kDeferred) {
+    return launch_oproj_backward_mxfp8_data(params.data, stream);
+  }
+  if (params.weight_mode != WeightGradientMode::kImmediate ||
+      params.data.rank < 0 || params.data.rank >= params.data.world_size ||
+      params.data.world_size > kMaxWorldSize) {
+    return cudaErrorInvalidValue;
+  }
+  Mxfp8OprojBackwardWeightParams weight = params.weight;
+  if (!weight.grad_output) {
+    weight.grad_output = params.data.grad_output;
+  }
+  if (weight.local_tokens == 0) {
+    weight.local_tokens = params.data.local_tokens;
+  }
+  if (weight.hidden == 0) {
+    weight.hidden = params.data.hidden;
+  }
+  if (weight.q_heads == 0) {
+    weight.q_heads = params.data.q_heads;
+  }
+  if (weight.head_dim == 0) {
+    weight.head_dim = params.data.head_dim;
+  }
+  if (weight.local_tokens != params.data.local_tokens ||
+      weight.hidden != params.data.hidden ||
+      weight.q_heads != params.data.q_heads ||
+      weight.head_dim != params.data.head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  if (!weight.grad_output || !weight.saved_attention || !weight.grad_weight ||
+      weight.local_tokens <= 0 || weight.local_tokens % kAlignment != 0 ||
+      weight.hidden <= 0 || weight.hidden % kAlignment != 0 ||
+      !std::isfinite(weight.alpha) || !std::isfinite(weight.beta)) {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t status = launch_oproj_backward_mxfp8_data(params.data, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return launch_oproj_backward_mxfp8_weight(weight, stream);
+}
+
 }  // namespace fuse

@@ -1,0 +1,649 @@
+{
+  "schema": "mxfp8-oproj-service-model-v1",
+  "complete": true,
+  "frozen": true,
+  "production_policy_written": false,
+  "milestone_evidence": false,
+  "scope": "OProj_F_experimental_selection_score_not_2F2B_total",
+  "tool_sha256": "02c62b9e1d9fc1c756982b9535daea35367c54fea9029a5967c5eaf81b4423b6",
+  "fitting": {
+    "objective": "independent_compute_and_copy_sum_squared_log_prediction_over_measurement",
+    "weighting": "equal_weight_per_physical_measurement_row",
+    "nonnegative": [
+      "a",
+      "e",
+      "b",
+      "t"
+    ],
+    "solver": "scipy.optimize.least_squares; bounds=(0,inf); x_scale=jac; default tolerances",
+    "initial_compute": [
+      180000.0,
+      4.0
+    ],
+    "initial_copy": [
+      3.4,
+      6.0
+    ],
+    "fixed_intercept_us": 5.0,
+    "intercept_is_measured_launch": false,
+    "fused_winners_used": false,
+    "numpy_version": "2.2.6",
+    "scipy_version": "1.15.3"
+  },
+  "feature_constants": {
+    "ready_m": 128,
+    "bulk_stage_bytes": 49152,
+    "issuers": 4
+  },
+  "coefficient_units": {
+    "a": "us_per_padded_tile_TFLOP_per_compute_wave",
+    "e": "us_per_normalized_tile_area_per_compute_wave",
+    "b": "effective_us_per_remote_MiB",
+    "t": "effective_us_per_copy_task_wave"
+  },
+  "candidate_comm_ctas": [
+    4,
+    8,
+    12,
+    16,
+    24,
+    32
+  ],
+  "risk_threshold": 0.1,
+  "risk_threshold_definition": "Require >=10% predicted latency reduction; conservative, not fitted",
+  "fused_score": "max(Tc,Tr)+min(Tc,Tr)/ceil(ready_m_tiles/m_window)",
+  "limitations": [
+    "Explicit calibration selection does not verify current clocks/topology.",
+    "Only native-resolved calibrated tile families and the legal homogeneous bulk path.",
+    "Window fill/drain is a candidate hypothesis, not an exact wait/contention decomposition.",
+    "DQ is omitted as candidate-invariant; no full-operator or milestone claim.",
+    "Short-search winners and fused timings are never fitting inputs."
+  ],
+  "original_experiment_context": "The user-reported H200 CP8 experiment included devices fixed near 1500 MHz; CP4 used a different card group. This history is not a clock measurement or an assumption about future calibration inputs.",
+  "models": [
+    {
+      "calibration_path": "/home/chen/workspace/fuse-mxfp8-sm90/results/mxfp8_weight/calibration/cp4_primitives_v1.json",
+      "calibration_sha256": "6a7953521e9bcbccea34e089d0f12eea0f37422e82014301763c7598a26ee340",
+      "source_hashes": {
+        "benchmarks/QKVproj+a2a/qkv_shape_bench.py": "b149544c73328aff534c648a14729f7d74fff7fa86c7093d02e252c5041a6177",
+        "benchmarks/a2a+Oproj/oproj_shape_bench.py": "b947546adcc875348545e1f0739810370f346168c88874d6ffb9d162f9909e4e",
+        "benchmarks/backward/backward_shape_bench.py": "a722c7b80221030c04eb6636d57388518cab8205f480b48b04ea91bb0c8ae72a",
+        "benchmarks/mxfp8_weight/backward_matrix.py": "9889174b3a95f3e055be5acf83cb018b466d39ff7825f1159a3178d961f4b522",
+        "benchmarks/mxfp8_weight/matrix.py": "0a93b236190a63a065c6e0674b353a495304de2128630e8bbc8bf2a53c1dfb2c",
+        "benchmarks/mxfp8_weight/operator_bench.py": "f6d3d287e298612968efe8e19ccd7cccd7118aa22be8c076030478751e47b475",
+        "benchmarks/mxfp8_weight/operator_bridge.cu": "30d4bd4c77c64ca8a1e82430da943fcf685dbcd216f0b7343a3a42f9c01bd36b",
+        "benchmarks/mxfp8_weight/operator_perf_runtime.py": "cfaca593e0566f41fab229e2a377c5caf9f08b610b99df15ceda30e431d0073f",
+        "benchmarks/mxfp8_weight/operator_profile.cuh": "8746531e5afa0443244539988f65d02151bb198ec81e9e820095886eb081e001",
+        "benchmarks/mxfp8_weight/operator_reference.cuh": "dc42ad579bdc949c93f532043a7ed606a59b30c719f23eb75ab8e62637efc480",
+        "benchmarks/mxfp8_weight/test_operators.py": "90526f8a2284b41ba49625a6a7ea8af1f6a5c16b348073e6168f977c22056040",
+        "build-mxfp8/libfuse_mxfp8_torch_bridge.so": "8c2f745b56525305df88aad1f550b5c7a91b662946180898f53c3c1a6f6276d5",
+        "csrc/operators/ulysses_sm90/api/backward.cuh": "f2f6d807b1a79d26fc31cff6f9ca7946d5e79ebfb4617c6e6c2b3c78c3321f30",
+        "csrc/operators/ulysses_sm90/api/forward.cuh": "ad24346e0b1b27b37e3e819189d6b115ffde390f4eaacb934abf5e0ae1c8de97",
+        "csrc/operators/ulysses_sm90/api/heterogeneous.cuh": "959dad97316f70f4a377ee72ffc04b7f393f5914986f0430c95bd9b543354fc5",
+        "csrc/operators/ulysses_sm90/api/mxfp8.cuh": "fcc6a725638edd33a0688eb96eb736863a053a99f488fd079e6567d1375e97a0",
+        "csrc/operators/ulysses_sm90/api/policy.cuh": "965f8d8d75b3872aa84493b2f9ac7d7a43ca0a4b2f2a4b5b1683f68b740069fa",
+        "csrc/operators/ulysses_sm90/api/reference.cuh": "a866636760e447cf561457893a5857dc0bb61c3c58c51d0b7cd1774f3ff3da1b",
+        "csrc/operators/ulysses_sm90/detail/a2a_gemm.cuh": "3525361d44264deab5d816c2788b7872b5168b8def8eeef64f447be640eb3ddc",
+        "csrc/operators/ulysses_sm90/detail/backward.cuh": "f28726dd59859ffed1478ecc5946553b47e9bf4fcef8d14344e75c0af306920d",
+        "csrc/operators/ulysses_sm90/detail/core.cuh": "d40d71ccc705d8ff83d7768dbdafa0fb7a9d89e4e08056f1256f5c55bba6175b",
+        "csrc/operators/ulysses_sm90/detail/gemm_a2a.cuh": "8709bbfe374715674758c051fdf17e29be5aad9dc38e778723a3149d5a5c7790",
+        "csrc/operators/ulysses_sm90/detail/launch.cuh": "891f7bcefba3d634e0a6f5c28639ba0efe1f85cc2ef7a1e56a90550ee0b20a24",
+        "csrc/operators/ulysses_sm90/detail/mxfp8.cuh": "c741dcc074e147565baa045b97b80ed982f64985b7c6abfda57e846d064b3093",
+        "csrc/operators/ulysses_sm90.cu": "6ab62d3adabe490210875fd7121f2a2a4abd7785bc1341aaf02181a5010f711d",
+        "include/fuse/arch/sm90.cuh": "4366f4757ec60611505ebdac6b39be5a157513e3643c148b2493abc7efba0807",
+        "include/fuse/fuse.h": "db9db135e8c53626c03854a8907a848d53a74bee13a900f8320b2a6b01665a68",
+        "include/fuse/layout/gemm.h": "b59497880d9545d9acda853012a365bbad3db292fa932deccf8fe595c1ba5559",
+        "include/fuse/layout/mxfp8.h": "085e8bd730ee93f66ebde6f9133fb50b3b85f0cd38e3b924c5ed2667d58b3887",
+        "include/fuse/layout/ulysses.h": "bc8f15b143d5d7c505a3d2e21d192aa0d6a94361202da5ad7c453ce2d28c01b1",
+        "include/fuse/operators/a2a_gemm.h": "477ff0141311141d508a8ac13eda030e488a28698043c614d0f44151540b0460",
+        "include/fuse/operators/backward_common.h": "fe737d3e10279c927f59a4b0450f6054a628db99833c7ce3ef3302356a1b1009",
+        "include/fuse/operators/gemm_a2a.h": "6997eed81c761c52b51dac8c8e15daecd58fd129c77074c88bf3f3719541887c",
+        "include/fuse/operators/heterogeneous_cp.h": "daa4e59d7b456d30ebebc300fc5e63caf5611613675ac1772d1c87b897cefc5d",
+        "include/fuse/operators/mega_moe.h": "e2cbdf9357eb118267fcb7ed70109dbfaf9c16ac0636be4688b04ed19b474bf4",
+        "include/fuse/operators/oproj_backward.h": "21c78ea2a7c647203917d426981ea9347858f60e22948d734af11bc5b15abee4",
+        "include/fuse/operators/primitives/a2a_gemm.h": "2417eaba46aaf170380d5fdb897eca2ff9743bd3c727cd2a43352f2e39774b70",
+        "include/fuse/operators/primitives/gemm_a2a.h": "87c36850046088acf50170f943e38844859f3f0acf26adde2c68ea66f980e17b",
+        "include/fuse/operators/qkv_backward.h": "4257966884f347e46b11affef45513d11aa033f2668a8c6776cee975418293cf",
+        "include/fuse/operators/semantics/operator.h": "285c3077c8c60105f349e807432ce0af8125a4fe7bd77abc7383fcd2190c99cb",
+        "include/fuse/operators/semantics/ulysses/projection.h": "71a45dfae7a1ab68c83f74491c88dba6f1dfd06ecae8a255ac410fbd37cb0362",
+        "include/fuse/operators/ulysses/backward_common.h": "700436019abeeaeb762c51e5d234921a90b672ba4d38380e1dff670a6dd6557d",
+        "include/fuse/operators/ulysses/heterogeneous_cp.h": "528a7045bb7e463702c9271da3fe4894eceffb7b6dbd20aa3b969fd7041950f2",
+        "include/fuse/operators/ulysses/oproj_backward.h": "cc7ade7140cbf7eef40f2e284388c5d9fe7cca083c595ddba14e7184e43fe075",
+        "include/fuse/operators/ulysses/projection_dataflow.h": "3a7277ad04e0b31a6c166701ac4bab6540c87d0646c59265bc75fe93e24c3ac8",
+        "include/fuse/operators/ulysses/qkv_backward.h": "aa922116628d67e727579423571af3855c4e3bca47bc3e5ab079133e8825ad61",
+        "include/fuse/profiling/timeline.cuh": "0272632bc8f6390a875985aa62e8b392c07cd5842f105de223b5e33143146edb",
+        "include/fuse/schedule/cutlass_pipeline.cuh": "cb3ebe1e03b4edd25fcc8bb090a6928c5464c5723c242c49618c7b5d561d9f3c",
+        "include/fuse/schedule/persistent_gemm.cuh": "7b8abc123fdffbdc2838c1858db525a096b633b245bc3408d630bf2a46d1434e",
+        "include/fuse/types.h": "8a25e010fe340c3321e45a83b7932237a300d2647a669eeb2f230dd746f85334",
+        "benchmarks/mxfp8_weight/calibrate_operators.py": "4b4b0cf237c27fe9408cfc4b9cc93e2dbed27f0815e89d833fd8a22118a48b9f",
+        "benchmarks/mxfp8_weight/profile_operators.py": "3b891f1ddb461e0fb2bd815492a593c2e60331b31be6e726f66982b10df5e5b9"
+      },
+      "devices": [
+        {
+          "rank": 0,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 1,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 2,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 3,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        }
+      ],
+      "cuda_visible_devices": "0,2,4,5",
+      "policy_environment": {
+        "FUSE_QKV_COMM_POLICY": null,
+        "FUSE_QKV_GEMM_POLICY": null,
+        "FUSE_A2A_LHS_COMM_POLICY": null,
+        "FUSE_NVLINK_BIDIR_GBPS": null
+      },
+      "gpu_clock_snapshot": null,
+      "clock_scope": "Measured card group and run state only; CP is not a universal hardware coefficient. Without a recorded clock snapshot, stable clocks are not established. Runtime product-name strings are retained verbatim, not used for selection.",
+      "world_size": 4,
+      "sm_count": 132,
+      "launch_prior_us": 5.0,
+      "minimum_gain": 0.1,
+      "domain": {
+        "tile_families": [
+          [
+            128,
+            256,
+            64,
+            2
+          ],
+          [
+            128,
+            320,
+            64,
+            2
+          ]
+        ]
+      },
+      "training": {
+        "points": 20,
+        "geometries": 4,
+        "global_sequences": [
+          131072
+        ],
+        "comm_ctas": [
+          4,
+          8,
+          16,
+          24,
+          32
+        ],
+        "warmup": 10,
+        "iterations": 50,
+        "errors": {
+          "compute_subgrid": {
+            "mape_percent": 3.194735253982456,
+            "max_absolute_percentage_error": 7.965957482381336
+          },
+          "copy": {
+            "mape_percent": 2.383116389655121,
+            "max_absolute_percentage_error": 5.339780900158431
+          }
+        }
+      },
+      "coefficients": {
+        "a": 162853.39409240257,
+        "e": 3.707185356028413e-16,
+        "b": 3.2076177331812543,
+        "t": 4.836559494843502
+      },
+      "leave_one_geometry_out": {
+        "grouping": "actual_N_K_not_model_name",
+        "errors": {
+          "compute_subgrid": {
+            "mape_percent": 6.520069601492562,
+            "max_absolute_percentage_error": 17.073452817671008
+          },
+          "copy": {
+            "mape_percent": 2.6392472965191183,
+            "max_absolute_percentage_error": 5.319308911185483
+          }
+        },
+        "folds": [
+          {
+            "held_out_nk": [
+              2048,
+              2048
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 150375.71311782318,
+              "e": 4.461721425789331,
+              "b": 3.186181625687855,
+              "t": 4.902639861771572
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 15.068412734553771,
+                "max_absolute_percentage_error": 17.073452817671008
+              },
+              "copy": {
+                "mape_percent": 3.5366645723013046,
+                "max_absolute_percentage_error": 5.159427514675841
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              3072,
+              6144
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 163850.40267786692,
+              "e": 7.076635878557982e-14,
+              "b": 3.2082672137174475,
+              "t": 4.78680454799206
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 4.279545665254368,
+                "max_absolute_percentage_error": 8.625391263241799
+              },
+              "copy": {
+                "mape_percent": 2.480695573577214,
+                "max_absolute_percentage_error": 4.21447959445882
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              4096,
+              4096
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 161846.27246863896,
+              "e": 2.4216616015639717e-15,
+              "b": 3.216705214111384,
+              "t": 4.809733388394514
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 3.350363281935944,
+                "max_absolute_percentage_error": 7.622904304945555
+              },
+              "copy": {
+                "mape_percent": 2.717686954282603,
+                "max_absolute_percentage_error": 5.319308911185483
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              5120,
+              5120
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 161698.08820464773,
+              "e": 4.726190287319147e-12,
+              "b": 3.2190714309192567,
+              "t": 4.848964059397208
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 3.381956724226163,
+                "max_absolute_percentage_error": 6.682850896971249
+              },
+              "copy": {
+                "mape_percent": 1.8219420859153512,
+                "max_absolute_percentage_error": 4.665716335811609
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "calibration_path": "/home/chen/workspace/fuse-mxfp8-sm90/results/mxfp8_weight/calibration/cp8_primitives_v1.json",
+      "calibration_sha256": "df45313c3b4c56d2b36a6988209cc9656231f44da2ca27da6b7e0cf7048bea93",
+      "source_hashes": {
+        "benchmarks/QKVproj+a2a/qkv_shape_bench.py": "b149544c73328aff534c648a14729f7d74fff7fa86c7093d02e252c5041a6177",
+        "benchmarks/a2a+Oproj/oproj_shape_bench.py": "b947546adcc875348545e1f0739810370f346168c88874d6ffb9d162f9909e4e",
+        "benchmarks/backward/backward_shape_bench.py": "a722c7b80221030c04eb6636d57388518cab8205f480b48b04ea91bb0c8ae72a",
+        "benchmarks/mxfp8_weight/backward_matrix.py": "9889174b3a95f3e055be5acf83cb018b466d39ff7825f1159a3178d961f4b522",
+        "benchmarks/mxfp8_weight/matrix.py": "0a93b236190a63a065c6e0674b353a495304de2128630e8bbc8bf2a53c1dfb2c",
+        "benchmarks/mxfp8_weight/operator_bench.py": "f6d3d287e298612968efe8e19ccd7cccd7118aa22be8c076030478751e47b475",
+        "benchmarks/mxfp8_weight/operator_bridge.cu": "30d4bd4c77c64ca8a1e82430da943fcf685dbcd216f0b7343a3a42f9c01bd36b",
+        "benchmarks/mxfp8_weight/operator_perf_runtime.py": "cfaca593e0566f41fab229e2a377c5caf9f08b610b99df15ceda30e431d0073f",
+        "benchmarks/mxfp8_weight/operator_profile.cuh": "8746531e5afa0443244539988f65d02151bb198ec81e9e820095886eb081e001",
+        "benchmarks/mxfp8_weight/operator_reference.cuh": "dc42ad579bdc949c93f532043a7ed606a59b30c719f23eb75ab8e62637efc480",
+        "benchmarks/mxfp8_weight/test_operators.py": "90526f8a2284b41ba49625a6a7ea8af1f6a5c16b348073e6168f977c22056040",
+        "build-mxfp8/libfuse_mxfp8_torch_bridge.so": "8c2f745b56525305df88aad1f550b5c7a91b662946180898f53c3c1a6f6276d5",
+        "csrc/operators/ulysses_sm90/api/backward.cuh": "f2f6d807b1a79d26fc31cff6f9ca7946d5e79ebfb4617c6e6c2b3c78c3321f30",
+        "csrc/operators/ulysses_sm90/api/forward.cuh": "ad24346e0b1b27b37e3e819189d6b115ffde390f4eaacb934abf5e0ae1c8de97",
+        "csrc/operators/ulysses_sm90/api/heterogeneous.cuh": "959dad97316f70f4a377ee72ffc04b7f393f5914986f0430c95bd9b543354fc5",
+        "csrc/operators/ulysses_sm90/api/mxfp8.cuh": "fcc6a725638edd33a0688eb96eb736863a053a99f488fd079e6567d1375e97a0",
+        "csrc/operators/ulysses_sm90/api/policy.cuh": "965f8d8d75b3872aa84493b2f9ac7d7a43ca0a4b2f2a4b5b1683f68b740069fa",
+        "csrc/operators/ulysses_sm90/api/reference.cuh": "a866636760e447cf561457893a5857dc0bb61c3c58c51d0b7cd1774f3ff3da1b",
+        "csrc/operators/ulysses_sm90/detail/a2a_gemm.cuh": "3525361d44264deab5d816c2788b7872b5168b8def8eeef64f447be640eb3ddc",
+        "csrc/operators/ulysses_sm90/detail/backward.cuh": "f28726dd59859ffed1478ecc5946553b47e9bf4fcef8d14344e75c0af306920d",
+        "csrc/operators/ulysses_sm90/detail/core.cuh": "d40d71ccc705d8ff83d7768dbdafa0fb7a9d89e4e08056f1256f5c55bba6175b",
+        "csrc/operators/ulysses_sm90/detail/gemm_a2a.cuh": "8709bbfe374715674758c051fdf17e29be5aad9dc38e778723a3149d5a5c7790",
+        "csrc/operators/ulysses_sm90/detail/launch.cuh": "891f7bcefba3d634e0a6f5c28639ba0efe1f85cc2ef7a1e56a90550ee0b20a24",
+        "csrc/operators/ulysses_sm90/detail/mxfp8.cuh": "c741dcc074e147565baa045b97b80ed982f64985b7c6abfda57e846d064b3093",
+        "csrc/operators/ulysses_sm90.cu": "6ab62d3adabe490210875fd7121f2a2a4abd7785bc1341aaf02181a5010f711d",
+        "include/fuse/arch/sm90.cuh": "4366f4757ec60611505ebdac6b39be5a157513e3643c148b2493abc7efba0807",
+        "include/fuse/fuse.h": "db9db135e8c53626c03854a8907a848d53a74bee13a900f8320b2a6b01665a68",
+        "include/fuse/layout/gemm.h": "b59497880d9545d9acda853012a365bbad3db292fa932deccf8fe595c1ba5559",
+        "include/fuse/layout/mxfp8.h": "085e8bd730ee93f66ebde6f9133fb50b3b85f0cd38e3b924c5ed2667d58b3887",
+        "include/fuse/layout/ulysses.h": "bc8f15b143d5d7c505a3d2e21d192aa0d6a94361202da5ad7c453ce2d28c01b1",
+        "include/fuse/operators/a2a_gemm.h": "477ff0141311141d508a8ac13eda030e488a28698043c614d0f44151540b0460",
+        "include/fuse/operators/backward_common.h": "fe737d3e10279c927f59a4b0450f6054a628db99833c7ce3ef3302356a1b1009",
+        "include/fuse/operators/gemm_a2a.h": "6997eed81c761c52b51dac8c8e15daecd58fd129c77074c88bf3f3719541887c",
+        "include/fuse/operators/heterogeneous_cp.h": "daa4e59d7b456d30ebebc300fc5e63caf5611613675ac1772d1c87b897cefc5d",
+        "include/fuse/operators/mega_moe.h": "e2cbdf9357eb118267fcb7ed70109dbfaf9c16ac0636be4688b04ed19b474bf4",
+        "include/fuse/operators/oproj_backward.h": "21c78ea2a7c647203917d426981ea9347858f60e22948d734af11bc5b15abee4",
+        "include/fuse/operators/primitives/a2a_gemm.h": "2417eaba46aaf170380d5fdb897eca2ff9743bd3c727cd2a43352f2e39774b70",
+        "include/fuse/operators/primitives/gemm_a2a.h": "87c36850046088acf50170f943e38844859f3f0acf26adde2c68ea66f980e17b",
+        "include/fuse/operators/qkv_backward.h": "4257966884f347e46b11affef45513d11aa033f2668a8c6776cee975418293cf",
+        "include/fuse/operators/semantics/operator.h": "285c3077c8c60105f349e807432ce0af8125a4fe7bd77abc7383fcd2190c99cb",
+        "include/fuse/operators/semantics/ulysses/projection.h": "71a45dfae7a1ab68c83f74491c88dba6f1dfd06ecae8a255ac410fbd37cb0362",
+        "include/fuse/operators/ulysses/backward_common.h": "700436019abeeaeb762c51e5d234921a90b672ba4d38380e1dff670a6dd6557d",
+        "include/fuse/operators/ulysses/heterogeneous_cp.h": "528a7045bb7e463702c9271da3fe4894eceffb7b6dbd20aa3b969fd7041950f2",
+        "include/fuse/operators/ulysses/oproj_backward.h": "cc7ade7140cbf7eef40f2e284388c5d9fe7cca083c595ddba14e7184e43fe075",
+        "include/fuse/operators/ulysses/projection_dataflow.h": "3a7277ad04e0b31a6c166701ac4bab6540c87d0646c59265bc75fe93e24c3ac8",
+        "include/fuse/operators/ulysses/qkv_backward.h": "aa922116628d67e727579423571af3855c4e3bca47bc3e5ab079133e8825ad61",
+        "include/fuse/profiling/timeline.cuh": "0272632bc8f6390a875985aa62e8b392c07cd5842f105de223b5e33143146edb",
+        "include/fuse/schedule/cutlass_pipeline.cuh": "cb3ebe1e03b4edd25fcc8bb090a6928c5464c5723c242c49618c7b5d561d9f3c",
+        "include/fuse/schedule/persistent_gemm.cuh": "7b8abc123fdffbdc2838c1858db525a096b633b245bc3408d630bf2a46d1434e",
+        "include/fuse/types.h": "8a25e010fe340c3321e45a83b7932237a300d2647a669eeb2f230dd746f85334",
+        "benchmarks/mxfp8_weight/calibrate_operators.py": "4b4b0cf237c27fe9408cfc4b9cc93e2dbed27f0815e89d833fd8a22118a48b9f",
+        "benchmarks/mxfp8_weight/profile_operators.py": "3b891f1ddb461e0fb2bd815492a593c2e60331b31be6e726f66982b10df5e5b9"
+      },
+      "devices": [
+        {
+          "rank": 0,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 1,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 2,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 3,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 4,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 5,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 6,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        },
+        {
+          "rank": 7,
+          "name": "NVIDIA L20X",
+          "cc": [
+            9,
+            0
+          ],
+          "sm_count": 132,
+          "total_memory_bytes": 150121021440
+        }
+      ],
+      "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+      "policy_environment": {
+        "FUSE_QKV_COMM_POLICY": null,
+        "FUSE_QKV_GEMM_POLICY": null,
+        "FUSE_A2A_LHS_COMM_POLICY": null,
+        "FUSE_NVLINK_BIDIR_GBPS": null
+      },
+      "gpu_clock_snapshot": null,
+      "clock_scope": "Measured card group and run state only; CP is not a universal hardware coefficient. Without a recorded clock snapshot, stable clocks are not established. Runtime product-name strings are retained verbatim, not used for selection.",
+      "world_size": 8,
+      "sm_count": 132,
+      "launch_prior_us": 5.0,
+      "minimum_gain": 0.1,
+      "domain": {
+        "tile_families": [
+          [
+            128,
+            256,
+            64,
+            2
+          ],
+          [
+            128,
+            320,
+            64,
+            2
+          ]
+        ]
+      },
+      "training": {
+        "points": 20,
+        "geometries": 4,
+        "global_sequences": [
+          131072
+        ],
+        "comm_ctas": [
+          4,
+          8,
+          16,
+          24,
+          32
+        ],
+        "warmup": 10,
+        "iterations": 50,
+        "errors": {
+          "compute_subgrid": {
+            "mape_percent": 0.8283258757687966,
+            "max_absolute_percentage_error": 2.0658797217126823
+          },
+          "copy": {
+            "mape_percent": 2.350735343589674,
+            "max_absolute_percentage_error": 5.46923792324594
+          }
+        }
+      },
+      "coefficients": {
+        "a": 179203.9577251841,
+        "e": 4.12882990089262,
+        "b": 3.401495464133248,
+        "t": 6.018567114265669
+      },
+      "leave_one_geometry_out": {
+        "grouping": "actual_N_K_not_model_name",
+        "errors": {
+          "compute_subgrid": {
+            "mape_percent": 1.2958753661611784,
+            "max_absolute_percentage_error": 4.002531779431074
+          },
+          "copy": {
+            "mape_percent": 2.664030197230054,
+            "max_absolute_percentage_error": 6.827754244468043
+          }
+        },
+        "folds": [
+          {
+            "held_out_nk": [
+              2048,
+              2048
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 182581.8106104383,
+              "e": 3.0003819260938567,
+              "b": 3.4033709240365315,
+              "t": 5.9501057335572085
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 2.4574476660548528,
+                "max_absolute_percentage_error": 4.002531779431074
+              },
+              "copy": {
+                "mape_percent": 2.637739495368878,
+                "max_absolute_percentage_error": 4.2908390471967595
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              3072,
+              6144
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 177845.44435767346,
+              "e": 4.34528521646274,
+              "b": 3.402057404930486,
+              "t": 5.966096746439502
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 0.9647078929409126,
+                "max_absolute_percentage_error": 1.4843129356925777
+              },
+              "copy": {
+                "mape_percent": 2.3814619981529317,
+                "max_absolute_percentage_error": 5.1184176418588745
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              4096,
+              4096
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 179434.32119817435,
+              "e": 4.1153827408932795,
+              "b": 3.3895527844485063,
+              "t": 6.13928472815363
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 0.9775590656019073,
+                "max_absolute_percentage_error": 1.769749457264469
+              },
+              "copy": {
+                "mape_percent": 3.85780305923404,
+                "max_absolute_percentage_error": 6.827754244468043
+              }
+            }
+          },
+          {
+            "held_out_nk": [
+              5120,
+              5120
+            ],
+            "train_points": 15,
+            "test_points": 5,
+            "coefficients": {
+              "a": 179851.4210733492,
+              "e": 4.041480890606986,
+              "b": 3.4113852492436063,
+              "t": 6.014838136075892
+            },
+            "errors": {
+              "compute_subgrid": {
+                "mape_percent": 0.7837868400470405,
+                "max_absolute_percentage_error": 1.2312794642807656
+              },
+              "copy": {
+                "mape_percent": 1.7791162361643666,
+                "max_absolute_percentage_error": 3.475365695946997
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

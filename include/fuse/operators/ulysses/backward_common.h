@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include <cuda_runtime_api.h>
+
 namespace fuse {
 
 // Immediate mode runs data-gradient and weight-gradient work in the same
@@ -26,5 +28,34 @@ enum class BackwardGemmPolicy : int32_t {
   kM128N256 = 5,
   kM128N64ClusterM2 = 6,
 };
+
+// Explicit FP32 main_grad candidates for the MXFP8-weight operators. kAuto
+// intentionally preserves the measured baseline until tuning is complete.
+enum class Mxfp8WgradPolicy : int32_t {
+  kAuto = 0,
+  kM128N256K64ClusterM2 = 1,
+  kM128N128K64ClusterM2 = 2,
+  kM128N128K128ClusterM2 = 3,
+  kM128N256K64ClusterM1 = 4,
+  kM128N192K64ClusterM2 = 5,
+  kM128N256K32ClusterM2 = 6,
+};
+
+struct Mxfp8WgradKernelTraits {
+  Mxfp8WgradPolicy policy = Mxfp8WgradPolicy::kAuto;
+  int32_t block_m = 0;
+  int32_t block_n = 0;
+  int32_t block_k = 0;
+  int32_t cluster_m = 0;
+  int32_t stages = 0;
+  int32_t dynamic_smem_bytes = 0;
+  int32_t registers_per_thread = 0;
+};
+
+// Metadata query on the current CUDA device, outside the timed launch path.
+// Registers come from cudaFuncGetAttributes, not an accumulator-size estimate.
+cudaError_t mxfp8_wgrad_kernel_traits(
+    Mxfp8WgradPolicy policy,
+    Mxfp8WgradKernelTraits* traits);
 
 }  // namespace fuse

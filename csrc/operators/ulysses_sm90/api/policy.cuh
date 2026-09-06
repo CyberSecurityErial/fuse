@@ -824,4 +824,191 @@ int32_t recommended_gemm_a2a_comm_ctas(
   return best_comm_ctas;
 }
 
+int32_t select_mxfp8_qkv_forward_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    const Mxfp8QkvForwardCommModel& model) {
+  const int32_t baseline = recommended_gemm_a2a_comm_ctas(problem, route);
+  int32_t sm_count = 0, device = 0;
+  if (device_sm_count(&sm_count, &device) != cudaSuccess || baseline <= 0 ||
+      sm_count != 132 || model.sm_count != sm_count ||
+      route.world_size != 4 || model.world_size != route.world_size ||
+      !supported_route_base(route) || route.batch != 1 || problem.l != 1 ||
+      problem.m != route.seq_local ||
+      int64_t(route.seq_local) * route.world_size != route.global_seq ||
+      route.kind != RouteKind::kQkvGqaPack ||
+      route.direction != RouteDirection::kForward ||
+      route.q_heads <= 0 || route.kv_heads <= 0 || route.local_heads <= 0 ||
+      route.q_heads % route.kv_heads != 0 ||
+      route.q_heads % route.world_size != 0 ||
+      route.kv_heads % route.world_size != 0 ||
+      int64_t(route.local_heads) * route.world_size != route.q_heads ||
+      route.head_dim != kQkvBulkColumns ||
+      (int64_t(route.q_heads) + 2ll * route.kv_heads) * route.head_dim != problem.n ||
+      route.qkv_peer_interleaved || route.defer_v_a2a ||
+      route.causal_load_balanced || route.cyclic_peer_order ||
+      route.packed_source_row || route.packed_row_granularity != 0 ||
+      route.channel_count != 1 ||
+      problem.m < 32768 || problem.m > 131072 || problem.m % 256 != 0 ||
+      problem.n < 4096 || problem.n > 18432 || problem.n % 256 != 0 ||
+      problem.k < 2048 || problem.k > 16384 || problem.k % 64 != 0 ||
+      !supported_problem(problem) ||
+      a_row_stride(problem) != problem.k || b_row_stride(problem) != problem.k ||
+      d_row_stride(problem) != problem.n || problem.max_swizzle_size != 1 ||
+      problem.raster != GemmRaster::kAlongN) {
+    return baseline;
+  }
+  const double coefficients[]{model.compute_gflop_sm_us,
+      model.route_slot_task_us, model.minimum_gain};
+  for (double value : coefficients) {
+    if (!std::isfinite(value) || value < 0.0) return baseline;
+  }
+  if (model.compute_gflop_sm_us == 0.0 || model.route_slot_task_us == 0.0 ||
+      model.minimum_gain >= 1.0) {
+    return baseline;
+  }
+
+  // Pin the measured service contract to the existing native types. Each
+  // route task moves 64 rows of one 128-wide BF16 head through one of 12
+  // slots. This counts all tasks, including the local destination's copy.
+  using Gemm = QkvForwardN256Binding::Gemm;
+  using Comm = QkvForwardN256Binding::Comm;
+  static_assert(cute::size<0>(Gemm::TileShape{}) == 128 &&
+                cute::size<1>(Gemm::TileShape{}) == 256 &&
+                cute::size<2>(Gemm::TileShape{}) == 64 &&
+                cute::size<0>(Gemm::ClusterShape{}) == 2);
+  static_assert(Gemm::CollectiveMainloop::DispatchPolicy::Stages == 4);
+  static_assert(kQkvBulkRows == 64 && kQkvBulkColumns == 128 && kQkvBulkSlots == 12);
+  static_assert(std::is_same_v<Comm::CommElement, Bf16> &&
+                Comm::kBulkStageElements == kQkvBulkRows * kQkvBulkColumns);
+  const double gemm_gflops = 2.0 * problem.m * problem.n * problem.k / 1.0e9;
+  const double route_tasks = double(problem.m) * problem.n / Comm::kBulkStageElements;
+  auto score = [&](int32_t comm_ctas) {
+    // A baseline outside the calibrated split domain must also fall back;
+    // do not compare an extrapolated baseline with interpolated candidates.
+    if (comm_ctas < 4 || comm_ctas > 24 || comm_ctas % 2 != 0 ||
+        select_qkv_gemm_policy(problem, comm_ctas, sm_count, false) !=
+            QkvGemmPolicy::kM128N256ClusterM2) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const double compute_us = model.compute_gflop_sm_us * gemm_gflops /
+        (sm_count - comm_ctas);
+    const double route_us = model.route_slot_task_us * route_tasks /
+        (kQkvBulkSlots * comm_ctas);
+    // Independent-service envelope hypothesis, not an exact decomposition
+    // of concurrent resource contention, ready waits or finalization.
+    return std::max(compute_us, route_us);
+  };
+  const double baseline_score = score(baseline);
+  if (!std::isfinite(baseline_score)) return baseline;
+  int32_t best = baseline;
+  double best_score = baseline_score;
+  for (int32_t candidate = 4; candidate <= 24; candidate += 2) {
+    const double candidate_score = score(candidate);
+    if (candidate_score < best_score) {
+      best = candidate;
+      best_score = candidate_score;
+    }
+  }
+  // Exact ties retain auto. The caller's explicit margin defaults to zero.
+  return best_score <= baseline_score * (1.0 - model.minimum_gain) ? best : baseline;
+}
+
+int32_t select_mxfp8_oproj_comm_ctas(
+    const GemmProblem& problem,
+    const UlyssesRoute& route,
+    const Mxfp8OprojCommModel& model) {
+  const int32_t baseline = recommended_a2a_lhs_gemm_comm_ctas(problem, route);
+  int32_t sm_count = 0, device = 0;
+  if (device_sm_count(&sm_count, &device) != cudaSuccess || baseline <= 0 ||
+      sm_count != 132 || model.sm_count != sm_count ||
+      model.world_size != route.world_size ||
+      (route.world_size != 4 && route.world_size != 8) ||
+      !supported_route_base(route) ||
+      route.batch != 1 || problem.l != 1 || problem.m != route.seq_local ||
+      int64_t(route.seq_local) * route.world_size != route.global_seq ||
+      route.q_heads <= 0 || route.local_heads <= 0 || route.head_dim <= 0 ||
+      int64_t(route.local_heads) * route.world_size != route.q_heads ||
+      int64_t(route.q_heads) * route.head_dim != problem.k ||
+      route.head_dim % A2ALhsInputComm::kCommElementsPerVector != 0 ||
+      route.cyclic_peer_order || route.packed_source_row || route.channel_count != 1 ||
+      route.kind != RouteKind::kHeadToSequence ||
+      route.direction != RouteDirection::kInverse ||
+      !supported_problem(problem) || problem.k % route.world_size != 0 ||
+      (problem.k / route.world_size) % 64 != 0 ||
+      a_row_stride(problem) != problem.k || b_row_stride(problem) != problem.k ||
+      d_row_stride(problem) != problem.n || problem.max_swizzle_size != 1 ||
+      (problem.raster != GemmRaster::kHeuristic && problem.raster != GemmRaster::kAlongN)) {
+    return baseline;
+  }
+  const double coefficients[]{model.compute_flop_us, model.compute_tile_us,
+      model.copy_mib_us, model.copy_task_wave_us, model.launch_prior_us,
+      model.minimum_gain};
+  for (double value : coefficients) {
+    if (!std::isfinite(value) || value < 0.0) return baseline;
+  }
+  if (model.compute_flop_us == 0.0 || model.copy_mib_us == 0.0 ||
+      model.copy_task_wave_us == 0.0 || model.minimum_gain >= 1.0) {
+    return baseline;
+  }
+
+  // Match the ordinary (non-heterogeneous) 128-row bulk route. Its source
+  // row offset is zero. Do not extrapolate this calibration to scalar copy.
+  constexpr int32_t kReadyRows = A2ALhsInputComm::kReadyBlockM;
+  static_assert(kReadyRows == 128 && kA2ALhsBulkSlots == 4 &&
+                kA2ALhsBulkStageBytes == 49152);
+  const int32_t row_bytes = problem.k / route.world_size * sizeof(Element);
+  const int32_t comm_rows = row_bytes > 0 ?
+      std::min(kReadyRows, kA2ALhsBulkStageBytes / row_bytes) : 0;
+  if (comm_rows <= 0 || row_bytes % 16 != 0 ||
+      route.seq_local % kReadyRows != 0 ||
+      (route.causal_load_balanced && (route.seq_local / 2) % kReadyRows != 0)) {
+    return baseline;
+  }
+  const int64_t ready_tiles = ceil_div(problem.m, kReadyRows);
+  const int64_t tasks = ready_tiles * route.world_size * ceil_div(kReadyRows, comm_rows);
+  const double remote_mib = 2.0 * problem.m * problem.k *
+      (route.world_size - 1) / route.world_size / (1024.0 * 1024.0);
+
+  auto score = [&](int32_t comm_ctas) {
+    const auto policy = select_a2a_lhs_policy_impl(
+        problem, comm_ctas, sm_count, A2ALhsGemmPolicy::kAuto);
+    // These are the only tile families represented in the service samples.
+    if (policy.tile_m != 128 || policy.tile_k != 64 || policy.cluster_m != 2 ||
+        (policy.tile_n != 256 && policy.tile_n != 320) || policy.waves <= 0 ||
+        !std::isfinite(policy.estimated_cycles)) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const int64_t padded_k = int64_t(ceil_div(problem.k, policy.tile_k)) * policy.tile_k;
+    const double tile_tflops = 2.0 * policy.tile_m * policy.tile_n * padded_k / 1.0e12;
+    const double tile_area = double(policy.tile_m) * policy.tile_n / (128.0 * 256.0);
+    const double compute_us = model.launch_prior_us + policy.waves *
+        (model.compute_flop_us * tile_tflops + model.compute_tile_us * tile_area);
+    const int64_t task_waves = ceil_div(tasks, int64_t(kA2ALhsBulkSlots) * comm_ctas);
+    const double route_us = model.launch_prior_us + std::hypot(
+        model.copy_mib_us * remote_mib, model.copy_task_wave_us * task_waves);
+    const int32_t window = a2a_lhs_comm_m_window(
+        problem.m, policy.n_tiles, policy.tile_m, kReadyRows, sm_count - comm_ctas);
+    const int64_t batches = ceil_div(ready_tiles, int64_t(window));
+    // This filling term is a selection hypothesis, not an exact measured
+    // decomposition of ready waits or concurrent memory-system contention.
+    return std::max(compute_us, route_us) + std::min(compute_us, route_us) / batches;
+  };
+  const double baseline_score = score(baseline);
+  if (!std::isfinite(baseline_score)) return baseline;
+  int32_t best = baseline;
+  double best_score = baseline_score;
+  constexpr std::array<int32_t, 6> kCandidates{4, 8, 12, 16, 24, 32};
+  for (int32_t candidate : kCandidates) {
+    if (candidate >= sm_count) continue;
+    const double candidate_score = score(candidate);
+    if (candidate_score < best_score) {
+      best = candidate;
+      best_score = candidate_score;
+    }
+  }
+  // A conservative rollout guard, not a fitted performance coefficient.
+  return best_score <= baseline_score * (1.0 - model.minimum_gain) ? best : baseline;
+}
+
 }  // namespace fuse

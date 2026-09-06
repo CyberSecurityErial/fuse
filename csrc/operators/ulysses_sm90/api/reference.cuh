@@ -192,9 +192,10 @@ cudaError_t launch_dense_fp8_cutlass_reference(
 
 template <class Comm, class ParamsType>
 cudaError_t launch_a2a_lhs_copy_reference_impl(
-    const ParamsType& params, cudaStream_t stream) {
+    const ParamsType& params, cudaStream_t stream, int32_t m_window = 2) {
     typename Comm::Arguments args{};
     args.params = params;
+    args.m_window = m_window;
     cudaError_t status = Comm::initialize(args);
     if (status != cudaSuccess) {
       return status;
@@ -240,6 +241,71 @@ cudaError_t launch_a2a_gemm_copy_reference(
   }
   return launch_a2a_lhs_copy_reference_impl<A2ALhsInputComm>(
       params, stream);
+}
+
+// Resolve the matched copy's policy, communication count and ready-M window
+// once for both launch and metadata. The original reference above is unchanged.
+template <class Visitor>
+cudaError_t visit_a2a_lhs_copy_schedule(
+    const A2AGemmParams& params, Visitor& visitor) {
+  int32_t sm_count = 0;
+  int32_t device = 0;
+  cudaError_t status = device_sm_count(&sm_count, &device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  A2AGemmParams resolved = params;
+  if (resolved.num_comm_ctas == 0) {
+    resolved.num_comm_ctas = recommended_a2a_lhs_gemm_comm_ctas(
+        resolved.gemm, resolved.route);
+  }
+  if (resolved.num_comm_ctas <= 0 || resolved.num_comm_ctas >= sm_count ||
+      !supported_problem(resolved.gemm)) {
+    return cudaErrorInvalidValue;
+  }
+  const auto selected = select_a2a_lhs_policy_impl(
+      resolved.gemm, resolved.num_comm_ctas, sm_count, resolved.lhs_policy);
+  auto visit = [&](auto binding_tag) {
+    using Binding = typename decltype(binding_tag)::type;
+    using Gemm = typename Binding::Gemm;
+    using Comm = typename Binding::Comm;
+    constexpr int32_t tile_m = cute::size<0>(typename Gemm::TileShape{});
+    constexpr int32_t tile_n = cute::size<1>(typename Gemm::TileShape{});
+    static_assert(Comm::kReadyBlockM % tile_m == 0);
+    const int32_t window = a2a_lhs_comm_m_window(
+        resolved.gemm.m, ceil_div(resolved.gemm.n, tile_n), tile_m,
+        Comm::kReadyBlockM, sm_count - resolved.num_comm_ctas);
+    return visitor(TypeTag<Comm>{}, resolved, window);
+  };
+  return visit_oproj_forward_policy(selected.policy, visit);
+}
+
+cudaError_t launch_a2a_gemm_copy_reference(
+    const A2AGemmParams& params,
+    cudaStream_t stream,
+    bool match_fused_schedule) {
+  if (!match_fused_schedule) {
+    return launch_a2a_gemm_copy_reference(params, stream);
+  }
+  auto launch = [&](auto comm_tag, const A2AGemmParams& resolved, int32_t window) {
+    using Comm = typename decltype(comm_tag)::type;
+    return launch_a2a_lhs_copy_reference_impl<Comm>(resolved, stream, window);
+  };
+  return visit_a2a_lhs_copy_schedule(params, launch);
+}
+
+cudaError_t a2a_gemm_comm_window(
+    const A2AGemmParams& params,
+    int32_t* m_window) {
+  if (m_window == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  *m_window = 0;
+  auto query = [&](auto, const A2AGemmParams&, int32_t window) {
+    *m_window = window;
+    return cudaSuccess;
+  };
+  return visit_a2a_lhs_copy_schedule(params, query);
 }
 
 cudaError_t launch_a2a_gemm_fp8_copy_reference(
@@ -322,3 +388,6 @@ cudaError_t launch_gemm_a2a_fp8_copy_reference(
 }
 
 }  // namespace fuse
+
+#include "backward_reference.cuh"
+#include "forward_reference.cuh"

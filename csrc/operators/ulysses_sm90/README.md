@@ -30,6 +30,8 @@ duplicate CUTLASS kernels or change device code generation.
 - `detail/backward.cuh`: device-side backward routing.
 - `detail/launch.cuh`: shared launch helpers, policy-to-kernel bindings, traits,
   and bounded launch-plan caches.
+- `detail/mxfp8.cuh`: original-axis E4M3/E8M0 software weight conversion and
+  workspace validation. MXFP8 reuses the BF16 routing kernels above.
 
 ## Public API implementation
 
@@ -38,6 +40,9 @@ duplicate CUTLASS kernels or change device code generation.
 - `api/policy.cuh`: automatic tile and communication-CTA selection.
 - `api/heterogeneous.cuh`: weighted CP planning and launch.
 - `api/reference.cuh`: independent GEMM and communication reference paths.
+- `api/mxfp8.cuh`: workspace sizing and shared software DQ entry point.
+  MXFP8 forward/backward entries remain beside BF16/FP8 in `forward.cuh` and
+  `backward.cuh`; FP32 main_grad shares the existing wgrad template.
 
 ## Rules for new code
 

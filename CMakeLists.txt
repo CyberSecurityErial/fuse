@@ -38,6 +38,18 @@ target_compile_options(
   PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 set_target_properties(fuse_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+set_target_properties(fuse_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Test-only raw-pointer bridge, analogous to fuse_backward_torch_bridge.
+# Reuse the same translation unit/library; no duplicate MXFP8 kernels.
+add_library(
+  fuse_mxfp8_torch_bridge SHARED EXCLUDE_FROM_ALL
+  "benchmarks/mxfp8_weight/operator_bridge.cu")
+target_link_libraries(fuse_mxfp8_torch_bridge PRIVATE fuse_kernels CUDA::cudart)
+target_compile_options(
+  fuse_mxfp8_torch_bridge
+  PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
 
 add_executable(fuse_smoke "benchmarks/a2a+Oproj/fuse_smoke.cu")
 target_link_libraries(fuse_smoke PRIVATE fuse_kernels CUDA::cublas CUDA::cudart)

@@ -3,6 +3,7 @@
 
 #include "fuse/operators/ulysses/backward_common.h"
 #include "fuse/types.h"
+#include "fuse/layout/mxfp8.h"
 #if FUSE_ENABLE_PROFILING
 #include "fuse/profiling/timeline.cuh"
 #endif
@@ -142,6 +143,47 @@ int64_t qkv_backward_ready_elements(const QkvBackwardDataParams& params);
 cudaError_t launch_qkv_backward_data(
     const QkvBackwardDataParams& params,
     cudaStream_t stream);
+
+// Diagnostic service references, not complete B operators. The caller owns
+// BF16 weight/staging preparation and cross-rank synchronization. Ready
+// references require every used head flag to contain epoch before launch;
+// their acquire cost is not a measurement of producer waiting. Copy publishes
+// head flags but does not run the production grid/source-done finalization.
+// Full-grid references retain the tile selected for params.num_comm_ctas.
+// CopyFusedReservation uses the same copy kernel with the selected fused
+// cluster and dynamic-SMEM budget; it still has no concurrent compute role.
+enum class QkvBackwardReference : int32_t {
+  kComputeBareSubgrid = 0,
+  kCopy = 1,
+  kComputeReadyPreloadedSubgrid = 2,
+  kComputeBareFullgrid = 3,
+  kComputeReadyPreloadedFullgrid = 4,
+  kCopyFusedReservation = 5,
+};
+
+struct QkvBackwardReferenceResources {
+  int32_t selected_gemm_stages = 0;
+  int32_t primitive_dynamic_smem_bytes = 0;
+  int32_t primitive_registers_per_thread = 0;
+  int32_t primitive_grid_x = 0;
+  int32_t primitive_launch_cluster_m = 0;
+  int32_t threads_per_cta = 0;
+  int32_t copy_use_tma = 0;
+  int32_t copy_slots = 0;
+  int32_t ready_block_m = 0;
+  int32_t ready_flag_stride = 0;
+  int32_t packed_heads = 0;
+  int32_t k_tiles_per_head = 0;
+};
+
+cudaError_t launch_qkv_backward_reference(
+    const QkvBackwardDataParams& params,
+    QkvBackwardReference primitive,
+    cudaStream_t stream);
+cudaError_t query_qkv_backward_reference(
+    const QkvBackwardDataParams& params,
+    QkvBackwardReference primitive,
+    QkvBackwardReferenceResources* resources);
 #if FUSE_ENABLE_PROFILING
 // Diagnostic-only launch. It preserves the production dataflow and records
 // one timestamp record per physical CTA; profiling builds must never be used
@@ -187,6 +229,63 @@ cudaError_t launch_qkv_backward_fp8_weight(
     cudaStream_t stream);
 cudaError_t launch_qkv_backward_fp8(
     const Fp8QkvBackwardParams& params,
+    cudaStream_t stream);
+
+// MXFP8-weight baseline: BF16 activations/communication/dX; FP32 dW.
+// Offline original-axis weights are dequantized on every forward/B launch.
+// Workspace and B-to-W input leases remain caller-owned. W does not read Wq.
+struct Mxfp8QkvBackwardDataParams {
+  const Bf16* grad_q = nullptr;
+  const Bf16* grad_k = nullptr;
+  const Bf16* grad_v = nullptr;
+  Bf16* peer_dqkv_staging[kMaxWorldSize]{};
+  uint32_t* peer_ready[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  Mxfp8Weight weight{};
+  Mxfp8WeightWorkspace weight_workspace{};
+  Bf16* grad_input = nullptr;    // [M, H].
+  int32_t local_tokens = 0;      // M on this CP rank.
+  int32_t hidden = 0;            // H.
+  int32_t q_heads = 0;
+  int32_t kv_heads = 0;
+  int32_t head_dim = 0;
+  int32_t world_size = 1;
+  int32_t rank = 0;
+  int32_t num_comm_ctas = 0;
+  BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+  uint32_t epoch = 0;
+  bool causal_load_balanced = false;
+  float alpha = 1.0f;
+};
+
+struct Mxfp8QkvBackwardWeightParams {
+  const Bf16* dqkv_staging = nullptr;  // [M, QKV], packed Q then K then V.
+  const Bf16* saved_input = nullptr;   // Forward input X [M, H].
+  float* grad_weight = nullptr;         // [QKV, H].
+  int32_t local_tokens = 0;
+  int32_t hidden = 0;
+  int32_t q_heads = 0;
+  int32_t kv_heads = 0;
+  int32_t head_dim = 0;
+  float alpha = 1.0f;
+  float beta = 0.0f;  // Set to one to accumulate into an existing main_grad.
+  Mxfp8WgradPolicy gemm_policy = Mxfp8WgradPolicy::kAuto;
+};
+
+struct Mxfp8QkvBackwardParams {
+  Mxfp8QkvBackwardDataParams data;
+  Mxfp8QkvBackwardWeightParams weight;
+  WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
+};
+
+cudaError_t launch_qkv_backward_mxfp8_data(
+    const Mxfp8QkvBackwardDataParams& params,
+    cudaStream_t stream);
+cudaError_t launch_qkv_backward_mxfp8_weight(
+    const Mxfp8QkvBackwardWeightParams& params,
+    cudaStream_t stream);
+cudaError_t launch_qkv_backward_mxfp8(
+    const Mxfp8QkvBackwardParams& params,
     cudaStream_t stream);
 
 }  // namespace fuse
