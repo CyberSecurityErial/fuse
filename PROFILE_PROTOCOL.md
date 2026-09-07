@@ -267,7 +267,34 @@ MPI role summary 将同一批 CTA 时间戳压缩成以下字段：
 绝对时钟值不能互相相减。它们是单次 diagnostic kernel 的角色分解，不是正式 E2E
 延迟，也不能替代 profiling 关闭后的跨 rank 最大值 10+50 结果。
 
-### TE Userbuffers QKV 对照
+### SM103 QKV 逐 route tile 诊断
+
+SM103 `fused_bf16 --profile --profile-direction qkv --profile-detail full`
+在原 CTA/finalize 时间线上增加每个通信 warp 的逐任务记录。目前只接受
+64×128 BF16 tensor-copy 路径，其他路径拒绝而非输出缺失记录。每个 task
+附带源 row/column、大小、目标 rank、Q/K/V segment，以及生产 GEMM tile 坐标。
+
+- `ready wait`：开始等待生产 tile 到 ready acquire 与原有 warp join 返回。
+- `local G2S`：TMA load 发起前至 transaction mbarrier 等待返回。
+- `peer S2G (SMEM read complete)`：TMA store 发起前至原有 `.read` wait 返回；
+  **仅表示源 SMEM 可复用，不表示远端 GMEM 写入完成**。
+- `all peer writes drain`：每个 warp 完成全部任务后，原有完整 wait-group
+  的区间；到此该 warp 发起的目标 GMEM 写入全部完成。
+
+不为逐任务打点添加完整 store wait 或新同步。阶段间隙包括地址计算、fence、
+原有 warp 同步和记录写回；不能把三段时间之和当作完整 route role。
+记录按 task 索引唯一写入，验收全覆盖、warp 内单调不重叠和 CTA role 边界。
+SM103 `producer_ready_v1` 的 task 是生产顺序中的候选槽位，padding 或归属
+另一个依赖 tile 的槽位不发起拷贝，因此 task 编号允许有空洞。
+`profile_qkv_order` 单独记录槽位数和实际拷贝数；逐几何块验收唯一覆盖，
+末尾 drain 从槽位数开始编号，不能用有效记录数推断 drain 的起始编号。
+生产参数结构不增加记录指针；开关关闭时不实例化详细诊断路径。诊断专用
+kernel 预热10次，清空记录后采一个连续 epoch，保留前后生产/诊断 event 时间。
+只采一个 epoch，不把这些时间替代正式10+50结果。使用已有
+`scripts/export_sm103_qkv_perfetto.py` 流式导出，验证后替换当前六份 JSON，
+不保留多轮重复 trace。
+
+### TE Userbuffers QKV 对照（CUDA Event）
 
 TE 对照不使用 `nsys --cuda-graph-trace=node`。逐 node 的 CUPTI 回调会显著放大
 由多个短 GEMM 和 P2P kernel 组成的 Graph。本协议在显式传入 `--trace-out` 时，

@@ -9,10 +9,10 @@ MODE="${MODE:-oproj_a2a_gemm}"
 
 case "${MODE}" in
   qkv_gemm_a2a)
-    BASELINE="${REPO_ROOT}/benchmarks/QKVproj+a2a/te_nccl_baseline.py"
+    BASELINE="${REPO_ROOT}/benchmarks/sm90/QKVproj+a2a/te_nccl_baseline.py"
     ;;
   oproj_a2a_gemm)
-    BASELINE="${REPO_ROOT}/benchmarks/a2a+Oproj/te_nccl_baseline.py"
+    BASELINE="${REPO_ROOT}/benchmarks/sm90/a2a+Oproj/te_nccl_baseline.py"
     ;;
   *)
     echo "Unsupported MODE: ${MODE}" >&2

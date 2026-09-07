@@ -1,5 +1,10 @@
 # Archived benchmark results
 
+v14.0 新增 [SM103 BF16 Graph 基线](sm103/v14.0/README.md)：两条前向融合边界，
+192 项中 190 项实测、两项显存不足留空；保留逐点配置、原始 max-rank 样本及
+证据哈希。历史 SM90 Golden 不覆盖、不重复复制。大 profile、离线依赖和中间
+搜索记录不进入版本归档。
+
 当前归档包含A2A -> O-projection历史Golden，以及132-SM H200 NVLink节点上的
 QKV projection -> A2A结果，以及v9.0/v9.1锁频异构CP的精简正式矩阵。QKV外部基线继续使用独立调优的v4/v5归档；均匀融合侧Eager/Graph结果和对比表为v8.0正式96点采样。
 

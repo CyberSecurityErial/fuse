@@ -11,6 +11,7 @@
 - [Output Projection backward](benchmarks/Oproj-backward/BENCHMARK.md)
 - [四算子完整训练 E2E](benchmarks/e2e/BENCHMARK.md)
 - [四算子 FP8](benchmarks/fp8/BENCHMARK.md)
+- [SM103 前向强基线与 profiler 验证](benchmarks/sm103/README.md)（独立于历史 SM90 Golden）
 
 两个均匀算子文档使用同一口径：BF16、10 次 warmup + 50 次正式采样、逐样本先取跨 rank 最大延迟，再报告 p50/p95；eager 与 CUDA Graph 分别采样、分别成列。Graph capture、instantiate 与显式 upload 均在正式采样外。QKV 正式数据固定 MPI 一进程一卡，单进程多卡只用于诊断。TE、经典 cuBLAS、cuBLASLt、NCCL 和适配版 TE Userbuffers 的调优方法与 winner 配置都在对应文档中逐点列出。
 

@@ -1,5 +1,30 @@
 # 版本演进手册
 
+## v14.0：SM103 BF16 前向基线
+
+本版交付 B300 / SM103a 上自研 QKVProj→A2A 与 A2A→OProj 的 BF16 前向算子，
+以及 cuBLASLt+NCCL、适配版 TE Userbuffers 和纯 cuBLASLt Graph 参考结果。
+按架构拆分 SM90/SM103 源码、CMake 和 benchmark，保留旧 benchmark 路径兼容入口。
+SM103 使用 CUTLASS Blackwell GEMM、持久化 CTA 角色特化、GMEM 信号量和
+宏控制 profiling；低精度融合、backward、异构 CP 不在此版本交付范围。
+
+QKV TMA 消费队列改为跟随 GEMM 解析后的 raster/swizzle：每个 copy rectangle
+归属于全部 ready 依赖中的最后一个逻辑 producer。每份 copy 恰好消费一次，
+仍 acquire 所有相交 producer；不加全局完成顺序屏障。该策略消除确定性的
+生产/消费遍历错位，不保证并发 CTA 下所有 ready wait 消失；向量回退路径不变。
+详细注释位于 `csrc/operators/sm103/detail/producer_consumer.cuh`。
+
+正式数据为 MPI、Graph、BF16 随机输入、至少 10+50、跨 rank 最大延迟。
+全量 190/192 项通过完整数值和路由校验；Llama405B CP4 512K 两项因显存不足
+留空。长序列 QKV 为 1.198 PFLOPS/卡、TEUB 1.278×（47 个匹配点），
+OProj 为 1.114 PFLOPS/卡、TEUB 1.058×（仅 23 个匹配点）。这些不是
+跨节点比较，不宣称所有点超过 TEUB 或达到 1.25 PFLOPS/卡。
+
+本轮使用既有固定 tile/通信 CTA 配置，不追加全量调优。性能模型的跨 shape
+泛化仍是后续工作；本版是可复现的优化起点，不是性能收口版本。CPU 回归与
+生产/profile CUDA 构建及设备验证分开记录；SM90 本轮未重新做设备性能验收。
+完整表、配置与样本见 [`results/sm103/v14.0`](results/sm103/v14.0)。
+
 本文记录 A2A + O-projection 与 QKV Projection + A2A 的版本改动、测量结果和已知边界。正式数据统一使用 BF16、10 次 warmup + 50 次采样，并先取每次采样的跨 rank 最大延迟，再统计 p50。
 
 ## v1.0：可复现的 A2A + O-projection Golden

@@ -1,0 +1,40 @@
+diff --git a/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu b/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
+--- a/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
++++ b/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
+@@ -1992,7 +1992,10 @@
+ #define UNROLLCOPY 8
+   const int start_elem = threadIdx.x + blockDim.x * blockIdx.x;
+   const int end_elem = lines;
+-  const int aligned_elem = (end_elem - start_elem) & (~(blockDim.x * gridDim.x * UNROLLCOPY - 1));
++  // fuse arbitrary-grid copy stride: a bit mask only works for powers of two.
++  const int copy_stride = blockDim.x * gridDim.x * UNROLLCOPY;
++  const int remaining = end_elem > start_elem ? end_elem - start_elem : 0;
++  const int aligned_elem = (remaining / copy_stride) * copy_stride;
+   const int end_aligned = start_elem + aligned_elem;
+ 
+   if (threadIdx.x == 0) {
+@@ -2034,8 +2037,10 @@
+   if (lines) {
+     const int start_elem = threadIdx.x + blockDim.x * blockIdx.x;
+     const int end_elem = lines;
+-    const int aligned_elem =
+-        ((end_elem - start_elem) & (~(blockDim.x * gridDim.x * UNROLLCOPY - 1)));
++    // Preserve exact coverage for every positive communication SM budget.
++    const int copy_stride = blockDim.x * gridDim.x * UNROLLCOPY;
++    const int remaining = end_elem > start_elem ? end_elem - start_elem : 0;
++    const int aligned_elem = (remaining / copy_stride) * copy_stride;
+     const int end_aligned = start_elem + aligned_elem;
+     if (end_elem > start_elem) {
+       for (int line = start_elem; line < end_aligned; line += blockDim.x * gridDim.x * UNROLLCOPY) {
+diff --git a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+--- a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+@@ -518,8 +518,6 @@
+   NVTE_CHECK(!_with_cublasmp && comm != nullptr, "fuse adapter requires native Userbuffers");
+   NVTE_CHECK(sms > 0 && sms <= UB_MAX_SM, "invalid communication SM budget");
+-  NVTE_CHECK(use_ce || (sms & (sms - 1)) == 0,
+-             "native Userbuffers SM copy requires a power-of-two grid");
+   comm->sms = sms;
+   comm->use_ce = use_ce;
+   comm->push = push;
+ }

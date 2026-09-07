@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v13.1
+        default: v14.0
 
 permissions:
   contents: write
@@ -27,9 +27,23 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v13.1");
+              : (process.env.REQUESTED_TAG || "v14.0");
 
             const releases = {
+              "v14.0": {
+                name: "v14.0 — Blackwell SM103 BF16 baseline",
+                body: [
+                  "B300 / SM103a 首版 BF16 前向融合基线：自研 QKVProj→A2A、A2A→OProj，CUTLASS Blackwell GEMM、持久化 CTA 角色特化、GMEM ready 同步和宏控制 profiling。",
+                  "",
+                  "源码、CMake 与 benchmark 按 SM90/SM103 分桶，保留历史路径兼容入口。QKV TMA 消费顺序按 producer/ready/copy 三种粒度协同，消除逻辑顺序错位引起的队头阻塞；并发完成仍需 acquire 全部依赖，没有添加全局完成屏障。",
+                  "",
+                  "Graph 全量 190/192 项通过；Llama405B CP4 512K 两方向因现有显存余量不足留空。随机输入、至少10+50、每个样本取 max-rank，生产与 profile 结果分开。",
+                  "",
+                  "长序列 QKV：1.198 PFLOPS/卡、相对 TEUB 1.278×（47 点）；OProj：1.114 PFLOPS/卡、相对 TEUB 1.058×（仅23个同口径匹配点）。不跨节点补值，不宣称全量最优或全部达到1.25P。",
+                  "",
+                  "本版是固定配置的 BF16 基线，不包含 SM103 低精度融合、backward 或异构 CP。完整 Graph 表、配置、max-rank 样本与证据哈希位于 results/sm103/v14.0；不附带大 profile、离线依赖或临时调优文件。",
+                ].join("\n"),
+              },
               "v1.0": {
                 name: "v1.0 — A2A + O-projection",
                 body: [

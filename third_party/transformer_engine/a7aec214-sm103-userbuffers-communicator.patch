@@ -1,0 +1,69 @@
+diff --git a/transformer_engine/common/include/transformer_engine/comm_gemm_overlap.h b/transformer_engine/common/include/transformer_engine/comm_gemm_overlap.h
+--- a/transformer_engine/common/include/transformer_engine/comm_gemm_overlap.h
++++ b/transformer_engine/common/include/transformer_engine/comm_gemm_overlap.h
+@@ -52,6 +52,10 @@
+ class CommOverlapCore {
+  protected:
+   static inline communicator *_ub_comm{nullptr};
++  // Resolve the communicator in the native DSO, not a hidden inline-static
++  // copy emitted by a framework extension. Definition must stay out of line.
++  communicator *fuse_userbuffers_communicator() const;
++
+   static inline bool _comm_created{false};
+ 
+   int _rank;
+diff --git a/transformer_engine/common/comm_gemm_overlap/comm_gemm_overlap.cpp b/transformer_engine/common/comm_gemm_overlap/comm_gemm_overlap.cpp
+--- a/transformer_engine/common/comm_gemm_overlap/comm_gemm_overlap.cpp
++++ b/transformer_engine/common/comm_gemm_overlap/comm_gemm_overlap.cpp
+@@ -55,6 +55,10 @@
+  * Comm+GEMM Overlap Common Core
+  **************************************************************************************************/
+ 
++communicator *CommOverlapCore::fuse_userbuffers_communicator() const {
++  return _ub_comm;
++}
++
+ // Constructor for Userbuffers backend
+ CommOverlapCore::CommOverlapCore(int myrank, int numranks, int mylocal, int numlocal, int mynode,
+                                  int numnodes, int tp_size, ExtAllgatherOp allgather_handle,
+diff --git a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+--- a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+@@ -514,16 +514,18 @@
+ void CommOverlapP2P::configure_userbuffers_p2p(int sms, bool use_ce, bool push) {
+-  NVTE_CHECK(!_with_cublasmp && _ub_comm != nullptr, "fuse adapter requires native Userbuffers");
++  auto *comm = fuse_userbuffers_communicator();
++  NVTE_CHECK(!_with_cublasmp && comm != nullptr, "fuse adapter requires native Userbuffers");
+   NVTE_CHECK(sms > 0 && sms <= UB_MAX_SM, "invalid communication SM budget");
+-  _ub_comm->sms = sms;
+-  _ub_comm->use_ce = use_ce;
+-  _ub_comm->push = push;
++  comm->sms = sms;
++  comm->use_ce = use_ce;
++  comm->push = push;
+ }
+ 
+ void CommOverlapP2P::validate_fuse_p2p(int64_t src, int64_t dst, int64_t bytes, int peer) {
+   const int64_t capacity = _ubuf.numel() * _ubuf.element_size();
+-  NVTE_CHECK(!_with_cublasmp && _ub_comm != nullptr, "native UB communicator required");
++  auto *comm = fuse_userbuffers_communicator();
++  NVTE_CHECK(!_with_cublasmp && comm != nullptr, "native UB communicator required");
+   NVTE_CHECK(peer >= 0 && peer < _tp_size && peer != _tp_id, "invalid P2P peer");
+   NVTE_CHECK(src >= 0 && dst >= 0 && bytes > 0 && bytes <= capacity &&
+              src <= capacity - bytes && dst <= capacity - bytes,
+              "P2P range exceeds registered Userbuffer");
+   NVTE_CHECK(src % 16 == 0 && dst % 16 == 0 && bytes % 16 == 0,
+@@ -543,11 +545,11 @@
+   validate_fuse_p2p(src, dst, bytes, peer);
+   NVTE_CHECK(stream >= 0 && stream < _stream_send.size(), "invalid send stream index");
+-  userbuffers_send(_ub_reg, src, _ub_reg, dst, bytes, _ub_comm,
++  userbuffers_send(_ub_reg, src, _ub_reg, dst, bytes, fuse_userbuffers_communicator(),
+                    _rank - _tp_id + peer, _stream_send[stream]);
+ }
+ 
+ void CommOverlapP2P::userbuffers_p2p_recv(int64_t src, int64_t dst, int64_t bytes, int peer) {
+   validate_fuse_p2p(src, dst, bytes, peer);
+-  userbuffers_recv(_ub_reg, src, _ub_reg, dst, bytes, _ub_comm,
++  userbuffers_recv(_ub_reg, src, _ub_reg, dst, bytes, fuse_userbuffers_communicator(),
+                    _rank - _tp_id + peer, _stream_recv);
+ }

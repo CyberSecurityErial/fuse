@@ -18,7 +18,15 @@ Read the headers in this order:
 The flat headers and `ulysses/projection_dataflow.h` are compatibility
 includes. New code should include the canonical paths above. A change to
 tensor meaning belongs in one semantic specification; a new kernel tile must
-be registered once in `csrc/operators/ulysses_sm90/detail/launch.cuh`.
+be registered once in the selected architecture's private launch layer.
+
+`csrc/operators/{sm90,sm103}` use the same `entry.cu`, `api/{forward,policy}.cuh`
+and `detail/{gemm,cutlass_pipeline,persistent_gemm,a2a_gemm,gemm_a2a,launch}.cuh`
+layout. CMake selects one
+backend for the common public entry points. SM90 retains BF16/FP8 and its
+backward/reference extensions; SM103 currently implements only the two BF16
+forward primitives and their optional role telemetry. Declarations for other SM90 capabilities are not an
+assertion that those symbols are implemented by the SM103 library.
 
 Do not put model or projection branches into a primitive. A primitive may use
 the specification's declared dataflow contract at compile time, while runtime

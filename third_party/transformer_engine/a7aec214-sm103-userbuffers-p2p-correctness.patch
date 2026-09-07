@@ -1,0 +1,25 @@
+diff --git a/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu b/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
+--- a/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
++++ b/transformer_engine/common/comm_gemm_overlap/userbuffers/userbuffers.cu
+@@ -2537,7 +2537,8 @@
+     kuserbuffers_pushrecv<<<1, 1, 0, stream>>>(
+         comm->myrank, peer, comm->nvrank, peerlocal,
+         &comm->recv_id[peer * NVTE_MAX_REGIONS + dsthandler], reinterpret_cast<int *>(flagptr),
+-        signalonly || comm->sms, comm->ub_timeout,
++        // Each push-copy CTA publishes one completion, not one per launch.
++        signalonly ? 1 : comm->sms, comm->ub_timeout,
+         reinterpret_cast<int *>(0 ?  // temporary disable
+                                     GET_RECV_PTR_BY_INDEX(peer, comm, dsthandler, 1)
+                                   : nullptr),
+diff --git a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+--- a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+@@ -518,6 +518,8 @@
+   NVTE_CHECK(!_with_cublasmp && comm != nullptr, "fuse adapter requires native Userbuffers");
+   NVTE_CHECK(sms > 0 && sms <= UB_MAX_SM, "invalid communication SM budget");
++  NVTE_CHECK(use_ce || (sms & (sms - 1)) == 0,
++             "native Userbuffers SM copy requires a power-of-two grid");
+   comm->sms = sms;
+   comm->use_ce = use_ce;
+   comm->push = push;
+ }

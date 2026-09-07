@@ -5,12 +5,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -35,6 +38,7 @@ struct Plan {
   int valid = 0;
   float tune_ms = 0.0f;
   float waves = 0.0f;
+  bool cache_hit = false;
 };
 
 thread_local std::string last_error;
@@ -101,22 +105,68 @@ bool launch(Plan* plan, const void* a, const void* b_nt, void* d,
 float time_candidate(Plan* plan, const void* a, const void* b_nt, void* d,
                      cudaStream_t stream,
                      const cublasLtMatmulAlgo_t& algorithm,
-                     int warmup, int iterations) {
+                     int warmup, int iterations, bool use_graph = false) {
   for (int i = 0; i < warmup; ++i) {
     if (!launch(plan, a, b_nt, d, stream, algorithm))
       return std::numeric_limits<float>::infinity();
   }
   if (cudaStreamSynchronize(stream) != cudaSuccess)
     return std::numeric_limits<float>::infinity();
+  // The SM103 planner explicitly selects the real launch mode. Historical
+  // callers retain eager tuning unless they opt in through the job environment.
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  cudaStream_t tuning_stream = nullptr;
+  auto cleanup_graph = [&]() {
+    if (executable) cudaGraphExecDestroy(executable);
+    if (graph) cudaGraphDestroy(graph);
+    if (tuning_stream) cudaStreamDestroy(tuning_stream);
+  };
+  if (use_graph) {
+    // PyTorch callers may be on the legacy default stream, which cannot be
+    // captured. Inputs are ready after the caller-stream synchronization above.
+    if (cudaStreamCreateWithFlags(&tuning_stream, cudaStreamNonBlocking) != cudaSuccess)
+      return std::numeric_limits<float>::infinity();
+    stream = tuning_stream;
+    auto begun = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (begun != cudaSuccess) {
+      last_error = std::string("cudaStreamBeginCapture: ") + cudaGetErrorString(begun);
+      cleanup_graph();
+      return std::numeric_limits<float>::infinity();
+    }
+    bool launched = launch(plan, a, b_nt, d, stream, algorithm);
+    cudaError_t ended = cudaStreamEndCapture(stream, &graph);
+    if (!launched || ended != cudaSuccess || !graph ||
+        cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess) {
+      cleanup_graph();
+      return std::numeric_limits<float>::infinity();
+    }
+    for (int i = 0; i < warmup; ++i) {
+      if (cudaGraphLaunch(executable, stream) != cudaSuccess) {
+        cleanup_graph();
+        return std::numeric_limits<float>::infinity();
+      }
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+      cleanup_graph();
+      return std::numeric_limits<float>::infinity();
+    }
+  }
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
-  if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
+  if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess) {
+    if (start) cudaEventDestroy(start);
+    cleanup_graph();
     return std::numeric_limits<float>::infinity();
+  }
   cudaEventRecord(start, stream);
   for (int i = 0; i < iterations; ++i) {
-    if (!launch(plan, a, b_nt, d, stream, algorithm)) {
+    bool launched = use_graph ? cudaGraphLaunch(executable, stream) == cudaSuccess
+                              : launch(plan, a, b_nt, d, stream, algorithm);
+    if (!launched) {
       cudaEventDestroy(stop);
       cudaEventDestroy(start);
+      cleanup_graph();
       return std::numeric_limits<float>::infinity();
     }
   }
@@ -126,6 +176,7 @@ float time_candidate(Plan* plan, const void* a, const void* b_nt, void* d,
   cudaEventElapsedTime(&elapsed, start, stop);
   cudaEventDestroy(stop);
   cudaEventDestroy(start);
+  cleanup_graph();
   return elapsed / iterations;
 }
 
@@ -175,6 +226,25 @@ bool supports_inplace_accumulate(Plan* plan, const void* a, const void* b_nt,
   return ok && host_mismatches == 0;
 }
 
+uint64_t cache_hash(const void* bytes, size_t size) {
+  uint64_t result = 14695981039346656037ull;
+  auto* data = static_cast<const unsigned char*>(bytes);
+  for (size_t i = 0; i < size; ++i) result = (result ^ data[i]) * 1099511628211ull;
+  return result;
+}
+
+struct AlgorithmCache {
+  uint64_t magic = 0x465553454C543031ull;
+  uint64_t key = 0;
+  cublasLtMatmulAlgo_t algorithm{};
+  uint64_t workspace = 0;
+  int returned = 0;
+  int valid = 0;
+  float tune_ms = 0;
+  float waves = 0;
+  uint64_t checksum = 0;
+};
+
 bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
                 cudaStream_t stream, int tune_warmup, int tune_iters,
                 size_t workspace_bytes, int sm_count_target = 0) {
@@ -210,6 +280,54 @@ bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
   plan->workspace_capacity = workspace_bytes == 0
       ? kDefaultWorkspaceBytes : workspace_bytes;
   CUDA_TRY(cudaMalloc(&plan->workspace, plan->workspace_capacity));
+  const char* tune_graph = std::getenv("FUSE_CUBLASLT_TUNE_GRAPH");
+  const bool use_graph = tune_graph && std::strcmp(tune_graph, "1") == 0;
+  std::string cache_path;
+  uint64_t key = 0;
+  if (const char* directory = std::getenv("FUSE_CUBLASLT_CACHE_DIR")) {
+    cudaDeviceProp properties{};
+    CUDA_TRY(cudaGetDeviceProperties(&properties, plan->device));
+    int driver_version = 0;
+    CUDA_TRY(cudaDriverGetVersion(&driver_version));
+    char signature[1024];
+    std::snprintf(signature, sizeof(signature),
+        "%s|%zu|%d|%d.%d|%d|%lld,%lld,%lld|%zu|%d|%d,%d|%d|%zu,%zu,%zu",
+        directory, cublasLtGetVersion(), driver_version, properties.major, properties.minor,
+        properties.multiProcessorCount, (long long)plan->m, (long long)plan->n,
+        (long long)plan->k, plan->workspace_capacity, sm_count_target, tune_warmup,
+        tune_iters, (int)use_graph, (uintptr_t)a%256, (uintptr_t)b_nt%256, (uintptr_t)d%256);
+    std::string identity(signature);
+    identity.append(properties.uuid.bytes, sizeof(properties.uuid.bytes));
+    key = cache_hash(identity.data(), identity.size());
+    char filename[40];
+    std::snprintf(filename, sizeof(filename), "/%016llx.bin", (unsigned long long)key);
+    cache_path = std::string(directory) + filename;
+    if (FILE* file = std::fopen(cache_path.c_str(), "rb")) {
+      AlgorithmCache record{};
+      bool complete = std::fread(&record, sizeof(record), 1, file) == 1 && std::fgetc(file) == EOF;
+      std::fclose(file);
+      cublasLtMatmulHeuristicResult_t checked{};
+      if (complete && record.magic == AlgorithmCache{}.magic && record.key == key &&
+          record.checksum == cache_hash(&record, offsetof(AlgorithmCache, checksum)) &&
+          record.workspace <= plan->workspace_capacity && record.returned > 0 && record.valid > 0 &&
+          std::isfinite(record.tune_ms) && record.tune_ms > 0 &&
+          cublasLtMatmulAlgoCheck(plan->handle, plan->operation, plan->a, plan->b, plan->c,
+                                 plan->d, &record.algorithm, &checked) == CUBLAS_STATUS_SUCCESS &&
+          checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= plan->workspace_capacity &&
+          supports_inplace_accumulate(plan, a, b_nt, d, stream, record.algorithm)) {
+        plan->algorithm = record.algorithm;
+        plan->algorithm_workspace = record.workspace;
+        plan->returned = record.returned;
+        plan->valid = record.valid;
+        plan->tune_ms = record.tune_ms;
+        plan->waves = record.waves;
+        plan->cache_hit = true;
+        return true;
+      }
+      // Invalid or incompatible cache entries are never treated as winners.
+      last_error.clear();
+    }
+  }
   cublasLtMatmulPreference_t preference = nullptr;
   CUBLAS_TRY(cublasLtMatmulPreferenceCreate(&preference));
   CUBLAS_TRY(cublasLtMatmulPreferenceSetAttribute(
@@ -224,15 +342,26 @@ bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
 
   int best = -1;
   float best_ms = std::numeric_limits<float>::infinity();
+  bool warmed_before_selection = false;
   for (int i = 0; i < plan->returned; ++i) {
     if (heuristics[i].state != CUBLAS_STATUS_SUCCESS ||
         heuristics[i].workspaceSize > plan->workspace_capacity)
       continue;
     if (!supports_inplace_accumulate(plan, a, b_nt, d, stream, heuristics[i].algo))
       continue;
+    if (!cache_path.empty() && !warmed_before_selection) {
+      const float probe = time_candidate(plan, a, b_nt, d, stream, heuristics[i].algo,
+                                        std::max(tune_warmup, 1), 10, use_graph);
+      if (!std::isfinite(probe) || probe <= 0) continue;
+      const int heat_iterations = static_cast<int>(std::min(100000.0, std::max(1.0, std::ceil(100.0 / probe))));
+      const float heat = time_candidate(plan, a, b_nt, d, stream, heuristics[i].algo,
+                                       0, heat_iterations, use_graph);
+      if (!std::isfinite(heat)) continue;
+      warmed_before_selection = true;
+    }
     const float ms = time_candidate(
         plan, a, b_nt, d, stream, heuristics[i].algo,
-        std::max(tune_warmup, 1), std::max(tune_iters, 1));
+        std::max(tune_warmup, 1), std::max(tune_iters, 1), use_graph);
     if (!std::isfinite(ms))
       continue;
     ++plan->valid;
@@ -242,13 +371,30 @@ bool initialize(Plan* plan, const void* a, const void* b_nt, void* d,
     }
   }
   if (best < 0) {
-    last_error = "cuBLASLt returned no runnable BF16 algorithm";
+    last_error = "cuBLASLt returned no runnable BF16 algorithm; last error: " + last_error;
     return false;
   }
   plan->algorithm = heuristics[best].algo;
   plan->algorithm_workspace = heuristics[best].workspaceSize;
   plan->tune_ms = best_ms;
   plan->waves = heuristics[best].wavesCount;
+  if (!cache_path.empty()) {
+    AlgorithmCache record{};
+    record.key = key;
+    record.algorithm = plan->algorithm;
+    record.workspace = plan->algorithm_workspace;
+    record.returned = plan->returned;
+    record.valid = plan->valid;
+    record.tune_ms = plan->tune_ms;
+    record.waves = plan->waves;
+    record.checksum = cache_hash(&record, offsetof(AlgorithmCache, checksum));
+    const std::string temporary = cache_path + ".tmp-" + std::to_string(getpid());
+    if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
+      bool written = std::fwrite(&record, sizeof(record), 1, file) == 1;
+      written = std::fclose(file) == 0 && written;
+      if (written) std::rename(temporary.c_str(), cache_path.c_str());
+    }
+  }
   return true;
 }
 
@@ -370,6 +516,11 @@ int fuse_cublaslt_bf16_info(void* opaque, FuseCublasLtInfo* info) {
       plan->tune_ms,
       plan->waves};
   return 1;
+}
+
+int fuse_cublaslt_bf16_cache_hit(void* opaque) {
+  auto* plan = reinterpret_cast<Plan*>(opaque);
+  return plan && plan->cache_hit;
 }
 
 void fuse_cublaslt_bf16_destroy(void* opaque) {

@@ -1,5 +1,24 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v14.0 — Blackwell SM103 BF16 基线
+
+新增 B300 / SM103a 的自研 **QKVProj→A2A、A2A→OProj** BF16 前向融合算子：
+CUTLASS Blackwell GEMM、持久化 kernel、计算/通信 CTA 功能特化、GMEM ready
+同步及宏控制 profiling。源码与 benchmark 按 `sm90/`、`sm103/` 分桶；下方
+历史优化和 FP8/backward 性能承诺仍属于 SM90，不扩展为 Blackwell 已实现功能。
+
+本版定位为基线，不宣称优化收口或全局最优。Graph 全量 190/192 项通过，
+Llama405B CP4 512K 两方向因现有显存余量不足留空。长序列 94/96 项：
+QKV 几何平均 1.198 PFLOPS/卡、相对 TEUB 1.278×（47 项）；OProj 为
+1.114 PFLOPS/卡、相对 TEUB 1.058×（仅 23 个同口径匹配项）。
+缺少基线的项不填、不跨节点配对；固定实测配置不是运行时全局最优策略。
+
+- [构建、配置和测量合同](benchmarks/sm103/README.md)
+- [完整 Graph 表、配置及证据](results/sm103/v14.0/README.md)
+- [生产/消费顺序与已知边界](csrc/operators/sm103/README.md)
+
+## 历史 SM90 实现
+
 单机 Ulysses Context Parallel 的 GEMM/All-to-All 融合算子。A2A+O-projection 已完成优化；QKV Projection+A2A 在 v8.0 联合选择通信 CTA 与 GEMM tile，并复用已经算好的自动配置。v9.1 提供两个面向已知锁频差异的 BF16 加权序列算子。v10.0 新增 QKV 和 OProj 的两条 BF16 反向融合路径，同时支持普通同流 B→W 与 ZeroBubble 分离 B/W；v11.0 补齐 PyTorch autograd 正确性、TE 强基线和前后向 trace；v11.2 验证四条融合边界在完整 CUDA Graph 训练中的 E2E 收益；v12.0 为这四条边界增加纯 E4M3 FP8 版本；v13.0 重构 Ulysses 源码和公开头文件层级；v13.1 将数据流原语与 Ulysses 投影语义收成两级编译期契约，设备代码与 ABI 保持不变。
 
 Attention 输出按 head 分片：

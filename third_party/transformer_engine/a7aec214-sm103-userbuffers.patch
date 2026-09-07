@@ -1,0 +1,109 @@
+diff --git a/build_tools/build_ext.py b/build_tools/build_ext.py
+--- a/build_tools/build_ext.py
++++ b/build_tools/build_ext.py
+@@ -49,6 +49,9 @@ class CMakeExtension(setuptools.Extension):
+ 
+         # CMake configure command
+         build_type = "Debug" if debug_build_enabled() else "Release"
++        python_include_dir = os.getenv(
++            "NVTE_PYTHON_INCLUDE_DIR", sysconfig.get_path("include")
++        )
+         configure_command = [
+             _cmake_bin,
+             "-S",
+@@ -56,7 +59,7 @@ class CMakeExtension(setuptools.Extension):
+             "-B",
+             build_dir,
+             f"-DPython_EXECUTABLE={sys.executable}",
+-            f"-DPython_INCLUDE_DIR={sysconfig.get_path('include')}",
++            f"-DPython_INCLUDE_DIR={python_include_dir}",
+             f"-DPython_SITEARCH={sysconfig.get_path('platlib')}",
+             f"-DCMAKE_BUILD_TYPE={build_type}",
+             f"-DCMAKE_INSTALL_PREFIX={install_dir}",
+diff --git a/transformer_engine/pytorch/csrc/extensions.h b/transformer_engine/pytorch/csrc/extensions.h
+--- a/transformer_engine/pytorch/csrc/extensions.h
++++ b/transformer_engine/pytorch/csrc/extensions.h
+@@ -844,6 +844,12 @@ class CommOverlapP2P : torch::CustomClassHolder, public transformer_engine::Comm
+ 
+   std::pair<at::Stream, at::Stream> get_communication_stream();
+ 
++  // fuse training benchmark adapters; byte ranges are checked before dispatch.
++  void configure_userbuffers_p2p(int sms, bool use_ce, bool push);
++  at::Stream get_userbuffers_send_stream(int index);
++  void userbuffers_p2p_send(int64_t src, int64_t dst, int64_t bytes, int peer, int stream);
++  void userbuffers_p2p_recv(int64_t src, int64_t dst, int64_t bytes, int peer);
++  void validate_fuse_p2p(int64_t src, int64_t dst, int64_t bytes, int peer);
+ };  // CommOverlapP2P
+ 
+ #endif  // TRANSFORMER_ENGINE_PYTORCH_CSRC_EXTENSIONS_H_
+diff --git a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+--- a/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/comm_gemm_overlap.cpp
+@@ -8,6 +8,8 @@
+ #endif
+ 
+ #include "../extensions.h"
++#include <climits>
++#include "../../../common/comm_gemm_overlap/userbuffers/userbuffers.h"
+ #include "transformer_engine/transformer_engine.h"
+ 
+ #define HALF_BYTES 2
+@@ -509,4 +511,43 @@ void transformer_engine::pytorch::bulk_overlap_ag_with_external_gemm(
+   auto main_stream = at::cuda::getCurrentCUDAStream();
+   allgather_communicator.bulk_overlap_external_ag(at::cuda::CUDAStream(send_stream),
+                                                   at::cuda::CUDAStream(recv_stream), main_stream);
++}
++
++void CommOverlapP2P::configure_userbuffers_p2p(int sms, bool use_ce, bool push) {
++  NVTE_CHECK(!_with_cublasmp && _ub_comm != nullptr, "fuse adapter requires native Userbuffers");
++  NVTE_CHECK(sms > 0 && sms <= UB_MAX_SM, "invalid communication SM budget");
++  _ub_comm->sms = sms;
++  _ub_comm->use_ce = use_ce;
++  _ub_comm->push = push;
+ }
++
++void CommOverlapP2P::validate_fuse_p2p(int64_t src, int64_t dst, int64_t bytes, int peer) {
++  const int64_t capacity = _ubuf.numel() * _ubuf.element_size();
++  NVTE_CHECK(!_with_cublasmp && _ub_comm != nullptr, "native UB communicator required");
++  NVTE_CHECK(peer >= 0 && peer < _tp_size && peer != _tp_id, "invalid P2P peer");
++  NVTE_CHECK(src >= 0 && dst >= 0 && bytes > 0 && bytes <= capacity &&
++             src <= capacity - bytes && dst <= capacity - bytes,
++             "P2P range exceeds registered Userbuffer");
++  NVTE_CHECK(src % 16 == 0 && dst % 16 == 0 && bytes % 16 == 0,
++             "Userbuffers P2P requires 16-byte alignment");
++  NVTE_CHECK(bytes / 16 <= INT_MAX, "P2P range exceeds underlying kernel indexing");
++}
++
++at::Stream CommOverlapP2P::get_userbuffers_send_stream(int index) {
++  NVTE_CHECK(index >= 0 && index < _stream_send.size(), "invalid send stream index");
++  return at::cuda::getStreamFromExternal(_stream_send[index], at::cuda::current_device());
++}
++
++void CommOverlapP2P::userbuffers_p2p_send(int64_t src, int64_t dst, int64_t bytes,
++                                        int peer, int stream) {
++  validate_fuse_p2p(src, dst, bytes, peer);
++  NVTE_CHECK(stream >= 0 && stream < _stream_send.size(), "invalid send stream index");
++  userbuffers_send(_ub_reg, src, _ub_reg, dst, bytes, _ub_comm,
++                   _rank - _tp_id + peer, _stream_send[stream]);
++}
++
++void CommOverlapP2P::userbuffers_p2p_recv(int64_t src, int64_t dst, int64_t bytes, int peer) {
++  validate_fuse_p2p(src, dst, bytes, peer);
++  userbuffers_recv(_ub_reg, src, _ub_reg, dst, bytes, _ub_comm,
++                   _rank - _tp_id + peer, _stream_recv);
++}
+diff --git a/transformer_engine/pytorch/csrc/extensions/pybind.cpp b/transformer_engine/pytorch/csrc/extensions/pybind.cpp
+--- a/transformer_engine/pytorch/csrc/extensions/pybind.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/pybind.cpp
+@@ -779,5 +779,10 @@ void init_comm_gemm_overlap_bindings(pybind11::module &m) {
+            py::arg("input"), py::arg("local_chunk") = false)
+       .def("get_buffer", &CommOverlapP2P::get_buffer, py::arg("local_chunk") = false,
+            py::arg("shape") = std::nullopt)
+-      .def("get_communication_stream", &CommOverlapP2P::get_communication_stream);
++      .def("get_communication_stream", &CommOverlapP2P::get_communication_stream)
++      .def("configure_userbuffers_p2p", &CommOverlapP2P::configure_userbuffers_p2p)
++      .def("get_userbuffers_send_stream", &CommOverlapP2P::get_userbuffers_send_stream)
++      .def("userbuffers_p2p_send", &CommOverlapP2P::userbuffers_p2p_send,
++           py::arg("src"), py::arg("dst"), py::arg("bytes"), py::arg("peer"), py::arg("stream") = 0)
++      .def("userbuffers_p2p_recv", &CommOverlapP2P::userbuffers_p2p_recv);
+ }  // NOLINT(readability/fn_size)

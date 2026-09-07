@@ -3,7 +3,7 @@
 
 #include "fuse/types.h"
 #if defined(__CUDACC__)
-#include "fuse/arch/sm90.cuh"
+#include "fuse/arch/common.cuh"
 #endif
 
 #include <cuda_runtime.h>

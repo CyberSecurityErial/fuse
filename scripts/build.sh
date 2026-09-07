@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
+FUSE_ARCH="${FUSE_ARCH:-sm90}"
 
 if [[ -z "${CUTLASS_ROOT:-}" ]]; then
   for candidate in \
@@ -20,6 +21,7 @@ if [[ ! -f "${CUTLASS_ROOT}/include/cutlass/cutlass.h" ]]; then
   exit 2
 fi
 cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -G Ninja \
+  -DFUSE_ARCH="${FUSE_ARCH}" -DFUSE_BUILD_KERNELS=ON \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER="${CUDACXX:-/usr/local/cuda/bin/nvcc}" \
   -DCUTLASS_ROOT="${CUTLASS_ROOT}"
