@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from export_sm103_qkv_perfetto import export, group_role_tracks
+from export_sm103_qkv_perfetto import export, group_role_tracks, annotate_trace, annotate_transfer_events
 
 
 class QkvPerfettoTests(unittest.TestCase):
@@ -67,6 +67,37 @@ class QkvPerfettoTests(unittest.TestCase):
         drains = [e for e in trace['traceEvents'] if e['name'] == 'all peer writes drain']
         self.assertEqual(len(drains), 8)
         self.assertTrue(all(e.get('dur', 0) >= 0 for e in trace['traceEvents']))
+        copies = [e for e in trace['traceEvents'] if e['name'] in
+                  ('local G2S', 'peer S2G (SMEM read complete)')]
+        self.assertEqual(len(copies), 6)
+        self.assertTrue(all(e['args']['bytes'] == 16384 for e in copies))
+        self.assertTrue(all(e['args']['src_gpu'] == e['args']['dst_gpu'] == 0 for e in copies))
+
+    def test_endpoint_annotation_preserves_sample_and_tracks(self):
+        events = [dict(ph='X', pid=2, tid=109, ts=i, dur=0.25, name=name, args=args)
+                  for i, (name, args) in enumerate([
+                      ('ready wait', dict(task=7, peer=5, rows=64, columns=128)),
+                      ('local G2S', dict(task=7)),
+                      ('peer S2G (SMEM read complete)', dict(task=7))])]
+        original = [{k:v for k,v in e.items() if k != 'args'} for e in events]
+        self.assertEqual(annotate_transfer_events(events, 8), 2)
+        self.assertEqual(events[1]['args']['dst_gpu'], 2)
+        self.assertEqual(events[2]['args']['src_gpu'], 2)
+        self.assertEqual(events[2]['args']['dst_gpu'], 5)
+        self.assertEqual(events[1]['args']['route_peer'], 5)
+        self.assertEqual(events[2]['args']['bytes'], 16384)
+        self.assertEqual(annotate_transfer_events(events, 8), 2)
+        self.assertEqual(original, [{k:v for k,v in e.items() if k != 'args'} for e in events])
+
+    def test_invalid_annotation_preserves_existing_file(self):
+        payload = dict(metadata=dict(schema='fuse_sm103_qkv_perfetto_v2', config=dict(world=8)),
+                       traceEvents=[dict(name='ready wait', pid=0,
+                           args=dict(task=1, peer=7, rows=64, columns=128))])
+        original = json.dumps(payload)
+        self.output.write_text(original)
+        with self.assertRaises(AssertionError): annotate_trace(self.output)
+        self.assertEqual(self.output.read_text(), original)
+        self.assertFalse(self.output.with_suffix('.endpoints-tmp').exists())
 
     def test_missing_drain_rejected_without_partial_delivery(self):
         self.lines.pop()

@@ -1,5 +1,18 @@
 # 版本演进手册
 
+## v15.0：SM103 QKV 可选 rank N-band swizzle
+
+- 构建选项 `FUSE_SM103_QKV_RANK_SWIZZLE` 默认 OFF；显式开启后生产者和
+  消费者共同轮转 N 分组，保留全部 ready 依赖与目的端语义。不引入模型名规则。
+- 同节点 A/B 完成 95/96 个 QKV Graph 点；全量几何平均 +0.61%，长序列
+  47/48 点 +1.29%。45/95 点变慢，故不默认开启。缺项仍为 Llama405B CP4 512K。
+- 默认路径的 Perfetto 条带新增 src_gpu/dst_gpu/route_peer/bytes；S2G 的
+  `.read` 完成不是远端到达。rank 错峰与 profiling 的组合暂不支持。
+- 测量前允许在有限窗口内等待原有三次连续空闲检查，不降低 5% 占用阈值；
+  正式采样、漂移阈值及正确性检查不变。不停止其他进程。
+- 数据见 [v15.0 结果](results/sm103/v15.0/README.md)。不包含大 profile、离线依赖
+  或中间搜索档案；SM90 算法及公开参数布局不变。
+
 ## v14.0：SM103 BF16 前向基线
 
 本版交付 B300 / SM103a 上自研 QKVProj→A2A 与 A2A→OProj 的 BF16 前向算子，

@@ -2478,6 +2478,11 @@ int main(int argc, char** argv) {
               << ",input_generator=" << options.input_generator
               << ",host_launch=" << options.host_launch
               << ",max_swizzle_size=" << options.max_swizzle_size
+#if FUSE_SM103_QKV_RANK_SWIZZLE
+              << ",qkv_rank_swizzle=rank_n_band_v1"
+#else
+              << ",qkv_rank_swizzle=off"
+#endif
               << ",qkv_raster=" << options.qkv_raster << ",oproj_raster=" << options.oproj_raster
               << ",qkv_effective_raster=" << (options.qkv_raster == "heuristic" ? "along_m" : options.qkv_raster)
               << ",oproj_effective_raster=" << (options.oproj_raster == "heuristic" ? "along_n" : options.oproj_raster)

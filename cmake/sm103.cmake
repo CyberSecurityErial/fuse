@@ -7,9 +7,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CUTLASS_ROOT "" CACHE PATH "Local CUTLASS source root with SM100 BF16 collectives")
 option(FUSE_ENABLE_PROFILING "Build diagnostic role telemetry kernels" OFF)
+option(FUSE_SM103_QKV_RANK_SWIZZLE "Experiment: rank-dependent QKV producer/consumer N-band rotation" OFF)
 option(FUSE_BUILD_KERNELS "Build the SM103 BF16 fused operators" ON)
 option(FUSE_BUILD_BASELINES "Build the independent SM103 cuBLASLt benchmarks" ON)
 option(FUSE_BUILD_MPI_BENCH "Build the same full-validation harness with MPI Eager execution" OFF)
+if(FUSE_SM103_QKV_RANK_SWIZZLE AND FUSE_ENABLE_PROFILING)
+  message(FATAL_ERROR "Rank-rotated profiling ownership is not implemented; disable rank swizzle or profiling")
+endif()
 if(FUSE_BUILD_KERNELS AND NOT EXISTS
     "${CUTLASS_ROOT}/include/cutlass/gemm/collective/sm100_mma_warpspecialized.hpp")
   message(FATAL_ERROR "Set CUTLASS_ROOT to a local Blackwell-capable CUTLASS checkout")
@@ -24,6 +28,8 @@ if(FUSE_BUILD_KERNELS)
     target_compile_definitions(fuse_kernels PUBLIC FUSE_ENABLE_PROFILING=0)
   endif()
   target_compile_definitions(fuse_kernels PUBLIC FUSE_ARCH_SM103=1)
+  target_compile_definitions(fuse_kernels PUBLIC
+    FUSE_SM103_QKV_RANK_SWIZZLE=$<BOOL:${FUSE_SM103_QKV_RANK_SWIZZLE}>)
   # CUDA 13's default CUTLASS wrapper resolves the driver entry point on each
   # call. Keep this direct-call variant private to the SM103 implementation;
   # the explicit driver link must propagate to consumers of this static library.

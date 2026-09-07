@@ -1,5 +1,27 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v15.0 — 可选的 SM103 QKV rank 错峰
+
+新增 `FUSE_SM103_QKV_RANK_SWIZZLE` **构建选项，默认 OFF**。开启后，GEMM
+生产顺序与 TMA 消费顺序共同按源 rank 轮转 N 分组；不改变数据布局、head
+归属或 ready 同步语义。不是自动调优，也不按模型名自动开启。
+
+同节点、同配置、无 profiling 的 Graph A/B 完成 95/96 个 QKV 点：全量
+几何平均 +0.61%，长序列 47/48 点 +1.29%；有增有减，因此不统一开启。
+Llama405B CP4 512K 保留显存缺项。SM90 算法与公开参数布局不变。
+
+```bash
+# 添加到原有 SM103 CMake 配置；关闭或省略该选项即使用原遍历顺序。
+cmake -S . -B build/sm103-rank-swizzle -DFUSE_ARCH=sm103 \
+  -DCUTLASS_ROOT=/path/to/cutlass -DFUSE_SM103_QKV_RANK_SWIZZLE=ON \
+  -DFUSE_ENABLE_PROFILING=OFF
+cmake --build build/sm103-rank-swizzle -j 4
+```
+
+目前不支持 rank 错峰与 profiling 同时开启；配置阶段明确拒绝此组合。
+默认路径的 Perfetto 导出新增搬运源/目的 GPU 与字节数元数据。
+[完整 A/B 表、配置、样本与复现说明](results/sm103/v15.0/README.md)。
+
 ## v14.0 — Blackwell SM103 BF16 基线
 
 新增 B300 / SM103a 的自研 **QKVProj→A2A、A2A→OProj** BF16 前向融合算子：

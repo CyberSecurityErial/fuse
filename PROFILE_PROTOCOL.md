@@ -294,6 +294,14 @@ kernel 预热10次，清空记录后采一个连续 epoch，保留前后生产/�
 `scripts/export_sm103_qkv_perfetto.py` 流式导出，验证后替换当前六份 JSON，
 不保留多轮重复 trace。
 
+TMA 条带的 `args` 记录 `src_gpu`、`dst_gpu`、`route_peer`、`bytes` 和 `task`。
+GPU 编号为 trace 的逻辑 rank，不是 PCI ordinal。local G2S 两端在同一 GPU，
+表示本地 GMEM→通信 SMEM；peer S2G 表示源通信 SMEM→目标 GMEM，若两端 rank
+相同则为本地写入。`route_peer` 是该 tile 最终路由目标；`bytes` 是 BF16 payload，
+不是实测 NVLink 线上字节数。S2G 终点仍为源 SMEM read complete，不生成虚构的
+接收端到达时间。旧六份 JSON 可用 `export_sm103_qkv_perfetto.py --annotate-trace
+<path>` 原位补充这些派生信息，不改变时间戳、轨道或 kernel，不需重新采集。
+
 ### TE Userbuffers QKV 对照（CUDA Event）
 
 TE 对照不使用 `nsys --cuda-graph-trace=node`。逐 node 的 CUPTI 回调会显著放大

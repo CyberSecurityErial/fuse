@@ -21,6 +21,17 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_qkv_rank_swizzle_build_isolation(self):
+        plain = self.fused_job(stage='fused-build', mpi=True)
+        rotated = plain | dict(qkv_rank_swizzle=True)
+        l20d.validate_job(rotated)
+        self.assertNotEqual(l20d.fused_build_dir(plain), l20d.fused_build_dir(rotated))
+        self.assertIn('-DFUSE_SM103_QKV_RANK_SWIZZLE=OFF', l20d.fused_argv(plain)[-1])
+        self.assertIn('-DFUSE_SM103_QKV_RANK_SWIZZLE=ON', l20d.fused_argv(rotated)[-1])
+        for change in (dict(profile=True), dict(stage='doctor'), dict(qkv_rank_swizzle=1)):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(rotated | change)
+
     def test_actual_cpp_counter_guard_accepts_mpi_owned_launch(self):
         compiler = shutil.which('c++')
         if not compiler:
@@ -1214,11 +1225,21 @@ int main() {
             with self.subTest(utilization=utilization, free=free), \
                     mock.patch.object(l20d, 'read_command', return_value=self.gpu_csv(
                         ['0', '1', '2', '3'], utilization=utilization, free=free)), \
-                    mock.patch.object(l20d.os, 'killpg') as kill:
+                    mock.patch.object(l20d.os, 'killpg') as kill, mock.patch.object(l20d.time, 'sleep'):
                 with self.assertRaisesRegex(RuntimeError, error):
                     l20d.check_fused_devices(self.fused_job(world=4), self.root / 'failed-check')
                 kill.assert_not_called()
                 self.assertTrue((self.root / 'failed-check/gpu-before.json').exists())
+
+    def test_gpu_guard_waits_for_three_consecutive_idle_samples(self):
+        idle = self.gpu_csv(list('0123'))
+        busy = self.gpu_csv(list('0123'), utilization=60)
+        with mock.patch.object(l20d, 'read_command', side_effect=[idle, busy, idle, busy, idle, idle, idle]) as read, \
+                mock.patch.object(l20d.time, 'sleep'), mock.patch.object(l20d.os, 'killpg') as kill:
+            self.assertEqual(l20d.check_fused_devices(self.fused_job(world=4), self.root / 'quiet-check'),
+                             ','.join('GPU-uuid' + str(rank) for rank in range(4)))
+        self.assertEqual(read.call_count, 7)
+        kill.assert_not_called()
 
     def test_remote_fused_smoke_uses_child_env_and_persists_node_receipt(self):
         job = self.fused_job(run_id='remote-smoke', experiment='smoke-test',

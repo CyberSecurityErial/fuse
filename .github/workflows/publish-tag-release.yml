@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v14.0
+        default: v15.0
 
 permissions:
   contents: write
@@ -27,9 +27,23 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v14.0");
+              : (process.env.REQUESTED_TAG || "v15.0");
 
             const releases = {
+              "v15.0": {
+                name: "v15.0 — Optional SM103 QKV rank swizzle",
+                body: [
+                  "新增 SM103 BF16 QKV rank N-band 错峰构建选项 FUSE_SM103_QKV_RANK_SWIZZLE，默认 OFF；不是运行时自动调优。",
+                  "",
+                  "GEMM 生产者与 TMA 消费者共同按源 rank 轮转 N 分组，不改变 head 归属、输出布局、ready 信号或发布/获取/排空协议。SM90 算法与公开参数布局不变。",
+                  "",
+                  "无 profiling 的 Graph 同节点 A/B 完成95/96点，全量几何平均+0.61%，长序列47/48点+1.29%；有增有减，不统一开启。Llama405B CP4 512K保留显存缺项。小幅单轮差异不代表稳定收益，也不能据此证明NVLink burst是普遍瓶颈。",
+                  "",
+                  "默认路径 Perfetto 导出增加src_gpu/dst_gpu/route_peer/bytes；S2G源读取完成不等于远端到达。rank错峰与profiling同时开启暂不支持，配置阶段明确拒绝。",
+                  "",
+                  "完整对照表、配置、原始max-rank样本及证据哈希见results/sm103/v15.0；不附带大profile、依赖包或中间调优文件。",
+                ].join("\n"),
+              },
               "v14.0": {
                 name: "v14.0 — Blackwell SM103 BF16 baseline",
                 body: [

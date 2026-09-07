@@ -288,6 +288,10 @@ def validate_job(job, hostname=None):
             raise ValueError('MPI counter experiment uses NCU only')
     if not isinstance(job.get('mpi', False), bool):
         raise ValueError('MPI selection must be a boolean')
+    if type(job.get('qkv_rank_swizzle', False)) is not bool:
+        raise ValueError('QKV rank swizzle selection must be a boolean')
+    if job.get('qkv_rank_swizzle') and (job['stage'] not in FUSED_STAGES or job.get('profile')):
+        raise ValueError('QKV rank swizzle experiment requires a non-profile fused stage')
     launch = job.get('fused_launch', 'eager')
     if launch not in ('eager', 'graph'):
         raise ValueError('Fused launch must be eager or graph')
@@ -873,9 +877,11 @@ def environment_receipt():
 
 
 def fused_build_dir(job):
-    if job.get('mpi'):
-        return REMOTE / 'build/sm103-fused-mpi'
-    return REMOTE / 'build' / ('sm103-fused-profile' if job.get('profile', False) else 'sm103-fused')
+    name = ('sm103-fused-mpi' if job.get('mpi') else
+            'sm103-fused-profile' if job.get('profile', False) else 'sm103-fused')
+    if job.get('qkv_rank_swizzle'):
+        name += '-rank-swizzle'
+    return REMOTE / 'build' / name
 
 
 def fused_binary(job):
@@ -924,6 +930,7 @@ def fused_argv(job):
         configure = ['cmake', '-S', str(REMOTE), '-B', str(build), '-G', 'Ninja',
                      '-DFUSE_ARCH=sm103', '-DFUSE_BUILD_KERNELS=ON', '-DFUSE_BUILD_BASELINES=OFF',
                      '-DFUSE_ENABLE_PROFILING=' + ('ON' if job.get('profile', False) else 'OFF'),
+                     '-DFUSE_SM103_QKV_RANK_SWIZZLE=' + ('ON' if job.get('qkv_rank_swizzle') else 'OFF'),
                      '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc',
                      '-DCUTLASS_ROOT=' + CUTLASS]
         if job.get('mpi'):
@@ -990,6 +997,8 @@ def fused_build_receipt(job, env_id):
     recorded = dict(node=job_node(job), profile=job.get('profile', False), binary=str(binary),
                 binary_sha256=sha(binary), build_inputs=fused_build_inputs(job),
                 environment_fingerprint=env_id, dynamic_dependencies=dependencies)
+    if job.get('qkv_rank_swizzle'):
+        recorded['qkv_rank_swizzle'] = 'rank_n_band_v1'
     if job.get('mpi'):
         if 'not found' in dependencies or 'libmpi.so' not in dependencies:
             raise RuntimeError('MPI executable has unresolved or absent libmpi linkage')
@@ -1313,7 +1322,13 @@ def check_fused_devices(job, folder, devices=None, memory=None):
     fields = ('index', 'uuid', 'utilization.gpu', 'memory.free', 'memory.used',
               'clocks.sm', 'clocks.mem', 'power.draw')
     observations = []
-    for sample in range(3):
+    quiet_samples = 0
+    last_busy = None
+    # A brief occupied observation is not permission to run through another
+    # workload, nor a reason to submit a stream of failed jobs. Wait within
+    # this job for the original three consecutive idle samples (<=5%); never
+    # lower the threshold, ignore an active rank, or stop its processes.
+    for sample in range(31):
         raw = read_command(['nvidia-smi', '--id=' + ','.join(devices),
                             '--query-gpu=' + ','.join(fields), '--format=csv,noheader,nounits'])
         rows = [dict(zip(fields, (value.strip() for value in row))) for row in csv.reader(raw.splitlines())]
@@ -1324,21 +1339,34 @@ def check_fused_devices(job, folder, devices=None, memory=None):
         by_index = {row.get('index'): row for row in rows}
         if len(rows) != len(devices) or set(by_index) != set(devices):
             raise RuntimeError('GPU observation did not cover exactly the selected physical devices')
+        busy = []
         for device in devices:
             row = by_index[device]
             utilization, free = float(row['utilization.gpu']), float(row['memory.free'])
             if not math.isfinite(utilization) or not math.isfinite(free):
                 raise RuntimeError(f'GPU {device} returned invalid utilization/memory telemetry')
             if utilization > 5:
-                raise RuntimeError(f'GPU {device} is computing ({utilization}%); no processes were stopped')
+                busy.append((device, utilization))
             if free * (1 << 20) < memory['minimum_free_bytes']:
                 required_mib = memory['minimum_free_bytes'] / (1 << 20)
                 raise RuntimeError(f'GPU {device} has {free:g} MiB free; estimated requirement '
                                    f'{required_mib:.1f} MiB (minimum 2 GiB); no processes were stopped')
             if not row.get('uuid', '').startswith('GPU-'):
                 raise RuntimeError(f'GPU {device} did not return a valid UUID')
-        if sample < 2:
-            time.sleep(1)
+        if busy:
+            if last_busy is None:
+                print('warning,gpu_wait=waiting_for_three_idle_samples,max_observations=31', flush=True)
+            last_busy = busy[0]
+            quiet_samples = 0
+        else:
+            quiet_samples += 1
+            if quiet_samples == 3:
+                break
+        if sample == 30:
+            device, utilization = last_busy
+            raise RuntimeError(f'No sustained idle window; last busy observation: GPU {device} '
+                               f'is computing ({utilization}%); no processes were stopped')
+        time.sleep(1)
     # UUIDs make nvidia-smi physical indices unambiguous despite CUDA ordinal order.
     return ','.join(by_index[device]['uuid'] for device in devices)
 
@@ -1651,6 +1679,8 @@ def main():
     run.add_argument('--qkv-epilogue-probe', action='store_true',
                      help='private N256/K64/e32 QKV epilogue diagnostic; requires profile and CTA detail')
     run.add_argument('--rebuild', action='store_true', help='fused-build: explicitly rebuild this workspace-local build directory')
+    run.add_argument('--qkv-rank-swizzle', action='store_true',
+                     help='experimental QKV rank-dependent N-band rotation; separate non-profile build')
     run.add_argument('--world', type=int, choices=(4, 8), default=8, help='fused smoke rank count')
     sequence = run.add_mutually_exclusive_group()
     sequence.add_argument('--seq-local', type=int, help='fused smoke rows per rank (default 256)')

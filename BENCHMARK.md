@@ -1,6 +1,8 @@
 # Benchmark Index
 
-当前版本：v13.1
+当前版本：v15.0
+
+- [SM103 QKV rank swizzle 完整 A/B（默认关闭）](results/sm103/v15.0/README.md)
 
 从 v4.0 开始，每个通算融合算子独立维护 benchmark、调优空间、正式结果与复现命令：
 

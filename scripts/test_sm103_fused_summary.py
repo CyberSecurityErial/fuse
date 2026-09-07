@@ -674,6 +674,14 @@ class FusedSummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summary.audit_run(self.root)
 
+    def test_rank_swizzle_marker_must_match_job(self):
+        self.change_log(lambda text: text.replace('config,', 'config,qkv_rank_swizzle=rank_n_band_v1,', 1))
+        with self.assertRaisesRegex(ValueError, 'rank swizzle job/config mismatch'):
+            summary.audit_run(self.root)
+        self.change_log(lambda text: text.replace('qkv_rank_swizzle=rank_n_band_v1', 'qkv_rank_swizzle=off'))
+        self.assertTrue(all(row['qkv_rank_swizzle'] == 'off'
+                            for row in summary.audit_run(self.root)['candidates']))
+
     def test_schedule_nondefaults_export_actual_geometry_for_fused_and_both_references(self):
         self.make_fixture(calibrate=True, seq_local=1024, schedule=dict(
             max_swizzle_size=8, qkv_raster='along_n', oproj_raster='along_m'))

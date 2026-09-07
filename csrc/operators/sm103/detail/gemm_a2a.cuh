@@ -104,6 +104,7 @@ struct QkvGqaPackCommT {
     bool use_tma = false;
     bool use_tma_store = false;
     SchedulerParams producer_order{};
+    detail::NBandSwizzle n_band_swizzle{};
   };
   using Params = Arguments;
 
@@ -130,6 +131,9 @@ struct QkvGqaPackCommT {
     if (!args.use_tma) {
       return cudaSuccess;
     }
+#if FUSE_SM103_QKV_RANK_SWIZZLE
+    args.n_band_swizzle = detail::NBandSwizzle::make(args.producer_order, p.route.rank);
+#endif
     const uint64_t global_dims[2] = {
         static_cast<uint64_t>(p.gemm.n),
         static_cast<uint64_t>(p.gemm.m)};
@@ -340,7 +344,11 @@ struct QkvGqaPackCommT {
         for (int64_t work = static_cast<int64_t>(slot) * comm_ctas + comm_id;
              work < bulk_tasks;
              work += task_stride) {
-          const auto task = CopyOrder::decode(args.producer_order, work, p.gemm.m, p.gemm.n);
+          const auto task = CopyOrder::decode(args.producer_order, work, p.gemm.m, p.gemm.n
+#if FUSE_SM103_QKV_RANK_SWIZZLE
+              , args.n_band_swizzle
+#endif
+              );
           if (!task.valid) continue;
           const int32_t q_width = p.route.q_heads * p.route.head_dim;
           const int32_t kv_width = p.route.kv_heads * p.route.head_dim;

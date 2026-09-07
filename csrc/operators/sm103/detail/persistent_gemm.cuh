@@ -36,16 +36,18 @@ class PersistentTileSchedulerSm100Monolithic
 
   struct Arguments : BaseArguments {
     int32_t block_offset = 0;
+    int32_t n_band_rank = 0;
   };
 
   struct Params : BaseParams {
     uint64_t compute_grid_size = 0;
     int32_t block_offset = 0;
+    NBandSwizzle n_band_swizzle{};
   };
 
   static bool can_implement(const Arguments& args) {
     const int swizzle = args.max_swizzle_size;
-    return args.block_offset >= 0 &&
+    return args.block_offset >= 0 && args.n_band_rank >= 0 &&
         (swizzle == 1 || swizzle == 2 || swizzle == 4 || swizzle == 8) &&
         Base::can_implement(static_cast<const BaseArguments&>(args));
   }
@@ -70,6 +72,7 @@ class PersistentTileSchedulerSm100Monolithic
         problem, tile, atom_thread_shape, cluster, hardware,
         args, workspace, epilogue_subtiles);
     params.block_offset = args.block_offset;
+    params.n_band_swizzle = NBandSwizzle::make(base_params, args.n_band_rank);
     if (hardware.sm_count > 0) {
       // hardware.sm_count is the caller's COMPUTE budget, excluding comm.
       // CUTLASS truncates this grid to the number of initial work tiles.
@@ -114,7 +117,8 @@ class PersistentTileSchedulerSm100Monolithic
       : Base(clc_response, static_cast<const BaseParams&>(params),
              block_id_in_cluster),
         current_(static_cast<uint64_t>(blockIdx.x) - params.block_offset),
-        stride_(params.compute_grid_size) {
+        stride_(params.compute_grid_size),
+        n_band_swizzle_(params.n_band_swizzle) {
     CUTLASS_ASSERT(blockIdx.y == 0 && blockIdx.z == 0);
     CUTLASS_ASSERT(valid_initial_worker(params, blockIdx.x));
   }
@@ -125,7 +129,11 @@ class PersistentTileSchedulerSm100Monolithic
   }
 
   CUTLASS_DEVICE WorkTileInfo get_current_work() const {
+#if FUSE_SM103_QKV_RANK_SWIZZLE
+    const auto tile = ProducerTileOrder::decode(this->scheduler_params, current_, n_band_swizzle_);
+#else
     const auto tile = ProducerTileOrder::decode(this->scheduler_params, current_);
+#endif
     return {tile.m, tile.n, tile.batch, tile.valid};
   }
 
@@ -153,6 +161,7 @@ class PersistentTileSchedulerSm100Monolithic
  private:
   uint64_t current_;
   uint64_t stride_;
+  NBandSwizzle n_band_swizzle_;
 };
 
 // One physical cooperative grid, two persistent CTA roles. Keep exactly

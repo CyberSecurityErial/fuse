@@ -25,7 +25,7 @@ import struct
 import tarfile
 import tempfile
 
-from l20d import NODES, fused_build_inputs, fused_candidates, fused_devices, fused_geometry, fused_policy_tile
+from l20d import NODES, fused_binary, fused_build_inputs, fused_candidates, fused_devices, fused_geometry, fused_policy_tile
 
 
 SCHEMA = 'sm103_fused_verified_v1'
@@ -234,9 +234,9 @@ def read_receipts(directory):
             env_id == fetched.get('environment_fingerprint') == status.get('environment_fingerprint'),
             'Environment fingerprint mismatch')
     build = records['fused-build.json']
-    expected_binary = ('/root/workspace_wct/fuse/build/sm103-fused-mpi/fused_bf16_mpi'
-                       if job.get('mpi') else '/root/workspace_wct/fuse/build/sm103-fused' + (
-                           '-profile' if job.get('profile') else '') + '/fused_bf16')
+    expected_binary = str(fused_binary(job))
+    require(build.get('qkv_rank_swizzle', 'off') ==
+            ('rank_n_band_v1' if job.get('qkv_rank_swizzle') else 'off'), 'Rank swizzle build mismatch')
     require(build.get('node') == job['node'] and build.get('profile') == bool(job.get('profile')) and
             build.get('binary') == expected_binary and SHA256.fullmatch(build.get('binary_sha256', '')) and
             build.get('build_inputs') == fused_build_inputs(job) and
@@ -978,6 +978,9 @@ def audit_log(text, job):
     configs = [r for r in rows if r['kind'] == 'config']
     require(len(configs) == 1, 'Requires exactly one harness config')
     config = configs[0]
+    rank_swizzle = 'rank_n_band_v1' if job.get('qkv_rank_swizzle') else 'off'
+    require(config.get('qkv_rank_swizzle', 'off') == rank_swizzle,
+            'QKV rank swizzle job/config mismatch')
     launch = fused_launch(job)
     graph = launch == 'graph'
     require(not graph or (config.get('launch') == 'graph' and
@@ -1208,6 +1211,7 @@ def audit_log(text, job):
         payload = 2 * m * (n if qkv_direction else k)
         results.append({'candidate': index, 'direction': direction, 'component': component,
             'measurement_role': 'production' if component == 'fused' else 'calibration',
+            'qkv_rank_swizzle': rank_swizzle if qkv_direction else 'off',
             'performance_accepted': not diagnostic, 'host_launch': host_launch,
             'collector': None if diagnostic else timing['collector'],
             'launch': launch, 'graph_epoch_mode': GRAPH_EPOCH_MODE if graph else None,
@@ -1331,7 +1335,7 @@ def summarize(directories, output):
                'm', 'n', 'k', 'layout', 'host_launch', 'launch', 'graph_epoch_mode', 'collector', 'precision', 'sm_count',
                'candidate', 'comm_ctas', 'tile_policy', 'tile_m', 'tile_n', 'tile_k',
                'schedule_schema', 'raster_requested', 'raster', 'max_swizzle_size', 'effective_swizzle_size',
-               'swizzle', 'padded_m_tiles', 'padded_n_tiles', 'has_padding', 'scheduled_work_tiles_derived',
+               'swizzle', 'qkv_rank_swizzle', 'padded_m_tiles', 'padded_n_tiles', 'has_padding', 'scheduled_work_tiles_derived',
                'problem_gemm_flops', 'problem_route_payload_bytes', 'problem_remote_payload_bytes',
                'executed_gemm_flops', 'executed_route_payload_bytes', 'p50_ms', 'p95_ms', 'half_drift')
     output.parent.mkdir(parents=True, exist_ok=True)

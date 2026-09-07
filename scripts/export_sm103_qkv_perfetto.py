@@ -11,6 +11,68 @@ import re
 from pathlib import Path
 
 
+TRANSFER_ENDPOINTS = dict(
+    version='gpu_endpoints_v1',
+    gpu_ids='Logical ranks matching trace GPU process IDs, not PCI device ordinals',
+    local_G2S='src_gpu GMEM -> same GPU communication SMEM; route_peer is the eventual destination',
+    peer_S2G='src_gpu communication SMEM -> dst_gpu GMEM; src_gpu == dst_gpu is a local store',
+    completion='G2S ends at mbarrier completion; S2G ends at source SMEM read completion, NOT destination arrival',
+    bytes='BF16 payload bytes per copy, not measured NVLink wire bytes')
+
+
+def transfer_args(rank, peer, task, rows, columns, phase):
+    assert phase in ('g2s', 's2g') and rows > 0 and columns > 0
+    return dict(task=task, src_gpu=rank, dst_gpu=rank if phase == 'g2s' else peer,
+                route_peer=peer, bytes=rows * columns * 2)
+
+
+def annotate_transfer_events(events, world):
+    """Join the exporter's ready/G2S/S2G triplets; never infer receive times."""
+    pending, count = {}, 0
+    for event in events:
+        name = event['name']
+        if name == 'ready wait':
+            args = event['args']
+            key = event['pid'], args['task']
+            assert key not in pending
+            assert 0 <= key[0] < world and 0 <= args['peer'] < world
+            pending[key] = (args, False)
+        elif name in ('local G2S', 'peer S2G (SMEM read complete)'):
+            key = event['pid'], event['args']['task']
+            args, seen_g2s = pending[key]
+            phase = 'g2s' if name == 'local G2S' else 's2g'
+            assert seen_g2s == (phase == 's2g'), 'Missing/duplicate transfer phase'
+            event['args'].update(transfer_args(key[0], args['peer'], key[1],
+                                             args['rows'], args['columns'], phase))
+            if phase == 's2g': del pending[key]
+            else: pending[key] = (args, True)
+            count += 1
+    assert not pending, 'Incomplete ready/G2S/S2G triplet'
+    return count
+
+
+def rewrite_trace(path, payload, suffix):
+    temporary = path.with_suffix(suffix)
+    created = False
+    try:
+        with temporary.open('x') as stream:
+            created = True
+            json.dump(payload, stream, separators=(',', ':'))
+        temporary.replace(path)
+    finally:
+        if created and temporary.exists(): temporary.unlink()
+
+
+def annotate_trace(path):
+    with path.open() as stream:
+        payload = json.load(stream)
+    assert payload['metadata']['schema'] == 'fuse_sm103_qkv_perfetto_v2'
+    count = annotate_transfer_events(payload['traceEvents'], int(payload['metadata']['config']['world']))
+    payload['metadata']['transfer_endpoints'] = TRANSFER_ENDPOINTS
+    rewrite_trace(path, payload, '.endpoints-tmp')
+    print(f'Annotated {path.name}: {count} transfer spans; timestamps/tracks unchanged')
+
+
 def grouped_tid(tid, comm):
     """Reserve nine adjacent tracks per route CTA: role, then eight warps."""
     if tid >= 1000:
@@ -55,16 +117,7 @@ def reorder_trace(path):
     count = len(events)
     group_role_tracks(events, int(payload['metadata']['config']['comm_sm']))
     payload['metadata']['track_layout'] = 'role_then_own_warps_v1'
-    temporary = path.with_suffix('.layout-tmp')
-    created = False
-    try:
-        with temporary.open('x') as stream:
-            created = True
-            json.dump(payload, stream, separators=(',', ':'))
-        temporary.replace(path)
-    finally:
-        if created and temporary.exists():
-            temporary.unlink()
+    rewrite_trace(path, payload, '.layout-tmp')
     print(f'Grouped {path.name}: {count} existing events preserved')
 
 
@@ -167,7 +220,8 @@ def export(run, output):
         route_semantics='ready wait includes warp join; G2S ends at mbarrier completion; '
             'S2G ends at SMEM read completion, NOT peer write completion; '
             'final per-warp drain waits all destination writes; gaps include setup and telemetry writes',
-        profile_host=hosts, route_order=orders, track_layout='role_then_own_warps_v1'))
+        profile_host=hosts, route_order=orders, track_layout='role_then_own_warps_v1',
+        transfer_endpoints=TRANSFER_ENDPOINTS))
     group_role_tracks(events, comm)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Stream tile events: largest traces have over a million spans. Do not
@@ -219,8 +273,10 @@ def export(run, output):
                                      producer_n_first=r['column']//tile_n,
                                      producer_n_last=(r['column']+r['columns']-1)//tile_n)
                         phases = [('ready wait', r['begin'], r['ready'], attrs),
-                                  ('local G2S', r['g2s_begin'], r['g2s_done'], {'task':task}),
-                                  ('peer S2G (SMEM read complete)', r['s2g_begin'], r['s2g_read_done'], {'task':task})]
+                                  ('local G2S', r['g2s_begin'], r['g2s_done'],
+                                   transfer_args(rank, r['peer'], task, r['rows'], r['columns'], 'g2s')),
+                                  ('peer S2G (SMEM read complete)', r['s2g_begin'], r['s2g_read_done'],
+                                   transfer_args(rank, r['peer'], task, r['rows'], r['columns'], 's2g'))]
                     for name, start, stop, attrs in phases:
                         stream.write(',')
                         json.dump(dict(ph='X', name=name, pid=rank, tid=grouped_tid(1000+cta*8+warp, comm),
@@ -248,8 +304,13 @@ if __name__ == '__main__':
     parser.add_argument('output', type=Path, nargs='?')
     parser.add_argument('--reorder-trace', type=Path,
                         help='Regroup an existing JSON in place; no GPU work')
+    parser.add_argument('--annotate-trace', type=Path,
+                        help='Add GPU endpoints/bytes to an existing JSON in place; no GPU work')
     args = parser.parse_args()
-    if args.reorder_trace:
+    if args.annotate_trace:
+        if args.run or args.output or args.reorder_trace: parser.error('Do not mix annotation and other operations')
+        annotate_trace(args.annotate_trace)
+    elif args.reorder_trace:
         if args.run or args.output: parser.error('Do not mix export and reorder arguments')
         reorder_trace(args.reorder_trace)
     else:

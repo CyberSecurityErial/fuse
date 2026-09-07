@@ -42,7 +42,7 @@ struct Params {
   Divmod divmod_batch_, divmod_cluster_blk_major_;
 };
 ''' + body + r'''
-template<int N> void run(int M, int columns, int swizzle, bool along_n) {
+template<int N> void run(int M, int columns, int swizzle, bool along_n, int rank) {
   using Ready = fuse::detail::PublishedTile<128, N>;
   using Consumer = fuse::detail::ConsumerTileOrder<Ready, 64, 128>;
   const int mt = (M + 127) / 128, nt = (columns + N - 1) / N;
@@ -54,28 +54,31 @@ template<int N> void run(int M, int columns, int swizzle, bool along_n) {
   params.divmod_cluster_blk_major_.divisor = along_n ? pn : pm;
   params.raster_order_ = along_n ? Params::RasterOrder::AlongN : Params::RasterOrder::AlongM;
   while ((1 << params.log_swizzle_size_) < swizzle) ++params.log_swizzle_size_;
+  const auto rotation = rank < 0 ? fuse::detail::NBandSwizzle{}
+      : fuse::detail::NBandSwizzle::make(params, rank);
   for (uint64_t q = 0; q < params.blocks_per_problem_; ++q) {
-    const auto t = fuse::detail::ProducerTileOrder::decode(params, q);
-    if (!t.valid || fuse::detail::ProducerTileOrder::linear(params, t.m, t.n, t.batch) != q) std::abort();
+    const auto t = fuse::detail::ProducerTileOrder::decode(params, q, rotation);
+    if (!t.valid || fuse::detail::ProducerTileOrder::linear(params, t.m, t.n, t.batch, rotation) != q) std::abort();
   }
   if (fuse::detail::ProducerTileOrder::decode(params, params.blocks_per_problem_).valid) std::abort();
   for (uint64_t u = 0; u < params.blocks_per_problem_ * Consumer::kSlots; ++u) {
-    const auto t = Consumer::decode(params, u, M, columns);
+    const auto t = Consumer::decode(params, u, M, columns, rotation);
     if (t.valid) std::cout << u << ' ' << u / Consumer::kSlots << ' '
         << t.row << ' ' << t.column << ' ' << t.rows << ' ' << t.columns << ' '
         << t.first_m << ' ' << t.last_m << ' ' << t.first_n << ' ' << t.last_n << '\n';
   }
 }
 int main(int argc, char** argv) {
-  if (argc != 6) return 2;
+  if (argc != 6 && argc != 7) return 2;
   int n = std::atoi(argv[1]), m = std::atoi(argv[2]), columns = std::atoi(argv[3]);
   int s = std::atoi(argv[4]); bool along_n = std::atoi(argv[5]);
+  int rank = argc == 7 ? std::atoi(argv[6]) : -1;
   switch (n) {
-    case 64: run<64>(m, columns, s, along_n); break;
-    case 128: run<128>(m, columns, s, along_n); break;
-    case 160: run<160>(m, columns, s, along_n); break;
-    case 192: run<192>(m, columns, s, along_n); break;
-    case 256: run<256>(m, columns, s, along_n); break;
+    case 64: run<64>(m, columns, s, along_n, rank); break;
+    case 128: run<128>(m, columns, s, along_n, rank); break;
+    case 160: run<160>(m, columns, s, along_n, rank); break;
+    case 192: run<192>(m, columns, s, along_n, rank); break;
+    case 256: run<256>(m, columns, s, along_n, rank); break;
     default: return 3;
   }
 }
@@ -87,13 +90,19 @@ int main(int argc, char** argv) {
         if result.returncode: raise AssertionError(result.stderr)
 
     def test_all_tiles_rasters_swizzles_tails_and_comm_budgets(self):
+        self.check_orders((-1,))
+
+    def test_rank_rotation_all_tiles_rasters_tails_and_comm_budgets(self):
+        self.check_orders(range(8))
+
+    def check_orders(self, ranks):
         for tile_n in (64,128,160,192,256):
             for m,n in ((63,384),(128,4096),(257,896),(1024,7168)):
                 for swizzle in (1,2,4,8):
-                    for along_n in (False,True):
-                        with self.subTest(tile_n=tile_n,m=m,n=n,swizzle=swizzle,along_n=along_n):
+                    for along_n, rank in ((a,r) for a in (False,True) for r in ranks):
+                        with self.subTest(tile_n=tile_n,m=m,n=n,swizzle=swizzle,along_n=along_n,rank=rank):
                             rows = [tuple(map(int,line.split())) for line in subprocess.check_output(
-                                [str(self.binary),str(tile_n),str(m),str(n),str(swizzle),str(int(along_n))],text=True).splitlines()]
+                                [str(self.binary),str(tile_n),str(m),str(n),str(swizzle),str(int(along_n)),str(rank)],text=True).splitlines()]
                             self.assertEqual(Counter((r[2],r[3]) for r in rows),
                                 Counter((x,y) for x in range(0,m,64) for y in range(0,n,128)))
                             pm = ((m+127)//128+swizzle-1)//swizzle*swizzle
@@ -104,7 +113,8 @@ int main(int argc, char** argv) {
                                 for major in range(pn if along_n else pm):
                                     for offset in range(swizzle):
                                         order.append((group+offset,major) if along_n else (major,group+offset))
-                            ordinal={tile:i for i,tile in enumerate(order)}
+                            offset = (rank % (pn // swizzle)) * swizzle if rank >= 0 else 0
+                            ordinal={(x,(y+offset)%pn):i for i,(x,y) in enumerate(order)}
                             for u,q,x,y,h,w,m0,m1,n0,n1 in rows:
                                 self.assertEqual((h,w),(min(64,m-x),min(128,n-y)))
                                 self.assertEqual((m0,m1,n0,n1),(x//128,(x+h-1)//128,y//tile_n,(y+w-1)//tile_n))

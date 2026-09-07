@@ -501,6 +501,11 @@ cudaError_t launch_gemm_a2a_impl(
   auto args = gemm_arguments<Gemm>(
       params.gemm, params.lhs, params.rhs_nt, params.local_output,
       params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongM);
+#if FUSE_SM103_QKV_RANK_SWIZZLE
+  // Only rotate when the consumer follows the shared tile-order contract.
+  // The scalar/vector fallback retains the original producer order.
+  args.scheduler.n_band_rank = comm.use_tma ? params.route.rank : 0;
+#endif
   args.epilogue.ready = params.ready;
   using ProducerTile = typename Gemm::TileShape;
   static_assert(cute::size<0>(ProducerTile{}) == Comm::kBlockM);

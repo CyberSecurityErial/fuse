@@ -1145,3 +1145,30 @@ mechanism would improve the end-to-end boundary. Do not sum overlapping waits
 or treat diagnostic kernel timings as production throughput. Latest six traces
 remain at `fuse_midfile/qkv-profile/`, with each role followed by its own warps.
 Their provenance includes the immutable raw artifact hash and run/config IDs.
+
+### Experimental rank-dependent N-band rotation
+
+`FUSE_SM103_QKV_RANK_SWIZZLE=ON` rotates padded N bands by
+`source_rank % band_count`, retaining the resolved group-local swizzle. GEMM
+decode and the copy queue's dependency inverse share `NBandSwizzle`; actual
+head destinations, physical ready addresses and release/acquire/drain semantics
+are unchanged. This tests whether rank-synchronous destination concentration
+affects the full boundary. It does not establish that NVLink congestion is the
+dominant cause of a long TMA interval. The non-TMA path is not rotated.
+
+The option defaults OFF and changes no SM90 code or public parameter layout.
+For the workspace controller, add `--qkv-rank-swizzle` to BOTH `fused-build`
+and `fused-smoke`. It uses a separate `*-rank-swizzle` build directory, records
+the option in the executable's config and build receipt, and is rejected for
+profiling tasks until rotated diagnostic ownership has been integrated.
+
+The first six CP8 pairs used MPI Graph, profiling OFF, full two-generation
+numeric/route validation, Philox input, 10 warmups and 50 samples, N256/K64/E32,
+AlongM/swizzle4; Dense used 32 comm CTAs and Qwen25 used 16. Node09 observed
+speedups of 1.0362/1.0179/1.0285x (Dense 128K/256K/512K) and
+1.0154/1.0108/1.0206x (Qwen25); geometric mean 1.0215x. These are single
+same-node A/B pairs, not repeated trials or a universal performance guarantee.
+The complete 95/96-point comparison has geometric mean 1.0061x overall and
+1.0129x for the 47/48 long-sequence points, with both gains and regressions.
+The option therefore remains OFF by default. Configuration, paired samples
+and evidence hashes are archived in [v15.0 results](../../../results/sm103/v15.0/README.md).

@@ -8,7 +8,7 @@ namespace fuse::detail {
 // QKV producer / ready / consumer ordering contract (SM103 BF16 baseline):
 // The old peer-major copy queue could wait for a late GEMM tile while earlier
 // tiles were already ready behind it: logical-order head-of-line blocking.
-// Keep the GEMM scheduler unchanged and instead build the copy queue from its
+// Build the copy queue from the GEMM scheduler's
 // resolved raster/swizzle order. A copy rectangle belongs to the LAST logical
 // producer among ALL ready tiles it intersects. Example: if a copy needs
 // producer tiles 3 and 7, enumerate it under 7, not 3; acquiring tile 3 alone
@@ -49,11 +49,42 @@ struct PublishedTile {
 // The one-CTA-cluster CUTLASS static mapping, shared by producer and consumer.
 // Read the RESOLVED scheduler parameters: padding, raster and swizzle must not
 // be independently guessed by the communication path.
+// Optional rank-dependent rotation of whole N bands. Rotate padded coordinates
+// (not head ownership), preserving a bijection even for partial final bands.
+// Both producer decode and consumer dependency inverse MUST use the same
+// rotation, otherwise a consumer can wait for an unproduced band again.
+// This dephases destination concentration across ranks; it does not impose
+// completion order or guarantee less NVLink congestion. Group-local swizzle,
+// physical output/ready addresses and all release/acquire fences stay intact.
+struct NBandSwizzle {
+  int offset = 0, extent = 0;
+
+  template <class Params>
+  CUTLASS_HOST_DEVICE static NBandSwizzle make(const Params& p, int rank) {
+    const bool along_n = p.raster_order_ == Params::RasterOrder::AlongN;
+    const int extent = static_cast<int>(along_n ? p.divmod_cluster_blk_major_.divisor
+        : p.divmod_batch_.divisor / p.divmod_cluster_blk_major_.divisor);
+    const int width = 1 << p.log_swizzle_size_;
+    const int bands = extent / width;
+    return {bands > 0 ? (rank % bands) * width : 0, extent};
+  }
+
+  CUTLASS_HOST_DEVICE int forward(int n) const {
+    n += offset;
+    return offset && n >= extent ? n - extent : n;
+  }
+  CUTLASS_HOST_DEVICE int inverse(int n) const {
+    n -= offset;
+    return n < 0 ? n + extent : n;
+  }
+};
+
 struct ProducerTileOrder {
   struct Tile { int m = 0, n = 0, batch = 0; bool valid = false; };
 
   template <class Params>
-  CUTLASS_HOST_DEVICE static Tile decode(const Params& p, uint64_t linear) {
+  CUTLASS_HOST_DEVICE static Tile decode(
+      const Params& p, uint64_t linear, NBandSwizzle swizzle = {}) {
     if (linear >= p.blocks_per_problem_) return {};
     uint64_t batch, rest, group, major;
     p.divmod_batch_(batch, rest, linear);
@@ -61,12 +92,14 @@ struct ProducerTileOrder {
     p.divmod_cluster_blk_major_(group, major, rest >> log);
     const int minor = static_cast<int>((group << log) + (rest & ((1u << log) - 1)));
     return p.raster_order_ == Params::RasterOrder::AlongN
-        ? Tile{minor, static_cast<int>(major), static_cast<int>(batch), true}
-        : Tile{static_cast<int>(major), minor, static_cast<int>(batch), true};
+        ? Tile{minor, swizzle.forward(static_cast<int>(major)), static_cast<int>(batch), true}
+        : Tile{static_cast<int>(major), swizzle.forward(minor), static_cast<int>(batch), true};
   }
 
   template <class Params>
-  CUTLASS_HOST_DEVICE static uint64_t linear(const Params& p, int m, int n, int batch = 0) {
+  CUTLASS_HOST_DEVICE static uint64_t linear(
+      const Params& p, int m, int n, int batch = 0, NBandSwizzle swizzle = {}) {
+    n = swizzle.inverse(n);
     const bool along_n = p.raster_order_ == Params::RasterOrder::AlongN;
     const uint64_t minor = along_n ? m : n, major = along_n ? n : m;
     const int log = p.log_swizzle_size_;
@@ -96,9 +129,10 @@ struct ConsumerTileOrder {
   };
 
   template <class Params>
-  CUTLASS_HOST_DEVICE static Task decode(const Params& p, uint64_t work, int rows, int columns) {
+  CUTLASS_HOST_DEVICE static Task decode(
+      const Params& p, uint64_t work, int rows, int columns, NBandSwizzle swizzle = {}) {
     const uint64_t owner = work / kSlots;
-    const auto producer = ProducerTileOrder::decode(p, owner);
+    const auto producer = ProducerTileOrder::decode(p, owner, swizzle);
     if (!producer.valid || producer.batch != 0) return {}; // Batch is flattened into M.
     const int pm = producer.m * ReadyTile::kM, pn = producer.n * ReadyTile::kN;
     if (pm >= rows || pn >= columns) return {};
@@ -117,7 +151,7 @@ struct ConsumerTileOrder {
     uint64_t last = 0;
     for (int m = t.first_m; m <= t.last_m; ++m) {
       for (int n = t.first_n; n <= t.last_n; ++n) {
-        const uint64_t dependency = ProducerTileOrder::linear(p, m, n);
+        const uint64_t dependency = ProducerTileOrder::linear(p, m, n, 0, swizzle);
         if (dependency > last) last = dependency;
       }
     }
