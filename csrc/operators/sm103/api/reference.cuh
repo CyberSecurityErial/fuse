@@ -34,7 +34,7 @@ cudaError_t launch_gemm_reference_impl(
   }
   using Gemm = typename Binding::PureGemm;
   using Kernel = detail::GemmReferenceKernel<Gemm, typename Binding::Kernel>;
-  auto args = gemm_arguments<Gemm, Binding::kSwapAB>(
+  auto args = gemm_arguments<Gemm>(
       problem, lhs, rhs_nt, output, alpha, reserved_comm_ctas, info, fallback);
   // Keep the reduced compute budget and scheduler stride. Only the physical
   // CTA prefix disappears: worker 0 now starts at blockIdx.x == 0.
@@ -128,10 +128,10 @@ cudaError_t launch_a2a_gemm_copy_reference(
     typename Comm::Arguments comm{};
     comm.params = params;
     using Gemm = typename Binding::Gemm;
-    const auto gemm = gemm_arguments<Gemm, Binding::kSwapAB>(
+    const auto gemm = gemm_arguments<Gemm>(
         params.gemm, params.input_staging, params.rhs_nt, params.output,
         params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongN);
-    comm.input_order = a2a_input_order<Gemm>(gemm, Binding::kSwapAB);
+    comm.input_order = a2a_input_order<Gemm>(gemm);
     cudaError_t result = Comm::initialize(comm);
     if (result != cudaSuccess) {
       return result;

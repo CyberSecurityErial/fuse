@@ -24,46 +24,6 @@ class OprojTraceTests(unittest.TestCase):
                              f'nonfinite=0,{field}=0,checked=128,elements=128')
         return job, lines
 
-    def aligned_fixture(self, swap=False):
-        job, lines = self.fixture()
-        policy = 'row_m128n32k64' if swap else 'kslice_m128n256k64'
-        bm, bn, slices = (32, 128, 1) if swap else (128, 256, 2)
-        job.update(global_seq=bm, hidden=bn, q_heads=2, head_dim=128, oproj_policy_list=policy)
-        peer_line = next(row for row in lines if row.startswith('profile_peer,'))
-        lines = [row for row in lines if not row.startswith('profile_peer,')]
-        for slice_id in range(slices):
-            lines.append(peer_line.replace('index=0', f'index={slice_id}').replace('copy_path=1', 'copy_path=3') +
-                f',ready_slice={slice_id},ready_slices={slices},k_begin_in_peer={slice_id * 128},'
-                f'k_end_in_peer={(slice_id + 1) * 128 if not swap else 256}')
-        lines.append(f'candidate,A2A_GEMM,rank=0,tile={policy},tile_m={bm},tile_n={bn},tile_k=64,'
-            f'alignment_schema=directional_v1,orientation={"swap_ab" if swap else "normal"},'
-            f'schedule_coordinates=physical,physical_tile_m=128,physical_tile_n={32 if swap else 256},'
-            f'physical_tile_k=64,ready_rows={bm},ready_k={256 if swap else 128},'
-            f'ready_slices={slices},ready_arrivals=1')
-        return job, lines
-
-    def test_joint_policy_slices_are_explicit_and_not_mislabelled_as_s2g(self):
-        for swap in (False, True):
-            with self.subTest(swap=swap):
-                job, lines = self.aligned_fixture(swap)
-                result = make_trace(lines, job)
-                self.assertEqual(result['metadata']['joint_policy']['orientation'], 'swap_ab' if swap else 'normal')
-                phases = [event for event in result['traceEvents'] if event['name'] == 'rectangular G2S + S2G pipeline']
-                self.assertEqual(len(phases), 1 if swap else 2)
-                self.assertFalse(any(event['name'] == 'local S2G (destination complete)' for event in result['traceEvents']))
-                self.assertFalse(any(event['args']['final_publisher_only'] for event in phases))
-                handoffs = [event for event in result['traceEvents'] if event['name'].startswith('release -> acquire')]
-                self.assertEqual([event['args']['k_begin'] for event in handoffs], [0] if swap else [0, 128])
-
-    def test_joint_policy_requires_actual_new_metadata_and_slice_coverage(self):
-        job, lines = self.aligned_fixture()
-        for bad in ([row for row in lines if not row.startswith('candidate,')],
-                    [row for row in lines if 'index=1' not in row],
-                    [row.replace('ready_slice=1', 'ready_slice=0') for row in lines],
-                    [row.replace('orientation=normal', 'orientation=swap_ab') for row in lines]):
-            with self.assertRaises(AssertionError):
-                make_trace(bad, job)
-
     def test_phases_and_metadata(self):
         job, lines = self.fixture()
         result = make_trace(lines, job)

@@ -6,54 +6,6 @@ approved on 2026-09-06; node2 CUDA bring-up and measured optimization are now
 authorized. CPU checks do not establish CUDA compilation, numerical
 correctness on B300, or performance. SM90 stays unchanged during this phase.
 
-## OProj accumulation-direction experiments (review first)
-
-“通信和计算在累积方向上的一致性” treats production and consumption in
-the same original `A[M,K]` coordinates. Align their direction, granularity,
-and ready publication so produced data forms a usable next compute step.
-It is a multidimensional head-of-line dependency principle, not a promise
-that the smallest directional angle gives the fastest kernel: transfer rates,
-GEMM efficiency, synchronization cost and concurrent completion still matter.
-
-Two explicit `FUSE_SM103_OPROJ_POLICY` values are experimental; default/auto
-and the existing five policies retain their original compute/copy paths:
-
-| Policy | Physical GEMM tile | Original-A ready unit | Owner |
-|---|---|---|---|
-| `kslice_m128n256k64` | 128x256x64, normal, E32 | 128 rows x K128 | one communication slot per K slice |
-| `row_m128n32k64` | 128x32x64, SwapAB, auto epilogue | 32 rows x full peer K | one slot per row/peer block |
-
-Both use the same rectangular TMA transfer implementation and preserve local
-staging reuse across projection tiles. RowBlock can exceed its 48 KiB slot;
-the owner then streams capacity-bounded K rectangles before one release.
-It removes cross-owner fan-in, not the need to finish the advertised region.
-SwapAB computes `D^T = W^T A^T` through views and a column-major epilogue into
-the original output buffer, without a separate transpose or split-K reduction.
-
-Supergroup integration is derived, not a second communication tuning knob:
-lower CUTLASS's actual raster/effective swizzle and compute CTA count; map
-physical tiles back to original sequence/projection axes; group original
-sequence tiles by their first-use compute window; order communication within
-each window by peer, K slice, then sequence tile. A supergroup can cross a
-compute window, and a window can cross a supergroup. Neither adds a runtime
-completion barrier. Swapping axes also swaps which physical axis defines the
-first-use window. Existing `max_swizzle_size` remains the explicit search input.
-
-These plans currently require sequence/batch/causal boundaries aligned to their
-ready row tile and peer K divisible by their advertised K unit. Unsupported
-opt-in geometry returns an error, never silently times a legacy fallback.
-Ready storage must be queried for the selected policy; changing policy/layout
-requires cleared counters and a restarted epoch sequence after prior work has
-finished. The benchmark resets this state at each candidate/payload boundary.
-
-PROFILING retains logical coordinates and indexes records by ready K slice.
-For rectangular copy path 3, a row owner's span can include multiple G2S/S2G
-pairs and must be displayed as a combined pipeline, not pure S2G latency.
-Host arithmetic tests cover both orientations, supergroups, padding, reduced
-compute budgets and exact transfer ownership. CUDA compilation, device
-correctness and speedups remain unverified until the user reviews this change;
-do not promote these candidates into an automatic performance model yet.
-
 ## Measured development log
 
 - `20260906-100534-446741`, node2, production SM103a build: failed at

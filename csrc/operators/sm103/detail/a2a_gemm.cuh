@@ -89,28 +89,22 @@ cudaError_t make_a2a_lhs_store_tma_3d(
   return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-template <bool Enabled> struct A2ALhsTransferArguments {};
-template <> struct A2ALhsTransferArguments<true> {
-  CUtensorMap load_tma[kMaxWorldSize]{};
-  detail::A2AInputTransferShape transfer{};
-};
-
-// Receiver-side pull. Legacy row chunks and the two aligned plans share the
-// route validation, sequence mapping, barriers and publication implementation.
-template <int32_t ReadyBlockM, int32_t TileK = 64, bool Instrumented = false,
-          int32_t ReadyK = 0, bool RowOwner = false>
+// Receiver-side pull and per-peer K-shard publication.
+template <
+    int32_t ReadyBlockM, int32_t TileK = 64
+#if FUSE_ENABLE_PROFILING
+    , bool Instrumented = false
+#endif
+    >
 struct A2ALhsInputCommT {
   // Blackwell-facing names for CUTLASS's shared SM90-era copy primitives.
   // These are type aliases only; they do not select different instructions.
   using SM100_BULK_COPY_G2S = cute::SM90_BULK_COPY_G2S;
   using SM100_BULK_COPY_S2G = cute::SM90_BULK_COPY_S2G;
   using SM100_TMA_STORE_3D = cute::SM90_TMA_STORE_3D;
-  using SM100_TMA_LOAD_3D = cute::SM90_TMA_LOAD_3D;
   using CommElement = Bf16;
   static constexpr int32_t kReadyBlockM = ReadyBlockM;
-  static constexpr bool kAlignedTransfer = ReadyK != 0 || RowOwner;
-  static_assert(ReadyBlockM == 128 || (RowOwner && ReadyBlockM == 32));
-  static_assert(ReadyK == 0 || (ReadyK == 128 && !RowOwner));
+  static_assert(ReadyBlockM == 128);
   // Only the consumer's peer-K segmentation depends on TileK. Copy rows,
   // arrival counts and byte routing remain identical across GEMM K policies.
   static_assert(TileK == 64 || TileK == 128);
@@ -128,9 +122,9 @@ struct A2ALhsInputCommT {
       kA2ALhsBulkSlots * sizeof(uint64_t);
   static constexpr bool kNeedsGridFinalize = false;
 
-  struct Arguments : A2ALhsTransferArguments<kAlignedTransfer>
+  struct Arguments
 #if FUSE_ENABLE_PROFILING
-      , A2ALhsCommTimelineArguments<Instrumented>
+      : A2ALhsCommTimelineArguments<Instrumented>
 #endif
   {
     A2AGemmParams params{};
@@ -191,9 +185,6 @@ struct A2ALhsInputCommT {
     }
     const auto& p = args.params;
     const auto& route = p.route;
-    if constexpr (kAlignedTransfer) {
-      return initialize_aligned(args);
-    }
     const int64_t row_bytes =
         static_cast<int64_t>(route.local_heads) * route.head_dim * sizeof(Bf16);
     args.use_bulk = false;
@@ -249,10 +240,6 @@ struct A2ALhsInputCommT {
   }
 
   static bool can_implement(const Arguments& args) {
-    if constexpr (kAlignedTransfer) {
-      if (!args.transfer.valid() || args.transfer.ready_k != ready_k(args.params))
-        return false;
-    }
     return supported_params(args.params) && args.comm_rows > 0 &&
         args.comm_rows <= kReadyBlockM && args.input_order.compute_ctas > 0 &&
         args.input_order.m_tiles == ceil_div(args.params.gemm.m, kReadyBlockM) &&
@@ -263,30 +250,18 @@ struct A2ALhsInputCommT {
   static Params to_underlying_arguments(const Arguments& args) { return args; }
 
   CUTLASS_HOST_DEVICE static int32_t arrivals_per_peer(const Params& args) {
-    if constexpr (kAlignedTransfer) return 1;
     return ceil_div(ReadyBlockM, args.comm_rows);
-  }
-
-  CUTLASS_HOST_DEVICE static int32_t ready_k(const A2AGemmParams& p) {
-    return ReadyK ? ReadyK : p.route.local_heads * p.route.head_dim;
-  }
-
-  CUTLASS_HOST_DEVICE static int32_t ready_slices(const A2AGemmParams& p) {
-    return ReadyK ? p.route.local_heads * p.route.head_dim / ReadyK : 1;
-  }
-
-  CUTLASS_HOST_DEVICE static int64_t ready_index(
-      const A2AGemmParams& p, int32_t tile_m, int32_t peer, int32_t slice) {
-    return (static_cast<int64_t>(tile_m) * p.route.world_size + peer) *
-        ready_slices(p) + slice;
   }
 
   CUTLASS_DEVICE static void publish_ready(
       const Params& args,
       int32_t tile_m,
-      int32_t peer_slot, int32_t slice = 0) {
+      int32_t peer_slot) {
     const auto& p = args.params;
-    auto* ready = p.ready + ready_index(p, tile_m, peer_slot, slice) * kReadyFlagStride;
+    const auto& route = p.route;
+    auto* ready = p.ready +
+        (static_cast<int64_t>(tile_m) * route.world_size + peer_slot) *
+            kReadyFlagStride;
     detail::add_release_gpu(ready);
   }
 
@@ -295,16 +270,19 @@ struct A2ALhsInputCommT {
       const Params& args,
       int32_t tile_m,
       int32_t peer_slot,
-      const A2ALhsCommStageSample<true>& sample, int32_t slice = 0) {
+      const A2ALhsCommStageSample<true>& sample) {
     const auto& p = args.params;
-    const int64_t index = ready_index(p, tile_m, peer_slot, slice);
-    auto* ready = p.ready + index * kReadyFlagStride;
+    const auto& route = p.route;
+    auto* ready = p.ready +
+        (static_cast<int64_t>(tile_m) * route.world_size + peer_slot) *
+            kReadyFlagStride;
     const uint64_t release_issue = static_cast<unsigned long long>(
         detail::read_global_timer());
     const uint32_t old = detail::add_release_gpu_fetch_old(ready);
     const uint64_t release_done = static_cast<unsigned long long>(
         detail::read_global_timer());
     const uint32_t target = p.epoch * arrivals_per_peer(args);
+    const int64_t index = static_cast<int64_t>(tile_m) * route.world_size + peer_slot;
     if (old + 1 == target && args.peer_timeline && index >= 0 &&
         index < args.peer_timeline_capacity) {
       auto& event = args.peer_timeline[index];
@@ -340,145 +318,11 @@ struct A2ALhsInputCommT {
     return chunk * chunk_rows + (first ? local_sequence : local_sequence - chunk_rows);
   }
 
-  static cudaError_t initialize_aligned(Arguments& args) {
-    const auto& p = args.params;
-    const auto& route = p.route;
-    const int32_t peer_k = route.local_heads * route.head_dim;
-    // A rectangular TMA must never cross a batch or causal routing boundary.
-    // Opt-in plans reject these tails; the default row/vector path retains its
-    // full existing contract. No silent fallback may falsify the measured plan.
-    if (route.seq_local % ReadyBlockM ||
-        (route.causal_load_balanced && (route.seq_local / 2) % ReadyBlockM) ||
-        static_cast<int64_t>(route.batch) * route.global_seq > INT32_MAX) {
-      return cudaErrorNotSupported;
-    }
-    args.transfer = detail::A2AInputTransferShape::make(
-        ReadyBlockM, peer_k, ready_k(p), TileK, kA2ALhsBulkStageBytes);
-    args.comm_rows = ReadyBlockM;
-    if (!can_implement(args)) return cudaErrorNotSupported;
-    const auto& t = args.transfer;
-    const int32_t inner_k = t.inner_u64 * 4;
-    const int32_t box_groups = t.copy_k / inner_k;
-    cudaError_t status = make_a2a_lhs_store_tma_3d(
-        &args.store_tma_full, p.input_staging, t.inner_u64,
-        p.gemm.k / inner_k, p.gemm.m, box_groups, ReadyBlockM);
-    if (status != cudaSuccess) return status;
-    for (int32_t peer = 0; peer < route.world_size; ++peer) {
-      status = make_a2a_lhs_store_tma_3d(
-          &args.load_tma[peer], const_cast<Bf16*>(p.peer_input[peer]),
-          t.inner_u64, peer_k / inner_k, route.batch * route.global_seq,
-          box_groups, ReadyBlockM);
-      if (status != cudaSuccess) return status;
-    }
-    return cudaSuccess;
-  }
-
-  CUTLASS_DEVICE static void run_aligned(
-      const Params& args, char* smem, int32_t comm_id, int32_t comm_ctas) {
-    const int32_t slot = static_cast<int32_t>(threadIdx.x) / 32;
-    const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
-    if (slot >= kA2ALhsBulkSlots || lane != 0) return;
-    const auto& p = args.params;
-    const auto& route = p.route;
-    const auto& shape = args.transfer;
-    const int32_t slices = shape.slices();
-    const int32_t inner_k = shape.inner_u64 * 4;
-    auto* stage = reinterpret_cast<CommElement*>(
-        smem + slot * kA2ALhsBulkStageBytes);
-    auto* barrier = reinterpret_cast<uint64_t*>(
-        smem + kA2ALhsBulkSlots * kA2ALhsBulkStageBytes) + slot;
-    cute::initialize_barrier(*barrier, 1);
-    cutlass::arch::fence_barrier_init();
-    cute::prefetch_tma_descriptor(&args.store_tma_full);
-    int32_t phase = 0, waited_peer = -1;
-    const int64_t tasks = static_cast<int64_t>(args.input_order.m_tiles) *
-        route.world_size * slices;
-    const int64_t stride = static_cast<int64_t>(comm_ctas) * kA2ALhsBulkSlots;
-    for (int64_t task = static_cast<int64_t>(slot) * comm_ctas + comm_id;
-         task < tasks; task += stride) {
-      const auto next = args.input_order.decode(task, route.world_size, slices, true);
-      const int32_t source_peer = route.cyclic_peer_order
-          ? (route.rank + next.peer) % route.world_size : next.peer;
-      const int32_t m_begin = next.m * ReadyBlockM;
-      const int32_t batch = m_begin / route.seq_local;
-      const int32_t source_row = batch * route.global_seq +
-          global_sequence_row(p, m_begin % route.seq_local);
-#if FUSE_ENABLE_PROFILING
-      A2ALhsCommStageSample<Instrumented> sample{};
-      if constexpr (Instrumented) {
-        sample.task_begin = detail::read_global_timer();
-        sample.comm_cta = comm_id;
-        sample.comm_slot = slot;
-        sample.task_id = task <= INT32_MAX ? task : -1;
-        sample.row_chunk = 0;
-        sample.copy_rows = ReadyBlockM;
-        sample.source_rank = source_peer;
-        sample.copy_path = 3;
-      }
-#endif
-      if (p.input_epoch && source_peer != waited_peer) {
-        // Only this elected lane participates; this helper contains no warp
-        // barrier. The remote input is immutable for the whole launch epoch.
-        detail::wait_acquire_system_single_lane(
-            p.peer_input_ready[source_peer], p.input_epoch);
-        waited_peer = source_peer;
-      }
-#if FUSE_ENABLE_PROFILING
-      if constexpr (Instrumented) sample.input_ready = detail::read_global_timer();
-#endif
-      const int32_t k_begin = next.chunk * shape.ready_k;
-      for (int32_t k = k_begin; k < k_begin + shape.ready_k; k += shape.copy_k) {
-        detail::fence_proxy_async_global();
-        cute::set_barrier_transaction_bytes(*barrier, ReadyBlockM * shape.copy_k * 2);
-#if FUSE_ENABLE_PROFILING
-        if constexpr (Instrumented) {
-          if (k == k_begin) sample.g2s_issue = detail::read_global_timer();
-        }
-#endif
-        SM100_TMA_LOAD_3D::copy(&args.load_tma[source_peer], barrier,
-            static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
-            stage, 0, k / inner_k, source_row);
-        cute::wait_barrier(*barrier, phase);
-        phase ^= 1;
-        cute::tma_store_fence();
-#if FUSE_ENABLE_PROFILING
-        if constexpr (Instrumented) {
-          if (k == k_begin) {
-            sample.g2s_done = detail::read_global_timer();
-            sample.s2g_issue = sample.g2s_done;
-          }
-        }
-#endif
-        SM100_TMA_STORE_3D::copy(&args.store_tma_full, stage, 0,
-            (next.peer * shape.peer_k + k) / inner_k, m_begin);
-        cute::tma_store_arrive();
-        // Destination completion is required both for SMEM reuse and release.
-        // RowBlock may stream several rectangles, but it has ONE owner and
-        // publishes only after all of its peer-K data is globally visible.
-        detail::tma_store_wait_all();
-      }
-#if FUSE_ENABLE_PROFILING
-      if constexpr (Instrumented) {
-        sample.s2g_done = detail::read_global_timer();
-        publish_ready_instrumented(args, next.m, next.peer, sample, next.chunk);
-      } else
-#endif
-      {
-        publish_ready(args, next.m, next.peer, next.chunk);
-      }
-    }
-    cutlass::arch::ClusterBarrier::invalidate(barrier);
-  }
-
   CUTLASS_DEVICE void operator()(
       const Params& args,
       char* smem,
       int32_t comm_id,
       int32_t comm_ctas) {
-    if constexpr (kAlignedTransfer) {
-      run_aligned(args, smem, comm_id, comm_ctas);
-      return;
-    }
     const auto& p = args.params;
     const auto& route = p.route;
     const int32_t m_tiles = ceil_div(p.gemm.m, ReadyBlockM);

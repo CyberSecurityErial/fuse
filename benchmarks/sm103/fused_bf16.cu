@@ -227,42 +227,8 @@ std::string normalize_qkv_policy(const std::string& policy) {
 std::string normalize_oproj_policy(const std::string& policy) {
   if (policy == "auto" || policy == "m128n128") return "m128n128";
   if (policy == "m128n256" || policy == "m128n128k128" ||
-      policy == "m128n256k64e32" || policy == "m128n256k128e32" ||
-      policy == "kslice_m128n256k64" || policy == "row_m128n32k64") return policy;
+      policy == "m128n256k64e32" || policy == "m128n256k128e32") return policy;
   throw std::runtime_error("unsupported OProj policy: " + policy);
-}
-
-// Keep measurements in the public logical M/N coordinates. Only scheduler
-// padding/raster use physical coordinates when the GEMM exchanges A and B.
-struct PolicyGeometry {
-  int m, n, k;
-  bool aligned = false;
-  bool swap_ab = false;
-  int ready_k = 0;
-  int slices = 1;
-};
-
-PolicyGeometry policy_geometry(const std::string& policy, int peer_k) {
-  if (policy == "kslice_m128n256k64") {
-    if (peer_k <= 0 || peer_k % 128) throw std::runtime_error("K-slice policy requires peer K divisible by 128");
-    return {128, 256, 64, true, false, 128, peer_k / 128};
-  }
-  if (policy == "row_m128n32k64") return {32, 128, 64, true, true, peer_k, 1};
-  return {128, std::stoi(policy.substr(5)), policy.find("k128") == std::string::npos ? 64 : 128};
-}
-
-PolicyGeometry current_oproj_geometry(int peer_k) {
-  const char* policy = std::getenv("FUSE_SM103_OPROJ_POLICY");
-  return policy_geometry(normalize_oproj_policy(policy ? policy : "auto"), peer_k);
-}
-
-void print_alignment(const PolicyGeometry& geometry) {
-  if (!geometry.aligned) return;  // Preserve legacy record fields.
-  std::cout << ",alignment_schema=directional_v1,orientation=" << (geometry.swap_ab ? "swap_ab" : "normal")
-            << ",schedule_coordinates=physical,physical_tile_m=" << (geometry.swap_ab ? geometry.n : geometry.m)
-            << ",physical_tile_n=" << (geometry.swap_ab ? geometry.m : geometry.n)
-            << ",physical_tile_k=" << geometry.k << ",ready_rows=" << geometry.m
-            << ",ready_k=" << geometry.ready_k << ",ready_slices=" << geometry.slices << ",ready_arrivals=1";
 }
 
 void set_tile_policy(Direction direction, const std::string& policy) {
@@ -473,8 +439,7 @@ Options parse_options(int argc, char** argv) {
                    "--calibrate adds independently validated compute/copy references; excludes profile/self-test.\n"
                    "QKV policies: auto,m128n64,m128n128,m128n160,m128n192,m128n256,"
                    "m128n128k128,m128n256k64e32,m128n256k128e32,m128n256k64e64.\n"
-                   "OProj policies: auto,m128n128,m128n256,m128n128k128,m128n256k64e32,m128n256k128e32,"
-                   "kslice_m128n256k64,row_m128n32k64.\n"
+                   "OProj policies: auto,m128n128,m128n256,m128n128k128,m128n256k64e32,m128n256k128e32.\n"
                    "e32/e64 select epilogue subtiles 128x32/128x64; E64 is QKV-only.\n"
                    "Unsuffixed policies retain K64/original epilogue.\n"
                    "Each list overrides its direction's environment.\n"
@@ -570,20 +535,16 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("tile grid or profiling capacity exceeds int32");
   }
   for (const auto& candidate : make_candidates(options)) {
-    const auto geometry = policy_geometry(candidate.tile_policy, options.q_width() / options.world);
-    if (candidate.direction == Direction::kOproj && (q_width / options.world) % geometry.k) {
-      throw std::runtime_error("OProj K shard must divide the selected GEMM tile K");
-    }
+    // Policy names were normalized above; all registered SM103 policies use
+    // physical M=128. Kernel-trait queries still audit the actual launch later.
+    const int tile_n = std::stoi(candidate.tile_policy.substr(5));
     const int width = candidate.direction == Direction::kQkv
         ? options.projection_width() : options.hidden;
-    int mt = ceil_div(options.seq_local, geometry.m), nt = ceil_div(width, geometry.n);
-    if (static_cast<int64_t>(std::max(mt * int64_t{options.world}, mt * int64_t{nt})) * geometry.slices > int_limit) {
-      throw std::runtime_error("aligned ready/profiling capacity exceeds int32");
-    }
-    if (geometry.swap_ab) std::swap(mt, nt);
-    const auto schedule = schedule_geometry(mt, nt, options.max_swizzle_size);
+    const int n_tiles = ceil_div(width, tile_n);
+    const auto schedule = schedule_geometry(static_cast<int>(m_tiles), n_tiles,
+                                            options.max_swizzle_size);
     if (schedule.tiles() > int_limit) throw std::runtime_error("padded tile grid exceeds int32");
-    if (options.profile && (schedule.padded_m_tiles != mt || schedule.padded_n_tiles != nt)) {
+    if (options.profile && (schedule.padded_m_tiles != m_tiles || schedule.padded_n_tiles != n_tiles)) {
       throw std::runtime_error("--profile does not support swizzle-padded M/N tiles; "
                                "use an unpadded geometry or smaller swizzle (production/calibration remain supported)");
     }
@@ -997,14 +958,8 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
                          "OProj-weight,rank=" + std::to_string(rank), 0.02f);
       } else upload(runtime.oproj.rhs_nt, oproj_weight, runtime.stream);
       runtime.oproj.output = allocate<Bf16>(runtime, checked_product(m, options.hidden));
-      int64_t oproj_flags = 0;
-      for (const auto& policy : options.oproj_policy_list) {
-        set_tile_policy(Direction::kOproj, policy);
-        const auto flags = fuse::a2a_lhs_gemm_ready_elements(runtime.oproj.gemm, runtime.oproj.route);
-        if (flags <= 0) throw std::runtime_error("invalid OProj ready query");
-        oproj_flags = std::max<int64_t>(oproj_flags, flags);
-      }
-      set_tile_policy(Direction::kOproj, options.oproj_policy_list.front());
+      const int64_t oproj_flags = fuse::a2a_lhs_gemm_ready_elements(runtime.oproj.gemm, runtime.oproj.route);
+      if (oproj_flags <= 0) throw std::runtime_error("invalid OProj ready query");
       runtime.oproj_ready_elements = static_cast<size_t>(oproj_flags);
       runtime.oproj.ready = allocate<uint32_t>(runtime, static_cast<size_t>(oproj_flags));
       runtime.oproj_reference = allocate<Bf16>(runtime, checked_product(m, options.hidden));
@@ -1037,8 +992,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
         }
         const int m_tiles = ceil_div(options.seq_local, oproj_traits.block_m);
         const int n_tiles = ceil_div(options.hidden, oproj_traits.block_n);
-        const auto geometry = current_oproj_geometry(options.q_width() / options.world);
-        runtime.peer_capacity = std::max(m_tiles * n_tiles, m_tiles * options.world) * geometry.slices;
+        runtime.peer_capacity = std::max(m_tiles * n_tiles, m_tiles * options.world);
         runtime.peer_timeline = allocate<fuse::A2AGemmPeerTimeline>(runtime, runtime.peer_capacity);
       }
     }
@@ -1185,13 +1139,8 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
     if (traits.block_m <= 0 || traits.block_n <= 0 || traits.block_k <= 0) {
       throw std::runtime_error("unsupported candidate or invalid geometry query");
     }
-    const auto geometry = policy_geometry(candidate.tile_policy, problem.k / static_cast<int>(runtimes.size()));
-    if (traits.block_m != geometry.m || traits.block_n != geometry.n || traits.block_k != geometry.k) {
-      throw std::runtime_error("policy and logical kernel traits disagree");
-    }
-    int mt = ceil_div(problem.m, traits.block_m), nt = ceil_div(problem.n, traits.block_n);
-    if (geometry.swap_ab) std::swap(mt, nt);
-    const auto schedule = schedule_geometry(mt, nt, problem.max_swizzle_size);
+    const auto schedule = schedule_geometry(ceil_div(problem.m, traits.block_m),
+                                            ceil_div(problem.n, traits.block_n), problem.max_swizzle_size);
     std::cout << "candidate," << direction_name(candidate.direction) << context
               << ",state=resolved,rank=" << rank << ",tile_m=" << traits.block_m
               << ",tile_n=" << traits.block_n << ",tile_k=" << traits.block_k
@@ -1200,26 +1149,10 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
               << ",max_swizzle_size=" << problem.max_swizzle_size
               << ",effective_swizzle_size=" << schedule.effective_swizzle_size
               << ",padded_m_tiles=" << schedule.padded_m_tiles << ",padded_n_tiles=" << schedule.padded_n_tiles
-              << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm});
-    print_alignment(geometry);
-    std::cout << '\n';
+              << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm})
+              << '\n';
   }
   std::cout << std::flush;
-}
-
-void reset_oproj_candidate(std::vector<RankRuntime>& runtimes, uint32_t& epoch) {
-  // Different joint policies have different ready indices and arrival counts.
-  // Reset only between completed candidates, never while another rank can be
-  // consuming. Input publication uses a separate input_epoch and is preserved.
-  finish_all(runtimes);
-  for (const int rank : fused_mpi::owned_ranks(static_cast<int>(runtimes.size()))) {
-    auto& runtime = runtimes[rank];
-    CUDA_CHECK(cudaSetDevice(runtime.device));
-    CUDA_CHECK(cudaMemsetAsync(runtime.oproj.ready, 0,
-        checked_bytes<uint32_t>(runtime.oproj_ready_elements), runtime.stream));
-  }
-  finish_all(runtimes);
-  epoch = 0;
 }
 
 void describe_component(std::vector<RankRuntime>& runtimes, const Options& options,
@@ -1234,11 +1167,8 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
         : fuse::cutlass_kernel_traits();
     if (traits.block_m <= 0 || traits.block_n <= 0) throw std::runtime_error("invalid component geometry");
     const int budget = runtime.sm_count - options.comm_sm;
-    const auto geometry = qkv ? PolicyGeometry{traits.block_m, traits.block_n, traits.block_k}
-                             : current_oproj_geometry(problem.k / options.world);
-    int mt = ceil_div(problem.m, traits.block_m), nt = ceil_div(problem.n, traits.block_n);
-    if (geometry.swap_ab) std::swap(mt, nt);
-    const auto schedule = schedule_geometry(mt, nt, problem.max_swizzle_size);
+    const auto schedule = schedule_geometry(ceil_div(problem.m, traits.block_m),
+                                            ceil_div(problem.n, traits.block_n), problem.max_swizzle_size);
     std::cout << "component_resources," << direction_name(direction) << context << ",rank=" << rank
               << ",tile_m=" << traits.block_m << ",tile_n=" << traits.block_n << ",tile_k=" << traits.block_k
               << ",raster=" << effective_raster(problem, direction)
@@ -1252,9 +1182,8 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
                                                 ? 0 : options.comm_sm)
               << ",production_threads=" << traits.threads
               << ",production_dynamic_smem=" << traits.dynamic_smem_bytes
-              << ",reference_resources=" << (options.component == MeasurementComponent::kFused ? "not_applicable" : "unknown");
-    print_alignment(geometry);
-    std::cout << '\n';
+              << ",reference_resources=" << (options.component == MeasurementComponent::kFused ? "not_applicable" : "unknown")
+              << '\n';
   }
 }
 
@@ -2468,17 +2397,13 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       continue;
     }
     if (options.profile_detail == "cta") continue;
-    const auto geometry = current_oproj_geometry(options.q_width() / options.world);
     const auto peers = download(runtime.peer_timeline, runtime.peer_capacity);
     for (int index = 0; index < runtime.peer_capacity; ++index) {
       const auto& event = peers[index];
-      const int logical_index = index / geometry.slices;
-      const int slice = index % geometry.slices;
-      if (logical_index < m_tiles * options.world) {
+      if (index < m_tiles * options.world) {
         if (!event.comm_valid || !event.task_begin || event.input_ready < event.task_begin ||
             event.publish_issue < event.input_ready || event.release < event.publish_issue ||
-            event.copy_rows < 0 || event.copy_path < 0 || event.copy_path > 3 ||
-            (geometry.aligned && event.copy_path != 3)) {
+            event.copy_rows < 0 || event.copy_path < 0 || event.copy_path > 2) {
           throw std::runtime_error("missing or invalid peer release record");
         }
         // Empty bulk tails can leave all copy phases zero. The vector path
@@ -2499,8 +2424,8 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
           }
         }
       }
-      if (logical_index < m_tiles * n_tiles) {
-        if (!event.valid || event.m_tile != logical_index / n_tiles || event.n_tile != logical_index % n_tiles || event.batch != 0) {
+      if (index < m_tiles * n_tiles) {
+        if (!event.valid || event.m_tile != index / n_tiles || event.n_tile != index % n_tiles || event.batch != 0) {
           throw std::runtime_error("missing logical GEMM tile record");
         }
         for (int peer = 0; peer < options.world; ++peer) {
@@ -2520,11 +2445,6 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                 << ",comm_slot=" << event.comm_slot << ",task_id=" << event.task_id << ",row_chunk=" << event.row_chunk
                 << ",copy_rows=" << event.copy_rows << ",source_rank=" << event.source_rank
                 << ",copy_path=" << event.copy_path << ",comm_valid=" << event.comm_valid;
-      if (geometry.aligned) {
-        std::cout << ",ready_slice=" << slice << ",ready_slices=" << geometry.slices
-                  << ",k_begin_in_peer=" << slice * geometry.ready_k
-                  << ",k_end_in_peer=" << (slice + 1) * geometry.ready_k;
-      }
       for (int peer = 0; peer < options.world; ++peer) std::cout << ",acquire" << peer << '=' << event.acquire[peer];
       std::cout << '\n';
     }
@@ -2609,7 +2529,6 @@ int main(int argc, char** argv) {
               << ",process_layout=" << (fused_mpi::enabled ? "mpi_one_process_per_gpu" : "single_process")
               << ",launch=" << options.launch
               << ",fused_direction=" << options.fused_direction
-              << ",oproj_epoch_scope=candidate_payload_v1"
               << ",calibrate=" << options.calibrate
               << ",profile=" << options.profile << ",timeout_seconds=" << options.timeout_seconds
               << ",profile_detail=" << (options.profile ? options.profile_detail : "none")
@@ -2665,7 +2584,6 @@ int main(int argc, char** argv) {
           StageTimer timer{"validate", context + ",includes=select_poison_fused_epoch_gpu_full_checks_small_stats"
               + (options.cpu_oracle ? "_and_full_cpu_oracle" : "")};
           select_candidate(runtimes, candidate, context);
-          if (candidate.direction == Direction::kOproj) reset_oproj_candidate(runtimes, epoch);
           bind_graph(runtimes, candidate_options, epoch);
           if (options.calibrate) describe_component(runtimes, candidate_options, candidate.direction, context);
           poison_outputs(runtimes, candidate_options, candidate.direction);
@@ -2688,8 +2606,8 @@ int main(int argc, char** argv) {
         }
         report_graph_preparation(runtimes, candidate_options, candidate.direction, context);
         if (options.calibrate) {
-          // Only calibration flags are reset here; production state is
-          // managed separately at candidate/payload selection.
+          // Only separate calibration flags are reset. Production counters
+          // continue across candidates and both payload generations.
           {
             StageTimer timer{"calibration_setup", candidate_payload + ",includes=completion_clear_independent_flags"};
             reset_calibration(runtimes, candidate_options, candidate.direction);

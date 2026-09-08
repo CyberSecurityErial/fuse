@@ -127,11 +127,10 @@ struct ProducerTileOrder {
 // This is a static PRIORITY, never a completion barrier. Communication workers
 // still stride their queue independently and may run ahead of GEMM. No new
 // atomics, GPU allocations, grid synchronization or consumer acknowledgements.
-// Each (M,peer,chunk) occurs exactly once. Legacy row chunks still contribute
-// to the existing 128-row/peer release; the opt-in K-slice path instead gives
-// each chunk its own ready unit. Both retain release/acquire memory ordering.
+// Each (M,peer,row chunk) occurs exactly once. All chunks still contribute to
+// the existing 128-row/peer release; keep its target, fences and acquire scope.
 // Concurrent CTA progress need not follow logical waves. TODO: only measured
-// residual stalls justify ready-aware lookahead or promoting finer K readiness;
+// residual stalls justify ready-aware lookahead or a finer K publication unit;
 // this mapping neither promises zero waiting nor changes GEMM's layout.
 struct A2AInputTileOrder {
   int32_t m_tiles = 0;
@@ -141,15 +140,12 @@ struct A2AInputTileOrder {
   bool along_n = true;
 
   template <class Params>
-  CUTLASS_HOST_DEVICE static A2AInputTileOrder make(
-      const Params& p, int32_t m, bool swap_ab = false) {
+  CUTLASS_HOST_DEVICE static A2AInputTileOrder make(const Params& p, int32_t m) {
     A2AInputTileOrder order{};
     order.m_tiles = m;
     order.log_swizzle = p.log_swizzle_size_;
     order.compute_ctas = p.compute_grid_size;
-    // m always means original sequence rows. SwapAB places that axis on
-    // physical N; do not derive a window from physical M in that case.
-    order.along_n = (p.raster_order_ == Params::RasterOrder::AlongN) != swap_ab;
+    order.along_n = p.raster_order_ == Params::RasterOrder::AlongN;
     order.group_stride = p.divmod_cluster_blk_major_.divisor << order.log_swizzle;
     return order;
   }
@@ -178,8 +174,7 @@ struct A2AInputTileOrder {
 
   struct Task { int32_t m = 0, peer = 0, chunk = 0; };
 
-  CUTLASS_HOST_DEVICE Task decode(
-      uint64_t task, int32_t world, int32_t chunks, bool k_slices = false) const {
+  CUTLASS_HOST_DEVICE Task decode(uint64_t task, int32_t world, int32_t chunks) const {
     const uint64_t tasks_per_m = static_cast<uint64_t>(world) * chunks;
     // A window [begin,end) occupies [begin,end)*tasks_per_m in the queue,
     // although its INNER order is peer-major. Thus this probe M identifies
@@ -192,54 +187,9 @@ struct A2AInputTileOrder {
     const uint64_t tasks_per_peer = static_cast<uint64_t>(end - begin) * chunks;
     const int32_t peer = static_cast<int32_t>(offset / tasks_per_peer);
     const uint64_t in_peer = offset - static_cast<uint64_t>(peer) * tasks_per_peer;
-    if (k_slices) {
-      // Supply the next K slice to every first-use M in this window before
-      // advancing K. Never finish all K for one M while starving its peers.
-      const int32_t window_m = end - begin;
-      return {begin + static_cast<int32_t>(in_peer % window_m), peer,
-              static_cast<int32_t>(in_peer / window_m)};
-    }
     return {begin + static_cast<int32_t>(in_peer / chunks), peer,
             static_cast<int32_t>(in_peer % chunks)};
   }
-};
-
-// Communication/computation accumulation-direction consistency:
-// compare both frontiers in the original A[M,K] coordinate system. Producing
-// rows while a consumer needs complete M and a short K slice creates a
-// multidimensional head-of-line dependency. Align direction, scale and ready
-// publication, not just queue indices. A small angle between the two frontier
-// directions is a useful intuition, NOT a cost model: rates, tile efficiency
-// and out-of-order completion still matter. No completion ordering is inferred.
-//
-// BF16 experiments share one rectangular transfer implementation. KSlice uses
-// M128 x K128, published independently. RowBlock uses a small original-M tile
-// (physical N after SwapAB) and publishes its entire peer K. One slot owns a
-// ready unit; if it exceeds SMEM capacity that slot streams subrectangles, then
-// releases once. No split-K output, duplicate communication or consumer ack.
-struct A2AInputTransferShape {
-  int32_t rows = 0, peer_k = 0, ready_k = 0, copy_k = 0, inner_u64 = 0;
-
-  CUTLASS_HOST_DEVICE static A2AInputTransferShape make(
-      int32_t rows, int32_t peer_k, int32_t ready_k, int32_t tile_k,
-      int32_t stage_bytes) {
-    A2AInputTransferShape shape{};
-    if (rows <= 0 || rows > 256 || peer_k <= 0 || ready_k <= 0 ||
-        tile_k <= 0 || peer_k % ready_k || ready_k % tile_k || tile_k % 8 ||
-        stage_bytes <= 0) return shape;
-    int32_t copy_k = stage_bytes / (rows * 2);
-    if (copy_k > ready_k) copy_k = ready_k;
-    copy_k = copy_k / tile_k * tile_k;
-    while (copy_k > 0 && ready_k % copy_k) copy_k -= tile_k;
-    if (!copy_k) return shape;
-    int32_t inner = 256;
-    while (inner >= 2 && ((peer_k / 4) % inner || (copy_k / 4) % inner)) inner /= 2;
-    if (inner < 2 || copy_k / (4 * inner) > 256) return shape;
-    return {rows, peer_k, ready_k, copy_k, inner};
-  }
-
-  CUTLASS_HOST_DEVICE bool valid() const { return copy_k > 0; }
-  CUTLASS_HOST_DEVICE int32_t slices() const { return peer_k / ready_k; }
 };
 
 // Enumerate copy rectangles near their latest *logical* publication dependency.

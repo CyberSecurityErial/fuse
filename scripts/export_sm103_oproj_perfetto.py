@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """Export SM103 OProj diagnostic telemetry; no kernel changes or GPU launches.
 
-Each GPU has its own time origin. Legacy communication details describe only
-the final publishing chunk; aligned plans describe the single owner's complete
-ready-region transfer, not each internal copy. Release is sampled after
-publication: acquire can precede that sample.
+Each GPU has its own time origin. Communication details describe only the final
+publishing chunk of a ready region, not every copy issued by the communication
+CTA. Release is sampled after publication: acquire can precede that sample.
 """
 import argparse
 import hashlib
 import json
 import tarfile
 from pathlib import Path
-
-from l20d import fused_policy_alignment, fused_policy_tile
 
 
 def parse(line):
@@ -21,7 +18,6 @@ def parse(line):
 
 def make_trace(lines, job):
     ctas, peers, hosts, devices, validations = {}, {}, {}, {}, set()
-    candidates = []
     verified = passed = False
     for line in lines:
         row = parse(line)
@@ -40,8 +36,6 @@ def make_trace(lines, job):
             rank = int(row['rank'])
             assert rank not in hosts
             hosts[rank] = row
-        elif line.startswith('candidate,A2A_GEMM,'):
-            candidates.append(row)
         elif line.startswith(('correctness,A2A_GEMM,', 'route,A2A_GEMM,')):
             phase = row.get('profile_phase')
             if phase in ('instrumented', 'host_stages'):
@@ -57,29 +51,18 @@ def make_trace(lines, job):
             passed = True
     world, comm = job['world'], job['comm_sm']
     m = job['global_seq'] // world
+    import re
     policy = job.get('oproj_policy_list') or job.get('oproj_policy')
     assert isinstance(policy, str) and ',' not in policy, 'One explicit tile required'
-    assert policy != 'auto', 'Explicit tile required'
-    bm, bn, bk = fused_policy_tile(policy)
-    peer_k = job.get('q_heads', 0) * job.get('head_dim', 0) // world
-    alignment = fused_policy_alignment(policy, peer_k)
-    slices = alignment.get('ready_slices', 1)
-    if alignment:
-        assert {int(row['rank']) for row in candidates} == set(range(world)), 'Missing joint-policy metadata'
-        for row in candidates:
-            assert row['tile'] == policy and tuple(int(row[f'tile_{axis}']) for axis in 'mnk') == (bm, bn, bk)
-            assert all(row.get(key) == str(value) for key, value in alignment.items()), 'Invalid joint-policy metadata'
+    tile = re.fullmatch(r'm(\d+)n(\d+).*', policy)
+    assert tile, 'Explicit tile required'
+    bm, bn = map(int, tile.groups())
     mt, nt = (m + bm - 1) // bm, (job['hidden'] + bn - 1) // bn
-    capacity = max(mt * nt, mt * world) * slices
+    capacity = max(mt * nt, mt * world)
     assert verified and passed and set(hosts) == set(devices) == set(range(world))
     assert validations == {(p, k, r) for p in ('instrumented', 'host_stages')
                            for k in ('correctness', 'route') for r in range(world)}
     assert set(peers) == {(r, i) for r in range(world) for i in range(capacity)}
-    if alignment:
-        for (_, index), row in peers.items():
-            slice_id = index % slices
-            assert (row.get('ready_slice'), row.get('ready_slices'), row.get('k_begin_in_peer'), row.get('k_end_in_peer')) == (
-                slice_id, slices, slice_id * alignment['ready_k'], (slice_id + 1) * alignment['ready_k']), 'Invalid ready slice metadata'
     events = []
     for rank in range(world):
         selected = {c: row for (r, c), row in ctas.items() if r == rank}
@@ -102,7 +85,7 @@ def make_trace(lines, job):
         track(0, 'A2A -> GEMM diagnostic boundary')
         span(0, 'A2A -> GEMM', origin, end)
         slots = {(p['comm_cta'], p['comm_slot']) for (r, i), p in peers.items()
-                 if r == rank and i < mt * world * slices}
+                 if r == rank and i < mt * world}
         for cta, row in sorted(selected.items()):
             tid = 100 + cta * 16
             track(tid, f'{"Communication" if cta < comm else "GEMM"} CTA {cta}')
@@ -111,56 +94,38 @@ def make_trace(lines, job):
                 for c, slot in sorted(slots):
                     if c == cta:
                         assert -1 <= slot < 8
-                        scope = 'ready-region transfer' if alignment else 'final-publisher chunk'
-                        track(tid + slot + 2, f'CTA {cta} slot {slot}: {scope} phases')
+                        track(tid + slot + 2, f'CTA {cta} slot {slot}: final-publisher chunk phases')
             else:
                 span(tid, 'first ready wait', row['start'], row['active_start'])
                 span(tid, 'GEMM role (includes later peer waits)', row['active_start'], row['end'])
-        for index in range(mt * world * slices):
+        for index in range(mt * world):
             p = peers[rank, index]
             assert p['comm_valid'] and 0 <= p['comm_cta'] < comm
             assert 0 <= p['source_rank'] < world
             assert p['task_begin'] <= p['input_ready'] <= p['publish_issue'] <= p['release']
             tid = 100 + p['comm_cta'] * 16 + p['comm_slot'] + 2
-            ready_index, slice_id = divmod(index, slices)
-            attrs = dict(ready_m=ready_index//world, ready_peer=ready_index%world,
+            attrs = dict(ready_m=index//world, ready_peer=index%world,
                          src_gpu=p['source_rank'], dst_gpu=rank, task=p['task_id'],
                          row_chunk=p['row_chunk'], copy_rows=p['copy_rows'],
-                         final_publisher_only=not bool(alignment), copy_path=p['copy_path'])
-            if alignment:
-                attrs.update(ready_slice=slice_id, k_begin_in_peer=p['k_begin_in_peer'],
-                             k_end_in_peer=p['k_end_in_peer'])
+                         final_publisher_only=True, copy_path=p['copy_path'])
             span(tid, 'task setup / input-ready wait', p['task_begin'], p['input_ready'], **attrs)
-            if p['copy_path'] == 3:
-                assert alignment and p['g2s_issue'] <= p['g2s_done'] <= p['s2g_issue'] <= p['s2g_done'] <= p['publish_issue']
-                # Row-owner can issue several subrectangles. The record has
-                # first-G2S and final-S2G endpoints, not separate accumulated
-                # G2S/S2G durations; never mislabel that interval as pure S2G.
-                attrs['phase_scope'] = 'first G2S issue through final destination S2G completion'
-                span(tid, 'rectangular G2S + S2G pipeline', p['g2s_issue'], p['s2g_done'], **attrs)
-            elif p['g2s_issue']:
+            if p['g2s_issue']:
                 span(tid, 'remote G2S' if p['copy_path'] else 'vector copy', p['g2s_issue'], p['g2s_done'], **attrs)
-            if p['s2g_issue'] and p['copy_path'] != 3:
+            if p['s2g_issue']:
                 local_attrs = dict(attrs, src_gpu=rank, remote_source_gpu=p['source_rank'])
                 span(tid, 'local S2G (destination complete)', p['s2g_issue'], p['s2g_done'], **local_attrs)
             span(tid, 'ready atomic (post-publication sample)', p['publish_issue'], p['release'], **attrs)
-        for index in range(mt * nt * slices):
+        for index in range(mt * nt):
             p = peers[rank, index]
-            tile_index, slice_id = divmod(index, slices)
-            assert p['valid'] and (p['m'], p['n'], p['batch']) == (tile_index//nt, tile_index%nt, 0)
+            assert p['valid'] and (p['m'], p['n'], p['batch']) == (index//nt, index%nt, 0)
             tid = 10000 + index
-            suffix = f' K slice {slice_id}' if alignment else ''
-            track(tid, f'GEMM tile ({p["m"]},{p["n"]}){suffix}: ready handoff, not GEMM duration')
+            track(tid, f'GEMM tile ({p["m"]},{p["n"]}): ready handoff, not GEMM duration')
             for peer in range(world):
                 acquire = p[f'acquire{peer}']
-                release = peers[rank, (p['m'] * world + peer) * slices + slice_id]['release']
+                release = peers[rank, p['m'] * world + peer]['release']
                 attrs = dict(m_tile=p['m'], n_tile=p['n'], ready_peer=peer,
                              acquire_minus_release_ns=acquire-release,
                              note='release timestamp is sampled after atomic; negative delta is permitted')
-                if alignment:
-                    attrs.update(ready_slice=slice_id,
-                        k_begin=peer * peer_k + slice_id * alignment['ready_k'],
-                        k_end=peer * peer_k + (slice_id + 1) * alignment['ready_k'])
                 assert origin <= acquire <= end
                 if acquire >= release:
                     span(tid, 'release -> acquire (may include preceding GEMM)', release, acquire, **attrs)
@@ -169,11 +134,9 @@ def make_trace(lines, job):
                                        pid=rank, tid=tid, ts=(acquire-origin)/1000, args=attrs))
     return dict(traceEvents=events, displayTimeUnit='ns', metadata=dict(
         schema='fuse_sm103_oproj_perfetto_v1', diagnostic_only=True, performance_accepted=False,
-        config=job, profile_host=hosts, joint_policy=alignment,
+        config=job, profile_host=hosts,
         clock='GPU-local globaltimer ns converted to microseconds; never subtract across ranks',
-        scope='single-process diagnostic; not MPI Graph performance; ' +
-              ('communication records cover each single-writer ready region' if alignment else
-               'communication records only final publishing chunks')))
+        scope='single-process diagnostic; not MPI Graph performance; communication records only final publishing chunks'))
 
 
 def export(run, output):

@@ -188,7 +188,7 @@ class TilePolicyHostContracts(unittest.TestCase):
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
         bindings = launch[launch.index("namespace fuse {"):launch.index("using DeviceInfo =")]
         comm = (ROOT / "csrc/operators/sm103/detail/a2a_gemm.cuh").read_text()
-        constants = comm[comm.index("template <int32_t ReadyBlockM"):comm.index("  struct Arguments")]
+        constants = comm[comm.index("template <\n    int32_t ReadyBlockM"):comm.index("  struct Arguments")]
         validator = comm[comm.index("  static bool supported_params("):
                          comm.index("  static cudaError_t initialize(")]
         gemm = (ROOT / "csrc/operators/sm103/detail/gemm.cuh").read_text()
@@ -215,7 +215,6 @@ template <int I, class S> constexpr int size(S) { return S::dims[I]; }
 struct SM90_BULK_COPY_G2S {};
 struct SM90_BULK_COPY_S2G {};
 struct SM90_TMA_STORE_3D {};
-struct SM90_TMA_LOAD_3D {};
 }
 namespace fuse {
 using Bf16 = uint16_t;
@@ -224,16 +223,15 @@ constexpr int kMaxWorldSize = 8, kAlignment = 8;
 };
 // Opaque type identities preserve N/K/epilogue choices, without pretending
 // to compile or execute any CUTLASS collective or tensor instruction.
-template <int N, int K = 64, int E = 0, bool Swap = false> struct Bf16GemmTypes {
+template <int N, int K = 64, int E = 0> struct Bf16GemmTypes {
   using Identity = Bf16GemmTypes;
   using TileShape = cute::Shape<128,N,K>;
   static constexpr int epilogue_n = E;
   struct OutputGemm { using Identity = Bf16GemmTypes; using TileShape = typename Identity::TileShape; };
   struct PureGemm { using Identity = Bf16GemmTypes; using TileShape = typename Identity::TileShape; };
 };
-template <int N, int K = 64, int E = 0, bool Swap = false>
-struct A2ALhsGemmTypes : Bf16GemmTypes<N,K,E,Swap> {
-  using Gemm = typename Bf16GemmTypes<N,K,E,Swap>::OutputGemm;
+template <int N, int K = 64, int E = 0> struct A2ALhsGemmTypes : Bf16GemmTypes<N,K,E> {
+  using Gemm = typename Bf16GemmTypes<N,K,E>::OutputGemm;
   using TelemetryGemm = Gemm;
 };
 template <int N> struct QkvComm { static constexpr int kBlockM = 128, kBlockN = N; };
@@ -318,9 +316,6 @@ int main(int argc, char** argv) {
             if direction == "qkv":
                 policies.update({f"m128n{n}": (128, n, 64, 0, 1) for n in (64, 160, 192)})
                 policies["m128n256k64e64"] = (128, 256, 64, 64, 1)
-            else:
-                policies["kslice_m128n256k64"] = (128, 256, 64, 32, 1)
-                policies["row_m128n32k64"] = (128, 32, 64, 0, 1)
             for policy, expected in policies.items():
                 with self.subTest(direction=direction, policy=policy, profiling=profiling):
                     result = self.run_policy(direction, policy, profiling=profiling)
@@ -404,10 +399,8 @@ int main(int argc, char** argv) {
     apply_schedule(oproj, options, Direction::kOproj);
     const auto qs = schedule_geometry(ceil_div(options.seq_local, 128),
         ceil_div(options.projection_width(), std::stoi(options.qkv_policy_list.front().substr(5))), qkv.max_swizzle_size);
-    const auto og = policy_geometry(options.oproj_policy_list.front(), options.q_width() / options.world);
-    int om = ceil_div(options.seq_local, og.m), on = ceil_div(options.hidden, og.n);
-    if (og.swap_ab) std::swap(om, on);
-    const auto os = schedule_geometry(om, on, oproj.max_swizzle_size);
+    const auto os = schedule_geometry(ceil_div(options.seq_local, 128),
+        ceil_div(options.hidden, std::stoi(options.oproj_policy_list.front().substr(5))), oproj.max_swizzle_size);
     std::cout << "schedule " << options.max_swizzle_size << ' ' << options.qkv_raster << ' ' << options.oproj_raster
               << ' ' << effective_raster(qkv, Direction::kQkv) << ' ' << effective_raster(oproj, Direction::kOproj)
               << ' ' << qs.effective_swizzle_size << ' ' << qs.padded_m_tiles << ' ' << qs.padded_n_tiles
@@ -451,10 +444,6 @@ void report_graph_preparation(const std::vector<RankRuntime>&, const Options& op
 }
 uint32_t payload_generation = 0, reference_generation = 99, last_epoch[2] = {};
 uint32_t reference_last_epoch[2][2] = {};
-void reset_oproj_candidate(std::vector<RankRuntime>&, uint32_t& epoch) {
-  epoch = last_epoch[1] = 0;
-  std::cout << "mock,oproj_candidate_reset,generation=" << payload_generation << '\n';
-}
 int last_selected_direction = -1;
 int selected_comm[2] = {};
 std::string selected_policy[2];
@@ -639,50 +628,6 @@ Options parse_options(int argc, char** argv) {
 ''' + graph_flow[point:]
         cls.graph_flow_probe = compile_host_probe(cls, graph_flow, "harness-graph-main-flow",
             "-DFUSE_ENABLE_PROFILING=1", "-pthread", "-I", str(ROOT / "benchmarks/sm103"))
-        reset_source = r'''
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <stdexcept>
-#include <vector>
-''' + source[source.index("size_t checked_product("):source.index("\nenum class Direction")] + r'''
-struct RankRuntime {
-  int device = 1, stream = 9;
-  size_t oproj_ready_elements = 32;
-  struct { uint32_t* ready; uint32_t input_epoch = 55; } oproj;
-};
-int completion_barriers = 0, clears = 0, current_device = -1;
-void finish_all(std::vector<RankRuntime>&) { ++completion_barriers; }
-int cudaSetDevice(int device) { current_device = device; return device < 0 || device > 1; }
-int cudaMemsetAsync(void* pointer, int value, size_t bytes, int stream) {
-  if (completion_barriers != 1 || value || bytes != (current_device ? 64 : 128) ||
-      stream != 9 || current_device != clears) return 1;
-  ++clears;
-  std::memset(pointer, value, bytes);
-  return 0;
-}
-#define CUDA_CHECK(operation) do { if (operation) throw std::runtime_error("bad reset order/extent"); } while (0)
-''' + source[source.index("void reset_oproj_candidate("):source.index("\nvoid describe_component(")] + r'''
-int main() {
-  uint32_t storage[2][32];
-  std::fill_n(storage[0], 32, 123);
-  std::fill_n(storage[1], 32, 456);
-  std::vector<RankRuntime> runtimes(2);
-  for (int rank = 0; rank < 2; ++rank) {
-    runtimes[rank].device = rank;
-    runtimes[rank].oproj.ready = storage[rank];
-  }
-  runtimes[1].oproj_ready_elements = 16;
-  uint32_t epoch = 97;
-  reset_oproj_candidate(runtimes, epoch);
-  if (epoch || completion_barriers != 2 || clears != 2) return 1;
-  for (int i = 0; i < 32; ++i) if (storage[0][i] != 0 || storage[1][i] != (i < 16 ? 0 : 456)) return 2;
-  if (runtimes[1].oproj.input_epoch != 55) return 3;
-}
-'''
-        cls.reset_probe = compile_host_probe(cls, reset_source, "harness-oproj-ready-reset")
 
     def invoke(self, *arguments, profiling=0, policy_env=None, oproj_policy_env=None):
         environment = os.environ.copy()
@@ -745,19 +690,6 @@ int main() {
         self.assertEqual(actual["schedule"][:5], ("1", "heuristic", "heuristic", "along_m", "along_n"))
         self.assertEqual(actual["candidates"], [("GEMM_A2A", 8, "m128n128"),
                                                 ("A2A_GEMM", 8, "m128n128")])
-
-    def test_joint_policies_parse_with_logical_tiles_and_physical_padding(self):
-        for policy, padding in (("kslice_m128n256k64", ("4", "4", "4")),
-                                ("row_m128n32k64", ("4", "8", "12"))):
-            result = self.query("--oproj-policy-list", policy, "--seq-local", "384",
-                                "--max-swizzle-size", "4", "--fused-direction", "oproj")
-            self.assertEqual(result["candidates"], [("A2A_GEMM", 8, policy)])
-            self.assertEqual(result["schedule"][-3:], padding)
-        self.assert_rejected("--oproj-policy-list", "kslice_m128n256k64",
-                             "--q-heads", "4", "--head-dim", "64", "--fused-direction", "oproj")
-
-    def test_actual_oproj_reset_respects_rank_ownership_extent_and_publication(self):
-        subprocess.run([str(self.reset_probe)], check=True, timeout=10)
 
     def test_profile_detail_is_explicit_and_requires_profiling(self):
         self.assertEqual(self.query("--profile", profiling=1)["profile_detail"], "full")
@@ -1100,22 +1032,6 @@ int main() {
         self.assertGreater(min(accepted), lines.index("mock,cleanup"))
         self.assertTrue(lines[-1].startswith("PASS:"))
 
-    def test_joint_candidate_switch_resets_oproj_before_binding_and_keeps_qkv_contiguous(self):
-        result = self.run_flow("--oproj-policy-list",
-                              "m128n128,kslice_m128n256k64,row_m128n32k64", graph=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
-        self.assertIn("oproj_epoch_scope=candidate_payload_v1", lines[0])
-        resets = [i for i, row in enumerate(lines) if row.startswith("mock,oproj_candidate_reset,")]
-        self.assertEqual(len(resets), 6)  # Three OProj policies times two payloads.
-        for index in resets:
-            self.assertTrue(lines[index - 1].startswith("mock,select,"))
-            self.assertEqual(lines[index + 1], "mock,graph_bind,0")
-            first_epoch = next(row for row in lines[index + 1:] if row.startswith("mock,epoch,"))
-            self.assertEqual(first_epoch, "mock,epoch,A2A_GEMM,1")
-        qkv = [int(row.rsplit(',', 1)[1]) for row in lines if row.startswith("mock,epoch,GEMM_A2A,")]
-        self.assertEqual(qkv, list(range(1, len(qkv) + 1)))
-
     def test_real_main_second_payload_failure_never_accepts_candidates(self):
         result = self.run_flow("--comm-sm-list", "8,16", fail_second_payload=True)
         self.assertNotEqual(result.returncode, 0)
@@ -1274,7 +1190,7 @@ class NoResidualHostContracts(unittest.TestCase):
         helpers = gemm[gemm.index("__host__ __device__ constexpr int64_t a_row_stride("):
                        gemm.index("// TODO: These Hopper tile widths")]
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
-        begin = launch.index("template <class Kernel, bool SwapAB = false>\ntypename Kernel::Arguments gemm_arguments(")
+        begin = launch.index("template <class Kernel>\ntypename Kernel::Arguments gemm_arguments(")
         # Extract this function only, not unrelated helpers inserted after it.
         arguments = launch[begin:launch.index("\n}\n", begin) + 3]
         source = r"""
@@ -1298,19 +1214,17 @@ struct PersistentTileSchedulerSm100Monolithic { enum RasterOrderOptions { AlongM
 }
 """ + helpers + r"""
 struct DeviceInfo { int device = 3, sm_count = 148; };
-template <bool Swap = false> struct ProbeGemm {
+struct ProbeGemm {
   struct Arguments {
     cutlass::gemm::GemmUniversalMode mode;
     std::tuple<int, int, int, int> problem_shape;
     using Stride = std::tuple<int64_t, cute::_1, int64_t>;
-    using OutputStride = std::conditional_t<Swap,
-        std::tuple<cute::_1, int64_t, int64_t>, Stride>;
     struct { const Bf16* ptr_A; const Bf16* ptr_B; Stride dA, dB; } mainloop;
     struct {
       struct { float alpha, beta; } thread;
       const void* ptr_C;
       Bf16* ptr_D;
-      OutputStride dC, dD;
+      Stride dC, dD;
     } epilogue;
     struct { int device_id, sm_count; } hw_info;
     struct {
@@ -1337,7 +1251,7 @@ int main() {
           p.max_swizzle_size = swizzle;
           const auto effective = requested == GemmRaster::kHeuristic ? fallback : requested;
           for (float alpha : {-2.0f, 0.0f, .25f, 1.0f}) {
-            const auto args = gemm_arguments<ProbeGemm<>>(p, a, b, d, alpha, 12, info, fallback);
+            const auto args = gemm_arguments<ProbeGemm>(p, a, b, d, alpha, 12, info, fallback);
             if (args.mode != cutlass::gemm::GemmUniversalMode::kGemm ||
                 args.problem_shape != std::make_tuple(128, 256, 2048, 1) ||
                 args.mainloop.ptr_A != a || args.mainloop.ptr_B != b || args.epilogue.ptr_D != d ||
@@ -1350,19 +1264,6 @@ int main() {
                 args.scheduler.block_offset != 12 || args.scheduler.max_swizzle_size != swizzle ||
                 args.scheduler.raster_order != (effective == GemmRaster::kAlongM ? Raster::AlongM : Raster::AlongN)) {
               throw std::runtime_error("no-residual argument contract");
-            }
-            const auto swapped = gemm_arguments<ProbeGemm<true>, true>(
-                p, a, b, d, alpha, 12, info, fallback);
-            if (swapped.problem_shape != std::make_tuple(256, 128, 2048, 1) ||
-                swapped.mainloop.ptr_A != b || swapped.mainloop.ptr_B != a ||
-                swapped.epilogue.ptr_D != d || swapped.epilogue.ptr_C != nullptr ||
-                swapped.epilogue.thread.beta != 0.0f || swapped.epilogue.thread.alpha != alpha ||
-                std::get<0>(swapped.mainloop.dA) != (padded ? 2080 : 2048) ||
-                std::get<0>(swapped.mainloop.dB) != (padded ? 2072 : 2048) ||
-                std::get<1>(swapped.epilogue.dD) != (padded ? 264 : 256) ||
-                swapped.hw_info.sm_count != args.hw_info.sm_count ||
-                swapped.scheduler.raster_order != args.scheduler.raster_order) {
-              throw std::runtime_error("SwapAB view/stride argument contract");
             }
           }
         }
@@ -1377,9 +1278,8 @@ int main() {
         subprocess.run([str(self.probe)], check=True, timeout=10)
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
         reference = (ROOT / "csrc/operators/sm103/api/reference.cuh").read_text()
-        self.assertEqual(launch.count("auto args = gemm_arguments<Gemm>("), 1)  # QKV unchanged.
-        self.assertEqual(launch.count("auto args = gemm_arguments<Gemm, SwapAB>("), 1)
-        self.assertEqual(reference.count("auto args = gemm_arguments<Gemm, Binding::kSwapAB>("), 1)
+        self.assertEqual(launch.count("auto args = gemm_arguments<Gemm>("), 2)
+        self.assertEqual(reference.count("auto args = gemm_arguments<Gemm>("), 1)
 
 
 class CtaTimelineHostContracts(unittest.TestCase):
@@ -1426,70 +1326,48 @@ struct Params {
   fuse::A2AGemmPeerTimeline* peer_timeline;
   int peer_timeline_capacity;
   int m_tiles = 2, n_tiles = 3;
-  int ready_slices_per_peer = 1;
 };
-template <bool Instrumented, bool SwapAB = false> struct Probe {
+template <bool Instrumented> struct Probe {
   const Params* params_;
 """ + recorder + r"""
 };
 void require(bool condition) { if (!condition) throw std::runtime_error("recorder assertion"); }
-#if FUSE_ENABLE_PROFILING
-template <bool SwapAB> void run_recorder(bool full, int slices) {
-  fuse::A2AGemmCtaTimeline timeline[4]{};
-  std::vector<fuse::A2AGemmPeerTimeline> peers(6 * slices);
-  Params params{timeline, 4, full ? peers.data() : nullptr, full ? 6 * slices : 0,
-                2, 3, slices};
-  active_address = &timeline[3].active_start;
-  Probe<true, SwapAB> probe{&params};
-  auto physical_tile = [](int m, int n, int l = 0) {
-    return std::make_tuple(SwapAB ? n : m, SwapAB ? m : n, 0, l);
-  };
-  for (auto tile : {std::make_tuple(-1, 0, 0, 0), std::make_tuple(2, 0, 0, 0),
-                    std::make_tuple(0, 3, 0, 0), std::make_tuple(0, 0, 0, 1)}) {
-    probe.record_peer_acquire(
-        physical_tile(std::get<0>(tile), std::get<1>(tile), std::get<3>(tile)), 0, 0);
-  }
-  require(!clock_reads && !cta_atomics && !peer_atomics);
-  for (int m = 0; m < 2; ++m) for (int n = 0; n < 3; ++n) {
-    for (int slice = 0; slice < slices; ++slice) for (int peer = 0; peer < 4; ++peer) {
-      const auto tile = physical_tile(m, n);
-      const int record = (m * 3 + n) * slices + slice;
-      probe.record_peer_acquire(tile, peer, slice);
-      const auto first = peers[record].acquire[peer];
-      probe.record_peer_acquire(tile, peer, slice); // Prologue/remainder or cached observation.
-      if (full) require(first != 0 && peers[record].acquire[peer] == first);
-    }
-  }
-  require(cta_atomics == 1 && timeline[3].active_start == 1);
-  require(clock_reads == (full ? 48u * slices : 1u) && peer_atomics == (full ? 48 * slices : 0));
-  if (full) for (int i = 0; i < 6 * slices; ++i) {
-    require(peers[i].valid && peers[i].m_tile == i / slices / 3 &&
-            peers[i].n_tile == i / slices % 3);
-    // Distinct slice records must not collapse into a common peer timestamp.
-    if (i && i % slices) require(peers[i].acquire[0] != peers[i - 1].acquire[0]);
-  }
-  const auto clocks_before = clock_reads;
-  Probe<false, SwapAB> production{&params};
-  production.record_peer_acquire(physical_tile(0, 0), 0, 0);
-  require(clock_reads == clocks_before && cta_atomics == 1);
-  timeline[3].active_start = 0;
-  Probe<true, SwapAB> next_launch{&params};
-  next_launch.record_peer_acquire(physical_tile(0, 0), 0, 0);
-  require(cta_atomics == 2 && timeline[3].active_start == clocks_before + 1);
-}
-#endif
 int main(int argc, char** argv) {
 #if FUSE_ENABLE_PROFILING
   const bool full = argc > 1 && std::string(argv[1]) == "full";
-  const bool swapped = argc > 2 && std::string(argv[2]) == "swap";
-  const int slices = argc > 3 ? std::stoi(argv[3]) : 1;
-  require(slices > 0);
-  if (swapped) run_recorder<true>(full, slices);
-  else run_recorder<false>(full, slices);
+  fuse::A2AGemmCtaTimeline timeline[4]{};
+  fuse::A2AGemmPeerTimeline peers[6]{};
+  Params params{timeline, 4, full ? peers : nullptr, full ? 6 : 0};
+  active_address = &timeline[3].active_start;
+  Probe<true> probe{&params};
+  for (auto tile : {std::make_tuple(-1, 0, 0, 0), std::make_tuple(2, 0, 0, 0),
+                    std::make_tuple(0, 3, 0, 0), std::make_tuple(0, 0, 0, 1)}) {
+    probe.record_peer_acquire(tile, 0);
+  }
+  require(!clock_reads && !cta_atomics && !peer_atomics);
+  for (int m = 0; m < 2; ++m) for (int n = 0; n < 3; ++n) for (int peer = 0; peer < 4; ++peer) {
+    const auto tile = std::make_tuple(m, n, 0, 0);
+    probe.record_peer_acquire(tile, peer);
+    const auto first = peers[m * 3 + n].acquire[peer];
+    probe.record_peer_acquire(tile, peer); // Prologue/remainder or cached observation.
+    if (full) require(first != 0 && peers[m * 3 + n].acquire[peer] == first);
+  }
+  require(cta_atomics == 1 && timeline[3].active_start == 1);
+  require(clock_reads == (full ? 48u : 1u) && peer_atomics == (full ? 48 : 0));
+  if (full) for (int i = 0; i < 6; ++i) {
+    require(peers[i].valid && peers[i].m_tile == i / 3 && peers[i].n_tile == i % 3);
+  }
+  const auto clocks_before = clock_reads;
+  Probe<false> production{&params};
+  production.record_peer_acquire(std::make_tuple(0, 0, 0, 0), 0);
+  require(clock_reads == clocks_before && cta_atomics == 1);
+  timeline[3].active_start = 0;
+  Probe<true> next_launch{&params};
+  next_launch.record_peer_acquire(std::make_tuple(0, 0, 0, 0), 0);
+  require(cta_atomics == 2 && timeline[3].active_start == clocks_before + 1);
 #else
   (void)argc; (void)argv;
   static_assert(sizeof(Probe<false>) == sizeof(const Params*));
-  static_assert(sizeof(Probe<false, true>) == sizeof(const Params*));
 #endif
 }
 """
@@ -1519,10 +1397,7 @@ struct Options {
   unsigned timeout_seconds = 0;
   std::string host_launch = "sequential", profile_detail = "full";
   int projection_width() const { return 384; }
-  int q_width() const { return 1024; }
 };
-struct PolicyGeometry { bool aligned = false; int ready_k = 0, slices = 1; };
-PolicyGeometry current_oproj_geometry(int) { return {}; }
 namespace fuse::detail { struct QkvEpilogueRecord {}; }
 struct RankRuntime {
   int device = 0, sm_count = 4, stream = 0, peer_capacity = 0;
@@ -1643,18 +1518,12 @@ int main(int argc, char** argv) {
         for profiling, detail in product((0, 1), ("full", "cta")):
             subprocess.run([str(self.recorders[profiling]), detail], check=True, timeout=10)
         source = (ROOT / "csrc/operators/sm103/detail/cutlass_pipeline.cuh").read_text()
-        call = source.index("record_peer_acquire(tile_coord, peer, slice);")
+        call = source.index("record_peer_acquire(tile_coord, peer);")
         self.assertIn("if (threadIdx.x % 32 == 0)", source[call - 60:call])
         # The readiness-cache block ends before telemetry. Cache hits still
         # reach the real recorder exercised above; no warp ordering is emulated.
-        cache_end = source.index("acquired_dependency_ = dependency;")
+        cache_end = source.index("acquired_peer_ = peer;")
         self.assertIn("}\n\n#if FUSE_ENABLE_PROFILING", source[cache_end:call])
-
-    def test_swapped_sequence_axis_and_k_slices_keep_distinct_observations(self):
-        for detail, orientation, slices in product(("full", "cta"), ("normal", "swap"), (2, 8)):
-            with self.subTest(detail=detail, orientation=orientation, slices=slices):
-                subprocess.run([str(self.recorders[1]), detail, orientation, str(slices)],
-                               check=True, timeout=10)
 
     def test_cta_mode_omits_all_peer_work_and_preserves_complete_profile_flow(self):
         for detail in ("full", "cta"):
