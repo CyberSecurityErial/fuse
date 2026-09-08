@@ -8,12 +8,15 @@
 #include "fuse/operators/primitives/a2a_gemm.h"
 
 #include <cute/arch/copy_sm90.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/cuda_host_adapter.hpp>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace fuse {
@@ -101,6 +104,7 @@ struct A2ALhsInputCommT {
   // These are type aliases only; they do not select different instructions.
   using SM100_BULK_COPY_G2S = cute::SM90_BULK_COPY_G2S;
   using SM100_BULK_COPY_S2G = cute::SM90_BULK_COPY_S2G;
+  using SM100_TMA_LOAD_3D = cute::SM90_TMA_LOAD_3D;
   using SM100_TMA_STORE_3D = cute::SM90_TMA_STORE_3D;
   using CommElement = Bf16;
   static constexpr int32_t kReadyBlockM = ReadyBlockM;
@@ -122,6 +126,29 @@ struct A2ALhsInputCommT {
       kA2ALhsBulkSlots * sizeof(uint64_t);
   static constexpr bool kNeedsGridFinalize = false;
 
+  // Layout-only experiment: rows are short-M/full-peer-K rectangles; columns
+  // cover all 128 M rows and advance along K, like the GEMM's loads. Both still
+  // publish ONE ready unit [128, full peer-K] after its LAST rectangle completes.
+  // No K-slice ready, extra consumer acquire, GEMM transpose or scheduler change.
+  // CopyK=192 fills the existing 48 KiB slot; it is independent of GEMM TileK.
+  // Keep the layout fixed for a ready buffer's epoch sequence: the cumulative
+  // counter's arrivals-per-epoch may differ. Switching requires a fresh buffer.
+  struct ColumnCopy {
+    int32_t width = 0;
+    int32_t chunks = 0;
+    int32_t tail = 0;
+
+    CUTLASS_HOST_DEVICE static ColumnCopy make(int32_t peer_k) {
+      if (peer_k <= 0) return {};
+      const int32_t width = peer_k < 192 ? peer_k : 192;
+      return {width, peer_k / width + (peer_k % width != 0), peer_k % width};
+    }
+
+    CUTLASS_HOST_DEVICE int32_t width_at(int32_t chunk) const {
+      return tail != 0 && chunk == chunks - 1 ? tail : width;
+    }
+  };
+
   struct Arguments
 #if FUSE_ENABLE_PROFILING
       : A2ALhsCommTimelineArguments<Instrumented>
@@ -129,12 +156,17 @@ struct A2ALhsInputCommT {
   {
     A2AGemmParams params{};
     CUtensorMap store_tma_full{};
+    CUtensorMap load_tma_full[kMaxWorldSize]{};
+    CUtensorMap load_tma_tail[kMaxWorldSize]{};
+    CUtensorMap store_tma_tail{};
+    ColumnCopy columns{};
     int32_t comm_rows = kA2ALhsCommRows;
     detail::A2AInputTileOrder input_order{};
     int32_t store_peer_groups = 0;
     int32_t store_rows = 0;
     bool use_bulk = false;
     bool use_tensor_store = false;
+    bool use_columns = false;
   };
   using Params = Arguments;
 
@@ -187,12 +219,20 @@ struct A2ALhsInputCommT {
     const auto& route = p.route;
     const int64_t row_bytes =
         static_cast<int64_t>(route.local_heads) * route.head_dim * sizeof(Bf16);
+    const char* layout = std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT");
+    args.use_columns = layout && std::strcmp(layout, "columns") == 0;
+    if (layout && *layout && !args.use_columns && std::strcmp(layout, "rows") != 0) {
+      return cudaErrorInvalidValue;
+    }
     args.use_bulk = false;
     args.use_tensor_store = false;
     args.store_rows = 0;
     args.store_peer_groups = 0;
     args.comm_rows = static_cast<int32_t>(
         std::min<int64_t>(kReadyBlockM, kA2ALhsBulkStageBytes / row_bytes));
+    if (args.use_columns) {
+      return initialize_columns(args);
+    }
     args.use_bulk = args.comm_rows > 0 && route.seq_local % kReadyBlockM == 0 &&
         (!route.causal_load_balanced || (route.seq_local / 2) % kReadyBlockM == 0);
     if (!args.use_bulk) {
@@ -239,10 +279,57 @@ struct A2ALhsInputCommT {
     return cudaSuccess;
   }
 
+  static cudaError_t initialize_columns(Arguments& args) {
+    const auto& p = args.params;
+    const auto& route = p.route;
+    const int32_t peer_k = route.local_heads * route.head_dim;
+    const int64_t source_rows = static_cast<int64_t>(route.batch) * route.global_seq;
+    // Full-M rectangles must not straddle a batch or the causal routing jump.
+    // Explicit columns requests fail instead of silently benchmarking rows.
+    if (route.seq_local % ReadyBlockM != 0 ||
+        (route.causal_load_balanced && (route.seq_local / 2) % ReadyBlockM != 0) ||
+        source_rows > INT32_MAX) {
+      return cudaErrorNotSupported;
+    }
+    args.columns = ColumnCopy::make(peer_k);
+    args.comm_rows = ReadyBlockM;
+    args.use_bulk = true;
+    args.use_tensor_store = true;
+    if (!can_implement(args)) return cudaErrorNotSupported;
+
+    // UINT64 [16, K/64, M] is only a byte-preserving view of BF16. Tensor G2S
+    // is required: consecutive source rows have stride peer-K, not CopyK;
+    // destination rows have stride full-K. A separate tail box prevents a
+    // partial final column from overwriting the next peer's staging region.
+    for (int32_t tail = 0; tail <= (args.columns.tail != 0); ++tail) {
+      const int32_t width = tail ? args.columns.tail : args.columns.width;
+      auto* store = tail ? &args.store_tma_tail : &args.store_tma_full;
+      {
+        FUSE_SM103_HOST_DESCRIPTOR_SCOPE(local_descriptor, 0);
+        FUSE_SM103_HOST_DESCRIPTOR_ATTEMPT(local_descriptor);
+        const auto status = make_a2a_lhs_store_tma_3d(
+            store, p.input_staging, 16, p.gemm.k / 64, p.gemm.m,
+            width / 64, ReadyBlockM);
+        if (status != cudaSuccess) return status;
+      }
+      for (int32_t peer = 0; peer < route.world_size; ++peer) {
+        FUSE_SM103_HOST_DESCRIPTOR_SCOPE(peer_descriptor, 1);
+        FUSE_SM103_HOST_DESCRIPTOR_ATTEMPT(peer_descriptor);
+        auto* load = tail ? &args.load_tma_tail[peer] : &args.load_tma_full[peer];
+        const auto status = make_a2a_lhs_store_tma_3d(
+            load, const_cast<CommElement*>(p.peer_input[peer]), 16, peer_k / 64,
+            static_cast<int32_t>(source_rows), width / 64, ReadyBlockM);
+        if (status != cudaSuccess) return status;
+      }
+    }
+    return cudaSuccess;
+  }
+
   static bool can_implement(const Arguments& args) {
     return supported_params(args.params) && args.comm_rows > 0 &&
         args.comm_rows <= kReadyBlockM && args.input_order.compute_ctas > 0 &&
         args.input_order.m_tiles == ceil_div(args.params.gemm.m, kReadyBlockM) &&
+        arrivals_per_peer(args) > 0 &&
         args.params.epoch <= std::numeric_limits<uint32_t>::max() /
             static_cast<uint32_t>(arrivals_per_peer(args));
   }
@@ -250,7 +337,7 @@ struct A2ALhsInputCommT {
   static Params to_underlying_arguments(const Arguments& args) { return args; }
 
   CUTLASS_HOST_DEVICE static int32_t arrivals_per_peer(const Params& args) {
-    return ceil_div(ReadyBlockM, args.comm_rows);
+    return args.use_columns ? args.columns.chunks : ceil_div(ReadyBlockM, args.comm_rows);
   }
 
   CUTLASS_DEVICE static void publish_ready(
@@ -351,6 +438,9 @@ struct A2ALhsInputCommT {
         cutlass::arch::fence_barrier_init();
         if (args.use_tensor_store) {
           cute::prefetch_tma_descriptor(&args.store_tma_full);
+          if (args.use_columns && args.columns.tail != 0) {
+            cute::prefetch_tma_descriptor(&args.store_tma_tail);
+          }
         }
       }
       __syncwarp();
@@ -370,7 +460,7 @@ struct A2ALhsInputCommT {
             sample.comm_cta = comm_id;
             sample.comm_slot = slot;
             sample.task_id = task <= INT32_MAX ? static_cast<int32_t>(task) : -1;
-            sample.copy_path = args.use_tensor_store ? 2 : 1;
+            sample.copy_path = args.use_columns ? 3 : (args.use_tensor_store ? 2 : 1);
           }
         }
 #endif
@@ -378,7 +468,12 @@ struct A2ALhsInputCommT {
         const int32_t tile_m = input_task.m;
         const int32_t peer_slot = input_task.peer;
         const int32_t row_chunk = input_task.chunk;
-        const int32_t row_in_tile = row_chunk * args.comm_rows;
+        // The queue/window is unchanged. Only the rectangle WITHIN each ready
+        // unit changes; all four slots still independently contribute arrivals.
+        const int32_t row_in_tile = args.use_columns ? 0 : row_chunk * args.comm_rows;
+        const int32_t column = args.use_columns ? row_chunk * args.columns.width : 0;
+        const int32_t copy_k = args.use_columns ? args.columns.width_at(row_chunk) : shard_width;
+        const bool column_tail = args.use_columns && copy_k != args.columns.width;
         const int32_t source_peer = route.cyclic_peer_order
             ? (route.rank + peer_slot) % route.world_size
             : peer_slot;
@@ -391,6 +486,7 @@ struct A2ALhsInputCommT {
 #if FUSE_ENABLE_PROFILING
         if constexpr (Instrumented) {
           if (lane == 0) {
+            // Historical schema field: copy_path=3 interprets this as a column.
             sample.row_chunk = row_chunk;
             sample.copy_rows = copy_rows;
             sample.source_rank = source_peer;
@@ -423,7 +519,7 @@ struct A2ALhsInputCommT {
               (static_cast<int64_t>(batch) * route.global_seq +
                source_sequence) * shard_width;
           const int32_t copy_bytes =
-              copy_rows * shard_width * sizeof(CommElement);
+              copy_rows * copy_k * sizeof(CommElement);
           detail::fence_proxy_async_global();
           cute::set_barrier_transaction_bytes(*barrier, copy_bytes);
 #if FUSE_ENABLE_PROFILING
@@ -431,8 +527,16 @@ struct A2ALhsInputCommT {
             sample.g2s_issue = detail::read_global_timer();
           }
 #endif
-          SM100_BULK_COPY_G2S::copy(
-              source, barrier, stage, copy_bytes);
+          if (args.use_columns) {
+            const auto* load = column_tail
+                ? &args.load_tma_tail[source_peer] : &args.load_tma_full[source_peer];
+            SM100_TMA_LOAD_3D::copy(
+                load, barrier, static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                stage, 0, column / 64,
+                batch * route.global_seq + source_sequence);
+          } else {
+            SM100_BULK_COPY_G2S::copy(source, barrier, stage, copy_bytes);
+          }
           cute::wait_barrier(*barrier, phase);
 #if FUSE_ENABLE_PROFILING
           if constexpr (Instrumented) {
@@ -446,7 +550,12 @@ struct A2ALhsInputCommT {
             sample.s2g_issue = detail::read_global_timer();
           }
 #endif
-          if (args.use_tensor_store) {
+          if (args.use_columns) {
+            const auto* store = column_tail ? &args.store_tma_tail : &args.store_tma_full;
+            SM100_TMA_STORE_3D::copy(
+                store, stage, 0, (peer_slot * shard_width + column) / 64, m_begin);
+            cute::tma_store_arrive();
+          } else if (args.use_tensor_store) {
             int32_t row = 0;
             for (; row + args.store_rows <= copy_rows;
                  row += args.store_rows) {

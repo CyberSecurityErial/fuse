@@ -87,6 +87,7 @@ struct Options {
   int max_swizzle_size = 1;
   std::string qkv_raster = "heuristic";
   std::string oproj_raster = "heuristic";
+  std::string oproj_comm_layout = "rows";
   std::vector<int> comm_sm_list;
   std::vector<std::string> qkv_policy_list;
   std::vector<std::string> oproj_policy_list;
@@ -267,6 +268,9 @@ void timeout_handler(int) {
 
 Options parse_options(int argc, char** argv) {
   Options options;
+  if (const char* layout = std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT")) {
+    options.oproj_comm_layout = layout;
+  }
 #if FUSE_BENCH_MPI
   options.world = fused_mpi::process_world;
   options.host_launch = "mpi_process";
@@ -362,6 +366,9 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error(argument + " requires heuristic, along_m, or along_n");
       }
       (argument == "--qkv-raster" ? options.qkv_raster : options.oproj_raster) = value;
+    } else if (argument == "--oproj-comm-layout") {
+      if (++index == argc) throw std::runtime_error("missing value for " + argument);
+      options.oproj_comm_layout = argv[index];
     } else if (argument == "--seed") {
       options.seed = static_cast<uint32_t>(number());
     } else if (argument == "--input-generator") {
@@ -427,6 +434,7 @@ Options parse_options(int argc, char** argv) {
                    "[--input-generator cpu_mt19937|gpu_philox] "
                    "[--max-swizzle-size 1|2|4|8] "
                    "[--qkv-raster heuristic|along_m|along_n] [--oproj-raster heuristic|along_m|along_n] "
+                   "[--oproj-comm-layout rows|columns] "
                    "[--host-launch sequential|per_gpu_thread] [--launch eager|graph] "
                    "[--cpu-oracle] [--validation-self-test] [--calibrate]\n"
                    "BF16 GQA; warmup=10, samples=50. Global sequence must divide evenly across ranks.\n"
@@ -443,6 +451,7 @@ Options parse_options(int argc, char** argv) {
                    "e32/e64 select epilogue subtiles 128x32/128x64; E64 is QKV-only.\n"
                    "Unsuffixed policies retain K64/original epilogue.\n"
                    "Each list overrides its direction's environment.\n"
+                   "OProj communication layout is fixed for the run, independent of GEMM tile policy; CLI overrides environment.\n"
                    "Input generators use different reproducible sequences; gpu_philox avoids full host input buffers.\n"
                    "Scheduling is shared by production and compute calibration; defaults are swizzle=1, QKV AlongM, OProj AlongN.\n"
                    "--profile requires no M/N tile padding from the effective swizzle; production/calibration allow padding.\n"
@@ -459,6 +468,9 @@ Options parse_options(int argc, char** argv) {
   }
   if (has_comm_sm && has_comm_sm_list) {
     throw std::runtime_error("--comm-sm and --comm-sm-list are mutually exclusive");
+  }
+  if (options.oproj_comm_layout != "rows" && options.oproj_comm_layout != "columns") {
+    throw std::runtime_error("--oproj-comm-layout requires rows or columns");
   }
 #if FUSE_BENCH_MPI
   if (options.world != fused_mpi::process_world) throw std::runtime_error("--world differs from MPI size");
@@ -1149,8 +1161,9 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
               << ",max_swizzle_size=" << problem.max_swizzle_size
               << ",effective_swizzle_size=" << schedule.effective_swizzle_size
               << ",padded_m_tiles=" << schedule.padded_m_tiles << ",padded_n_tiles=" << schedule.padded_n_tiles
-              << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm})
-              << '\n';
+              << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm});
+    if (!qkv) std::cout << ",oproj_comm_layout=" << std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT");
+    std::cout << '\n';
   }
   std::cout << std::flush;
 }
@@ -1182,8 +1195,9 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
                                                 ? 0 : options.comm_sm)
               << ",production_threads=" << traits.threads
               << ",production_dynamic_smem=" << traits.dynamic_smem_bytes
-              << ",reference_resources=" << (options.component == MeasurementComponent::kFused ? "not_applicable" : "unknown")
-              << '\n';
+              << ",reference_resources=" << (options.component == MeasurementComponent::kFused ? "not_applicable" : "unknown");
+    if (!qkv) std::cout << ",oproj_comm_layout=" << options.oproj_comm_layout;
+    std::cout << '\n';
   }
 }
 
@@ -2403,7 +2417,7 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       if (index < m_tiles * options.world) {
         if (!event.comm_valid || !event.task_begin || event.input_ready < event.task_begin ||
             event.publish_issue < event.input_ready || event.release < event.publish_issue ||
-            event.copy_rows < 0 || event.copy_path < 0 || event.copy_path > 2) {
+            event.copy_rows < 0 || event.copy_path < 0 || event.copy_path > 3) {
           throw std::runtime_error("missing or invalid peer release record");
         }
         // Empty bulk tails can leave all copy phases zero. The vector path
@@ -2504,11 +2518,16 @@ int main(int argc, char** argv) {
              << options.host_launch << ' ' << options.calibrate << ' ' << options.cpu_oracle << ' '
              << options.validation_self_test << ' ' << options.profile << ' ' << options.timeout_seconds << ' '
              << options.max_swizzle_size << ' ' << options.qkv_raster << ' ' << options.oproj_raster
-             << ' ' << options.launch << ' ' << options.fused_direction;
+             << ' ' << options.launch << ' ' << options.fused_direction << ' ' << options.oproj_comm_layout;
     for (size_t index = 0; index < candidates.size(); ++index) {
       contract << ' ' << direction_name(candidates[index].direction) << candidate_context(index, candidates[index]);
     }
     fused_mpi::agree(contract.str());
+    // One communication layout for every candidate/payload; never mutate the
+    // ready arrival geometry while reusing this run's cumulative epochs.
+    if (::setenv("FUSE_SM103_OPROJ_COMM_LAYOUT", options.oproj_comm_layout.c_str(), 1) != 0) {
+      throw std::runtime_error("cannot set OProj communication layout");
+    }
     std::cout << std::setprecision(9); // Also retain full input statistics on non-root ranks.
     fused_mpi::root_output() << std::setprecision(9) << "config,world=" << options.world << ",comm_sm=" << options.comm_sm
               << ",global_seq=" << options.global_seq() << ",seq_local=" << options.seq_local
@@ -2524,6 +2543,7 @@ int main(int argc, char** argv) {
               << ",qkv_rank_swizzle=off"
 #endif
               << ",qkv_raster=" << options.qkv_raster << ",oproj_raster=" << options.oproj_raster
+              << ",oproj_comm_layout=" << options.oproj_comm_layout
               << ",qkv_effective_raster=" << (options.qkv_raster == "heuristic" ? "along_m" : options.qkv_raster)
               << ",oproj_effective_raster=" << (options.oproj_raster == "heuristic" ? "along_n" : options.oproj_raster)
               << ",process_layout=" << (fused_mpi::enabled ? "mpi_one_process_per_gpu" : "single_process")

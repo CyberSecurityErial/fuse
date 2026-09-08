@@ -281,6 +281,8 @@ def validate_job(job, hostname=None):
         raise ValueError('--fused-direction requires non-profile fused-smoke and both/qkv/oproj')
     if job['stage'] not in STAGES:
         raise ValueError('Unknown stage')
+    if job.get('oproj_comm_layout', 'rows') not in ('rows', 'columns'):
+        raise ValueError('OProj communication layout must be rows or columns')
     if job.get('fused_counter_tool', 'ncu') not in ('ncu', 'nsys'):
         raise ValueError('Unknown fused counter tool')
     if job.get('fused_counter_replay', 'app-range') not in ('app-range', 'range', 'application'):
@@ -990,7 +992,8 @@ def fused_argv(job):
     if job.get('fused_counters'):
         argv += ['--counter-component', job['fused_counters'],
                  '--counter-direction', job.get('directions', 'qkv')]
-    for key, default in (('max_swizzle_size', 1), ('qkv_raster', 'heuristic'), ('oproj_raster', 'heuristic')):
+    for key, default in (('max_swizzle_size', 1), ('qkv_raster', 'heuristic'), ('oproj_raster', 'heuristic'),
+                         ('oproj_comm_layout', 'rows')):
         if job.get(key, default) != default:
             argv += ['--' + key.replace('_', '-'), str(job[key])]
     if job.get('input_generator', 'cpu_mt19937') != 'cpu_mt19937':
@@ -1493,6 +1496,7 @@ def remote(job_path):
                 env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder)
                 env['FUSE_QKV_GEMM_POLICY'] = job.get('qkv_policy', 'auto')
                 env['FUSE_SM103_OPROJ_POLICY'] = job.get('oproj_policy', 'auto')
+                env['FUSE_SM103_OPROJ_COMM_LAYOUT'] = job.get('oproj_comm_layout', 'rows')
                 if job.get('fused_counters') and not job.get('mpi'):
                     prepare_fused_counters(folder, env, job)
                     argv = fused_counter_argv(folder, argv, job.get('fused_counter_tool', 'ncu'),
@@ -1722,6 +1726,8 @@ def main():
     oproj_tiles.add_argument('--oproj-policy', choices=OPROJ_POLICIES,
                             help='fused smoke A2A tile (default auto=N128)')
     oproj_tiles.add_argument('--oproj-policy-list', help='fused smoke: independent OProj tile candidates')
+    run.add_argument('--oproj-comm-layout', choices=('rows', 'columns'), default='rows',
+                     help='fused smoke: one OProj communication layout per run, independent of GEMM tile policy')
     run.add_argument('--causal', action='store_true', help='fused smoke: OProj two-chunk gather')
     run.add_argument('--cpu-oracle', action='store_true', help='fused smoke: small-shape CPU/GPU full-validation cross-check')
     run.add_argument('--validation-self-test', action='store_true', help='fused smoke: small-shape corruption/NaN detection and restoration checks')

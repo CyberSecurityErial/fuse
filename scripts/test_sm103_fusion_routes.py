@@ -207,6 +207,7 @@ class TilePolicyHostContracts(unittest.TestCase):
 #include <type_traits>
 #define __host__
 #define __device__
+#define CUTLASS_HOST_DEVICE
 using cudaError_t = int;
 enum { cudaSuccess = 0, cudaErrorInvalidValue = 1, cudaErrorNotSupported = 2 };
 namespace cute {
@@ -214,6 +215,7 @@ template <int M, int N, int K> struct Shape { static constexpr int dims[3] = {M,
 template <int I, class S> constexpr int size(S) { return S::dims[I]; }
 struct SM90_BULK_COPY_G2S {};
 struct SM90_BULK_COPY_S2G {};
+struct SM90_TMA_LOAD_3D {};
 struct SM90_TMA_STORE_3D {};
 }
 namespace fuse {
@@ -405,6 +407,7 @@ int main(int argc, char** argv) {
               << ' ' << effective_raster(qkv, Direction::kQkv) << ' ' << effective_raster(oproj, Direction::kOproj)
               << ' ' << qs.effective_swizzle_size << ' ' << qs.padded_m_tiles << ' ' << qs.padded_n_tiles
               << ' ' << os.effective_swizzle_size << ' ' << os.padded_m_tiles << ' ' << os.padded_n_tiles << '\n';
+    std::cout << "comm_layout " << options.oproj_comm_layout << '\n';
     for (const auto& candidate : make_candidates(options)) {
       std::cout << "candidate " << direction_name(candidate.direction) << ' '
                 << candidate.comm_sm << ' ' << candidate.tile_policy << '\n';
@@ -465,6 +468,8 @@ void timeout_handler(int) {}
 std::vector<RankRuntime> create_runtimes(const Options& options) {
   check_policy_environment(Direction::kQkv, options.qkv_policy_list.front());
   check_policy_environment(Direction::kOproj, options.oproj_policy_list.front());
+  const char* layout = std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT");
+  if (!layout || layout != options.oproj_comm_layout) throw std::runtime_error("wrong communication layout environment");
   std::cout << "mock,setup\n";
   selected_input_generator = options.input_generator;
   selected_host_launch = options.host_launch;
@@ -629,14 +634,17 @@ Options parse_options(int argc, char** argv) {
         cls.graph_flow_probe = compile_host_probe(cls, graph_flow, "harness-graph-main-flow",
             "-DFUSE_ENABLE_PROFILING=1", "-pthread", "-I", str(ROOT / "benchmarks/sm103"))
 
-    def invoke(self, *arguments, profiling=0, policy_env=None, oproj_policy_env=None):
+    def invoke(self, *arguments, profiling=0, policy_env=None, oproj_policy_env=None, comm_layout_env=None):
         environment = os.environ.copy()
         environment.pop("FUSE_QKV_GEMM_POLICY", None)
         environment.pop("FUSE_SM103_OPROJ_POLICY", None)
+        environment.pop("FUSE_SM103_OPROJ_COMM_LAYOUT", None)
         if policy_env is not None:
             environment["FUSE_QKV_GEMM_POLICY"] = policy_env
         if oproj_policy_env is not None:
             environment["FUSE_SM103_OPROJ_POLICY"] = oproj_policy_env
+        if comm_layout_env is not None:
+            environment["FUSE_SM103_OPROJ_COMM_LAYOUT"] = comm_layout_env
         return subprocess.run([str(self.probes[profiling]), *arguments],
                               env=environment, text=True, capture_output=True, timeout=10)
 
@@ -654,7 +662,7 @@ Options parse_options(int argc, char** argv) {
         self.assertEqual(lines[6].split()[0], "host_launch")
         self.assertEqual(lines[7].split()[0], "calibration")
         candidates = []
-        for line in lines[10:]:
+        for line in lines[11:]:
             tag, direction, comm_sm, policy = line.split()
             self.assertEqual(tag, "candidate")
             candidates.append((direction, int(comm_sm), policy))
@@ -667,7 +675,8 @@ Options parse_options(int argc, char** argv) {
                 "host_launch": lines[6].split()[1],
                 "calibration": (int(lines[7].split()[1]), lines[7].split()[2]),
                 "profile_detail": lines[8].split()[1],
-                "schedule": tuple(lines[9].split()[1:])}
+                "schedule": tuple(lines[9].split()[1:]),
+                "comm_layout": lines[10].split()[1]}
 
     def assert_rejected(self, *arguments, **kwargs):
         result = self.invoke(*arguments, **kwargs)
@@ -729,6 +738,33 @@ Options parse_options(int argc, char** argv) {
             for value in ("auto", "m", "AlongM", "along_m,along_n", ""):
                 self.assert_rejected(option, value)
             self.assert_rejected(option)
+
+    def test_oproj_comm_layout_is_independent_of_tiles_and_cli_overrides_environment(self):
+        args = ("--comm-sm-list", "8,16", "--qkv-policy-list", "auto,m128n256",
+                "--oproj-policy-list", "m128n128,m128n256k128e32", "--calibrate")
+        default = self.query(*args)
+        self.assertEqual(default["comm_layout"], "rows")
+        for layout in ("rows", "columns"):
+            actual = self.query(*args, "--oproj-comm-layout", layout, comm_layout_env="invalid")
+            self.assertEqual(actual["comm_layout"], layout)
+            self.assertEqual(actual["candidates"], default["candidates"])
+            self.assertEqual(self.query(*args, comm_layout_env=layout)["comm_layout"], layout)
+        for value in ("", "Rows", "rows,columns", "invalid"):
+            self.assert_rejected("--oproj-comm-layout", value)
+            self.assert_rejected(comm_layout_env=value)
+        self.assert_rejected("--oproj-comm-layout")
+
+    def test_fixed_comm_layout_reaches_setup_config_and_mpi_agreement(self):
+        for layout in ("rows", "columns"):
+            result = self.run_flow("--oproj-comm-layout", layout, "--comm-sm-list", "8,16",
+                "--oproj-policy-list", "m128n128,m128n256", "--calibrate", graph=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = next(row for row in result.stdout.splitlines() if row.startswith("config,"))
+            self.assertIn("oproj_comm_layout=" + layout, config)
+            self.assertIn("candidates=6", config)
+        source = (ROOT / "benchmarks/sm103/fused_bf16.cu").read_text()
+        agreement = source[source.index("std::ostringstream contract;"):source.index("fused_mpi::agree(contract.str());")]
+        self.assertIn("options.oproj_comm_layout", agreement)
 
     def test_effective_swizzle_downshifts_and_padding_is_not_hidden(self):
         # Actual parser/helper results at CUTLASS's min-tile thresholds 2/3/6.
@@ -948,6 +984,7 @@ Options parse_options(int argc, char** argv) {
         environment = os.environ.copy()
         environment.pop("FUSE_QKV_GEMM_POLICY", None)
         environment.pop("FUSE_SM103_OPROJ_POLICY", None)
+        environment.pop("FUSE_SM103_OPROJ_COMM_LAYOUT", None)
         environment.pop("FUSE_TEST_FAIL_SECOND_PAYLOAD", None)
         environment.pop("FUSE_TEST_FAIL_SELF_TEST", None)
         environment.pop("FUSE_TEST_FAIL_CALIBRATION_COMPONENT", None)

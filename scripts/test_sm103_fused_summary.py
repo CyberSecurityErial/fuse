@@ -37,7 +37,7 @@ class FusedSummaryTests(unittest.TestCase):
         path.write_text(json.dumps(value))
 
     def make_fixture(self, diagnostic=False, profile=False, calibrate=False, host_launch=None, profile_schema=None,
-                     profile_detail=None, seq_local=256, schedule=None):
+                     profile_detail=None, seq_local=256, schedule=None, comm_layout=None):
         manifest = {'CMakeLists.txt': 'a' * 64, 'benchmarks/sm103/fused_bf16.cu': 'b' * 64}
         job = dict(run_id='20260906-120000-abcdef', stage='fused-smoke', node='0a', experiment='fixture',
                    world=4, seq_local=seq_local, hidden=1024, q_heads=8, kv_heads=4, head_dim=128,
@@ -47,6 +47,8 @@ class FusedSummaryTests(unittest.TestCase):
                    files=manifest, source_id=summary.json_digest(manifest))
         if schedule is not None:
             job.update(schedule)
+        if comm_layout is not None:
+            job['oproj_comm_layout'] = comm_layout
         if calibrate:
             job['calibrate'] = True
         if host_launch is not None:
@@ -190,6 +192,10 @@ class FusedSummaryTests(unittest.TestCase):
         if any(key in job for key in summary.SCHEDULE_REQUEST_FIELDS):
             values = self.add_schedule_records(values, job)
         values.append('PASS: both BF16 boundaries, complete routes, changed payloads')
+        if 'oproj_comm_layout' in job:
+            values = [row + ',oproj_comm_layout=' + job['oproj_comm_layout']
+                      if row.startswith(('config,', 'candidate,A2A_GEMM,', 'component_resources,A2A_GEMM,'))
+                      else row for row in values]
         return '\n'.join(values) + '\n'
 
     def host_stage_rows(self, direction, host_launch):
@@ -654,7 +660,8 @@ class FusedSummaryTests(unittest.TestCase):
         result = summary.summarize([self.control.parent], out)
         self.assertEqual(result['performance_rows'], 2)
         run = result['runs'][0]
-        self.assertEqual(run['schema_defaults'], {'host_launch': 'sequential', 'component': 'fused'})
+        self.assertEqual(run['schema_defaults'], {'host_launch': 'sequential', 'component': 'fused',
+                                                'oproj_comm_layout': 'rows'})
         self.assertEqual(len(run['input_statistics']), 24)
         candidate = run['candidates'][0]
         self.assertEqual(len(candidate['timing']['rounds'][0]['rank_ms']), 50)
@@ -729,6 +736,40 @@ class FusedSummaryTests(unittest.TestCase):
         self.assertEqual(len(rows), 6)
         self.assertTrue(all(row['swizzle'] == row['max_swizzle_size'] == '8' for row in rows))
         self.assertEqual({row['raster'] for row in rows}, {'along_m', 'along_n'})
+
+    def test_oproj_comm_layout_is_audited_and_exported_without_changing_logical_work(self):
+        self.make_fixture(calibrate=True)
+        original = summary.audit_run(self.root)['candidates']
+        self.make_fixture(calibrate=True, comm_layout='columns')
+        out = Path(self.directory.name) / 'columns-summary'
+        report = summary.summarize([self.root], out)
+        run = report['runs'][0]
+        self.assertNotIn('oproj_comm_layout', run['schema_defaults'])
+        for before, after in zip(original, run['candidates']):
+            self.assertEqual(after['oproj_comm_layout'],
+                             'columns' if after['direction'] == 'A2A_GEMM' else 'not_applicable')
+            for field in ('tile_m', 'tile_n', 'tile_k', 'work_tiles_derived', 'problem_gemm_flops',
+                          'problem_route_payload_bytes', 'production_compute_ctas_derived'):
+                self.assertEqual(after[field], before[field])
+        with (out / 'summary.csv').open() as stream:
+            self.assertEqual({row['oproj_comm_layout'] for row in csv.DictReader(stream)},
+                             {'columns', 'not_applicable'})
+
+    def test_oproj_comm_layout_rejects_missing_or_mismatched_config_and_each_resource(self):
+        for layout in ('rows', 'columns'):
+            self.make_fixture(calibrate=True, comm_layout=layout)
+            original = self.log.read_text()
+            records = original.splitlines()
+            indices = [i for i, row in enumerate(records) if row.startswith(
+                ('config,', 'candidate,A2A_GEMM,', 'component_resources,A2A_GEMM,'))]
+            for index in indices:
+                for replacement in ('', ',oproj_comm_layout=' + ('rows' if layout == 'columns' else 'columns')):
+                    with self.subTest(layout=layout, index=index, replacement=replacement):
+                        changed = records.copy()
+                        changed[index] = changed[index].replace(',oproj_comm_layout=' + layout, replacement)
+                        self.change_log(lambda _: '\n'.join(changed) + '\n')
+                        with self.assertRaisesRegex(ValueError, 'OProj communication layout'):
+                            summary.audit_run(self.root)
 
     def test_epilogue_diagnostics_are_complete_and_never_performance_rows(self):
         self.make_epilogue_fixture()

@@ -108,6 +108,9 @@ def make_trace(lines, job):
                          src_gpu=p['source_rank'], dst_gpu=rank, task=p['task_id'],
                          row_chunk=p['row_chunk'], copy_rows=p['copy_rows'],
                          final_publisher_only=True, copy_path=p['copy_path'])
+            if p['copy_path'] == 3:
+                attrs['column_chunk'] = attrs.pop('row_chunk')
+                attrs['comm_layout'] = 'columns'
             span(tid, 'task setup / input-ready wait', p['task_begin'], p['input_ready'], **attrs)
             if p['g2s_issue']:
                 span(tid, 'remote G2S' if p['copy_path'] else 'vector copy', p['g2s_issue'], p['g2s_done'], **attrs)
@@ -169,7 +172,7 @@ def export(run, output):
     trace['metadata']['config'] = {k: job.get(k) for k in (
         'run_id', 'source_id', 'node', 'global_seq', 'world', 'hidden', 'q_heads',
         'kv_heads', 'head_dim', 'comm_sm', 'oproj_policy', 'oproj_policy_list', 'max_swizzle_size',
-        'oproj_raster', 'host_launch', 'input_generator')}
+        'oproj_raster', 'oproj_comm_layout', 'host_launch', 'input_generator')}
     trace['metadata']['artifact_sha256'] = receipt['artifact_sha256']
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x') as stream:

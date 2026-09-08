@@ -418,7 +418,7 @@ int main() {
 
     def test_remote_mpi_uses_fork_private_env_and_keeps_per_rank_logs(self):
         job = self.fused_job(run_id='mpi-smoke', experiment='mpi-test', source_id='source',
-                             timeout=300, world=4, mpi=True)
+                             timeout=300, world=4, mpi=True, oproj_comm_layout='columns')
         job_path = self.root / 'mpi-job.json'
         job_path.write_text(json.dumps(job))
         control, remote = self.root / 'control', self.root / 'remote'
@@ -451,6 +451,8 @@ int main() {
         self.assertEqual(argv[argv.index('-n') + 1], '4')
         self.assertTrue(argv[argv.index('-outfile-pattern') + 1].endswith('rank-%r.stdout.log'))
         self.assertEqual(popen.call_args.kwargs['env']['UCX_TLS'], 'sm,self')
+        self.assertEqual(popen.call_args.kwargs['env']['FUSE_SM103_OPROJ_COMM_LAYOUT'], 'columns')
+        self.assertEqual(argv[argv.index('--oproj-comm-layout') + 1], 'columns')
         state = json.loads((folder / 'status.json').read_text())
         self.assertEqual(state['state'], 'succeeded')
         self.assertTrue((folder / 'mpi-runtime-attempt1.json').is_file())
@@ -495,6 +497,22 @@ int main() {
                        {'stage': 'fused-build', 'oproj_raster': 'along_m'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 l20d.validate_job(default | change)
+
+    def test_oproj_comm_layout_is_one_run_option_independent_of_candidate_grid(self):
+        default = self.fused_job(comm_sm_list='8,16', qkv_policy_list='auto,m128n256',
+                                 oproj_policy_list='m128n128,m128n256k128e32')
+        self.assertNotIn('--oproj-comm-layout', l20d.fused_argv(default))
+        for mpi in (False, True):
+            job = default | dict(oproj_comm_layout='columns', mpi=mpi, calibrate=True,
+                                 fused_launch='graph' if mpi else 'eager')
+            l20d.validate_job(job)
+            self.assertEqual(l20d.fused_candidates(job), l20d.fused_candidates(default))
+            self.assertEqual(l20d.fused_geometry(job), l20d.fused_geometry(default))
+            argv = l20d.fused_argv(job)
+            self.assertEqual(argv[argv.index('--oproj-comm-layout') + 1], 'columns')
+        for layout in ('', 'Rows', 'rows,columns', None, True):
+            with self.subTest(layout=layout), self.assertRaises(ValueError):
+                l20d.validate_job(default | dict(oproj_comm_layout=layout))
 
     def test_scheduler_padding_is_explicit_and_profile_rejects_only_padded_cases(self):
         self.assertEqual(l20d.fused_scheduler_geometry(128, 128, 128, 8), (1, 1, 1, False))
@@ -1294,8 +1312,10 @@ int main() {
                 mock.patch.object(l20d, 'fused_telemetry', return_value=contextlib.nullcontext()), \
                 mock.patch.object(l20d, 'mc_copy'), \
                 mock.patch.object(l20d.subprocess, 'Popen', return_value=proc) as popen, \
+                mock.patch.dict(os.environ, FUSE_SM103_OPROJ_COMM_LAYOUT='columns'), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(l20d.remote(path), 0)
+            self.assertEqual(os.environ['FUSE_SM103_OPROJ_COMM_LAYOUT'], 'columns')
         check_build.assert_called_once()
         check_gpus.assert_called_once()
         argv = popen.call_args.args[0]
@@ -1306,6 +1326,7 @@ int main() {
         self.assertEqual(child_env['CUDA_VISIBLE_DEVICES'], 'GPU-a,GPU-b')
         self.assertEqual(child_env['FUSE_QKV_GEMM_POLICY'], 'm128n128')
         self.assertEqual(child_env['FUSE_SM103_OPROJ_POLICY'], 'auto')
+        self.assertEqual(child_env['FUSE_SM103_OPROJ_COMM_LAYOUT'], 'rows')
         self.assertEqual(child_env['CPATH'], '/own/headers')
         self.assertTrue(popen.call_args.kwargs['start_new_session'])
         state = json.loads((control / 'jobs/remote-smoke/status.json').read_text())

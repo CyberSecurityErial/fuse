@@ -40,6 +40,15 @@ class OprojTraceTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 make_trace(bad, job)
 
+    def test_column_chunk_does_not_claim_to_be_a_row_chunk(self):
+        job, lines = self.fixture()
+        result = make_trace([l.replace('copy_path=1', 'copy_path=3') for l in lines], job)
+        phases = [e for e in result['traceEvents'] if e['name'] == 'remote G2S']
+        self.assertEqual(len(phases), 1)
+        self.assertEqual(phases[0]['args']['column_chunk'], 0)
+        self.assertEqual(phases[0]['args']['comm_layout'], 'columns')
+        self.assertNotIn('row_chunk', phases[0]['args'])
+
     def test_single_policy_flag_and_reject_multiple(self):
         job, lines = self.fixture()
         expected = make_trace(lines, job)['traceEvents']

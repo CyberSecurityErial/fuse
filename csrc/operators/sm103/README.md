@@ -6,6 +6,37 @@ approved on 2026-09-06; node2 CUDA bring-up and measured optimization are now
 authorized. CPU checks do not establish CUDA compilation, numerical
 correctness on B300, or performance. SM90 stays unchanged during this phase.
 
+## OProj communication layout only
+
+`FUSE_SM103_OPROJ_COMM_LAYOUT=rows|columns` (default `rows`) selects only the
+communication rectangles. `columns` uses 128 rows x up to 192 BF16 columns
+per existing 48 KiB slot, with exact-width tail descriptors. The first-use
+window, four-slot concurrency, ready storage, full-peer acquire boundary,
+GEMM policies, raster/swizzle and mainloop remain unchanged. All rectangles
+still contribute to ONE `[128, peer-K]` ready; this does **not** enable early
+K-slice consumption. It tests transport layout, not finer synchronization.
+
+Keep one layout for the lifetime of a ready buffer's epoch sequence, because
+the number of contributing copy rectangles can differ. Explicit `columns`
+requires full 128-row regions (also within each causal half); unsupported tails
+are rejected, not silently timed with the rows path. Profiling keeps the
+existing final-publisher-only records; `copy_path=3` names a column chunk.
+CUDA correctness and measured speedup must be established separately.
+
+- Production SM103a build `20260908-205914-d9d8ad` passed. CP8 causal S2048
+  `20260908-210111-058110` passed full CPU/GPU numeric and route agreement on
+  two payloads, K64/K128 policies x comm CTA8/16, with `columns` fixed.
+- Layout-only MPI Graph comparison, Qwen3-235B S131072/CP8,
+  M16384/N4096/K8192, N256/K64/e32, CTA16, AlongN/swizzle4:
+  `rows` (`20260908-210208-a9b3ba`) p50/p95 0.993792/1.004139 ms;
+  `columns` (`20260908-210231-085a7c`) 1.000720/1.013403 ms.
+  Same source/binary, random inputs, converged >=10+50 and full validation.
+  This single pair shows no benefit (columns throughput -0.69%); it is not a
+  full-matrix conclusion. Default remains `rows`; no autotune was added.
+- Existing profiling build `20260908-210325-9fbe49` and CP8 columns diagnostic
+  `20260908-210530-d8e2b3` passed full timeline/numeric/route validation. No new
+  per-K instrumentation was added; this diagnostic is not a performance sample.
+
 ## Measured development log
 
 - `20260906-100534-446741`, node2, production SM103a build: failed at

@@ -186,5 +186,85 @@ int main(int argc, char** argv) {
                                     self.assertGreaterEqual(q,previous.get(owner,-1));previous[owner]=q
 
 
+class ColumnCopyTests(unittest.TestCase):
+    """Execute the communication helper; CUDA descriptor checks stay separate."""
+
+    PEER_WIDTHS = (64, 128, 192, 256, 512, 1024, 1536, 1792, 2048, 3584, 4096)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = Path(cls.temp.name) / 'column-copy'
+        body = (ROOT / 'csrc/operators/sm103/detail/a2a_gemm.cuh').read_text()
+        start = body.index('  struct ColumnCopy {')
+        stop = body.index('\n  };', start) + len('\n  };')
+        source = r'''
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#define CUTLASS_HOST_DEVICE
+''' + body[start:stop] + r'''
+int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    const int peer_k = std::atoi(argv[i]);
+    if (peer_k <= 0) return 2;
+    const auto copy = ColumnCopy::make(peer_k);
+    std::cout << peer_k << ' ' << copy.width << ' ' << copy.chunks << ' ' << copy.tail;
+    for (int chunk = 0; chunk < copy.chunks; ++chunk) {
+      std::cout << ' ' << copy.width_at(chunk);
+    }
+    std::cout << '\n';
+  }
+}
+'''
+        compiler = shutil.which('clang++') or shutil.which('g++')
+        if not compiler:
+            raise unittest.SkipTest('C++ compiler required')
+        result = subprocess.run(
+            [compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+             '-x', 'c++', '-', '-o', str(cls.binary)],
+            input=source, text=True, capture_output=True)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        output = subprocess.check_output(
+            [str(cls.binary), *map(str, cls.PEER_WIDTHS)], text=True)
+        cls.copies = {row[0]: row[1:] for line in output.splitlines()
+                      if (row := tuple(map(int, line.split())))}
+
+    def test_stage_capacity_and_exact_tail(self):
+        self.assertEqual(set(self.copies), set(self.PEER_WIDTHS))
+        for peer_k, (width, chunks, tail, *widths) in self.copies.items():
+            with self.subTest(peer_k=peer_k):
+                self.assertEqual(width, min(peer_k, 192))
+                expected = [min(192, peer_k - start)
+                            for start in range(0, peer_k, 192)]
+                self.assertEqual(widths, expected)
+                self.assertEqual(chunks, len(expected))
+                self.assertEqual(tail, peer_k % width)
+                self.assertEqual(sum(widths), peer_k)
+                for actual in widths:
+                    self.assertGreater(actual, 0)
+                    self.assertLessEqual(128 * actual * 2, 48 * 1024)
+                    self.assertEqual(actual % 64, 0)
+
+    def test_cp4_cp8_exact_cover_without_peer_overlap(self):
+        for peer_k, (width, _, _, *widths) in self.copies.items():
+            for world in (4, 8):
+                with self.subTest(peer_k=peer_k, world=world):
+                    coverage = Counter()
+                    for peer in range(world):
+                        peer_begin, peer_end = peer * peer_k, (peer + 1) * peer_k
+                        for chunk, actual in enumerate(widths):
+                            begin = peer_begin + chunk * width
+                            end = begin + actual
+                            self.assertGreaterEqual(begin, peer_begin)
+                            self.assertLessEqual(end, peer_end)
+                            coverage.update(range(begin, end))
+                    # Every row of the 128-row rectangle uses these same K
+                    # intervals with row stride world*peer_k, not copy.width.
+                    self.assertEqual(coverage, Counter(range(world * peer_k)))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -992,6 +992,11 @@ def audit_log(text, job):
     rank_swizzle = 'rank_n_band_v1' if job.get('qkv_rank_swizzle') else 'off'
     require(config.get('qkv_rank_swizzle', 'off') == rank_swizzle,
             'QKV rank swizzle job/config mismatch')
+    oproj_comm_layout = job.get('oproj_comm_layout', 'rows')
+    require(oproj_comm_layout in ('rows', 'columns'), 'Unknown OProj communication layout')
+    explicit_comm_layout = 'oproj_comm_layout' in job or any('oproj_comm_layout' in row for row in rows)
+    require(config.get('oproj_comm_layout', None if explicit_comm_layout else 'rows') == oproj_comm_layout,
+            'OProj communication layout job/config mismatch')
     launch = fused_launch(job)
     graph = launch == 'graph'
     require(not graph or (config.get('launch') == 'graph' and
@@ -1097,6 +1102,9 @@ def audit_log(text, job):
         direction, c, tile = expected[index - 1]
         require((row.get('label'), count(row, 'comm_sm'), row.get('tile')) == (direction, c, tile),
                 'Candidate config/direction mismatch')
+        if direction == 'A2A_GEMM' and row['kind'] in ('candidate', 'component_resources'):
+            require(row.get('oproj_comm_layout', None if explicit_comm_layout else 'rows') == oproj_comm_layout,
+                    'OProj communication layout resource mismatch')
         if row['kind'] == 'candidate':
             rank = count(row, 'rank')
             require(rank < shape['world'], 'Unexpected scheduled candidate rank')
@@ -1226,6 +1234,7 @@ def audit_log(text, job):
         results.append({'candidate': index, 'direction': direction, 'component': component,
             'measurement_role': 'production' if component == 'fused' else 'calibration',
             'qkv_rank_swizzle': rank_swizzle if qkv_direction else 'off',
+            'oproj_comm_layout': 'not_applicable' if qkv_direction else oproj_comm_layout,
             'performance_accepted': not diagnostic, 'host_launch': host_launch,
             'collector': None if diagnostic else timing['collector'],
             'launch': launch, 'graph_epoch_mode': GRAPH_EPOCH_MODE if graph else None,
@@ -1315,7 +1324,8 @@ def audit_log(text, job):
     return {'config': config, 'geometry': shape, 'input_statistics': inputs, 'devices': devices,
             'scheduling': scheduling,
             'schema_defaults': ({'host_launch': 'sequential'} if 'host_launch' not in config else {}) |
-                ({'component': 'fused'} if not any('component' in r for r in rows) else {}),
+                ({'component': 'fused'} if not any('component' in r for r in rows) else {}) |
+                ({'oproj_comm_layout': 'rows'} if not explicit_comm_layout else {}),
             'diagnostic_only': diagnostic, 'profile_diagnostic_records': profile_records,
             'profile_schema': profile_schema, 'profile_detail': profile_detail,
             'host_stage_diagnostics': host_stage_diagnostics,
@@ -1349,7 +1359,7 @@ def summarize(directories, output):
                'm', 'n', 'k', 'layout', 'host_launch', 'launch', 'graph_epoch_mode', 'collector', 'precision', 'sm_count',
                'candidate', 'comm_ctas', 'tile_policy', 'tile_m', 'tile_n', 'tile_k',
                'schedule_schema', 'raster_requested', 'raster', 'max_swizzle_size', 'effective_swizzle_size',
-               'swizzle', 'qkv_rank_swizzle', 'padded_m_tiles', 'padded_n_tiles', 'has_padding', 'scheduled_work_tiles_derived',
+               'swizzle', 'qkv_rank_swizzle', 'oproj_comm_layout', 'padded_m_tiles', 'padded_n_tiles', 'has_padding', 'scheduled_work_tiles_derived',
                'problem_gemm_flops', 'problem_route_payload_bytes', 'problem_remote_payload_bytes',
                'executed_gemm_flops', 'executed_route_payload_bytes', 'p50_ms', 'p95_ms', 'half_drift')
     output.parent.mkdir(parents=True, exist_ok=True)
