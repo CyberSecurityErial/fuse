@@ -136,7 +136,7 @@ class PureGemmContracts(unittest.TestCase):
         collect.assert_not_called()
         self.assertEqual(failure.exception.evidence['additional_warmup_cuda_ms'], 40)
 
-    def test_one_plan_is_reused_by_eager_graph_with_separate_measurements(self):
+    def test_eager_graph_tune_separate_plans_and_reuse_inputs(self):
         a = argparse.Namespace(matrix_json=Path('matrix.json'), precisions='bf16', launches='eager,graph',
                                candidates=256, workspace_mib=256, tune_warmup=10, tune_iterations=50,
                                warmup=10, iterations=50)
@@ -146,6 +146,7 @@ class PureGemmContracts(unittest.TestCase):
         torch = mock.Mock()
         torch.cuda.CUDAGraph.return_value = graph
         torch.cuda.graph.return_value = contextlib.nullcontext()
+        torch.cuda.stream.return_value = contextlib.nullcontext()
         with mock.patch.object(bench, 'torch', torch), \
                 mock.patch.object(bench, 'input_tensor', side_effect=['activation', 'weight']) as inputs, \
                 mock.patch.object(bench, 'input_statistics', return_value={'sample_count': 4096}), \
@@ -154,14 +155,15 @@ class PureGemmContracts(unittest.TestCase):
                 mock.patch.object(bench, 'measure', return_value=([4.] * 50, {'protocol': bench.PROTOCOL})) as measure, \
                 contextlib.redirect_stdout(io.StringIO()):
             bench.run_geometry(a, object(), geometry, 1, 2)
-        create.assert_called_once()
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual([call.kwargs['graph'] for call in create.call_args_list], [False, True])
         self.assertEqual(create.call_args.kwargs['candidates'], 256)
         self.assertEqual((create.call_args.kwargs['warmup'], create.call_args.kwargs['iterations']), (10, 50))
         self.assertEqual([call.args for call in inputs.call_args_list], [((128, 64), .125, True), ((192, 64), .02, True)])
         self.assertEqual(measure.call_args_list[0].args[0], plan.run)
         self.assertEqual(measure.call_args_list[1].args[0], graph.replay)
         self.assertEqual(checker.call_args_list[-1].args[0].run, graph.replay)
-        plan.close.assert_called_once()
+        self.assertEqual(plan.close.call_count, 2)
         self.assertEqual([row['launch'] for row in geometry['results']], ['eager', 'graph'])
         self.assertEqual(geometry['inputs']['distribution'], 'uniform')
         for row in geometry['results']:
@@ -561,9 +563,10 @@ class PureGemmContracts(unittest.TestCase):
                 nodes[name]._fields = tuple(field for field in nodes[name]._fields if field != 'type_params')
         digest = hashlib.sha256('\n'.join(ast.dump(nodes[name], include_attributes=False)
                                           for name in names).encode()).hexdigest()
-        # Same six function ASTs as frozen v23/v24. The comparison's explicit
-        # plan arguments/check coverage changed; order/lifetime have tests above.
-        self.assertEqual(digest, '9ae2e93141fdea8936313d83a671352467d7a722785d6ab6fa96884f9175472e')
+        # v3 deliberately tunes per launch mode; sampler/input contracts remain
+        # unchanged. Plan mode, reuse and lifetime are tested independently above.
+        self.assertEqual(bench.PROTOCOL, 'single_gpu_pure_gemm_stable_v3_launch_tuned')
+        self.assertEqual(digest, '4f086ba38cbe8fbefdf903af47f774c3d67a80bca276fdf1a3c5a58afb9fc705')
 
     def test_counter_warmup_body_matches_production_sampler_exactly(self):
         nodes = {node.name: node for node in ast.parse(ENTRY.read_text()).body

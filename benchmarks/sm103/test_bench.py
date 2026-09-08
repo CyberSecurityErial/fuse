@@ -35,6 +35,14 @@ class BenchmarkContracts(unittest.TestCase):
         qkv = next(c for c in cases if c["direction"] == "qkv" and c["model"] == "llama3_8b")
         self.assertEqual((qkv["m"], qkv["n"], qkv["k"]), (256, 6144, 4096))
 
+    def test_production_matrix_excludes_1k_4k(self):
+        self.assertEqual(bench.PRODUCTION_SEQUENCES, (16384, 131072, 262144, 524288))
+        cases = list(bench.cases(self.args(seqs=bench.PRODUCTION_SEQUENCES)))
+        self.assertEqual(len(cases), 128)
+        self.assertFalse(any(c['seq'] in (1024, 4096) for c in cases))
+        for direction in ('qkv', 'oproj'):
+            self.assertEqual(sum(c['direction'] == direction for c in cases), 64)
+
     def test_formal_ub_uses_actual_sm_budget_and_launch(self):
         args = self.args()
         case = next(bench.cases(args))

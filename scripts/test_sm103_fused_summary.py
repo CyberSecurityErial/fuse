@@ -674,6 +674,30 @@ class FusedSummaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summary.audit_run(self.root)
 
+    def test_single_direction_requires_only_selected_evidence_but_never_missing_payloads(self):
+        for direction, label, excluded in (('oproj', 'A2A_GEMM', 'QKV'),
+                                            ('qkv', 'GEMM_A2A', 'OProj')):
+            with self.subTest(direction=direction):
+                self.make_fixture()
+                job = json.loads((self.control / 'job.json').read_text())
+                job['fused_direction'] = direction
+                for path in (self.control / 'job.json', self.root / 'job.json'):
+                    self.write_json(path, job)
+                other = 'GEMM_A2A' if label == 'A2A_GEMM' else 'A2A_GEMM'
+                def select(text):
+                    rows = [row for row in text.splitlines() if f',{other},' not in row
+                            and not row.startswith('input,' + excluded + '-')]
+                    return '\n'.join(rows).replace('config,', f'config,fused_direction={direction},') \
+                        .replace('candidates=2', 'candidates=1').replace('candidate=2,', 'candidate=1,') + '\n'
+                self.change_log(select)
+                result = summary.audit_run(self.root)
+                self.assertEqual(len(result['candidates']), 1)
+                self.assertEqual(len(result['input_statistics']), 12)
+                self.change_log(lambda text: '\n'.join(row for row in text.splitlines()
+                    if not (row.startswith('input,') and 'generation=1' in row)) + '\n')
+                with self.assertRaises(ValueError):
+                    summary.audit_run(self.root)
+
     def test_rank_swizzle_marker_must_match_job(self):
         self.change_log(lambda text: text.replace('config,', 'config,qkv_rank_swizzle=rank_n_band_v1,', 1))
         with self.assertRaisesRegex(ValueError, 'rank swizzle job/config mismatch'):

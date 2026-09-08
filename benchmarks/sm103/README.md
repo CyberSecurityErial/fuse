@@ -1,5 +1,9 @@
 # SM103 Ulysses forward baseline bench
 
+新增可选的[大模型/近期模型投影矩阵](PROJECTION_SHAPES.md)，覆盖 GQA、MHA、
+MLA、KDA 与 Gated DeltaNet。完整融合边界和独立 GEMM 分开记录；新增模型显式选择。
+生产默认序列已移除 1K/4K，保留 16K/128K/256K/512K；小尺寸仅用于 smoke/回归。
+
 本目录为 B300 / SM103a 上的两条前向边界准备强基线：
 QKV Projection → 完整 Q/K/V A2A，以及 inverse A2A → O-projection。
 独立基线由本目录的 Python runner 测量；自研 BF16 融合算子使用
@@ -95,7 +99,7 @@ Graph replay 下计时并选择 GEMM 候选，不把 Eager 选出的算法直接
 
 ## 计划、调优与正式复测
 
-默认复用每方向 8 个模型/人工 geometry × 6 个 S × CP4/8 = 96 点，
+默认复用每方向 8 个模型/人工 geometry × 4 个 S（16K/128K/256K/512K）× CP4/8 = 64 点，
 完整记录 Hq/Hkv/D 和 MNK。Eager/Graph 分开调优、分开选择 winner。
 
 - `smoke`：固定小型 production Qwen geometry、S=1024、默认 CP8，每条边界、
@@ -105,7 +109,7 @@ Graph replay 下计时并选择 GEMM 候选，不把 Eager 选出的算法直接
   固定上游版本的 P2P 拷贝分块使用了仅适用于2的幂的位运算，且 push 接收完成
   计数误用了布尔或；本仓补丁分别改为整数除法对齐和正确的发送CTA计数。
   不把这些实现缺陷作为永久的策略搜索限制；必须使用带修复的 TE 构建。
-  每个配置分别测 Eager 与 Graph。全默认矩阵共 20,736 个作业；建议先用
+  每个配置分别测 Eager 与 Graph。全默认矩阵共 13,824 个作业；建议先用
   `--models production_qwen_dense --seqs 1024 --cps 2` 验证整个流程。
 - `refine`：各组前三名继续搜索 pack block/warps 和 stream priority；UB 搜索
   streams、push/pull、CE/SM、pack、方向及 QKV local-first。

@@ -362,6 +362,18 @@ class ReportContracts(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 report.audit_pure_run(run)
 
+    def test_pure_v3_requires_launch_matched_tuning(self):
+        run, data, control = self.pure_fixture()
+        data['measurement_protocol'] = 'single_gpu_pure_gemm_stable_v3_launch_tuned'
+        data['geometries'][0]['results'][1]['tuning']['graph_tuning'] = 1
+        (control/'gemm-probe.json').write_text(json.dumps(data))
+        rows = report.audit_pure_run(run)
+        self.assertTrue(all(r['measurement_protocol'] == data['measurement_protocol'] for r in rows))
+        data['geometries'][0]['results'][1]['tuning']['graph_tuning'] = 0
+        (control/'gemm-probe.json').write_text(json.dumps(data))
+        with self.assertRaises(ValueError):
+            report.audit_pure_run(run)
+
     def campaign_fixture(self):
         manifest = dict(scope=dict(logical_direction_geometry_rows=192,physical_direction_geometry_rows=168,
             requested_launches=['eager','graph'],historical_sequence_lengths=[1024,4096,16384,131072,262144,524288],

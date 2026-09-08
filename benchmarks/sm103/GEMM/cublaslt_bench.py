@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Single-GPU cuBLASLt search; optionally reuse one process across BF16 shapes."""
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
@@ -12,7 +13,7 @@ import time
 import torch
 from cublaslt import Library, Operand, Plan, check_gemm
 
-PROTOCOL = "single_gpu_pure_gemm_stable_v2"
+PROTOCOL = "single_gpu_pure_gemm_stable_v3_launch_tuned"
 COUNTER_RANGE = "fuse_cutlass_1sm_counters"
 
 
@@ -179,12 +180,25 @@ def run_geometry(a, lib, geometry, index, total):
         output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
         print(f"{precision} RUN {index}/{total} shape={m}x{n}x{k} "
               f"aliases={','.join(geometry['aliases'])} candidates={a.candidates}", flush=True)
-        plan = Plan(lib, x, w, output, candidates=a.candidates, workspace_mib=a.workspace_mib,
-                    warmup=a.tune_warmup, iterations=a.tune_iterations, graph=False)
+        plan = None
         try:
             for launch in a.launches.split(","):
-                # Search once per geometry/precision. Graph replays the same
-                # eager-tuned winner but has separate correctness/warmup/samples.
+                # Tune in the measured launch mode, without reallocating inputs.
+                # Eager and Graph may select different algorithms.
+                if plan is not None:
+                    plan.close()
+                    plan = None
+                # Native candidate capture cannot use CUDA's legacy default
+                # stream. Join input initialization, then tune on a side stream.
+                tuning_stream = torch.cuda.Stream() if launch == 'graph' else None
+                if tuning_stream is not None:
+                    torch.cuda.synchronize()
+                with (torch.cuda.stream(tuning_stream) if tuning_stream is not None
+                      else contextlib.nullcontext()):
+                    plan = Plan(lib, x, w, output, candidates=a.candidates, workspace_mib=a.workspace_mib,
+                                warmup=a.tune_warmup, iterations=a.tune_iterations, graph=launch == 'graph')
+                if tuning_stream is not None:
+                    tuning_stream.synchronize()
                 correctness = check_gemm(plan)
                 run, graph = plan.run, None
                 try:
@@ -219,7 +233,8 @@ def run_geometry(a, lib, geometry, index, total):
                       f"p50={p50:.6f}ms p95={record['p95_ms']:.6f}ms "
                       f"PFLOPS/GPU={record['pflops_per_gpu_p50']:.6f} valid={plan.info['valid']}", flush=True)
         finally:
-            plan.close()
+            if plan is not None:
+                plan.close()
         del plan, x, w, output
     # No GPU objects escape this function. Reuse the allocator across shapes;
     # do not retain every shape's buffers or empty its cache after each sample.

@@ -1,5 +1,14 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v16.0 — 大尺寸长序列 benchmark
+
+仅更新 SM103 BF16 Graph benchmark、测量入口及结果，算子实现保持 v15.0。
+64K/128K/256K/512K × CP4/8：自研融合56/80项、336个有限候选；其余因
+未适配或显存限制留空。主对照为同尺寸纯 cuBLASLt，保留比例不是硬件峰值MFU。
+已有 TEUB/NCCL 数据保留；KDA/MLA 特殊路由暂缓，不发布中间调优文件。
+
+[完整表、配置、样本与复现说明](results/sm103/v16.0/README.md)。
+
 ## v15.0 — 可选的 SM103 QKV rank 错峰
 
 新增 `FUSE_SM103_QKV_RANK_SWIZZLE` **构建选项，默认 OFF**。开启后，GEMM

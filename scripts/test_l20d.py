@@ -1120,6 +1120,29 @@ int main() {
         self.assertFalse(memory['guarantees_fit'])
         self.assertIn('host reference RAM', memory['note'])
 
+    def test_fused_direction_decouples_oproj_from_kv_sharding(self):
+        job = self.fused_job(world=8, q_heads=64, kv_heads=4, hidden=4096,
+                             fused_direction='oproj')
+        l20d.validate_job(job)
+        self.assertIn('--fused-direction', l20d.fused_argv(job))
+        self.assertIn('oproj', l20d.fused_argv(job))
+        for direction in ('both', 'qkv'):
+            with self.assertRaises(ValueError):
+                l20d.fused_geometry(job | {'fused_direction': direction})
+        for changes in ({'profile': True}, {'stage': 'fused-build'}, {'fused_direction': 'bad'}):
+            with self.assertRaises(ValueError):
+                l20d.validate_job(job | changes)
+
+    def test_fused_direction_resource_estimates_are_additive(self):
+        job = self.fused_job()
+        both = l20d.fused_device_memory(job)
+        qkv = l20d.fused_device_memory(job | {'fused_direction': 'qkv'})
+        oproj = l20d.fused_device_memory(job | {'fused_direction': 'oproj'})
+        for key in ('buffer_bytes', 'flag_bytes'):
+            self.assertEqual(both[key], qkv[key] + oproj[key])
+            self.assertGreater(qkv[key], 0)
+            self.assertGreater(oproj[key], 0)
+
     def test_fused_device_estimate_scales_with_shape_and_profiling(self):
         job = self.fused_job(seq_local=None, global_seq=524288, hidden=4096, q_heads=32)
         memory = l20d.fused_device_memory(job)

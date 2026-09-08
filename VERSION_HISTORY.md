@@ -1,5 +1,15 @@
 # 版本演进手册
 
+## v16.0：大尺寸长序列 benchmark
+
+- 算子实现与 v15.0 一致；仅更新 benchmark、控制/验收工具与结果。
+- 新增八个模型的投影目录；融合主表56/80项、336个候选。KDA六路暂缓16项、
+  Qwen3 QKV CP8不合法4项、BLOOM 512K成对测试显存受限4项留空。
+- BF16 Graph、64K～512K、CP4/8、随机输入、至少10+50；主对照为纯
+  cuBLASLt。已有通信参考保留，保留比例不等于硬件理论MFU。
+- 独立QKV/OProj测试资源与验收；生产默认移除1K/4K，小型回归保留。
+- [完整结果与复现说明](results/sm103/v16.0/README.md)。无profile或临时搜索包。
+
 ## v15.0：SM103 QKV 可选 rank N-band swizzle
 
 - 构建选项 `FUSE_SM103_QKV_RANK_SWIZZLE` 默认 OFF；显式开启后生产者和

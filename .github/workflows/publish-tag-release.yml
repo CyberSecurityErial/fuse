@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v15.0
+        default: v16.0
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v15.0");
+              : (process.env.REQUESTED_TAG || "v16.0");
 
             const releases = {
+              "v16.0": {
+                name: "v16.0 — Large-model long-sequence benchmarks",
+                body: [
+                  "Benchmark-only release: SM90/SM103 operator implementation is unchanged from v15.0.",
+                  "BF16 Graph, 64K–512K, CP4/8: 56/80 fused cells, 336 finite candidates; 24 unsupported/deferred/memory-limited cells remain blank.",
+                  "Primary comparison is same-M/N/K pure cuBLASLt; existing TEUB/NCCL references retained. Throughput retention is not hardware-peak MFU.",
+                  "Adds pinned projection catalog and independent QKV/OProj harness resources; does not implement KDA/MLA special routing.",
+                  "Tables, winner configurations, selected raw samples and evidence hashes: results/sm103/v16.0. No profiles, dependencies or intermediate sweep packages.",
+                ].join("\n"),
+              },
               "v15.0": {
                 name: "v15.0 — Optional SM103 QKV rank swizzle",
                 body: [

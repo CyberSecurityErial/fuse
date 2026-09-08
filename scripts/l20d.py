@@ -170,6 +170,11 @@ def fused_candidates(job):
 def fused_geometry(job):
     """Resolve the same integer/shape contract as fused_bf16, without CUDA."""
     limit = (1 << 31) - 1
+    direction = job.get('fused_direction', 'both')
+    if direction not in ('both', 'qkv', 'oproj'):
+        raise ValueError('Invalid --fused-direction')
+    if direction != 'both' and (job.get('stage') != 'fused-smoke' or job.get('profile')):
+        raise ValueError('--fused-direction requires non-profile fused-smoke')
 
     def positive(value, name):
         if type(value) is not int or not 1 <= value <= limit:
@@ -199,7 +204,7 @@ def fused_geometry(job):
     projection_width = q_width + 2 * kv_width
     if global_seq > limit or projection_width > limit:
         raise ValueError('Global sequence or packed projection width exceeds int32')
-    if (q_heads % kv_heads or q_heads % world or kv_heads % world or
+    if ((direction != 'oproj' and (q_heads % kv_heads or kv_heads % world)) or q_heads % world or
             head_dim % 8 or hidden % 8 or (q_width // world) % 64):
         raise ValueError('Requires GQA/CP-divisible heads, BF16 8-element alignment, '
                          'and OProj K shards divisible by 64')
@@ -227,11 +232,14 @@ def fused_device_memory(job):
     """Per-rank device estimate; not an OOM guarantee or a host-RAM check."""
     shape = fused_geometry(job)
     m, h, p, q = (shape[key] for key in ('seq_local', 'hidden', 'projection_width', 'q_width'))
-    # Both boundaries and their full references coexist in this harness.
-    buffer_bytes = 2 * (3 * m * (h + p + q) + h * (p + q))
+    qkv = job.get('fused_direction', 'both') != 'oproj'
+    oproj = job.get('fused_direction', 'both') != 'qkv'
+    # Count only selected directions, including their independent full references.
+    buffer_bytes = 2 * (qkv * (m * h + 3 * m * p + h * p) +
+                        oproj * (3 * m * q + 2 * m * h + h * q))
     m_tiles = (m + 127) // 128
-    flag_bytes = 4 * 32 * (m_tiles * ((p + 63) // 64) +
-                          m_tiles * shape['world'] + shape['world'] + 1)
+    flag_bytes = 4 * 32 * (qkv * (m_tiles * ((p + 63) // 64) + shape['world']) +
+                          oproj * (m_tiles * shape['world'] + 1))
     # Calibration duplicates only the ready/done flags, never full tensors.
     calibration_flag_bytes = flag_bytes if job.get('calibrate') else 0
     profile_bytes = 0
@@ -264,6 +272,10 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 def validate_job(job, hostname=None):
     node = job_node(job)
+    direction = job.get('fused_direction', 'both')
+    if direction not in ('both', 'qkv', 'oproj') or (direction != 'both' and
+            (job['stage'] != 'fused-smoke' or job.get('profile'))):
+        raise ValueError('--fused-direction requires non-profile fused-smoke and both/qkv/oproj')
     if job['stage'] not in STAGES:
         raise ValueError('Unknown stage')
     if job.get('fused_counter_tool', 'ncu') not in ('ncu', 'nsys'):
@@ -304,8 +316,9 @@ def validate_job(job, hostname=None):
             raise ValueError('MPI does not support profile or host-launch overrides')
     if job.get('oproj_layout', 'legacy') not in ('legacy', 'causal_dual_chunk_v1'):
         raise ValueError('Unknown OProj baseline layout')
-    if job.get('oproj_layout', 'legacy') != 'legacy' and job['stage'] != 'baseline-replay':
-        raise ValueError('OProj layout override is only supported for baseline-replay')
+    if job.get('oproj_layout', 'legacy') != 'legacy' and job['stage'] not in (
+            'baseline-replay', 'smoke', 'sweep', 'refine', 'formal', 'summary'):
+        raise ValueError('OProj layout override requires a baseline measurement stage')
     if job['stage'] not in FUSED_STAGES and any(job.get(key) is not None for key in
                                              ('comm_sm_list', 'qkv_policy_list', 'oproj_policy_list')):
         raise ValueError('Fused candidate lists are only valid for fused stages')
@@ -945,6 +958,8 @@ def fused_argv(job):
     shape = fused_geometry(job)
     comm, qkv, oproj = fused_candidates(job)
     argv = [str(fused_binary(job)), '--world', str(shape['world'])]
+    if job.get('fused_direction', 'both') != 'both':
+        argv += ['--fused-direction', job['fused_direction']]
     if job.get('fused_launch', 'eager') != 'eager':
         argv += ['--launch', job['fused_launch']]
     if job.get('comm_sm_list') is not None:
@@ -1554,6 +1569,7 @@ def remote(job_path):
                     '--models', job['models'], '--seqs', job['seqs'], '--cps', job['cps'],
                     '--devices', job['devices'], '--backends', job['backends'],
                     '--directions', job['directions'], '--launches', job['launches'],
+                    '--oproj-layout', job.get('oproj_layout', 'legacy'),
                     '--job-timeout', str(job['job_timeout'])]
             if job.get('reuse_experiment'):
                 if job.get('executor') != 'batch':
@@ -1674,6 +1690,8 @@ def main():
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
     run.add_argument('--fused-launch', choices=('eager', 'graph'), default='eager',
                      help='fused-smoke: Graph is explicit MPI-only, with epoch preparation outside CUDA events')
+    run.add_argument('--fused-direction', choices=('both', 'qkv', 'oproj'), default='both',
+                     help='non-profile fused-smoke: allocate, validate and measure only selected direction')
     run.add_argument('--profile-detail', choices=('full', 'cta'),
                      help='fused-smoke --profile: full peer trace (default), or CTA-only diagnostics')
     run.add_argument('--qkv-epilogue-probe', action='store_true',

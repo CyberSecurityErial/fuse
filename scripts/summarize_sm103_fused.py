@@ -596,23 +596,31 @@ def audit_inputs(rows, config, shape):
     generator, world = config['input_generator'], shape['world']
     seed = count(config, 'seed')
     expected = {}
+    direction = config.get('fused_direction', 'both')
+    def selected(label):
+        return direction == 'both' or label.lower().startswith(direction + '-')
     for label, count_value, offset in (
         ('QKV-weight', shape['hidden'] * shape['projection_width'], 11),
         ('OProj-weight', shape['hidden'] * shape['q_width'], 17)):
+        if not selected(label):
+            continue
         for rank in (range(world) if generator == 'gpu_philox' else (-1,)):
             expected[label, -1, rank] = (count_value, (seed + offset) % 2**32, .02)
     for generation in range(2):
         for rank in range(world):
             for label, width, offset in (('QKV-activation', shape['hidden'], 1000),
                                           ('OProj-activation', shape['q_width'], 2000)):
+                if not selected(label):
+                    continue
                 expected[label, generation, rank] = (shape['seq_local'] * width,
                     (seed + generation * 100003 + rank * 101 + offset) % 2**32, .125)
     actual = {}
     for row in rows:
         if row['kind'] != 'input':
             continue
-        if row.get('label') == 'QKV-repeat':
+        if row.get('label') in ('QKV-repeat', 'OProj-repeat'):
             require(count(config, 'cpu_oracle') == 1, 'Unexpected repeat-input diagnostic')
+            require(selected(row['label']), 'Repeat diagnostic for unselected direction')
             continue
         key = row.get('label'), int(row.get('generation', -1)), int(row.get('rank', -1))
         require(key in expected and key not in actual, f'Unknown/duplicate input statistics: {key}')
@@ -640,8 +648,10 @@ def audit_inputs(rows, config, shape):
     require(set(actual) == set(expected), 'Missing rank/generation input statistics')
     oracles = [r for r in rows if r['kind'] == 'input_oracle']
     if generator == 'gpu_philox' and count(config, 'cpu_oracle'):
-        require(Counter(r.get('check') for r in oracles) ==
-                {'cross_rank_weights': 1, 'same_seed_repeat': 1, 'oproj_reference_gather': 2 * world},
+        expected_checks = {'cross_rank_weights': 1, 'same_seed_repeat': 1}
+        if direction != 'qkv':
+            expected_checks['oproj_reference_gather'] = 2 * world
+        require(Counter(r.get('check') for r in oracles) == expected_checks,
                 'Missing Philox CPU-oracle diagnostics')
         gathers = []
         for row in oracles:
@@ -652,7 +662,8 @@ def audit_inputs(rows, config, shape):
                 gathers.append(count(row, 'rank'))
             else:
                 require(count(row, 'full_bitwise_match') == 1, 'Input repeat/weight oracle failed')
-        require(Counter(gathers) == {rank: 2 for rank in range(world)}, 'Missing gather-oracle rank')
+        require(Counter(gathers) == ({rank: 2 for rank in range(world)} if direction != 'qkv' else {}),
+                'Missing gather-oracle rank')
     else:
         require(not oracles, 'Unexpected input oracle diagnostics')
     return list(actual.values())
@@ -1013,6 +1024,8 @@ def audit_log(text, job):
     elif profile_detail == 'full' and 'profile_detail' in config:
         require(profile_records.get('profile_peer', 0) > 0, 'Full diagnostics require peer traces')
     shape = fused_geometry(job)
+    require(config.get('fused_direction', 'both') == job.get('fused_direction', 'both'),
+            'Fused direction mismatch')
     for key in ('world', 'global_seq', 'seq_local', 'hidden', 'q_heads', 'kv_heads', 'head_dim', 'timeout_seconds'):
         require(count(config, key, 1) == shape[key], f'Job/config mismatch: {key}')
     diagnostic = bool(job.get('validation_self_test'))
@@ -1043,6 +1056,7 @@ def audit_log(text, job):
             scheduling['schema'] == 'explicit_v1' and qkv == ['m128n256k64e32'] and len(comm) == len(oproj) == 1),
             'Unsupported QKV epilogue diagnostic scope')
     expected = [(direction, c, tile) for direction, policies in zip(DIRECTIONS, (qkv, oproj))
+                if job.get('fused_direction', 'both') in ('both', 'qkv' if direction == DIRECTIONS[0] else 'oproj')
                 for tile in policies for c in comm]
     require(count(config, 'candidates') == len(expected), 'Candidate plan count mismatch')
     require(count(config, 'comm_sm', 1) == comm[0], 'Resolved default communication CTA mismatch')

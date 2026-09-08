@@ -83,6 +83,7 @@ struct Options {
   std::string launch = "eager";
   std::string profile_detail = "full";
   std::string profile_direction = "both";
+  std::string fused_direction = "both";
   int max_swizzle_size = 1;
   std::string qkv_raster = "heuristic";
   std::string oproj_raster = "heuristic";
@@ -95,6 +96,8 @@ struct Options {
   int q_width() const { return q_heads * head_dim; }
   int kv_width() const { return kv_heads * head_dim; }
   int projection_width() const { return q_width() + 2 * kv_width(); }
+  bool run_qkv() const { return fused_direction != "oproj"; }
+  bool run_oproj() const { return fused_direction != "qkv"; }
 };
 
 int ceil_div(int value, int divisor) {
@@ -180,6 +183,10 @@ std::vector<Candidate> make_candidates(const Options& options) {
       candidates.push_back({Direction::kOproj, comm_sm, policy});
     }
   }
+  candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+      [&](const Candidate& c) {
+        return c.direction == Direction::kQkv ? !options.run_qkv() : !options.run_oproj();
+      }), candidates.end());
   if (options.profile && options.profile_direction != "both") {
     const auto selected = options.profile_direction == "qkv" ? Direction::kQkv : Direction::kOproj;
     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
@@ -380,6 +387,11 @@ Options parse_options(int argc, char** argv) {
       options.causal = true;
     } else if (argument == "--profile") {
       options.profile = true;
+    } else if (argument == "--fused-direction") {
+      if (++index == argc) throw std::runtime_error("missing fused direction");
+      options.fused_direction = argv[index];
+      if (options.fused_direction != "both" && options.fused_direction != "qkv" &&
+          options.fused_direction != "oproj") throw std::runtime_error("invalid fused direction");
     } else if (argument == "--profile-direction") {
       if (++index == argc) throw std::runtime_error("missing profile direction");
       options.profile_direction = argv[index];
@@ -499,6 +511,9 @@ Options parse_options(int argc, char** argv) {
     options.seq_local = static_cast<int>(global_seq / options.world);
   }
   const int64_t q_width = static_cast<int64_t>(options.q_heads) * options.head_dim;
+  if (options.profile && options.fused_direction != "both") {
+    throw std::runtime_error("profiling uses --profile-direction, not --fused-direction");
+  }
   const int64_t kv_width = static_cast<int64_t>(options.kv_heads) * options.head_dim;
   const int64_t int_limit = std::numeric_limits<int32_t>::max();
   if (static_cast<int64_t>(options.seq_local) * options.world > int_limit ||
@@ -506,8 +521,8 @@ Options parse_options(int argc, char** argv) {
       q_width + 2 * kv_width > int_limit) {
     throw std::runtime_error("global sequence or packed projection width exceeds int32");
   }
-  if (options.q_heads % options.kv_heads != 0 || options.q_heads % options.world != 0 ||
-      options.kv_heads % options.world != 0 || options.head_dim % 8 != 0 ||
+  if ((options.run_qkv() && (options.q_heads % options.kv_heads != 0 ||
+      options.kv_heads % options.world != 0)) || options.q_heads % options.world != 0 || options.head_dim % 8 != 0 ||
       options.hidden % 8 != 0 || (q_width / options.world) % 64 != 0) {
     throw std::runtime_error("requires GQA/CP-divisible heads, BF16 8-element alignment, and OProj K shards divisible by 64");
   }
@@ -853,9 +868,9 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
   const size_t qkv_weight_count = checked_product(options.projection_width(), options.hidden);
   const size_t oproj_weight_count = checked_product(options.hidden, options.q_width());
   const std::string weight_rank = fused_mpi::enabled ? ",rank=" + std::to_string(fused_mpi::process_rank) : "";
-  const auto qkv_weight = gpu_inputs ? std::vector<Bf16>{}
+  const auto qkv_weight = gpu_inputs || !options.run_qkv() ? std::vector<Bf16>{}
       : make_values(qkv_weight_count, options.seed + 11, "QKV-weight" + weight_rank, 0.02f);
-  const auto oproj_weight = gpu_inputs ? std::vector<Bf16>{}
+  const auto oproj_weight = gpu_inputs || !options.run_oproj() ? std::vector<Bf16>{}
       : make_values(oproj_weight_count, options.seed + 17, "OProj-weight" + weight_rank, 0.02f);
   std::vector<RankRuntime> runtimes(options.world);
   for (const int rank : fused_mpi::owned_ranks(options.world)) {
@@ -897,56 +912,66 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
     }
     const size_t m = options.seq_local;
     if (gpu_inputs) runtime.inputs = allocate<fused_inputs::Scratch>(runtime, 1);
-    runtime.qkv.route = make_route(options, rank, Direction::kQkv);
-    runtime.qkv.gemm.m = options.seq_local;
-    runtime.qkv.gemm.n = options.projection_width();
-    runtime.qkv.gemm.k = options.hidden;
-    apply_schedule(runtime.qkv.gemm, options, Direction::kQkv);
-    runtime.qkv.num_comm_ctas = options.comm_sm;
-    runtime.qkv.lhs = allocate<Bf16>(runtime, checked_product(m, options.hidden));
-    Bf16* qkv_rhs = allocate<Bf16>(runtime, qkv_weight_count);
-    if (gpu_inputs) {
-      make_gpu_values(runtime, qkv_rhs, qkv_weight_count, options.seed + 11,
-                       "QKV-weight,rank=" + std::to_string(rank), 0.02f);
-    } else upload(qkv_rhs, qkv_weight, runtime.stream);
-    runtime.qkv.rhs_nt = qkv_rhs;
-    runtime.qkv.local_output = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
-    runtime.peer_output = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
-    runtime.route_done = allocate<uint32_t>(runtime, options.world * fuse::kReadyFlagStride);
-    const auto traits = fuse::qkv_cutlass_kernel_traits(runtime.qkv.gemm);
-    if (traits.block_m <= 0 || traits.block_n <= 0) throw std::runtime_error("invalid QKV tile query");
-    const size_t qkv_tiles = checked_product(ceil_div(options.seq_local, traits.block_m),
-                                             ceil_div(options.projection_width(), traits.block_n));
-    const size_t qkv_flags = checked_product(qkv_tiles, fuse::kReadyFlagStride);
-    runtime.qkv_ready_elements = qkv_flags;
-    runtime.qkv.ready = allocate<uint32_t>(runtime, qkv_flags);
-    runtime.qkv_reference = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
-    runtime.oproj.route = make_route(options, rank, Direction::kOproj);
-    runtime.oproj.gemm.m = options.seq_local;
-    runtime.oproj.gemm.n = options.hidden;
-    runtime.oproj.gemm.k = options.q_width();
-    apply_schedule(runtime.oproj.gemm, options, Direction::kOproj);
-    runtime.oproj.num_comm_ctas = options.comm_sm;
-    runtime.peer_input = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
-    runtime.input_ready = allocate<uint32_t>(runtime, fuse::kReadyFlagStride);
-    runtime.oproj.input_staging = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
-    runtime.oproj.rhs_nt = allocate<Bf16>(runtime, oproj_weight_count);
-    if (gpu_inputs) {
-      make_gpu_values(runtime, runtime.oproj.rhs_nt, oproj_weight_count, options.seed + 17,
-                       "OProj-weight,rank=" + std::to_string(rank), 0.02f);
-    } else upload(runtime.oproj.rhs_nt, oproj_weight, runtime.stream);
-    runtime.oproj.output = allocate<Bf16>(runtime, checked_product(m, options.hidden));
-    const int64_t oproj_flags = fuse::a2a_lhs_gemm_ready_elements(runtime.oproj.gemm, runtime.oproj.route);
-    if (oproj_flags <= 0) throw std::runtime_error("invalid OProj ready query");
-    runtime.oproj_ready_elements = static_cast<size_t>(oproj_flags);
-    runtime.oproj.ready = allocate<uint32_t>(runtime, static_cast<size_t>(oproj_flags));
-    runtime.oproj_reference = allocate<Bf16>(runtime, checked_product(m, options.hidden));
-    runtime.reference_lhs = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+    // Directions own independent resources: an OProj-only run must not allocate
+    // or validate an unrelated QKV boundary (e.g. KV heads smaller than CP).
+    if (options.run_qkv()) {
+      runtime.qkv.route = make_route(options, rank, Direction::kQkv);
+      runtime.qkv.gemm.m = options.seq_local;
+      runtime.qkv.gemm.n = options.projection_width();
+      runtime.qkv.gemm.k = options.hidden;
+      apply_schedule(runtime.qkv.gemm, options, Direction::kQkv);
+      runtime.qkv.num_comm_ctas = options.comm_sm;
+      runtime.qkv.lhs = allocate<Bf16>(runtime, checked_product(m, options.hidden));
+      Bf16* qkv_rhs = allocate<Bf16>(runtime, qkv_weight_count);
+      if (gpu_inputs) {
+        make_gpu_values(runtime, qkv_rhs, qkv_weight_count, options.seed + 11,
+                         "QKV-weight,rank=" + std::to_string(rank), 0.02f);
+      } else upload(qkv_rhs, qkv_weight, runtime.stream);
+      runtime.qkv.rhs_nt = qkv_rhs;
+      runtime.qkv.local_output = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
+      runtime.peer_output = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
+      runtime.route_done = allocate<uint32_t>(runtime, options.world * fuse::kReadyFlagStride);
+      const auto traits = fuse::qkv_cutlass_kernel_traits(runtime.qkv.gemm);
+      if (traits.block_m <= 0 || traits.block_n <= 0) throw std::runtime_error("invalid QKV tile query");
+      const size_t qkv_tiles = checked_product(ceil_div(options.seq_local, traits.block_m),
+                                               ceil_div(options.projection_width(), traits.block_n));
+      const size_t qkv_flags = checked_product(qkv_tiles, fuse::kReadyFlagStride);
+      runtime.qkv_ready_elements = qkv_flags;
+      runtime.qkv.ready = allocate<uint32_t>(runtime, qkv_flags);
+      runtime.qkv_reference = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
+    }
+    if (options.run_oproj()) {
+      runtime.oproj.route = make_route(options, rank, Direction::kOproj);
+      runtime.oproj.gemm.m = options.seq_local;
+      runtime.oproj.gemm.n = options.hidden;
+      runtime.oproj.gemm.k = options.q_width();
+      apply_schedule(runtime.oproj.gemm, options, Direction::kOproj);
+      runtime.oproj.num_comm_ctas = options.comm_sm;
+      runtime.peer_input = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+      runtime.input_ready = allocate<uint32_t>(runtime, fuse::kReadyFlagStride);
+      runtime.oproj.input_staging = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+      runtime.oproj.rhs_nt = allocate<Bf16>(runtime, oproj_weight_count);
+      if (gpu_inputs) {
+        make_gpu_values(runtime, runtime.oproj.rhs_nt, oproj_weight_count, options.seed + 17,
+                         "OProj-weight,rank=" + std::to_string(rank), 0.02f);
+      } else upload(runtime.oproj.rhs_nt, oproj_weight, runtime.stream);
+      runtime.oproj.output = allocate<Bf16>(runtime, checked_product(m, options.hidden));
+      const int64_t oproj_flags = fuse::a2a_lhs_gemm_ready_elements(runtime.oproj.gemm, runtime.oproj.route);
+      if (oproj_flags <= 0) throw std::runtime_error("invalid OProj ready query");
+      runtime.oproj_ready_elements = static_cast<size_t>(oproj_flags);
+      runtime.oproj.ready = allocate<uint32_t>(runtime, static_cast<size_t>(oproj_flags));
+      runtime.oproj_reference = allocate<Bf16>(runtime, checked_product(m, options.hidden));
+      runtime.reference_lhs = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+    }
     runtime.validation = allocate<fused_validation::Scratch>(runtime, 1);
     if (options.calibrate) {
-      runtime.calibration_qkv_ready = allocate<uint32_t>(runtime, runtime.qkv_ready_elements);
+      if (options.run_qkv()) {
+        runtime.calibration_qkv_ready = allocate<uint32_t>(runtime, runtime.qkv_ready_elements);
+        runtime.calibration_route_done = allocate<uint32_t>(runtime, options.world * fuse::kReadyFlagStride);
+      }
+      if (options.run_oproj()) {
       runtime.calibration_oproj_ready = allocate<uint32_t>(runtime, runtime.oproj_ready_elements);
-      runtime.calibration_route_done = allocate<uint32_t>(runtime, options.world * fuse::kReadyFlagStride);
+      }
     }
 #if FUSE_ENABLE_PROFILING
     if (options.profile) {
@@ -988,6 +1013,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       CUDA_CHECK(cudaSetDevice(runtimes[rank].device));
       auto& runtime = runtimes[rank];
       for (int direction = 0; direction < 2; ++direction) {
+        if (direction == 0 ? !options.run_qkv() : !options.run_oproj()) continue;
         const auto* actual = direction == 0 ? runtime.qkv.rhs_nt : runtime.oproj.rhs_nt;
         const auto* expected = direction == 0 ? runtimes[0].qkv.rhs_nt : runtimes[0].oproj.rhs_nt;
         CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(actual),
@@ -1001,6 +1027,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       CUDA_CHECK(cudaSetDevice(runtimes[rank].device));
       const auto results = download(runtimes[rank].validation->result, 2);
       for (int direction = 0; direction < 2; ++direction) {
+        if (direction == 0 ? !options.run_qkv() : !options.run_oproj()) continue;
         const auto& result = results[direction];
         if (result.checked != (direction == 0 ? qkv_weight_count : oproj_weight_count) ||
             result.mismatches || result.nonfinite) {
@@ -1027,34 +1054,44 @@ void set_inputs(std::vector<RankRuntime>& runtimes, const Options& options, uint
     if (options.input_generator == "gpu_philox") {
       const size_t qkv_count = checked_product(options.seq_local, options.hidden);
       const size_t oproj_count = checked_product(options.seq_local, options.q_width());
-      make_gpu_values(runtime, const_cast<Bf16*>(runtime.qkv.lhs), qkv_count,
+      if (options.run_qkv()) make_gpu_values(runtime, const_cast<Bf16*>(runtime.qkv.lhs), qkv_count,
                         seed + 1000, "QKV-activation," + label, 0.125f);
-      make_gpu_values(runtime, runtime.peer_input, oproj_count,
+      if (options.run_oproj()) make_gpu_values(runtime, runtime.peer_input, oproj_count,
                         seed + 2000, "OProj-activation," + label, 0.125f);
       if (options.cpu_oracle) {
-        runtime.qkv_input = download(runtime.qkv.lhs, qkv_count);
-        runtime.oproj_input = download(runtime.peer_input, oproj_count);
+        if (options.run_qkv()) runtime.qkv_input = download(runtime.qkv.lhs, qkv_count);
+        if (options.run_oproj()) runtime.oproj_input = download(runtime.peer_input, oproj_count);
         if (generation == 0 && rank == 0) {
-          make_gpu_values(runtime, const_cast<Bf16*>(runtime.qkv.lhs), qkv_count,
-                            seed + 1000, "QKV-repeat," + label, 0.125f);
-          const auto repeated = download(runtime.qkv.lhs, qkv_count);
-          if (std::memcmp(repeated.data(), runtime.qkv_input.data(), checked_bytes<Bf16>(qkv_count)) != 0) {
+          const bool qkv = options.run_qkv();
+          auto* input = qkv ? const_cast<Bf16*>(runtime.qkv.lhs) : runtime.peer_input;
+          const auto count = qkv ? qkv_count : oproj_count;
+          const auto& original = qkv ? runtime.qkv_input : runtime.oproj_input;
+          make_gpu_values(runtime, input, count, seed + (qkv ? 1000 : 2000),
+                          std::string(qkv ? "QKV-repeat," : "OProj-repeat,") + label, 0.125f);
+          const auto repeated = download(input, count);
+          if (std::memcmp(repeated.data(), original.data(), checked_bytes<Bf16>(count)) != 0) {
             throw std::runtime_error("Philox same-seed repeat differs");
           }
           std::cout << "input_oracle,generator=gpu_philox,check=same_seed_repeat,full_bitwise_match=1\n";
         }
       }
     } else {
+      if (options.run_qkv()) {
       runtime.qkv_input = make_values(checked_product(options.seq_local, options.hidden),
                                       seed + 1000, "QKV-activation," + label, 0.125f);
+      upload(const_cast<Bf16*>(runtime.qkv.lhs), runtime.qkv_input, runtime.stream);
+      }
+      if (options.run_oproj()) {
       runtime.oproj_input = make_values(checked_product(options.seq_local, options.q_width()),
                                         seed + 2000, "OProj-activation," + label, 0.125f);
-      upload(const_cast<Bf16*>(runtime.qkv.lhs), runtime.qkv_input, runtime.stream);
       upload(runtime.peer_input, runtime.oproj_input, runtime.stream);
+      }
     }
+    if (options.run_oproj()) {
     runtime.oproj.input_epoch = generation + 1;
     CUDA_CHECK(cudaMemcpyAsync(runtime.input_ready, &runtime.oproj.input_epoch,
                                sizeof(uint32_t), cudaMemcpyHostToDevice, runtime.stream));
+    }
   }
   // Complete every payload and input-ready upload before any rank consumes it.
   finish_all(runtimes);
@@ -1427,8 +1464,9 @@ void prepare_references(std::vector<RankRuntime>& runtimes, const Options& optio
   for (const int rank : fused_mpi::owned_ranks(options.world)) {
     CUDA_CHECK(cudaSetDevice(runtimes[rank].device));
     auto& runtime = runtimes[rank];
-    cublas_nt(runtime, options.seq_local, options.projection_width(), options.hidden,
+    if (options.run_qkv()) cublas_nt(runtime, options.seq_local, options.projection_width(), options.hidden,
               runtime.qkv.lhs, runtime.qkv.rhs_nt, runtime.qkv_reference);
+    if (!options.run_oproj()) continue;
     auto& expected = runtime.reference_input;
     if (!gpu_inputs || options.cpu_oracle) {
       prepare_cpu_gather(expected, runtimes, options, rank);
@@ -2464,7 +2502,7 @@ int main(int argc, char** argv) {
              << options.host_launch << ' ' << options.calibrate << ' ' << options.cpu_oracle << ' '
              << options.validation_self_test << ' ' << options.profile << ' ' << options.timeout_seconds << ' '
              << options.max_swizzle_size << ' ' << options.qkv_raster << ' ' << options.oproj_raster
-             << ' ' << options.launch;
+             << ' ' << options.launch << ' ' << options.fused_direction;
     for (size_t index = 0; index < candidates.size(); ++index) {
       contract << ' ' << direction_name(candidates[index].direction) << candidate_context(index, candidates[index]);
     }
@@ -2488,6 +2526,7 @@ int main(int argc, char** argv) {
               << ",oproj_effective_raster=" << (options.oproj_raster == "heuristic" ? "along_n" : options.oproj_raster)
               << ",process_layout=" << (fused_mpi::enabled ? "mpi_one_process_per_gpu" : "single_process")
               << ",launch=" << options.launch
+              << ",fused_direction=" << options.fused_direction
               << ",calibrate=" << options.calibrate
               << ",profile=" << options.profile << ",timeout_seconds=" << options.timeout_seconds
               << ",profile_detail=" << (options.profile ? options.profile_detail : "none")

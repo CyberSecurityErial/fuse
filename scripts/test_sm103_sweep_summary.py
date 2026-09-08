@@ -34,6 +34,31 @@ class SweepSummaryTests(unittest.TestCase):
         self.assertEqual(len(expected), 20736)
         self.assertEqual(len({key[0] for key in expected}), 768)
 
+    def test_explicit_matrix_inventory_and_missing_candidate(self):
+        scope = dict(directions=('qkv', 'oproj'), models=('kimi_k3_kda',),
+                     seqs=(65536,), cps=(4,), launches=('graph',))
+        expected = summary.expected_candidates(scope)
+        self.assertEqual(len(expected), 108)
+        args = argparse.Namespace(stage='sweep', results=Path('/remote/experiment'),
+            library=Path('/remote/library.so'), python='python3', sm_count=148,
+            devices='0,1,2,3,4,5,6,7')
+        cases = {case['direction']: case for case in expected.values()}
+        jobs = [summary.bench.make_job(args, case, backend, 'graph', config)
+                for case in cases.values() for backend in ('cublaslt_nccl', 'te_ub')
+                for config in summary.bench.initial_configs(backend)]
+        plan = dict(stage='sweep', precision='bf16', fingerprint='explicit', jobs=jobs)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            raw = json.dumps(plan).encode()
+            summary.load_plan(path, 'explicit', scope=scope, raw_plan=raw)
+            with self.assertRaisesRegex(ValueError, 'complete historical'):
+                summary.load_plan(path, raw_plan=raw)
+            with self.assertRaisesRegex(ValueError, 'fingerprint'):
+                summary.load_plan(path, 'wrong', scope=scope, raw_plan=raw)
+            plan['jobs'].pop()
+            with self.assertRaisesRegex(ValueError, 'complete explicit'):
+                summary.load_plan(path, 'explicit', scope=scope, raw_plan=json.dumps(plan).encode())
+
     def test_selection_remaps_paths_and_marks_sweep_only(self):
         with tempfile.TemporaryDirectory() as folder:
             path, plan, expected = self.fixture(folder)

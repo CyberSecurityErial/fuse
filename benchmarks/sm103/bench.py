@@ -22,6 +22,11 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
+_projection_spec = importlib.util.spec_from_file_location(
+    'sm103_projection_shapes', HERE / 'projection_shapes.py')
+_projection_shapes = importlib.util.module_from_spec(_projection_spec)
+_projection_spec.loader.exec_module(_projection_shapes)
+BOUNDARY_MODELS = _projection_shapes.BOUNDARY_MODELS
 DIRECTORIES = {"qkv": "sm90/QKVproj+a2a", "oproj": "sm90/a2a+Oproj"}
 METRICS = {
     ("qkv", "cublaslt_nccl"): "cublaslt_packed_qkv_gemm_a2a",
@@ -30,6 +35,9 @@ METRICS = {
     ("oproj", "te_ub"): "te_userbuffers_oproj_boundary",
 }
 OPROJ_LAYOUTS = ('legacy', 'causal_dual_chunk_v1')
+# Production sweeps exclude 1K/4K. Explicit small smoke/regression inputs and
+# historical result readers remain supported, but are not production cases.
+PRODUCTION_SEQUENCES = (16384, 131072, 262144, 524288)
 
 
 def load_shapes(direction):
@@ -39,6 +47,12 @@ def load_shapes(direction):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # Extend SM103 only; preserve the historical default matrix and SM90 files.
+    for name, (hidden, q_heads, kv_heads, head_dim) in BOUNDARY_MODELS.items():
+        fields = ((hidden, q_heads, kv_heads, head_dim) if direction == 'qkv'
+                  else (hidden, q_heads, head_dim))
+        module.MODELS[name] = module.Model(
+            name, 'model', *fields, 'Pinned projection geometry; see projection_shapes.py')
     return module
 
 
@@ -68,7 +82,8 @@ def cases(args):
             k = model.hidden if direction == "qkv" else model.attention_width
             yield {"direction": direction, "model": name, "seq": seq, "cp": cp,
                    "hidden": model.hidden, "q_heads": model.q_heads,
-                   "kv_heads": getattr(model, "kv_heads", 8), "head_dim": model.head_dim,
+                   "kv_heads": (BOUNDARY_MODELS[name][2] if name in BOUNDARY_MODELS
+                                else getattr(model, "kv_heads", 8)), "head_dim": model.head_dim,
                    "m": seq//cp, "n": n, "k": k}
 
 
@@ -325,7 +340,8 @@ def main():
     p.add_argument("--job-timeout", type=float, default=600,
                    help="maximum seconds per torchrun job (default: 600)")
     p.add_argument("--models", default="")
-    p.add_argument("--seqs", type=ints, default=(1024,4096,16384,131072,262144,524288))
+    p.add_argument("--seqs", type=ints, default=PRODUCTION_SEQUENCES,
+                   help="production default: 16K,128K,256K,512K; small sizes are explicit diagnostics")
     p.add_argument("--cps", type=ints, default=(4,8))
     p.add_argument("--smoke-cp", type=int, choices=(2,4,8), default=8,
                    help="world size for the smoke stage; final SM103 validation defaults to CP8")

@@ -1,6 +1,8 @@
 # Benchmark Index
 
-当前版本：v15.0
+当前版本：v16.0
+
+- [SM103 大尺寸长序列：融合 vs 纯 cuBLASLt](results/sm103/v16.0/README.md)
 
 - [SM103 QKV rank swizzle 完整 A/B（默认关闭）](results/sm103/v15.0/README.md)
 

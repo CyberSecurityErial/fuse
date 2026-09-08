@@ -15,20 +15,32 @@ import tarfile
 from sm103_batch import bench
 
 
-def expected_candidates():
+def expected_candidates(scope=None):
     args = argparse.Namespace(directions='qkv,oproj', models='',
         seqs=(1024, 4096, 16384, 131072, 262144, 524288), cps=(4, 8),
         devices='0,1,2,3,4,5,6,7')
+    launches = ('eager', 'graph')
+    if scope is not None:
+        if set(scope) != {'directions', 'models', 'seqs', 'cps', 'launches'}:
+            raise ValueError('explicit matrix requires all five scope dimensions')
+        if any(not values or len(values) != len(set(values)) for values in scope.values()):
+            raise ValueError('matrix dimensions must be nonempty and unique')
+        if not set(scope['directions']) <= {'qkv', 'oproj'} or not set(scope['launches']) <= {'eager', 'graph'}:
+            raise ValueError('invalid matrix direction or launch')
+        if not set(scope['cps']) <= {4, 8}:
+            raise ValueError('matrix CP must be 4 or 8')
+        args.directions, args.models = ','.join(scope['directions']), ','.join(scope['models'])
+        args.seqs, args.cps, launches = scope['seqs'], scope['cps'], scope['launches']
     expected = {}
     for case, backend, launch in itertools.product(
-            bench.cases(args), ('cublaslt_nccl', 'te_ub'), ('eager', 'graph')):
+            bench.cases(args), ('cublaslt_nccl', 'te_ub'), launches):
         group = bench.group_key(case, backend, launch)
         for config in bench.initial_configs(backend):
             expected[(group, bench.digest(config))] = case
     return expected
 
 
-def load_plan(results, expected_fingerprint=None, *, raw_plan=None):
+def load_plan(results, expected_fingerprint=None, *, raw_plan=None, scope=None):
     """Keep the original full plan authoritative, even for a partial snapshot."""
     if raw_plan is None:
         raw_plan = (results / 'sweep_plan.json').read_bytes()
@@ -37,10 +49,11 @@ def load_plan(results, expected_fingerprint=None, *, raw_plan=None):
         raise ValueError('expected BF16 sweep plan')
     if expected_fingerprint is not None and plan['fingerprint'] != expected_fingerprint:
         raise ValueError('measurement fingerprint differs from the expected source plan')
-    expected = expected_candidates()
+    expected = expected_candidates() if scope is None else expected_candidates(scope)
     actual = Counter((j['group'], bench.digest(j['config'])) for j in plan['jobs'])
     if actual != Counter({key: 1 for key in expected}):
-        raise ValueError('sweep plan does not cover the complete historical candidate matrix exactly')
+        label = 'historical' if scope is None else 'explicit'
+        raise ValueError(f'sweep plan does not cover the complete {label} candidate matrix exactly')
     outputs = set()
     for job in plan['jobs']:
         key = (job['group'], bench.digest(job['config']))
@@ -72,9 +85,11 @@ def measurement_row(results, plan, job, *, stats=None):
         raw=str(path), remote_raw=str(remote), fingerprint=plan['fingerprint'])
 
 
-def summarize(results, destination):
+def summarize(results, destination, *, scope=None, expected_fingerprint=None):
     results, destination = Path(results).resolve(), Path(destination).resolve()
-    plan, raw_plan = load_plan(results)
+    if scope is not None and not expected_fingerprint:
+        raise ValueError('explicit matrix requires an expected fingerprint')
+    plan, raw_plan = load_plan(results, expected_fingerprint, scope=scope)
     winners = {}
     for job in plan['jobs']:
         row = measurement_row(results, plan, job)
@@ -94,6 +109,10 @@ def summarize(results, destination):
               'QKV/OProj; cuBLASLt+NCCL/TE UB; eager/graph',
         limitation='Best observed p50 within the sweep grid; no refine or independent '
                    'formal remeasurement, per user scope change.')
+    if scope is not None:
+        report['schema'] = 'sm103_explicit_sweep_summary_v1'
+        report['scope'] = scope
+        report['limitation'] = 'Best observed p50 within the sweep grid; refine and independent formal remeasurement are not included.'
     # Validate every candidate before publishing anything; refuse overwrite.
     destination.mkdir(parents=True, exist_ok=False)
     with (destination / 'summary.csv').open('w') as stream:
@@ -101,6 +120,19 @@ def summarize(results, destination):
         writer.writeheader()
         writer.writerows(rows)
     (destination / 'coverage.json').write_text(json.dumps(report, indent=2) + '\n')
+    if scope is not None:
+        lines = ['# Explicit matrix sweep winners', '',
+                 'Per-GPU FLOPs = 2MNK; latency covers the complete distributed boundary. '
+                 'Best p50 in the declared grid, not a global optimum or an independent remeasurement.', '',
+                 '| Direction | Model | S | CP | Backend | Launch | p50 ms | p95 ms | PFLOPS/GPU | Config |',
+                 '|---|---|---:|---:|---|---|---:|---:|---:|---|']
+        for row in rows:
+            pflops = 2 * row['m'] * row['n'] * row['k'] / (row['p50_ms'] * 1e12)
+            values = [row['direction'], row['model'], row['seq'], row['cp'],
+                      row['backend'], row['launch'], f"{row['p50_ms']:.6f}",
+                      f"{row['p95_ms']:.6f}", f'{pflops:.3f}', '`' + row['config_json'] + '`']
+            lines.append('| ' + ' | '.join(map(str, values)) + ' |')
+        (destination / 'summary.md').write_text('\n'.join(lines) + '\n')
     print(json.dumps(report, indent=2))
     return report
 
@@ -380,6 +412,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', required=True, type=Path,
                         help='New local summary directory; existing directory is never overwritten')
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--matrix', action='store_true',
+                      help='Audit an exact explicit matrix, with both baseline backends and the full sweep grid')
     mode.add_argument('--partial', action='store_true',
                       help='Consume complete selected groups; never report full-stage completion')
     mode.add_argument('--snapshot', action='store_true',
@@ -392,7 +426,14 @@ if __name__ == '__main__':
     parser.add_argument('--cps', type=bench.ints, help='Comma-separated CP sizes; partial default: 4,8')
     parser.add_argument('--launches', help='Comma-separated launch modes; partial default: eager')
     args = parser.parse_args()
-    if args.partial or args.snapshot:
+    if args.matrix:
+        names = ('directions', 'models', 'seqs', 'cps', 'launches')
+        if not args.expected_fingerprint or any(getattr(args, name) is None for name in names):
+            parser.error('--matrix requires --expected-fingerprint and all five scope filters')
+        scope = {name: (tuple(getattr(args, name).split(',')) if name in
+                       ('directions', 'models', 'launches') else getattr(args, name)) for name in names}
+        summarize(args.results, args.output, scope=scope, expected_fingerprint=args.expected_fingerprint)
+    elif args.partial or args.snapshot:
         if not args.expected_fingerprint or not args.seqs:
             parser.error('--partial/--snapshot requires --expected-fingerprint and explicit --seqs')
         operation = snapshot_partial if args.snapshot else summarize_partial

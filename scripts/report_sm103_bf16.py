@@ -178,7 +178,9 @@ def audit_pure_run(run):
             data['compute'] == '10.3' and data['sms'] == 148 and data['output_dtype'] == 'bf16' and
             data['measured_ranks'] == 1 and data['distributed_boundary_measured'] is False and
             data['cublas_classic_measured'] is False, 'Not a pure BF16 matrix protocol')
-    require(data['measurement_protocol'] == 'single_gpu_pure_gemm_stable_v2' and
+    protocol = data['measurement_protocol']
+    launch_tuned = protocol == 'single_gpu_pure_gemm_stable_v3_launch_tuned'
+    require(protocol in ('single_gpu_pure_gemm_stable_v2', 'single_gpu_pure_gemm_stable_v3_launch_tuned') and
             fused.SHA256.fullmatch(data['library_sha256']) and
             data['library_sha256'] == contract['library_sha256'], 'Missing pure protocol/library identity')
     matrix_path = control / 'gemm-matrix.json'
@@ -229,7 +231,8 @@ def audit_pure_run(run):
             plan = result['tuning']
             require(plan['requested'] == 256 and 0 < plan['valid'] <= plan['returned'] <= 256 and
                     len(plan['candidates']) == plan['valid'] and plan['precision'] == 16 and
-                    plan['math_sms'] == 0 and plan['beta'] == 0 and plan['graph_tuning'] == 0 and
+                    plan['math_sms'] == 0 and plan['beta'] == 0 and
+                    plan['graph_tuning'] == int(launch_tuned and result['launch'] == 'graph') and
                     plan['replay'] == result['launch'], 'Pure algorithm plan contract')
             require(all(fused.finite(c['tune_ms'], 'algorithm tune time', 0) > 0 for c in plan['candidates']),
                     'Invalid heuristic candidate')
@@ -237,12 +240,13 @@ def audit_pure_run(run):
             plans.append({k: v for k, v in plan.items() if k != 'replay'})
             close(result['pflops_per_gpu_p50'], 2 * math.prod(mnk) / stats['p50_ms'] / 1e12, 'Pure PFLOPS')
             rows.append(dict(kind='pure', node=run['node'], mnk=mnk, launch=result['launch'], **stats,
-                samples_ms=result['samples_ms'], sampling=sampling,
+                samples_ms=result['samples_ms'], sampling=sampling, measurement_protocol=protocol,
                 provenance=origin(run, control / 'gemm-probe.json',
                     pointer=f'/geometries/{gi}/results/{ri}', library_sha256=data['library_sha256'],
                     gpu_uuid=contract['cuda_visible_devices'], algorithm=plan['algorithm']),
                 scope='single_gpu_diagnostic_not_distributed_maxrank'))
-        require(all(plan == plans[0] for plan in plans), 'Pure Graph silently retuned algorithm')
+        if not launch_tuned:
+            require(all(plan == plans[0] for plan in plans), 'Pure Graph silently retuned algorithm')
     return rows
 
 
