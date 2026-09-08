@@ -34,7 +34,7 @@ cudaError_t launch_gemm_reference_impl(
   }
   using Gemm = typename Binding::PureGemm;
   using Kernel = detail::GemmReferenceKernel<Gemm, typename Binding::Kernel>;
-  auto args = gemm_arguments<Gemm>(
+  auto args = gemm_arguments<Gemm, Binding::kSwapAB>(
       problem, lhs, rhs_nt, output, alpha, reserved_comm_ctas, info, fallback);
   // Keep the reduced compute budget and scheduler stride. Only the physical
   // CTA prefix disappears: worker 0 now starts at blockIdx.x == 0.
@@ -127,14 +127,15 @@ cudaError_t launch_a2a_gemm_copy_reference(
     static_assert(!Comm::kNeedsGridFinalize);
     typename Comm::Arguments comm{};
     comm.params = params;
+    using Gemm = typename Binding::Gemm;
+    const auto gemm = gemm_arguments<Gemm, Binding::kSwapAB>(
+        params.gemm, params.input_staging, params.rhs_nt, params.output,
+        params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongN);
+    comm.input_order = a2a_input_order<Gemm>(gemm, Binding::kSwapAB);
     cudaError_t result = Comm::initialize(comm);
     if (result != cudaSuccess) {
       return result;
     }
-    using ConsumerTile = typename Binding::TileShape;
-    constexpr int32_t tile_n = cute::size<1>(ConsumerTile{});
-    const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
-    comm.m_window = ceil_div(info.sm_count - params.num_comm_ctas, n_tiles);
     if (!Comm::can_implement(comm)) {
       return cudaErrorNotSupported;
     }

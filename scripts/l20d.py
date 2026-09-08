@@ -41,7 +41,8 @@ MPI_PREFIX = Path('/root/workspace_wct/toolchain/mpich-5.0.1.post1')
 MPI_TRANSPORT = 'sm,self'
 BLACKWELL_TILE_VARIANTS = ('m128n128k128', 'm128n256k64e32', 'm128n256k128e32')
 QKV_POLICIES = ('auto', 'm128n64', 'm128n128', 'm128n160', 'm128n192', 'm128n256') + BLACKWELL_TILE_VARIANTS + ('m128n256k64e64',)
-OPROJ_POLICIES = ('auto', 'm128n128', 'm128n256') + BLACKWELL_TILE_VARIANTS
+OPROJ_ALIGNED_POLICIES = ('kslice_m128n256k64', 'row_m128n32k64')
+OPROJ_POLICIES = ('auto', 'm128n128', 'm128n256') + BLACKWELL_TILE_VARIANTS + OPROJ_ALIGNED_POLICIES
 FUSED_STAGES = ('fused-build', 'fused-smoke')
 DONE = {'succeeded', 'failed'}
 STAGES = ('doctor', 'build', 'te-build', 'ub-check', 'batch-check', 'matrix-check', 'cache-check', 'smoke', 'sweep', 'refine', 'formal', 'summary', 'overhead', 'baseline-replay', 'gemm-probe', 'gemm-cutlass-build', *FUSED_STAGES)
@@ -139,12 +140,31 @@ def fused_devices(job):
 
 
 def fused_policy_tile(policy):
-    """Physical M/N/K, not a cluster aggregate; e32/e64 select epilogue N."""
+    """Tile in logical output M/N/K coordinates; SwapAB swaps physical M/N."""
+    if policy == 'kslice_m128n256k64':
+        return 128, 256, 64
+    if policy == 'row_m128n32k64':
+        return 32, 128, 64
     if policy not in QKV_POLICIES:
         raise ValueError(f'Unknown fused tile policy: {policy}')
     match = re.fullmatch(r'm128n(64|128|160|192|256)(?:k(64|128))?(?:e(?:32|64))?',
                          'm128n128' if policy == 'auto' else policy)
     return 128, int(match.group(1)), int(match.group(2) or 64)
+
+
+def fused_policy_alignment(policy, peer_k):
+    """Explicit joint-policy metadata. Empty for the unchanged legacy protocol."""
+    if policy not in OPROJ_ALIGNED_POLICIES:
+        return {}
+    if peer_k <= 0 or peer_k % (128 if policy.startswith('kslice_') else 64):
+        raise ValueError('Aligned OProj peer K must be divisible by its ready/tile K')
+    bm, bn, bk = fused_policy_tile(policy)
+    swap = policy.startswith('row_')
+    return dict(alignment_schema='directional_v1', orientation='swap_ab' if swap else 'normal',
+                schedule_coordinates='physical', physical_tile_m=bn if swap else bm,
+                physical_tile_n=bm if swap else bn, physical_tile_k=bk,
+                ready_rows=bm, ready_k=peer_k if swap else 128,
+                ready_slices=1 if swap else peer_k // 128, ready_arrivals=1)
 
 
 def fused_candidates(job):
@@ -175,6 +195,8 @@ def fused_geometry(job):
         raise ValueError('Invalid --fused-direction')
     if direction != 'both' and (job.get('stage') != 'fused-smoke' or job.get('profile')):
         raise ValueError('--fused-direction requires non-profile fused-smoke')
+    if job.get('profile') and job.get('directions') == 'oproj':
+        direction = 'oproj'
 
     def positive(value, name):
         if type(value) is not int or not 1 <= value <= limit:
@@ -211,6 +233,12 @@ def fused_geometry(job):
     _, _, oproj_policies = fused_candidates(job)
     if any((q_width // world) % fused_policy_tile(policy)[2] for policy in oproj_policies):
         raise ValueError('OProj K shards must be divisible by every explicitly selected tile K')
+    for policy in oproj_policies:
+        bm, bn, _ = fused_policy_tile(policy)
+        slices = fused_policy_alignment(policy, q_width // world).get('ready_slices', 1)
+        mt, nt = (seq_local + bm - 1) // bm, (hidden + bn - 1) // bn
+        if max(mt * nt, mt * world) * slices > limit:
+            raise ValueError('Aligned OProj tile/ready profiling capacity exceeds int32')
     m_tiles = (seq_local + 127) // 128
     if (m_tiles * ((projection_width + 63) // 64) > limit or
             m_tiles * ((hidden + 127) // 128) > limit or m_tiles * world > limit):
@@ -232,19 +260,26 @@ def fused_device_memory(job):
     """Per-rank device estimate; not an OOM guarantee or a host-RAM check."""
     shape = fused_geometry(job)
     m, h, p, q = (shape[key] for key in ('seq_local', 'hidden', 'projection_width', 'q_width'))
-    qkv = job.get('fused_direction', 'both') != 'oproj'
+    qkv = (job.get('fused_direction', 'both') != 'oproj' and
+           not (job.get('profile') and job.get('directions') == 'oproj'))
     oproj = job.get('fused_direction', 'both') != 'qkv'
     # Count only selected directions, including their independent full references.
     buffer_bytes = 2 * (qkv * (m * h + 3 * m * p + h * p) +
                         oproj * (3 * m * q + 2 * m * h + h * q))
     m_tiles = (m + 127) // 128
+    ready_tiles, peer_capacity = 0, 0
+    for policy in fused_candidates(job)[2]:
+        bm, bn, _ = fused_policy_tile(policy)
+        slices = fused_policy_alignment(policy, q // shape['world']).get('ready_slices', 1)
+        mt, nt = (m + bm - 1) // bm, (h + bn - 1) // bn
+        ready_tiles = max(ready_tiles, mt * shape['world'] * slices)
+        peer_capacity = max(peer_capacity, max(mt * nt, mt * shape['world']) * slices)
     flag_bytes = 4 * 32 * (qkv * (m_tiles * ((p + 63) // 64) + shape['world']) +
-                          oproj * (m_tiles * shape['world'] + 1))
+                          oproj * (ready_tiles + 1))
     # Calibration duplicates only the ready/done flags, never full tensors.
     calibration_flag_bytes = flag_bytes if job.get('calibrate') else 0
     profile_bytes = 0
     if job.get('profile', False):
-        peer_capacity = max(m_tiles * ((h + 127) // 128), m_tiles * shape['world'])
         # Current peer events fit in 256 bytes; 1 MiB also covers CTA records.
         # Update this allowance if the profiling record/layout contract changes.
         profile_bytes = (0 if job.get('profile_detail') == 'cta' else peer_capacity * 256) + (1 << 20)
@@ -258,9 +293,11 @@ def fused_device_memory(job):
                 note='Device estimate only; CUDA/cuBLAS overhead and host reference RAM remain runtime constraints')
 
 
-def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
+def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size, tile_m=128, swap_ab=False):
     """Pinned CUTLASS static cluster-1 scheduler padding, not logical work."""
-    m_tiles, n_tiles = (m + 127) // 128, (n + tile_n - 1) // tile_n
+    m_tiles, n_tiles = (m + tile_m - 1) // tile_m, (n + tile_n - 1) // tile_n
+    if swap_ab:
+        m_tiles, n_tiles = n_tiles, m_tiles
     minimum = min(m_tiles, n_tiles)
     effective = (8 if max_swizzle_size >= 8 and minimum >= 6 else
                  4 if max_swizzle_size >= 4 and minimum >= 3 else
@@ -429,8 +466,9 @@ def validate_job(job, hostname=None):
         _, qkv, oproj = fused_candidates(job)
         for width, policies in ((shape['projection_width'], qkv), (shape['hidden'], oproj)):
             for policy in policies:
-                _, tile_n, _ = fused_policy_tile(policy)
-                _, pm, pn, padded = fused_scheduler_geometry(shape['seq_local'], width, tile_n, swizzle)
+                tile_m, tile_n, _ = fused_policy_tile(policy)
+                _, pm, pn, padded = fused_scheduler_geometry(shape['seq_local'], width, tile_n, swizzle,
+                                                             tile_m, policy == 'row_m128n32k64')
                 if pm * pn > (1 << 31) - 1:
                     raise ValueError('Padded fused scheduling grid exceeds int32')
                 if job.get('profile') and padded:

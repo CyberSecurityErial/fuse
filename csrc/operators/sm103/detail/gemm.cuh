@@ -76,7 +76,7 @@ inline auto raster_option(GemmRaster value, GemmRaster fallback) {
 // correctness and resource validation, keeping communication SMs explicit.
 // TODO: Calibrate B300 compute costs for the required performance-model tuner;
 // do not reuse Hopper's measured wave tables or treat these defaults as optimal.
-template <int BlockN, int BlockK = 64, int EpilogueN = 0>
+template <int BlockN, int BlockK = 64, int EpilogueN = 0, bool SwapAB = false>
 struct Bf16GemmTypes {
   // Precision-specific family, not a generic BF16-versus-FP8 branch. A future
   // block-scaled family needs its actual operand/scale contract and CUTLASS
@@ -86,8 +86,10 @@ struct Bf16GemmTypes {
   // Both forward APIs compute D = alpha * A * B; neither accepts a C source.
   using ElementC = void;
   static constexpr int kAlignment = 16 / sizeof(Element);
-  static_assert(BlockN == 64 || BlockN == 128 || BlockN == 160 ||
+  static_assert((SwapAB && BlockN == 32) || BlockN == 64 || BlockN == 128 || BlockN == 160 ||
                 BlockN == 192 || BlockN == 256, "Unsupported BF16 tile width");
+  static_assert(!SwapAB || (BlockN == 32 && BlockK == 64 && EpilogueN == 0),
+                "The row-owned input plan uses physical M128/N32/K64/Auto");
   static_assert(BlockK == 64 || BlockK == 128, "Unsupported BF16 K tile");
   static_assert(EpilogueN == 0 || EpilogueN == 32 || EpilogueN == 64,
                 "Epilogue N is Auto (0), 32 or 64");
@@ -113,12 +115,16 @@ struct Bf16GemmTypes {
       cute::conditional_t<EpilogueN == 32 || BlockN == 160,
           cute::Shape<cute::_128, cute::_32>,
           cutlass::epilogue::collective::EpilogueTileAuto>>;
+  // SwapAB computes D^T = W^T A^T from the existing [N,K]/[M,K] buffers.
+  // A column-major D^T view writes the caller's row-major D directly: no
+  // staging transpose or post-GEMM transpose kernel is part of this plan.
+  using OutputLayout = cute::conditional_t<SwapAB, cutlass::layout::ColumnMajor, LayoutD>;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, cutlass::arch::OpClassTensorOp,
       TileShape, ClusterShape, EpilogueTile,
       Accumulator, Accumulator,
-      ElementC, LayoutD, kAlignment,
-      Element, LayoutD, kAlignment,
+      ElementC, OutputLayout, kAlignment,
+      Element, OutputLayout, kAlignment,
       cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
 
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
@@ -133,13 +139,16 @@ struct Bf16GemmTypes {
                 Mainloop::DispatchPolicy::Stages == 4,
                 "N256/K64 no-residual BF16 must retain four A/B stages");
 
-  using OutputGemm = cutlass::gemm::kernel::GemmUniversal<
-      ProblemShape, Mainloop, detail::SignalingEpilogue<Epilogue, TileShape>,
-      detail::MonolithicPersistentScheduler>;
   // Independent compute calibration uses the same BF16 collective and
   // scheduler, without a ready-wait mainloop or ready-publishing epilogue.
   using PureGemm = cutlass::gemm::kernel::GemmUniversal<
       ProblemShape, Mainloop, Epilogue, detail::MonolithicPersistentScheduler>;
+  // Only QKV publishes output tiles. The swapped input plan must not bind
+  // that publisher to its physical N32 tile or expose it as QKV geometry.
+  using OutputGemm = cute::conditional_t<SwapAB, PureGemm,
+      cutlass::gemm::kernel::GemmUniversal<
+          ProblemShape, Mainloop, detail::SignalingEpilogue<Epilogue, TileShape>,
+          detail::MonolithicPersistentScheduler>>;
   static_assert(cute::size(typename Mainloop::AtomThrShapeMNK{}) == 1,
                 "Communication and compute require independent one-SM CTAs.");
   static_assert(OutputGemm::MaxThreadsPerBlock == 256,
@@ -175,20 +184,20 @@ using ProjectionOutputGemm = typename Bf16GemmTypes<256>::OutputGemm;
 
 // Inverse A2A uses the same BF16 collective family, but consumes ready lhs
 // shards and stores ordinary GEMM output: no QKV signaling epilogue here.
-template <int BlockN, int BlockK = 64, int EpilogueN = 0>
+template <int BlockN, int BlockK = 64, int EpilogueN = 0, bool SwapAB = false>
 struct A2ALhsGemmTypes {
-  static_assert(BlockN == 128 || BlockN == 256);
-  using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN>;
+  static_assert((SwapAB && BlockN == 32) || (!SwapAB && (BlockN == 128 || BlockN == 256)));
+  using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN, SwapAB>;
   using TileShape = typename Dense::TileShape;
   using PureGemm = typename Dense::PureGemm;
-  using Mainloop = detail::A2ALhsReadyMainloop<typename Dense::Mainloop, TileShape>;
+  using Mainloop = detail::A2ALhsReadyMainloop<typename Dense::Mainloop, TileShape, false, SwapAB>;
   using Gemm = cutlass::gemm::kernel::GemmUniversal<
       ProblemShape, Mainloop, typename Dense::Epilogue,
       detail::MonolithicPersistentScheduler>;
 
 #if FUSE_ENABLE_PROFILING
   using TelemetryMainloop =
-      detail::A2ALhsReadyMainloop<typename Dense::Mainloop, TileShape, true>;
+      detail::A2ALhsReadyMainloop<typename Dense::Mainloop, TileShape, true, SwapAB>;
   using TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
       ProblemShape, TelemetryMainloop, typename Dense::Epilogue,
       detail::MonolithicPersistentScheduler>;

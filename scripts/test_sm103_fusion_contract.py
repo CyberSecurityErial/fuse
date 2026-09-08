@@ -660,10 +660,10 @@ class GemmTileParameterContracts(unittest.TestCase):
 
     def test_real_family_threads_k_and_epilogue_through_one_compute_definition(self):
         source = (ROOT / "csrc/operators/sm103/detail/gemm.cuh").read_text()
-        family = source[source.index("template <int BlockN, int BlockK = 64, int EpilogueN = 0>"):]
+        family = source[source.index("struct Bf16GemmTypes {"):]
         self.assertIn("static constexpr int kTileK = BlockK;", family)
         self.assertIn("EpilogueN == 32 || BlockN == 160", family)
-        self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN>;", family)
+        self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN, SwapAB>;", family)
         self.assertIn("using PureGemm = typename Dense::PureGemm;", family)
         # Source wiring guard only. Real collective types/resources still
         # require NVCC; the host policy probe intentionally uses opaque types.
@@ -675,13 +675,14 @@ class GemmTileParameterContracts(unittest.TestCase):
         self.assertIn("using Element = Bf16;", family)
         self.assertIn("using Accumulator = float;", family)
         self.assertIn("using ElementC = void;", family)
-        self.assertIn("Accumulator, Accumulator,\n      ElementC, LayoutD, kAlignment,\n"
-                      "      Element, LayoutD, kAlignment,", family)
+        self.assertIn("using OutputLayout = cute::conditional_t<SwapAB, cutlass::layout::ColumnMajor, LayoutD>;", family)
+        self.assertIn("Accumulator, Accumulator,\n      ElementC, OutputLayout, kAlignment,\n"
+                      "      Element, OutputLayout, kAlignment,", family)
         self.assertIn("Element, LayoutA, kAlignment,\n      Element, LayoutB, kAlignment,", family)
         self.assertIn("Mainloop::DispatchPolicy::Stages == 4", family)
         self.assertIn("OutputGemm::MaxThreadsPerBlock == 256", family)
         inverse = source[source.index("struct A2ALhsGemmTypes {"):]
-        self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN>;", inverse)
+        self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN, SwapAB>;", inverse)
         self.assertEqual(inverse.count("typename Dense::Epilogue"), 2)  # Fused + telemetry.
         for path, name in (("a2a_gemm.h", "A2AGemmParams"), ("gemm_a2a.h", "GemmA2AParams")):
             public = (ROOT / "include/fuse/operators/primitives" / path).read_text()

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <utility>
+
 namespace fuse {
 
 KernelTraits cutlass_kernel_traits() {
@@ -12,6 +14,11 @@ KernelTraits cutlass_kernel_traits() {
   auto read_traits = [&](auto binding_tag) {
     using Binding = typename decltype(binding_tag)::type;
     traits = kernel_traits<typename Binding::Kernel>();
+    if constexpr (Binding::kSwapAB) {
+      // Public geometry describes sequence/projection, not the internal D^T
+      // axes. Launch reservations and physical thread/SMEM counts are unchanged.
+      std::swap(traits.block_m, traits.block_n);
+    }
     return cudaSuccess;
   };
   return visit_oproj_forward_policy(policy, read_traits) == cudaSuccess
@@ -57,9 +64,16 @@ int64_t a2a_lhs_gemm_ready_elements(const GemmProblem& p, const UlyssesRoute& ro
   int64_t elements = 0;
   auto count_ready = [&](auto binding_tag) {
     using Binding = typename decltype(binding_tag)::type;
-    using ConsumerTile = typename Binding::Gemm::TileShape;
-    elements = static_cast<int64_t>(ceil_div(p.m, cute::size<0>(ConsumerTile{}))) *
-        route.world_size * kReadyFlagStride;
+    using Comm = typename Binding::Comm;
+    A2AGemmParams params{};
+    params.gemm = p;
+    params.route = route;
+    const int32_t slices = Comm::ready_slices(params);
+    if (slices <= 0) {
+      return cudaErrorNotSupported;
+    }
+    elements = static_cast<int64_t>(ceil_div(p.m, Binding::kSequenceTile)) *
+        route.world_size * slices * kReadyFlagStride;
     return cudaSuccess;
   };
   return visit_oproj_forward_policy(policy, count_ready) == cudaSuccess ? elements : 0;

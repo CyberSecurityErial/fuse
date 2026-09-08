@@ -522,6 +522,43 @@ int main() {
         argv = l20d.fused_argv(both)
         self.assertEqual(argv[argv.index('--oproj-policy-list')+1], 'm128n256,m128n128')
 
+    def test_oproj_joint_policies_use_logical_tiles_and_physical_schedule(self):
+        self.assertEqual(l20d.fused_policy_tile('kslice_m128n256k64'), (128, 256, 64))
+        self.assertEqual(l20d.fused_policy_tile('row_m128n32k64'), (32, 128, 64))
+        for policy, orientation, rows, ready_k, slices in (
+                ('kslice_m128n256k64', 'normal', 128, 128, 8),
+                ('row_m128n32k64', 'swap_ab', 32, 1024, 1)):
+            alignment = l20d.fused_policy_alignment(policy, 1024)
+            self.assertEqual((alignment['orientation'], alignment['ready_rows'],
+                              alignment['ready_k'], alignment['ready_slices']),
+                             (orientation, rows, ready_k, slices))
+            self.assertEqual(alignment['ready_arrivals'], 1)
+            job = self.fused_job(oproj_policy=policy, fused_direction='oproj')
+            l20d.validate_job(job)
+            self.assertEqual(l20d.fused_candidates(job)[2], [policy])
+            with self.assertRaises(ValueError):
+                l20d.validate_job(job | {'qkv_policy': policy})
+        # Original M=384/N=1024 -> logical tile grid 12x8, physical grid 8x12.
+        self.assertEqual(l20d.fused_scheduler_geometry(384, 1024, 128, 4, 32, True),
+                         (4, 8, 12, False))
+        with self.assertRaisesRegex(ValueError, 'ready/tile K'):
+            l20d.validate_job(self.fused_job(oproj_policy='kslice_m128n256k64',
+                fused_direction='oproj', q_heads=4, head_dim=64, world=4))
+
+    def test_oproj_joint_memory_uses_maximum_ready_and_slice_capacity(self):
+        base = self.fused_job(seq_local=256, q_heads=32, world=4,
+                              profile=True, profile_detail='full', directions='oproj')
+        old = l20d.fused_device_memory(base)
+        kslice = l20d.fused_device_memory(base | {'oproj_policy': 'kslice_m128n256k64'})
+        row = l20d.fused_device_memory(base | {'oproj_policy': 'row_m128n32k64'})
+        self.assertGreater(kslice['flag_bytes'], old['flag_bytes'])
+        self.assertGreater(row['flag_bytes'], old['flag_bytes'])
+        self.assertEqual(kslice['profile_bytes'], max(2 * 4, 2 * 4) * 8 * 256 + (1 << 20))
+        self.assertEqual(row['profile_bytes'], max(8 * 8, 8 * 4) * 256 + (1 << 20))
+        mixed = base | {'profile': False, 'fused_direction': 'oproj', 'oproj_policy_list':
+                        'm128n128,kslice_m128n256k64,row_m128n32k64'}
+        self.assertEqual(l20d.fused_device_memory(mixed)['flag_bytes'], kslice['flag_bytes'])
+
     def test_fused_candidate_lists_reject_invalid_values_and_profile_grids(self):
         for changes in ({'comm_sm_list': ''}, {'comm_sm_list': '0,16'},
                         {'comm_sm_list': '8,-1'}, {'comm_sm_list': '8,1.5'},
@@ -1142,6 +1179,15 @@ int main() {
             self.assertEqual(both[key], qkv[key] + oproj[key])
             self.assertGreater(qkv[key], 0)
             self.assertGreater(oproj[key], 0)
+
+    def test_oproj_profile_skips_unrelated_qkv_resources_and_kv_sharding(self):
+        job = self.fused_job(world=8, q_heads=64, kv_heads=4, hidden=4096,
+                             profile=True, directions='oproj')
+        l20d.validate_job(job)
+        profile = l20d.fused_device_memory(job)
+        plain = l20d.fused_device_memory(job | {'profile': False, 'fused_direction': 'oproj'})
+        self.assertEqual(profile['buffer_bytes'], plain['buffer_bytes'])
+        self.assertEqual(profile['flag_bytes'], plain['flag_bytes'])
 
     def test_fused_device_estimate_scales_with_shape_and_profiling(self):
         job = self.fused_job(seq_local=None, global_seq=524288, hidden=4096, q_heads=32)

@@ -20,7 +20,10 @@
 //   CUTLASS interface differences, not a change in the ready-epoch contract.
 //
 // Current implementation choices, not Blackwell requirements:
-// - Keep peer-bounded Base::load() calls and the per-CTA peer-ready cache.
+// - Keep readiness-bounded Base::load() calls and a per-CTA readiness cache.
+//   Legacy and row-owned plans publish a complete peer K shard; the K-slice
+//   plan publishes smaller K-aligned rectangles. All preserve the K iteration
+//   order, the same accumulator and the returned prologue/remainder state.
 // - Publish output readiness at GPU scope because its consumer is a local
 //   communication CTA. Wait on every lane of the issuing epilogue warp to
 //   cover TMA stores issued by that warp before lane zero publishes. Scope
@@ -61,6 +64,17 @@ CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
   }
 }
 
+// Aligned receiver pulls wait for the source GPU's input epoch before TMA.
+// The caller can be just lane zero; keep warp synchronization at the caller.
+CUTLASS_DEVICE void wait_acquire_system_single_lane(
+    const uint32_t* flag,
+    uint32_t target) {
+#pragma unroll 1
+  while (load_acquire_system(flag) < target) {
+    __nanosleep(64);
+  }
+}
+
 #if FUSE_ENABLE_PROFILING
 template <bool Instrumented>
 struct A2ALhsTimelineArguments {};
@@ -76,18 +90,20 @@ struct A2ALhsTimelineArguments<true> {
 #endif
 
 // The receive slab is populated by this GPU's communication CTAs. Each
-// peer owns one contiguous, tile-aligned K shard of A for every M tile.
+// peer owns a tile-aligned K shard for every original sequence tile. SwapAB
+// changes this from CUTLASS's A operand/M axis to its B operand/N axis; it
+// does NOT change the reduction axis, source routing or public D layout.
 template <
     class Base,
-    class TileShape
-#if FUSE_ENABLE_PROFILING
-    , bool Instrumented = false
-#endif
-    >
+    class TileShape,
+    bool Instrumented = false,
+    bool SwapAB = false>
 struct A2ALhsReadyMainloop : Base {
   static constexpr int kTileM = cute::size<0>(TileShape{});
   static constexpr int kTileN = cute::size<1>(TileShape{});
   static constexpr int kTileK = cute::size<2>(TileShape{});
+  static constexpr int kSequenceTile = SwapAB ? kTileN : kTileM;
+  static constexpr int kProjectionTile = SwapAB ? kTileM : kTileN;
   using BaseArguments = typename Base::Arguments;
   using BaseParams = typename Base::Params;
   using MainloopClusterShape = typename Base::DispatchPolicy::ClusterShape;
@@ -102,6 +118,8 @@ struct A2ALhsReadyMainloop : Base {
     int32_t m_tiles = 0;
     int32_t arrivals_per_peer = 0;
     int32_t k_tiles_per_peer = 0;
+    int32_t ready_k_tiles = 0;
+    int32_t ready_slices_per_peer = 0;
     uint32_t epoch = 0;
   };
 
@@ -115,6 +133,8 @@ struct A2ALhsReadyMainloop : Base {
     int32_t m_tiles = 0;
     int32_t arrivals_per_peer = 0;
     int32_t k_tiles_per_peer = 0;
+    int32_t ready_k_tiles = 0;
+    int32_t ready_slices_per_peer = 0;
     uint32_t epoch = 0;
   };
 
@@ -132,6 +152,8 @@ struct A2ALhsReadyMainloop : Base {
     params.m_tiles = args.m_tiles;
     params.arrivals_per_peer = args.arrivals_per_peer;
     params.k_tiles_per_peer = args.k_tiles_per_peer;
+    params.ready_k_tiles = args.ready_k_tiles;
+    params.ready_slices_per_peer = args.ready_slices_per_peer;
     params.epoch = args.epoch;
 #if FUSE_ENABLE_PROFILING
     if constexpr (Instrumented) {
@@ -148,24 +170,25 @@ struct A2ALhsReadyMainloop : Base {
   template <class Problem>
   static bool can_implement(const Problem& problem, const Arguments& args) {
     const auto shape = cute::append<4>(problem, 1);
-    const int64_t m = cute::get<0>(shape);
+    const int64_t m = cute::get<SwapAB ? 1 : 0>(shape);
     const int64_t k = cute::get<2>(shape);
 #if FUSE_ENABLE_PROFILING
     if constexpr (Instrumented) {
-      const int64_t n = cute::get<1>(shape);
+      const int64_t n = cute::get<SwapAB ? 0 : 1>(shape);
       if (!args.timeline || args.timeline_capacity <= 0 || n <= 0 ||
           cute::get<3>(shape) != 1 ||
-          args.n_tiles != (n + kTileN - 1) / kTileN ||
+          args.n_tiles != (n + kProjectionTile - 1) / kProjectionTile ||
           args.peer_timeline_capacity < 0) {
         return false;
       }
-      // Release/comm fields use [M, peer], while acquire/tile metadata use
-      // [L, M, N] in the same allocation. A null peer buffer requests only
-      // CTA timing; a supplied buffer must hold both complete index spaces.
+      // Both index spaces use the ORIGINAL sequence/projection axes, even
+      // for SwapAB. One existing record per K slice retains acquire[peer].
+      // A null peer buffer requests only CTA timing; a supplied buffer must
+      // hold both [M,peer,slice] release and [L,M,N,slice] acquire records.
       const int64_t acquire_records = static_cast<int64_t>(args.m_tiles) *
-          args.n_tiles * cute::get<3>(shape);
+          args.n_tiles * cute::get<3>(shape) * args.ready_slices_per_peer;
       const int64_t release_records =
-          static_cast<int64_t>(args.m_tiles) * args.world_size;
+          static_cast<int64_t>(args.m_tiles) * args.world_size * args.ready_slices_per_peer;
       if (args.peer_timeline &&
           (args.peer_timeline_capacity < acquire_records ||
            args.peer_timeline_capacity < release_records)) {
@@ -177,10 +200,14 @@ struct A2ALhsReadyMainloop : Base {
     // M; multiple independent L batches would alias the same arrivals.
     return args.ready && args.world_size > 0 &&
         args.world_size <= kMaxWorldSize && args.arrivals_per_peer > 0 &&
-        args.k_tiles_per_peer > 0 && args.epoch > 0 &&
+        args.k_tiles_per_peer > 0 && args.ready_k_tiles > 0 &&
+        args.ready_slices_per_peer > 0 &&
+        args.k_tiles_per_peer ==
+            static_cast<int64_t>(args.ready_k_tiles) * args.ready_slices_per_peer &&
+        args.epoch > 0 &&
         static_cast<uint64_t>(args.epoch) * args.arrivals_per_peer <=
             std::numeric_limits<uint32_t>::max() &&
-        m > 0 && args.m_tiles == (m + kTileM - 1) / kTileM &&
+        m > 0 && args.m_tiles == (m + kSequenceTile - 1) / kSequenceTile &&
         cute::get<3>(shape) == 1 &&
         k == static_cast<int64_t>(args.world_size) *
                  args.k_tiles_per_peer * kTileK &&
@@ -203,8 +230,8 @@ struct A2ALhsReadyMainloop : Base {
       const TileCoord& tile_coord,
       KTileIterator k_iter,
       int k_tiles) {
-    const int32_t m = static_cast<int32_t>(cute::get<0>(tile_coord));
-    // Static scheduling can pad M for swizzling. TMA handles those OOB
+    const int32_t m = static_cast<int32_t>(cute::get<SwapAB ? 1 : 0>(tile_coord));
+    // Static scheduling can pad the sequence axis. TMA handles those OOB
     // loads; there is no communication flag to wait for outside the slab.
     if (m < 0 || m >= params_->m_tiles) {
       return Base::load(pipeline, state, inputs, tile_coord, k_iter, k_tiles);
@@ -212,21 +239,30 @@ struct A2ALhsReadyMainloop : Base {
 
     const uint32_t target = params_->epoch * params_->arrivals_per_peer;
     // A kernel calls load twice per output tile (prologue and remainder).
-    // Split both calls at peer boundaries, preserving CUTLASS's pipeline
+    // Split both calls at ready boundaries, preserving CUTLASS's pipeline
     // state and never reinitializing or splitting the MMA accumulator.
+    // A full row-owned peer stays one boundary, whereas K128 readiness can
+    // feed two K64 stages without waiting for the rest of the peer shard.
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tiles > 0) {
       const int32_t first_k = static_cast<int32_t>(*k_iter);
       const int32_t peer = first_k / params_->k_tiles_per_peer;
       CUTLASS_ASSERT(peer >= 0 && peer < params_->world_size);
-      const int32_t to_peer_end =
-          params_->k_tiles_per_peer - first_k % params_->k_tiles_per_peer;
-      const int count = k_tiles < to_peer_end ? k_tiles : to_peer_end;
+      const int32_t peer_k = first_k % params_->k_tiles_per_peer;
+      // Full-peer plans keep the original single div/mod by peer length;
+      // do not add a second variable division to every legacy K boundary.
+      const bool sliced = params_->ready_slices_per_peer != 1;
+      const int32_t slice = sliced ? peer_k / params_->ready_k_tiles : 0;
+      const int32_t dependency = peer * params_->ready_slices_per_peer + slice;
+      const int32_t to_ready_end = sliced
+          ? params_->ready_k_tiles - peer_k % params_->ready_k_tiles
+          : params_->k_tiles_per_peer - peer_k;
+      const int count = k_tiles < to_ready_end ? k_tiles : to_ready_end;
 
-      if (acquired_m_ != m || acquired_peer_ != peer) {
+      if (acquired_m_ != m || acquired_dependency_ != dependency) {
         const uint32_t* flag = params_->ready +
-            (static_cast<int64_t>(m) * params_->world_size + peer) *
-                kReadyFlagStride;
+            ((static_cast<int64_t>(m) * params_->world_size + peer) *
+                 params_->ready_slices_per_peer + slice) * kReadyFlagStride;
         if (threadIdx.x % 32 == 0) {
           wait_acquire_gpu_single_lane(flag, target);
         }
@@ -236,7 +272,7 @@ struct A2ALhsReadyMainloop : Base {
         // the async proxy before entering CUTLASS's TMA load function.
         fence_proxy_async_global();
         acquired_m_ = m;
-        acquired_peer_ = peer;
+        acquired_dependency_ = dependency;
       }
 
 #if FUSE_ENABLE_PROFILING
@@ -245,7 +281,7 @@ struct A2ALhsReadyMainloop : Base {
         // Record cache hits too: another N tile can reuse this peer's ready
         // observation without repeating the semaphore acquire.
         if (threadIdx.x % 32 == 0) {
-          record_peer_acquire(tile_coord, peer);
+          record_peer_acquire(tile_coord, peer, slice);
         }
       }
 #endif
@@ -265,10 +301,10 @@ struct A2ALhsReadyMainloop : Base {
 #if FUSE_ENABLE_PROFILING
   template <class TileCoord>
   CUTLASS_DEVICE void record_peer_acquire(
-      const TileCoord& tile_coord, int32_t peer) {
+      const TileCoord& tile_coord, int32_t peer, int32_t slice) {
     if constexpr (Instrumented) {
-      const int32_t m = static_cast<int32_t>(cute::get<0>(tile_coord));
-      const int32_t n = static_cast<int32_t>(cute::get<1>(tile_coord));
+      const int32_t m = static_cast<int32_t>(cute::get<SwapAB ? 1 : 0>(tile_coord));
+      const int32_t n = static_cast<int32_t>(cute::get<SwapAB ? 0 : 1>(tile_coord));
       const int32_t l = static_cast<int32_t>(cute::get<3>(tile_coord));
       // Swizzle padding in N must not alias the next M tile's event. This
       // collective's ready protocol accepts only L=1, with batch in M.
@@ -293,12 +329,13 @@ struct A2ALhsReadyMainloop : Base {
       const int64_t tile_id =
           (static_cast<int64_t>(l) * params_->m_tiles + m) *
               params_->n_tiles + n;
+      const int64_t record_id = tile_id * params_->ready_slices_per_peer + slice;
       if (params_->peer_timeline &&
-          tile_id < params_->peer_timeline_capacity) {
-        auto& event = params_->peer_timeline[tile_id];
+          record_id < params_->peer_timeline_capacity) {
+        auto& event = params_->peer_timeline[record_id];
         // The caller clears both timeline buffers before each diagnostic
         // launch, independently of the cumulative ready/epoch state. Keep
-        // the first observation when prologue and remainder share a peer.
+        // the first observation when prologue and remainder share a slice.
         if (atomicCAS(
                 reinterpret_cast<unsigned long long*>(&event.acquire[peer]),
                 0ull, static_cast<unsigned long long>(now)) == 0ull) {
@@ -317,7 +354,7 @@ struct A2ALhsReadyMainloop : Base {
 
   const Params* params_;
   int32_t acquired_m_ = -1;
-  int32_t acquired_peer_ = -1;
+  int32_t acquired_dependency_ = -1;
 };
 
 // The first epilogue warp issues CUTLASS's TMA stores. Publish its output

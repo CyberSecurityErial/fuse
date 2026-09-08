@@ -25,7 +25,8 @@ import struct
 import tarfile
 import tempfile
 
-from l20d import NODES, fused_binary, fused_build_inputs, fused_candidates, fused_devices, fused_geometry, fused_policy_tile
+from l20d import (NODES, OPROJ_ALIGNED_POLICIES, fused_binary, fused_build_inputs, fused_candidates,
+                  fused_devices, fused_geometry, fused_policy_alignment, fused_policy_tile)
 
 
 SCHEMA = 'sm103_fused_verified_v1'
@@ -575,7 +576,7 @@ def audit_graph_preparation(records, timing, checks, domains, world):
     return by_generation
 
 
-def audit_graph_epoch_continuity(results):
+def audit_graph_epoch_continuity(results, oproj_epoch_scope='direction_contiguous_v1'):
     # F counters continue across candidates and payload generations, separately
     # for each direction. C/R flags/counters reset for every candidate/payload.
     for direction in DIRECTIONS:
@@ -584,6 +585,8 @@ def audit_graph_epoch_continuity(results):
         for generation in (0, 1):
             for row in fused:
                 preparation = row['graph_preparation'][generation]
+                if direction == 'A2A_GEMM' and oproj_epoch_scope == 'candidate_payload_v1':
+                    committed = 0
                 require(preparation['first_epoch'] == committed + 1, 'Graph fused epochs are not contiguous')
                 committed = preparation['last_epoch']
     for row in results:
@@ -954,11 +957,13 @@ def audit_schedule_config(job, config, rows):
             'requested_rasters': requested, 'effective_rasters': effective}
 
 
-def resolved_schedule(scheduling, direction, m, n, tile_n):
+def resolved_schedule(scheduling, direction, m, n, tile_n, tile_m=128, swap_ab=False):
     # Independent audit of pinned CUTLASS 57e3cfb's cluster-1 static scheduler:
     # tile_scheduler_params.h:get_log_swizzle_size/initialize. The requested
     # maximum is not necessarily the effective swizzle on a small tile grid.
-    m_tiles, n_tiles = (m + 127) // 128, (n + tile_n - 1) // tile_n
+    m_tiles, n_tiles = (m + tile_m - 1) // tile_m, (n + tile_n - 1) // tile_n
+    if swap_ab:
+        m_tiles, n_tiles = n_tiles, m_tiles
     minimum, maximum = min(m_tiles, n_tiles), scheduling['max_swizzle_size']
     effective = (8 if maximum >= 8 and minimum >= 6 else
                  4 if maximum >= 4 and minimum >= 3 else
@@ -982,6 +987,14 @@ def audit_schedule_row(row, schedule, compute_ctas):
             all(count(row, field, 1) == schedule[field] for field in SCHEDULE_ROW_FIELDS[1:5]) and
             count(row, 'scheduled_compute_ctas') == compute_ctas,
             'Scheduling resources disagree with request/geometry/budget')
+
+
+def audit_alignment_row(row, alignment):
+    """A new policy cannot masquerade as an old log with inferred metadata."""
+    for key, expected in alignment.items():
+        require(key in row, f'Missing joint-policy metadata: {key}')
+        actual = count(row, key, 1) if isinstance(expected, int) else row[key]
+        require(actual == expected, f'Joint-policy metadata mismatch: {key}')
 
 
 def audit_log(text, job):
@@ -1051,6 +1064,12 @@ def audit_log(text, job):
     require(count(config, 'seed') == job.get('seed', 20260906) and count(config, 'warmup') >= 10 and
             count(config, 'samples') == 50, 'Seed/warmup/sample config mismatch')
     comm, qkv, oproj = fused_candidates(job)
+    oproj_epoch_scope = config.get('oproj_epoch_scope', 'direction_contiguous_v1')
+    require(oproj_epoch_scope in ('direction_contiguous_v1', 'candidate_payload_v1'),
+            'Unknown OProj ready epoch scope')
+    if any(policy in OPROJ_ALIGNED_POLICIES for policy in oproj):
+        require(oproj_epoch_scope == 'candidate_payload_v1' and scheduling['schema'] == 'explicit_v1',
+                'Joint policies require explicit scheduling and candidate-scoped ready epochs')
     require(not epilogue_probe or (job.get('profile') and profile_detail == 'cta' and
             profile_schema == 'host_stages_v1' and not job.get('mpi') and not diagnostic and not calibrate and
             scheduling['schema'] == 'explicit_v1' and qkv == ['m128n256k64e32'] and len(comm) == len(oproj) == 1),
@@ -1100,9 +1119,12 @@ def audit_log(text, job):
         if row['kind'] == 'candidate':
             rank = count(row, 'rank')
             require(rank < shape['world'], 'Unexpected scheduled candidate rank')
-            _, tile_n, _ = fused_policy_tile(tile)
+            tile_m, tile_n, _ = fused_policy_tile(tile)
+            alignment = fused_policy_alignment(tile, shape['q_width'] // shape['world'])
+            audit_alignment_row(row, alignment)
             width = shape['projection_width'] if direction == DIRECTIONS[0] else shape['hidden']
-            schedule = resolved_schedule(scheduling, direction, shape['seq_local'], width, tile_n)
+            schedule = resolved_schedule(scheduling, direction, shape['seq_local'], width, tile_n, tile_m,
+                                         alignment.get('orientation') == 'swap_ab')
             require(not job.get('profile') or not schedule['has_padding'],
                     'Profiling does not support swizzle-padded tile grids')
             audit_schedule_row(row, schedule, min(schedule['scheduled_work_tiles_derived'], sm_counts[rank] - c))
@@ -1118,6 +1140,7 @@ def audit_log(text, job):
     for index, component in ((i, comp) for i in range(1, len(expected) + 1) for comp in components):
         direction, c, tile = expected[index - 1]
         tile_m, tile_n, tile_k = fused_policy_tile(tile)
+        alignment = fused_policy_alignment(tile, shape['q_width'] // shape['world'])
         records = grouped[index, component]
         if component != 'fused':
             records = records + [r for r in grouped[index, 'fused'] if r['kind'] == 'candidate']
@@ -1197,7 +1220,8 @@ def audit_log(text, job):
             second = checks['candidate', 1, 'pre', rank]
             require(all(first[field] == second[field] for field in ('tile_m', 'tile_n', 'tile_k', 'threads', 'dynamic_smem')),
                     'Resources changed between payload generations')
-        schedule = resolved_schedule(scheduling, direction, m, n, tile_n)
+        schedule = resolved_schedule(scheduling, direction, m, n, tile_n, tile_m,
+                                     alignment.get('orientation') == 'swap_ab')
         work_tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
         scheduled_work_tiles = schedule['scheduled_work_tiles_derived']
         compute_ctas = [min(scheduled_work_tiles, sm - c) for sm in sm_counts]
@@ -1210,6 +1234,7 @@ def audit_log(text, job):
                     'Duplicate/invalid component resource record')
             resource_keys.add((generation, rank))
             production = resolved[rank]
+            audit_alignment_row(row, alignment)
             audit_schedule_row(row, schedule, 0 if component == 'copy_reference' else compute_ctas[rank])
             require(all(row[field] == production[field] for field in ('tile_m', 'tile_n', 'tile_k')) and
                     row.get('raster') == schedule['raster'] and
@@ -1236,6 +1261,7 @@ def audit_log(text, job):
             **{key: shape[key] for key in ('hidden', 'q_heads', 'kv_heads', 'head_dim')},
             'm': m, 'n': n, 'k': k, 'comm_ctas': c, 'tile_policy': tile,
             'tile_m': tile_m, 'tile_n': tile_n, 'tile_k': tile_k, 'cluster_ctas': 1,
+            **alignment, 'oproj_epoch_scope': oproj_epoch_scope if not qkv_direction else 'not_applicable',
             **schedule,
             'compute_ctas_derived': [0] * shape['world'] if component == 'copy_reference' else compute_ctas,
             'production_compute_ctas_derived': compute_ctas,
@@ -1249,7 +1275,7 @@ def audit_log(text, job):
             'production_resources': resolved, 'component_resources': component_resources, 'timing': timing,
             'validation_lines': [r['line'] for r in checks.values()], 'acceptance_line': final[0]['line']})
     if graph:
-        audit_graph_epoch_continuity(results)
+        audit_graph_epoch_continuity(results, oproj_epoch_scope)
     if diagnostic:
         faults = [r for r in rows if r['kind'] == 'validation_self_test']
         m, q, kv = shape['seq_local'], shape['q_width'], shape['kv_width']
@@ -1348,6 +1374,8 @@ def summarize(directories, output):
                'world', 'global_seq', 'seq_local', 'hidden', 'q_heads', 'kv_heads', 'head_dim',
                'm', 'n', 'k', 'layout', 'host_launch', 'launch', 'graph_epoch_mode', 'collector', 'precision', 'sm_count',
                'candidate', 'comm_ctas', 'tile_policy', 'tile_m', 'tile_n', 'tile_k',
+               'alignment_schema', 'orientation', 'schedule_coordinates', 'physical_tile_m',
+               'physical_tile_n', 'physical_tile_k', 'ready_rows', 'ready_k', 'ready_slices', 'ready_arrivals',
                'schedule_schema', 'raster_requested', 'raster', 'max_swizzle_size', 'effective_swizzle_size',
                'swizzle', 'qkv_rank_swizzle', 'padded_m_tiles', 'padded_n_tiles', 'has_padding', 'scheduled_work_tiles_derived',
                'problem_gemm_flops', 'problem_route_payload_bytes', 'problem_remote_payload_bytes',
@@ -1365,7 +1393,7 @@ def summarize(directories, output):
                     if not candidate['performance_accepted']:
                         continue
                     values = run | candidate | candidate['timing'] | {'binary_sha256': run['build']['binary_sha256']}
-                    writer.writerow({key: values[key] for key in columns})
+                    writer.writerow({key: values.get(key, '') for key in columns})
         require(not output.exists(), 'Output appeared during audit; refusing overwrite')
         staged.rename(output)
     return report

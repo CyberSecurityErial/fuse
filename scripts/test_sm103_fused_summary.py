@@ -36,6 +36,73 @@ class FusedSummaryTests(unittest.TestCase):
     def write_json(self, path, value):
         path.write_text(json.dumps(value))
 
+    def aligned_fixture(self, policy):
+        self.make_fixture(seq_local=384, schedule={'max_swizzle_size': 4})
+        job = json.loads((self.control / 'job.json').read_text())
+        job['oproj_policy'] = policy
+        for path in (self.root / 'job.json', self.control / 'job.json'):
+            self.write_json(path, job)
+        swap = policy.startswith('row_')
+        # Independent fixed oracle for M=384, N=1024, K/CP=256.
+        bm, bn, pm, pn = (32, 128, 8, 12) if swap else (128, 256, 4, 4)
+        metadata = dict(alignment_schema='directional_v1', orientation='swap_ab' if swap else 'normal',
+            schedule_coordinates='physical', physical_tile_m=128,
+            physical_tile_n=32 if swap else 256, physical_tile_k=64,
+            ready_rows=bm, ready_k=256 if swap else 128, ready_slices=1 if swap else 2, ready_arrivals=1)
+        rows = []
+        for original in self.log.read_text().splitlines():
+            if original.startswith('config,'):
+                original += ',oproj_epoch_scope=candidate_payload_v1'
+            if ',A2A_GEMM,' in original and ',tile=m128n128,' in original:
+                original = original.replace(',tile=m128n128,', f',tile={policy},')
+                if original.startswith('candidate,'):
+                    fields = dict(part.split('=', 1) for part in original.split(',')[2:])
+                    fields.update(tile_m=bm, tile_n=bn, padded_m_tiles=pm, padded_n_tiles=pn,
+                                  scheduled_compute_ctas=pm * pn, **metadata)
+                    original = line('candidate', 'A2A_GEMM', **fields)
+            rows.append(original)
+        self.log.write_text('\n'.join(rows) + '\n')
+        self.repack()
+        return metadata
+
+    def test_joint_policies_audit_logical_work_and_physical_schedule(self):
+        for policy, tile, work, scheduled, padding in (
+                ('kslice_m128n256k64', (128, 256, 64), 12, 16, (4, 4)),
+                ('row_m128n32k64', (32, 128, 64), 96, 96, (8, 12))):
+            with self.subTest(policy=policy):
+                metadata = self.aligned_fixture(policy)
+                result = summary.audit_run(self.root)['candidates'][1]
+                self.assertEqual(tuple(result[f'tile_{axis}'] for axis in 'mnk'), tile)
+                self.assertEqual(result['problem_gemm_flops'], 2 * 384 * 1024 * 1024)
+                self.assertEqual(result['scheduled_work_tiles_derived'], scheduled)
+                self.assertEqual((result['padded_m_tiles'], result['padded_n_tiles']), padding)
+                self.assertEqual(result['work_tiles_derived'], work)
+                for key, value in metadata.items():
+                    self.assertEqual(result[key], value)
+
+    def test_joint_policy_missing_or_wrong_metadata_is_rejected(self):
+        for policy in ('kslice_m128n256k64', 'row_m128n32k64'):
+            metadata = self.aligned_fixture(policy)
+            original = self.log.read_text()
+            for key, value in metadata.items():
+                with self.subTest(policy=policy, field=key):
+                    self.log.write_text(original.replace(f',{key}={value}', '', 1))
+                    self.repack()
+                    with self.assertRaisesRegex(ValueError, 'joint-policy metadata'):
+                        summary.audit_run(self.root)
+            self.log.write_text(original.replace(',physical_tile_m=128', ',physical_tile_m=32', 1))
+            self.repack()
+            with self.assertRaisesRegex(ValueError, 'Joint-policy metadata mismatch'):
+                summary.audit_run(self.root)
+
+    def test_oproj_candidate_epoch_scope_does_not_relax_legacy_graph(self):
+        preparation = lambda first, last: {'first_epoch': first, 'last_epoch': last}
+        rows = [dict(direction='A2A_GEMM', component='fused',
+                     graph_preparation=[preparation(1, 100), preparation(1, 1)])]
+        summary.audit_graph_epoch_continuity(rows, 'candidate_payload_v1')
+        with self.assertRaisesRegex(ValueError, 'contiguous'):
+            summary.audit_graph_epoch_continuity(rows)
+
     def make_fixture(self, diagnostic=False, profile=False, calibrate=False, host_launch=None, profile_schema=None,
                      profile_detail=None, seq_local=256, schedule=None):
         manifest = {'CMakeLists.txt': 'a' * 64, 'benchmarks/sm103/fused_bf16.cu': 'b' * 64}

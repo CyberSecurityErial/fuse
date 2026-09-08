@@ -16,23 +16,31 @@ struct TypeTag {
   using type = T;
 };
 
-// A2A readiness is indexed by M tile and peer, independent of the output N
-// width. K policies share the copy algorithm but validate their own peer-K
-// divisibility, so adding K128 never narrows the existing K64 input contract.
-template <int BlockN, int BlockK = 64, int EpilogueN = 0>
+// One joint input plan binds physical GEMM geometry, original-sequence ready
+// rows, the ready K extent and communication ownership. These are not
+// independent switches: mismatched geometry could publish unreadable input.
+// Legacy K policies retain their full-peer readiness and copy algorithm.
+template <int BlockN, int BlockK = 64, int EpilogueN = 0,
+          bool SwapAB = false, int ReadyK = 0, bool RowOwner = false>
 struct A2ALhsKernelBinding {
-  using Types = A2ALhsGemmTypes<BlockN, BlockK, EpilogueN>;
+  static constexpr bool kSwapAB = SwapAB;
+  static constexpr int kReadyK = ReadyK;
+  static_assert(SwapAB == RowOwner && (!SwapAB || ReadyK == 0));
+  using Types = A2ALhsGemmTypes<BlockN, BlockK, EpilogueN, SwapAB>;
   using Gemm = typename Types::Gemm;
   using PureGemm = typename Types::PureGemm;
   using TileShape = typename Gemm::TileShape;
-  using Comm = A2ALhsInputCommT<cute::size<0>(TileShape{}), cute::size<2>(TileShape{})>;
-  static_assert(cute::size<0>(TileShape{}) == Comm::kReadyBlockM);
+  static constexpr int kSequenceTile = cute::size<SwapAB ? 1 : 0>(TileShape{});
+  static constexpr int kProjectionTile = cute::size<SwapAB ? 0 : 1>(TileShape{});
+  using Comm = A2ALhsInputCommT<kSequenceTile, cute::size<2>(TileShape{}),
+                               false, ReadyK, RowOwner>;
+  static_assert(kSequenceTile == Comm::kReadyBlockM);
   static_assert(cute::size<2>(TileShape{}) == Comm::kTileK);
   using Kernel = detail::MonolithicGemm<Gemm, Comm>;
 #if FUSE_ENABLE_PROFILING
   using TelemetryGemm = typename Types::TelemetryGemm;
   using TelemetryComm = A2ALhsInputCommT<
-      cute::size<0>(TileShape{}), cute::size<2>(TileShape{}), true>;
+      kSequenceTile, cute::size<2>(TileShape{}), true, ReadyK, RowOwner>;
   using TelemetryKernel = detail::RoleTelemetryKernel<
       detail::MonolithicGemm<TelemetryGemm, TelemetryComm>>;
 #endif
@@ -43,6 +51,9 @@ using OprojForwardN256Binding = A2ALhsKernelBinding<256>;
 using OprojForwardN128K128Binding = A2ALhsKernelBinding<128, 128>;
 using OprojForwardN256K64E32Binding = A2ALhsKernelBinding<256, 64, 32>;
 using OprojForwardN256K128E32Binding = A2ALhsKernelBinding<256, 128, 32>;
+// Opt-in communication/readiness experiments. Neither changes legacy Auto.
+using OprojKSliceN256Binding = A2ALhsKernelBinding<256, 64, 32, false, 128>;
+using OprojRowN32Binding = A2ALhsKernelBinding<32, 64, 0, true, 0, true>;
 
 enum class OprojGemmPolicy {
   kM128N128,
@@ -50,6 +61,8 @@ enum class OprojGemmPolicy {
   kM128N128K128,
   kM128N256K64E32,
   kM128N256K128E32,
+  kKSliceM128N256K64,
+  kRowM128N32K64,
 };
 
 inline cudaError_t select_oproj_gemm_policy(OprojGemmPolicy* policy) {
@@ -69,6 +82,10 @@ inline cudaError_t select_oproj_gemm_policy(OprojGemmPolicy* policy) {
     *policy = OprojGemmPolicy::kM128N256K64E32;
   } else if (std::strcmp(value, "m128n256k128e32") == 0) {
     *policy = OprojGemmPolicy::kM128N256K128E32;
+  } else if (std::strcmp(value, "kslice_m128n256k64") == 0) {
+    *policy = OprojGemmPolicy::kKSliceM128N256K64;
+  } else if (std::strcmp(value, "row_m128n32k64") == 0) {
+    *policy = OprojGemmPolicy::kRowM128N32K64;
   } else {
     return cudaErrorNotSupported;
   }
@@ -88,6 +105,10 @@ cudaError_t visit_oproj_forward_policy(OprojGemmPolicy policy, Visitor& visitor)
       return visitor(TypeTag<OprojForwardN256K64E32Binding>{});
     case OprojGemmPolicy::kM128N256K128E32:
       return visitor(TypeTag<OprojForwardN256K128E32Binding>{});
+    case OprojGemmPolicy::kKSliceM128N256K64:
+      return visitor(TypeTag<OprojKSliceN256Binding>{});
+    case OprojGemmPolicy::kRowM128N32K64:
+      return visitor(TypeTag<OprojRowN32Binding>{});
     default:
       return cudaErrorInvalidValue;
   }
@@ -97,6 +118,7 @@ cudaError_t visit_oproj_forward_policy(OprojGemmPolicy policy, Visitor& visitor)
 // The geometry is the actual producer-ready tile, not the MMA atom or cluster.
 template <class GemmTypes, class CommType>
 struct GemmA2AKernelBinding {
+  static constexpr bool kSwapAB = false;
   using Gemm = typename GemmTypes::OutputGemm;
   using Comm = CommType;
   using TileShape = typename Gemm::TileShape;
@@ -253,26 +275,32 @@ inline cudaError_t device_info(DeviceInfo* result) {
   return cudaSuccess;
 }
 
-template <class Kernel>
+template <class Kernel, bool SwapAB = false>
 typename Kernel::Arguments gemm_arguments(
     const GemmProblem& problem, const Bf16* lhs, const Bf16* rhs_nt,
     Bf16* output, float alpha, int32_t num_comm_ctas,
     const DeviceInfo& info, GemmRaster fallback) {
   typename Kernel::Arguments args{};
   args.mode = cutlass::gemm::GemmUniversalMode::kGemm;
-  args.problem_shape = cute::make_shape(problem.m, problem.n, problem.k, 1);
-  args.mainloop.ptr_A = lhs;
-  args.mainloop.dA = cute::make_stride(a_row_stride(problem),
+  args.problem_shape = cute::make_shape(
+      SwapAB ? problem.n : problem.m, SwapAB ? problem.m : problem.n, problem.k, 1);
+  args.mainloop.ptr_A = SwapAB ? rhs_nt : lhs;
+  args.mainloop.dA = cute::make_stride(SwapAB ? b_row_stride(problem) : a_row_stride(problem),
                                       cute::_1{}, int64_t{0});
-  args.mainloop.ptr_B = rhs_nt;
-  // rhs_nt is physically [N,K], CUTLASS B uses the logical (N,K,L) view.
-  args.mainloop.dB = cute::make_stride(b_row_stride(problem),
+  args.mainloop.ptr_B = SwapAB ? lhs : rhs_nt;
+  // Both buffers are physical [outer,K]. CUTLASS views B as (N,K,L), so
+  // swapping the pointers and outer extents needs no physical transpose.
+  args.mainloop.dB = cute::make_stride(SwapAB ? a_row_stride(problem) : b_row_stride(problem),
                                       cute::_1{}, int64_t{0});
   args.epilogue.thread.alpha = alpha;
   args.epilogue.thread.beta = 0.0f;
   args.epilogue.ptr_C = nullptr;
-  args.epilogue.dC = cute::make_stride(d_row_stride(problem),
-                                      cute::_1{}, int64_t{0});
+  if constexpr (SwapAB) {
+    // D^T[projection,sequence] is column-major in the public D buffer.
+    args.epilogue.dC = cute::make_stride(cute::_1{}, d_row_stride(problem), int64_t{0});
+  } else {
+    args.epilogue.dC = cute::make_stride(d_row_stride(problem), cute::_1{}, int64_t{0});
+  }
   args.epilogue.ptr_D = output;
   args.epilogue.dD = args.epilogue.dC;
   args.hw_info.device_id = info.device;
@@ -281,6 +309,25 @@ typename Kernel::Arguments gemm_arguments(
   args.scheduler.max_swizzle_size = problem.max_swizzle_size;
   args.scheduler.raster_order = raster_option(problem.raster, fallback);
   return args;
+}
+
+// Resolve exactly the scheduler used by GEMM, including the truncated compute
+// grid and effective (not merely requested) swizzle. Only scheduler parameters
+// are lowered here: do not build duplicate TMA descriptors or change GEMM args.
+// The copy-only calibration uses this helper too, so it measures the SAME queue.
+template <class Gemm>
+detail::A2AInputTileOrder a2a_input_order(
+    const typename Gemm::Arguments& args, bool swap_ab = false) {
+  using Scheduler = typename Gemm::TileScheduler;
+  const auto schedule = Scheduler::to_underlying_arguments(
+      args.problem_shape, typename Gemm::TileShape{}, typename Gemm::AtomThrShapeMNK{},
+      typename Gemm::ClusterShape{}, args.hw_info, args.scheduler);
+  const int32_t m_tiles = swap_ab
+      ? ceil_div(static_cast<int32_t>(cute::get<1>(args.problem_shape)),
+                 static_cast<int32_t>(cute::size<1>(typename Gemm::TileShape{})))
+      : ceil_div(static_cast<int32_t>(cute::get<0>(args.problem_shape)),
+                 static_cast<int32_t>(cute::size<0>(typename Gemm::TileShape{})));
+  return detail::A2AInputTileOrder::make(schedule, m_tiles, swap_ab);
 }
 
 template <class Kernel>
@@ -324,7 +371,8 @@ cudaError_t launch_monolithic(
 #endif
 }
 
-template <class Gemm, class Kernel, class Comm, bool Instrumented = false>
+template <class Gemm, class Kernel, class Comm, bool Instrumented = false,
+          bool SwapAB = false>
 cudaError_t launch_a2a_lhs_gemm_policy(
     const A2AGemmParams& params, cudaStream_t stream
 #if FUSE_ENABLE_PROFILING
@@ -357,27 +405,29 @@ cudaError_t launch_a2a_lhs_gemm_policy(
   }
 #endif
   FUSE_SM103_HOST_MARK(kCommunicationPrepare);
+  auto args = gemm_arguments<Gemm, SwapAB>(
+      params.gemm, params.input_staging, params.rhs_nt, params.output,
+      params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongN);
+  comm.input_order = a2a_input_order<Gemm>(args, SwapAB);
   status = Comm::initialize(comm);
   if (status != cudaSuccess) {
     return status;
   }
   FUSE_SM103_HOST_MARK(kArguments);
   using ConsumerTile = typename Gemm::TileShape;
-  constexpr int32_t tile_m = cute::size<0>(ConsumerTile{});
-  constexpr int32_t tile_n = cute::size<1>(ConsumerTile{});
+  constexpr int32_t tile_m = cute::size<SwapAB ? 1 : 0>(ConsumerTile{});
+  constexpr int32_t tile_n = cute::size<SwapAB ? 0 : 1>(ConsumerTile{});
   constexpr int32_t tile_k = cute::size<2>(ConsumerTile{});
   static_assert(tile_m == Comm::kReadyBlockM);
   static_assert(tile_k == Comm::kTileK);
   const int32_t n_tiles = ceil_div(params.gemm.n, tile_n);
-  comm.m_window = ceil_div(info.sm_count - params.num_comm_ctas, n_tiles);
-  auto args = gemm_arguments<Gemm>(
-      params.gemm, params.input_staging, params.rhs_nt, params.output,
-      params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongN);
   args.mainloop.ready = params.ready;
   args.mainloop.world_size = params.route.world_size;
   args.mainloop.m_tiles = ceil_div(params.gemm.m, tile_m);
   args.mainloop.arrivals_per_peer = Comm::arrivals_per_peer(comm);
   args.mainloop.k_tiles_per_peer = params.gemm.k / params.route.world_size / tile_k;
+  args.mainloop.ready_k_tiles = Comm::ready_k(params) / tile_k;
+  args.mainloop.ready_slices_per_peer = Comm::ready_slices(params);
   args.mainloop.epoch = params.epoch;
 #if FUSE_ENABLE_PROFILING
   if constexpr (Instrumented) {
@@ -424,13 +474,14 @@ cudaError_t launch_oproj_forward_policy(
         typename Binding::TelemetryKernel, typename Binding::Kernel>;
     using Comm = std::conditional_t<Instrumented,
         typename Binding::TelemetryComm, typename Binding::Comm>;
-    return launch_a2a_lhs_gemm_policy<Gemm, Kernel, Comm, Instrumented>(
+    return launch_a2a_lhs_gemm_policy<Gemm, Kernel, Comm, Instrumented, Binding::kSwapAB>(
         params, stream, timeline, timeline_capacity,
         peer_timeline, peer_timeline_capacity);
 #else
     static_assert(!Instrumented);
     return launch_a2a_lhs_gemm_policy<
-        typename Binding::Gemm, typename Binding::Kernel, typename Binding::Comm>(
+        typename Binding::Gemm, typename Binding::Kernel, typename Binding::Comm,
+        false, Binding::kSwapAB>(
             params, stream);
 #endif
   };
