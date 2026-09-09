@@ -43,7 +43,7 @@ struct Params {
   Divmod divmod_batch_, divmod_cluster_blk_major_;
 };
 ''' + body + r'''
-void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world, int chunks) {
+void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world, int chunks, int comm_slots) {
   const int pm = (mt + swizzle - 1) / swizzle * swizzle;
   const int pn = (nt + swizzle - 1) / swizzle * swizzle;
   Params params;
@@ -53,7 +53,8 @@ void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world
   params.divmod_cluster_blk_major_.divisor = along_n ? pn : pm;
   params.raster_order_ = along_n ? Params::RasterOrder::AlongN : Params::RasterOrder::AlongM;
   while ((1 << params.log_swizzle_size_) < swizzle) ++params.log_swizzle_size_;
-  const auto order = fuse::detail::A2AInputTileOrder::make(params, mt);
+  auto order = fuse::detail::A2AInputTileOrder::make(params, mt);
+  order.ready_group_m_tiles = comm_slots / chunks > 0 ? comm_slots / chunks : 1;
   for (uint64_t task = 0; task < uint64_t(mt) * world * chunks; ++task) {
     const auto t = order.decode(task, world, chunks);
     std::cout << t.m << ' ' << t.peer << ' ' << t.chunk << '\n';
@@ -86,9 +87,10 @@ template<int N> void run(int M, int columns, int swizzle, bool along_n, int rank
   }
 }
 int main(int argc, char** argv) {
-  if (argc == 9) {
+  if (argc == 10) {
     run_input(std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]),
-        std::atoi(argv[5]), std::atoi(argv[6]), std::atoi(argv[7]), std::atoi(argv[8]));
+        std::atoi(argv[5]), std::atoi(argv[6]), std::atoi(argv[7]), std::atoi(argv[8]),
+        std::atoi(argv[9]));
     return 0;
   }
   if (argc != 6 && argc != 7) return 2;
@@ -119,7 +121,9 @@ int main(int argc, char** argv) {
 
     def test_a2a_input_first_use_windows(self):
         # Oracle enumerates real GEMM work, deduplicates M by FIRST-use wave,
-        # then supplies peers in K-consumption order. No inverse formula here.
+        # then follows the resolved raster: multi-N-band AlongM completes ready
+        # cohorts; AlongN and single-N-band AlongM retain the group/peer diagonal.
+        # No prefix inversion formula from the device implementation is used.
         for mt, nt in ((1, 1), (3, 5), (13, 7), (128, 16), (128, 28),
                        (128, 32), (128, 56), (128, 64)):
             for swizzle in (1, 2, 4, 8):
@@ -137,23 +141,108 @@ int main(int argc, char** argv) {
                             if m < mt and n < nt and m not in seen:
                                 waves.setdefault(i // compute_grid, []).append(m)
                                 seen.add(m)
-                        for world, chunks in ((4, 1), (8, 6), (8, 11)):
+                        for world, chunks, slots in ((4, 1, 4), (4, 11, 32),
+                                                      (4, 11, 64), (4, 16, 64),
+                                                      (8, 6, 8), (8, 22, 16)):
                             with self.subTest(mt=mt, nt=nt, swizzle=swizzle,
                                               along_n=along_n, compute=compute,
-                                              world=world, chunks=chunks):
+                                              world=world, chunks=chunks, slots=slots):
                                 rows = [tuple(map(int, line.split())) for line in subprocess.check_output(
                                     [str(self.binary), 'input', str(mt), str(nt), str(swizzle),
-                                     str(int(along_n)), str(compute), str(world), str(chunks)],
+                                     str(int(along_n)), str(compute), str(world), str(chunks), str(slots)],
                                     text=True).splitlines()]
-                                expected = [(m, p, c) for ms in waves.values()
-                                            for p in range(world) for m in ms for c in range(chunks)]
+                                expected = []
+                                for ms in waves.values():
+                                    use_cohorts = not along_n and nt > swizzle
+                                    width = (max(1, slots // chunks) if use_cohorts else
+                                             max(swizzle, (len(ms) + world - 1) // world))
+                                    groups = [ms[i:i + width] for i in range(0, len(ms), width)]
+                                    if not use_cohorts:
+                                        for diagonal in range(len(groups) + world - 1):
+                                            for peer in range(world):
+                                                group = diagonal - peer
+                                                if 0 <= group < len(groups):
+                                                    expected.extend((m, peer, c) for m in groups[group]
+                                                                    for c in range(chunks))
+                                    else:
+                                        for group in groups:
+                                            for peer in range(world):
+                                                expected.extend((m, peer, c) for m in group
+                                                                for c in range(chunks))
                                 self.assertEqual(rows, expected)
                                 self.assertEqual(len(set(rows)), mt * world * chunks)
                                 # Persistent comm workers partition this queue exactly once.
-                                for comm in (1, 8, 16, 24):
-                                    visited = [t for slot in range(comm * 4)
-                                               for t in rows[slot::comm * 4]]
+                                for workers in (1, slots, 96):
+                                    visited = [t for slot in range(workers)
+                                               for t in rows[slot::workers]]
                                     self.assertEqual(Counter(visited), Counter(expected))
+
+    def test_a2a_cohorts_schedule_all_peers_before_next_group(self):
+        # Representative AlongM cases include partial first-window cohorts.
+        # These assertions constrain queue priority, not asynchronous completion.
+        for nt, swizzle, compute, chunks, slots, width, window in (
+                (16, 8, 132, 11, 64, 5, 17),
+                (32, 8, 140, 11, 32, 2, 18),
+                (28, 4, 132, 16, 64, 4, 33),
+                (56, 4, 140, 22, 32, 1, 35),
+                (64, 4, 140, 4, 64, 16, 35)):
+            with self.subTest(nt=nt, swizzle=swizzle, compute=compute,
+                              chunks=chunks, slots=slots):
+                rows = [tuple(map(int, line.split())) for line in subprocess.check_output(
+                    [str(self.binary), 'input', '256', str(nt), str(swizzle), '0',
+                     str(compute), '4', str(chunks), str(slots)],
+                    text=True).splitlines()]
+                positions = {task: i for i, task in enumerate(rows)}
+                expected_window = [(m, peer, chunk)
+                                   for begin in range(0, window, width)
+                                   for peer in range(4)
+                                   for m in range(begin, min(begin + width, window))
+                                   for chunk in range(chunks)]
+                self.assertEqual(rows[:len(expected_window)], expected_window)
+                self.assertLess(positions[width - 1, 3, chunks - 1], positions[width, 0, 0])
+                self.assertEqual(rows[len(expected_window)], (window, 0, 0))
+                for m in range(256):
+                    for peer in range(3):
+                        self.assertLess(positions[m, peer, chunks - 1], positions[m, peer + 1, 0])
+                self.assertEqual(len(positions), 256 * 4 * chunks)
+
+    def test_a2a_copy_slots_affect_along_m_but_not_along_n(self):
+        for along_n in (False, True):
+            with self.subTest(along_n=along_n):
+                queues = []
+                for slots in (1, 8, 32, 64):
+                    queues.append([tuple(map(int, line.split())) for line in subprocess.check_output(
+                        [str(self.binary), 'input', '128', '28', '4', str(int(along_n)),
+                         '132', '4', '11', str(slots)], text=True).splitlines()])
+                if along_n:
+                    for rows in queues[1:]:
+                        self.assertEqual(rows, queues[0])
+                else:
+                    # Fewer slots than chunks clamp the M cohort to one, then
+                    # larger budgets permit two/five M without altering coverage.
+                    self.assertEqual(queues[0], queues[1])
+                    self.assertNotEqual(queues[0], queues[2])
+                    self.assertNotEqual(queues[2], queues[3])
+                    for rows in queues[1:]:
+                        self.assertEqual(Counter(rows), Counter(queues[0]))
+
+    def test_a2a_single_n_band_along_m_preserves_diagonal(self):
+        for nt, swizzle in ((1, 1), (3, 4), (4, 4), (7, 8), (8, 8)):
+            with self.subTest(nt=nt, swizzle=swizzle):
+                queues = []
+                for slots in (1, 32, 64):
+                    queues.append([tuple(map(int, line.split())) for line in subprocess.check_output(
+                        [str(self.binary), 'input', '128', str(nt), str(swizzle), '0',
+                         '132', '4', '11', str(slots)], text=True).splitlines()])
+                for rows in queues[1:]:
+                    self.assertEqual(rows, queues[0])
+                self.assertEqual(len(set(queues[0])), 128 * 4 * 11)
+
+    def test_a2a_single_group_preserves_peer_major(self):
+        rows = [tuple(map(int, line.split())) for line in subprocess.check_output(
+            [str(self.binary), 'input', '4', '64', '4', '1', '140', '4', '4', '64'],
+            text=True).splitlines()]
+        self.assertEqual(rows, [(m, p, c) for p in range(4) for m in range(4) for c in range(4)])
 
     def check_orders(self, ranks):
         for tile_n in (64,128,160,192,256):

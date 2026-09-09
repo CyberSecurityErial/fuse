@@ -109,31 +109,66 @@ struct ProducerTileOrder {
   }
 };
 
-// OProj reverses the dependency: communication PRODUCES A[m, peer], and all
-// GEMM N tiles at that M reuse it. Keep GEMM's raster/swizzle/CTA budget fixed;
-// derive the communication priority from its resolved static schedule instead
-// of estimating a rectangular window as ceil(compute_ctas / n_tiles).
+// GEMM-consumption-driven communication scheduling (OProj):
+// OProj communication produces A[M, peer]; all N tiles at that M reuse it.
+// GEMM's resolved tile/raster/swizzle/compute-CTA budget is the input to this
+// mapping, not a quantity changed by communication. Worker c consumes logical
+// tiles c, c+C, c+2C, ... . M blocks whose FIRST consumer falls in [wave*C,
+// (wave+1)*C) share a window; each M occurs in exactly one window.
 //
-// first_use(m) is the logical GEMM index of (m, n=0), the first consumer of M
-// for either raster (one-CTA clusters, unrotated OProj). Persistent worker c
-// visits c, c+C, c+2C, ... . M blocks whose FIRST use lies in the same interval
-// [wave*C, (wave+1)*C) form one window. Deduplicate M across N tiles, then copy
-// window -> peer (GEMM's K order) -> M -> row chunk. For AlongN/swizzle4,
-// Ntiles=64, C=140, the first window is M[0,4), not the old M[0,3): m3/peer0
-// must not be queued behind every peer of m0..2. Window sizes can vary as the
-// compute stride cuts through swizzle groups; simply rounding to 4 is not the
-// same mapping. AlongM and padded/tail tiles use the same first-use rule.
+// The RESOLVED raster is also an input to delivery policy, not just indexing:
 //
-// This is a static PRIORITY, never a completion barrier. Communication workers
-// still stride their queue independently and may run ahead of GEMM. No new
-// atomics, GPU allocations, grid synchronization or consumer acknowledgements.
-// Each (M,peer,row chunk) occurs exactly once. All chunks still contribute to
-// the existing 128-row/peer release; keep its target, fences and acquire scope.
-// Concurrent CTA progress need not follow logical waves. TODO: only measured
-// residual stalls justify ready-aware lookahead or a finer K publication unit;
-// this mapping neither promises zero waiting nor changes GEMM's layout.
+// AlongM, multiple N bands:
+//   C[M, N=0..swizzle-1] visits every M before the remaining N bands.
+//   That first band needs all A while doing only part of the GEMM work. Deliver
+//   a bounded M cohort through ALL peers before opening the next cohort:
+//
+//       cohort A: P0 -> P1 -> P2 -> P3
+//       cohort B:                         P0 -> P1 -> P2 -> P3
+//
+//   Inside each peer: M -> original copy chunks. Cohort width is bounded by
+//   active copy slots / chunks per complete (M,peer), at least one M. A peer
+//   stage therefore fits one set of copy slots when an individual ready unit
+//   fits; a wider shard keeps its original chunks even when that is impossible.
+//   This prioritizes K completion for fewer M blocks over broad first-peer
+//   coverage. It is an experimental tradeoff, not a guaranteed deadline policy.
+//
+// AlongN, or only one N band:
+//   A small M group serves all N without the same first-band demand burst.
+//   Keep the existing group/peer diagonal order:
+//
+//                  peer0   peer1   peer2   peer3
+//   M group A        0       1       2       3       numbers = diagonals
+//   M group B        1       2       3       4
+//   M group C        2       3       4       5
+//
+//   queue: A/P0 -> B/P0 -> A/P1 -> C/P0 -> B/P1 -> A/P2 -> ...
+//
+// Every cell contains all (M, chunk) tasks for that group and peer. This mixes
+// starting new M groups with supplying later K stages to already-started groups.
+// Within one diagonal, lower peer stages come first. Each group sees peers in
+// GEMM K order; chunks still publish the SAME complete 128-row/peer ready unit.
+// No extra ready checks, K subdivisions, fences or acknowledgements are added.
+//
+// Diagonal group size = max(resolved swizzle width, ceil(window M tiles / peer count)).
+// This bounds groups by peer count, retains at least one swizzle-width group
+// when it fits, and adapts to the actual first-use window rather than model names.
+// A one-group window naturally becomes peer-major. This is a starting heuristic,
+// not a fitted performance model. M/N, GEMM tile/raster/swizzle and compute CTA
+// budget determine reuse/windows; K/CP, row/column layout and staging capacity
+// determine copy chunks; communication CTA/slot count bounds cohort width.
+// TODO: use measured GEMM tile/K-stage and communication service times (including
+// pipeline lookahead) to model delivery deadlines and choose cohort width/lead.
+// Do not substitute a model-name lookup or pretend geometry proves bandwidth.
+//
+// The queue defines priority, NOT execution/completion order: communication CTAs
+// independently stride it and may finish out of order. Every (M, peer, chunk)
+// appears exactly once; all existing arrivals and release/acquire fences remain
+// mandatory. Padding and tail groups never introduce fictitious ready units.
 struct A2AInputTileOrder {
   int32_t m_tiles = 0;
+  int32_t n_tiles = 0;  // Resolved padded extent; padding cannot add an N band.
+  int32_t ready_group_m_tiles = 1;
   int32_t log_swizzle = 0;
   uint64_t compute_ctas = 0;
   uint64_t group_stride = 1;
@@ -146,6 +181,9 @@ struct A2AInputTileOrder {
     order.log_swizzle = p.log_swizzle_size_;
     order.compute_ctas = p.compute_grid_size;
     order.along_n = p.raster_order_ == Params::RasterOrder::AlongN;
+    order.n_tiles = static_cast<int32_t>(order.along_n
+        ? p.divmod_cluster_blk_major_.divisor
+        : p.divmod_batch_.divisor / p.divmod_cluster_blk_major_.divisor);
     order.group_stride = p.divmod_cluster_blk_major_.divisor << order.log_swizzle;
     return order;
   }
@@ -174,21 +212,85 @@ struct A2AInputTileOrder {
 
   struct Task { int32_t m = 0, peer = 0, chunk = 0; };
 
+  // Sum max(depth-g, 0) for g in [0, groups). Used to count the rectangular
+  // group/peer grid before a diagonal without scanning M blocks or copy tasks.
+  CUTLASS_HOST_DEVICE static uint64_t ramp_cells(int32_t depth, int32_t groups) {
+    if (depth <= 0) return 0;
+    const uint64_t count = depth < groups ? depth : groups;
+    return count * depth - count * (count - 1) / 2;
+  }
+
+  CUTLASS_HOST_DEVICE static uint64_t m_tasks_before_diagonal(
+      int32_t depth, int32_t groups, int32_t group_m_tiles,
+      int32_t tail_m_tiles, int32_t world) {
+    const uint64_t cells = ramp_cells(depth, groups) - ramp_cells(depth - world, groups);
+    const int32_t tail_depth = depth - (groups - 1);
+    const int32_t tail_peers = tail_depth <= 0 ? 0 : (tail_depth < world ? tail_depth : world);
+    return cells * group_m_tiles - static_cast<uint64_t>(group_m_tiles - tail_m_tiles) * tail_peers;
+  }
+
   CUTLASS_HOST_DEVICE Task decode(uint64_t task, int32_t world, int32_t chunks) const {
     const uint64_t tasks_per_m = static_cast<uint64_t>(world) * chunks;
-    // A window [begin,end) occupies [begin,end)*tasks_per_m in the queue,
-    // although its INNER order is peer-major. Thus this probe M identifies
-    // the window, not the M of the final copy task.
+    // Interleaving changes only a window's interior: its queue extent remains
+    // [begin,end)*tasks_per_m. The probe M locates the window, not the copy's M.
     const uint64_t probe_m = task / tasks_per_m;
     const uint64_t wave = first_use(probe_m) / compute_ctas;
     const int32_t begin = lower_bound(wave * compute_ctas);
     const int32_t end = lower_bound((wave + 1) * compute_ctas);
     const uint64_t offset = task - static_cast<uint64_t>(begin) * tasks_per_m;
-    const uint64_t tasks_per_peer = static_cast<uint64_t>(end - begin) * chunks;
-    const int32_t peer = static_cast<int32_t>(offset / tasks_per_peer);
-    const uint64_t in_peer = offset - static_cast<uint64_t>(peer) * tasks_per_peer;
-    return {begin + static_cast<int32_t>(in_peer / chunks), peer,
-            static_cast<int32_t>(in_peer % chunks)};
+    const int32_t window_m_tiles = end - begin;
+    const int32_t width = int32_t{1} << log_swizzle;
+    if (!along_n && n_tiles > width) {
+      // Cohorts are queue priorities only: independent copy slots may overlap
+      // groups/windows. No completion barrier, new ready flag or acknowledgement.
+      const int32_t cohort = ready_group_m_tiles > 0 ? ready_group_m_tiles : 1;
+      const uint64_t group_tasks = static_cast<uint64_t>(cohort) * tasks_per_m;
+      const int32_t group_begin = static_cast<int32_t>(offset / group_tasks) * cohort;
+      const int32_t remaining = window_m_tiles - group_begin;
+      const int32_t group_m = remaining < cohort ? remaining : cohort;
+      const uint64_t in_group = offset % group_tasks;
+      const uint64_t peer_tasks = static_cast<uint64_t>(group_m) * chunks;
+      const uint64_t in_peer = in_group % peer_tasks;
+      return {begin + group_begin + static_cast<int32_t>(in_peer / chunks),
+              static_cast<int32_t>(in_group / peer_tasks),
+              static_cast<int32_t>(in_peer % chunks)};
+    }
+    const int32_t share = (window_m_tiles + world - 1) / world;
+    const int32_t group_m_tiles = share > width ? share : width;
+    const int32_t groups = (window_m_tiles + group_m_tiles - 1) / group_m_tiles;
+    if (groups == 1) {
+      const uint64_t tasks_per_peer = static_cast<uint64_t>(window_m_tiles) * chunks;
+      const int32_t peer = static_cast<int32_t>(offset / tasks_per_peer);
+      const uint64_t in_peer = offset % tasks_per_peer;
+      return {begin + static_cast<int32_t>(in_peer / chunks), peer,
+              static_cast<int32_t>(in_peer % chunks)};
+    }
+
+    const int32_t tail_m_tiles = window_m_tiles - (groups - 1) * group_m_tiles;
+    const uint64_t m_task = offset / chunks;
+    // At most 2*world-1 diagonals; CP4/8 needs at most four prefix probes.
+    // Search M/peer task counts (not padded cells), so a partial final group has no holes.
+    int32_t lo = 0, hi = groups + world - 1;
+    while (hi - lo > 1) {
+      const int32_t mid = (lo + hi) / 2;
+      if (m_tasks_before_diagonal(mid, groups, group_m_tiles, tail_m_tiles, world) <= m_task) lo = mid;
+      else hi = mid;
+    }
+    uint64_t in_diagonal = m_task - m_tasks_before_diagonal(lo, groups, group_m_tiles, tail_m_tiles, world);
+    int32_t group = lo < groups ? lo : groups - 1;
+    // Descending group order is ascending peer order. A partial tail group, if
+    // present on this diagonal, is first; all remaining groups have equal width.
+    if (group == groups - 1) {
+      if (in_diagonal < static_cast<uint64_t>(tail_m_tiles)) {
+        return {begin + group * group_m_tiles + static_cast<int32_t>(in_diagonal),
+                lo - group, static_cast<int32_t>(offset % chunks)};
+      }
+      in_diagonal -= tail_m_tiles;
+      --group;
+    }
+    group -= static_cast<int32_t>(in_diagonal / group_m_tiles);
+    return {begin + group * group_m_tiles + static_cast<int32_t>(in_diagonal % group_m_tiles),
+            lo - group, static_cast<int32_t>(offset % chunks)};
   }
 };
 

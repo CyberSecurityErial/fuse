@@ -1,5 +1,35 @@
 # SM103 Ulysses forward baseline bench
 
+## OProj ready / MMA / epilogue diagnostic
+
+`l20d.py run fused-smoke --profile --profile-detail full --directions oproj
+--oproj-pipeline-probe` adds a private pipeline probe; supply the same explicit
+shape, tile, communication CTA budget, raster, and swizzle as the uninstrumented
+comparison. First build with `l20d.py run fused-build --profile`. The probe is
+single-process Eager only, never an accepted MPI Graph performance sample.
+
+Only GPU0 workers 0, 1, and the start of the final swizzle-sized worker group
+are sampled (deduplicated for small grids). Buffers are bounded to 64 MiB.
+Other GPUs still run and undergo complete numeric/route validation. Ready
+checks retain the original whole-peer granularity; K-stage timestamps observe
+existing MMA input waits without adding ready checks, fences, or GPU barriers.
+The selected BF16 CUTLASS `mma()` needs a small diagnostic mirror because its
+concrete pipeline parameter would slice an observer subclass. Keep this mirror
+aligned with the pinned CUTLASS implementation when upgrading dependencies.
+
+`scripts/export_sm103_oproj_perfetto.py` exports the verified receipt to a new
+JSON. Load-warp checks, MMA stages, TMEM-slot waits, and epilogue phases appear
+directly below their owning CTA. Submission timestamps are **not** tensor-active
+intervals; epilogue observation of the existing accumulator barrier is an upper
+bound on MMA completion. An input-wait span may overlap earlier asynchronous MMA.
+
+Cross-check with the existing **unprofiled** `--calibrate --fused-counters fused`
+NCU path (GPU0 only; all peers active), separately for rows/columns with matched
+geometry and budgets. Preserve concurrent range replay, no clock locking or
+cache flushing. Tensor-active, memory and NVLink counters describe the measured
+GPU/range, not a particular CTA or a time-aligned slice of the separate Perfetto
+capture. Quantify probe overhead before attributing differences to production.
+
 新增可选的[大模型/近期模型投影矩阵](PROJECTION_SHAPES.md)，覆盖 GQA、MHA、
 MLA、KDA 与 Gated DeltaNet。完整融合边界和独立 GEMM 分开记录；新增模型显式选择。
 生产默认序列已移除 1K/4K，保留 16K/128K/256K/512K；小尺寸仅用于 smoke/回归。
@@ -73,6 +103,33 @@ CUDA_VISIBLE_DEVICES=0 /root/workspace_wct/bench-env/bin/python \
 ```
 
 最后一个命令仅为单卡纯 GEMM 诊断，不包含 A2A，不是正式分布式边界结果。
+
+纯 GEMM 的计算预算对照：`scripts/l20d.py run gemm-probe --launches graph`
+支持 `--gemm-sm-budget N`，其中 N 应取待比较融合配置的实际计算 CTA 预算
+（例如 Runtime 148 SM、通信 16 CTA 时为 132）。不传该参数保留满卡对照。
+每个预算重新选 cuBLASLt 算法，仍使用随机输入、选算法及正式采样各至少 10+50，
+不按 SM 比例缩放已有耗时。只比较同物理 GPU、同 M/N/K/精度/布局/Graph 边界；
+单 GPU Lt 不能直接与自研跨 rank 最大耗时作同卡 GEMM 归因。
+
+`--gemm-sm-budget` 创建进程内 CUDA green context，查询并要求实际分配 SM 数
+与 N 完全相同，同时核实 stream 绑定的资源。选算法、Graph capture/replay 和计时
+均使用该 stream。无法精确分配时失败，不静默取整。正常分组不能表示 N 时使用
+`IGNORE_SM_COSCHEDULING`，记录 split flags 与实际 co-scheduling alignment；
+该选择可能限制大 cluster 算法，结果不能隐藏这项条件。没有配置 MIG/MPS 或系统
+环境；已设置 MPS active-thread override 的进程拒绝这项实验。
+
+只想验证库的提示参数可用 `--cublaslt-sm-target N`（显式 0 是满卡审计）：
+`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET` 只是启发式提示，不是硬件 SM 分区。
+两种显式入口都在计时后保存**实际测量 Graph**的 verbose DOT，包含 kernel
+grid/block 等信息；CTA 网格不等于驻留 SM 数。资源限制版记录
+`sm_budget_diagnostic`，仅提示版记录 `sm_target_diagnostic`。
+非零 `tuning.math_sms` 的诊断不会通过满卡基线表的导入检查，不覆盖既有全量参考。
+
+2026-09-08 验证：Qwen3-235B OProj 每 GPU M16384/N4096/K8192、BF16 Graph，
+node09 GPU0，green context 实际分配 132 SM、stream 资源复核通过，split flags=1、
+co-scheduling alignment=2，8/8 Lt 算法可运行。随机输入、10+50、4096 点数值校验
+通过；run `20260908-222829-c5a6c7`。这不是完整矩阵更新，也不是融合 CP8 测量。
+
 `BUILD_DIR`、`BUILD_JOBS`、`CUDACXX`、`CUDAARCHS` 可在构建子 shell 中覆盖。
 默认产物位于 `build/sm103`；不需要 CUTLASS、Torch、MPI 或 TE 即可完成 C++ 构建。
 
@@ -206,3 +263,79 @@ NCU 禁用自动锁频与 cache flush；NSYS 只采应用的 CUDA/NVTX，不做 
 ```bash
 python3 -m unittest discover -s benchmarks/sm103 -p 'test_*.py' -v
 ```
+# 独立 OProj GEMM 片间空隙诊断
+
+独立本体调参使用 `fused-smoke --mpi --fused-launch graph --fused-direction oproj
+--calibrate --compute-only`：只启动 `compute_reference`，跳过 F 与 copy reference。
+输入提前物化，计算 CTA 预算由 `148-comm_sm` 明确给定；此处 comm_sm 是预留预算，
+并不启动通信 CTA。同 shape 的 tile 候选复用进程、输入和校验器，每个候选两种
+随机 payload 完整校验、至少10+50；独立选优不能声称融合/overlap也有相同收益。
+
+`l20d.py run fused-smoke --profile --oproj-gap-probe --directions oproj`
+复用既有单进程 Eager profiling 入口、完整校验和显式 tile/计算 CTA 预算。
+本选项额外物化完整 lhs，测独立 `compute_reference`，不把融合的 ready 等待
+混入独立 GEMM。GPU0 的全部计算 CTA/逻辑 tile 都记录；其余 GPU 不插细粒度点。
+只记录 tile 边界，不逐 K-stage 输出，不生成大型 Perfetto 文件。
+
+每条 CTA 链定义 `A_i=第一份 K 输入可消费的时间`、
+`B_i=epilogue 观察 accumulator 可消费的时间`；片间间隔为
+`A_(i+1)-B_i`，保留负值以表示观察区间重叠。`B_i-A_i` 仍含 tile 内部
+输入/流水等待，不是纯 Tensor Core 执行时间。输出每条链的 service、signed gap、
+正 gap、首尾时间与 tile 数，逐链校验时间闭合，禁止把并行 CTA 的 gap 相加当 E2E。
+采用最后观察完成的 CTA 作为计算关键链的近似，并不证明它就是 kernel 关键路径。
+
+插桩前后各 10+50，额外至少 100 ms 预热；输出扰动和样本半段稳定性。
+`scripts/summarize_sm103_gemm_gaps.py --log <log> --output <json>` 汇总。
+`--table <abc.json> --run-root <l20d目录> --output <json>` 按 M/N/K/预算映射
+历史表，另出 CSV。此处是 Eager 诊断与历史 Graph 的数量级比较：
+`gap占比/(1-b/a)` **不是已测出的损失归因比例或严格上界**，因为没有测到
+cuBLASLt 自身逐 tile 的 gap，且插桩、epoch、launch mode 均可能带来差异。
+
+`l20d.py run gemm-probe --cublaslt-counters --launches graph` 可对单一 BF16
+geometry 的已预热、已选算法 Graph 采集 NCU，并保留 `--gemm-sm-budget`
+green context。NCU 使用现有六项计数器及同一导出/校验器（输出文件沿用
+`cutlass-counters.csv` 名称，contract 明确 backend=cublaslt）。结果是 diagnostic，
+不可替换正式性能表；Tensor 活跃度不能直接换算成片间 gap 时间。
+
+## OProj：生产消费统一性能模型
+
+当前收口（2026-09-09）：保留现有离线选优与显式传参，运行时自动选择作为
+TODO，暂不继续调优或部署。后续将GEMM tile/epilogue、AlongM/AlongN、swizzle
+与通信CTA纳入统一选择；用独立C/R实测预算曲线评分，并按每个候选重新计算
+通信窗口、cohort及交货顺序。必须保留显式参数覆盖，不能按模型名硬编码。
+现有窗口/cohort自动适配是确定性调度规则，不是运行时参数寻优。
+模型Top1尚有退化，Top2经实测选优不能替代运行期自动选择的验证。
+
+核心同时约束两件事：**数值上的生产/消费速率**，以及**位置上的交货/消费
+布局和顺序**。SM103 的旧固定 `auto` 入口不等于运行期成本模型；新模型先以
+离线预测和留出 workload 验证，不把未验证的预测直接设为生产默认值。
+
+`fused_model.py::score_oproj_schedule` 保留 tile、计算 CTA、整数波、启动与收尾项，
+并显式展开与算子一致的调度：
+
+```text
+candidate = GEMM tile/raster/swizzle + communication CTAs + cohort
+  compute CTAs = physical SMs - communication CTAs
+  GEMM schedule -> first-use windows -> copy-slot-bounded delivery queue
+  copy slots -> last chunk of each (M, peer) -> complete-ready time
+  compute worker: tile c, c+compute_CTAs, ...; consume peer 0,1,... in K order
+  predicted finish = critical dependency path, not a sum of parallel waits
+```
+
+每个预算使用**对应实测的 GEMM 服务曲线**，不假设吞吐与 SM 数线性增长。
+增加通信 CTA 同时会改变计算预算、窗口、copy 槽位与 cohort，必须重新评分。
+有效通信带宽包含全部独立 A 字节（本地和远端），不是仅远端 NVLink 带宽。
+同一个 `(M, peer)` 被多个 N tile 复用，交货量只计一次；所有原 chunk 完成
+才可发布 ready，不引入 K 细粒度信号、额外 fence 或全局队列屏障。
+
+多 N-band 的 AlongM 在第一段就需要全部 A，但只完成约 `swizzle/N_tiles`
+的 GEMM；因此总量上的 `T_comm < T_gemm` 不足以证明不会断供。模型同时输出
+这个阶段的生产/消费比，以及真实队列映射形成的预测关键路径等待。AlongN
+按实际 M 分组的 N 复用轨迹处理，不套用 AlongM 的前段放大系数。
+
+校准只使用独立计算 C、独立通信 R 或明确定义的 profile 服务数据；融合 F
+仅作预测验证，不按模型名、序列标签或融合赢家表拟合。完整 C/R 边界折算为
+有效周期和带宽时，启动/收尾仅被摊销，不能再额外相加或称为已测得零开销。
+各 peer 的计算服务均分、固定 copy-slot 服务、未模拟资源竞争反馈是当前
+明确的近似；预测误差与留出尺寸结果必须单独报告。Profile 诊断与 Graph
+性能不直接相减，1+5 快筛不能覆盖为正式 10+50 bench。

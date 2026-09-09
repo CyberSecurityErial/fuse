@@ -170,6 +170,9 @@ def fused_candidates(job):
 def fused_geometry(job):
     """Resolve the same integer/shape contract as fused_bf16, without CUDA."""
     limit = (1 << 31) - 1
+    if job.get('quick') and (job.get('stage') != 'fused-smoke' or job.get('profile') or
+            job.get('validation_self_test') or job.get('fused_counters') or job.get('oproj_gap_probe')):
+        raise ValueError('--quick requires non-profile fused-smoke without diagnostics')
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj'):
         raise ValueError('Invalid --fused-direction')
@@ -251,6 +254,8 @@ def fused_device_memory(job):
         # Current peer events fit in 256 bytes; 1 MiB also covers CTA records.
         # Update this allowance if the profiling record/layout contract changes.
         profile_bytes = (0 if job.get('profile_detail') == 'cta' else peer_capacity * 256) + (1 << 20)
+        if job.get('oproj_pipeline_probe') or job.get('oproj_gap_probe'):
+            profile_bytes += 64 << 20  # GPU0-only bounded private probe; conservative per-rank allowance.
     allocated_bytes = buffer_bytes + flag_bytes + calibration_flag_bytes + profile_bytes
     headroom_bytes = max(512 << 20, (allocated_bytes + 9) // 10)
     return dict(geometry=shape, buffer_bytes=buffer_bytes, flag_bytes=flag_bytes,
@@ -275,6 +280,17 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 def validate_job(job, hostname=None):
     node = job_node(job)
+    if job.get('compute_only') and (job['stage'] != 'fused-smoke' or not job.get('calibrate') or
+            job.get('fused_direction') != 'oproj' or job.get('profile') or job.get('fused_counters')):
+        raise ValueError('Compute-only requires non-profile OProj calibration')
+    if job.get('oproj_gap_probe') and (job['stage'] != 'fused-smoke' or
+            not job.get('profile') or job.get('mpi') or job.get('directions') != 'oproj' or
+            job.get('profile_detail', 'full') not in (None, 'full') or job.get('oproj_pipeline_probe')):
+        raise ValueError('OProj gaps require standalone full OProj profiling without K-stage probes')
+    if job.get('cublaslt_counters') and (job['stage'] != 'gemm-probe' or
+            job.get('compare_cutlass') or job.get('launches') != 'graph' or
+            len(gemm_probe_shapes(job)) != 1):
+        raise ValueError('cuBLASLt counters require one standalone Graph geometry')
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj') or (direction != 'both' and
             (job['stage'] != 'fused-smoke' or job.get('profile'))):
@@ -355,6 +371,12 @@ def validate_job(job, hostname=None):
             raise ValueError('Unknown profile detail')
         if job['stage'] != 'fused-smoke' or not job.get('profile'):
             raise ValueError('Explicit profile detail requires fused-smoke --profile')
+    if type(job.get('oproj_pipeline_probe', False)) is not bool:
+        raise ValueError('OProj pipeline probe selection must be a boolean')
+    if job.get('oproj_pipeline_probe') and (job['stage'] != 'fused-smoke' or
+            not job.get('profile') or (job.get('profile_detail') or 'full') != 'full' or
+            job.get('directions') != 'oproj' or job.get('mpi') or job.get('qkv_epilogue_probe')):
+        raise ValueError('OProj pipeline probe requires single-process full OProj profiling')
     if type(job.get('qkv_epilogue_probe', False)) is not bool:
         raise ValueError('QKV epilogue probe must be a boolean')
     if job.get('qkv_epilogue_probe'):
@@ -386,6 +408,16 @@ def validate_job(job, hostname=None):
             validate_gemm_matrix(job['gemm_matrix_payload'])
     elif job.get('gemm_matrix') or job.get('gemm_matrix_payload'):
         raise ValueError('--gemm-matrix is only valid for gemm-probe')
+    lt_target = job.get('cublaslt_sm_target')
+    if lt_target is not None and (type(lt_target) is not int or not 0 <= lt_target <= 148
+            or job['stage'] != 'gemm-probe' or job.get('launches') != 'graph'
+            or job.get('compare_cutlass')):
+        raise ValueError('cuBLASLt SM target requires standalone Graph gemm-probe and a value in 0..148')
+    gemm_budget = job.get('gemm_sm_budget')
+    if gemm_budget is not None and (type(gemm_budget) is not int or not 1 <= gemm_budget <= 148
+            or job['stage'] != 'gemm-probe' or job.get('launches') != 'graph'
+            or job.get('compare_cutlass') or lt_target not in (None, gemm_budget)):
+        raise ValueError('GEMM SM budget requires standalone Graph gemm-probe and matching target in 1..148')
     if type(job.get('compare_cutlass', False)) is not bool:
         raise ValueError('CUTLASS comparison selection must be a boolean')
     if job.get('compare_cutlass') and (job['stage'] != 'gemm-probe' or
@@ -963,6 +995,8 @@ def fused_argv(job):
     shape = fused_geometry(job)
     comm, qkv, oproj = fused_candidates(job)
     argv = [str(fused_binary(job)), '--world', str(shape['world'])]
+    if job.get('quick'):
+        argv += ['--quick']
     if job.get('fused_direction', 'both') != 'both':
         argv += ['--fused-direction', job['fused_direction']]
     if job.get('fused_launch', 'eager') != 'eager':
@@ -986,7 +1020,7 @@ def fused_argv(job):
             argv += ['--profile-direction', job['directions']]
         if job.get('profile_detail') is not None:
             argv += ['--profile-detail', job['profile_detail']]
-    for key in ('cpu_oracle', 'validation_self_test', 'calibrate', 'qkv_epilogue_probe'):
+    for key in ('cpu_oracle', 'validation_self_test', 'calibrate', 'compute_only', 'qkv_epilogue_probe', 'oproj_pipeline_probe', 'oproj_gap_probe'):
         if job.get(key):
             argv.append('--' + key.replace('_', '-'))
     if job.get('fused_counters'):
@@ -1136,6 +1170,10 @@ def gemm_probe_argv(job, folder):
             '--tune-warmup', '10', '--tune-iterations', '50',
             '--library', str(REMOTE / 'build/sm103/libfuse_sm103_cublaslt.so'),
             '--output', str(folder / 'gemm-probe.json')]
+    if job.get('cublaslt_sm_target') is not None:
+        argv += ['--cublaslt-sm-target', str(job['cublaslt_sm_target'])]
+    if job.get('gemm_sm_budget') is not None:
+        argv += ['--gemm-sm-budget', str(job['gemm_sm_budget'])]
     if job.get('gemm_matrix_payload'):
         argv += ['--matrix-json', str(folder / 'gemm-matrix.json')]
     else:
@@ -1166,6 +1204,14 @@ def cutlass_counter_argv(folder, argv):
             '--clock-control', 'none', '--cache-control', 'none',
             '--metrics', ','.join(CUTLASS_COUNTER_METRICS),
             '--export', str(folder / 'cutlass-counters'), *argv]
+
+
+def cublaslt_counter_argv(folder, argv):
+    return ['ncu', '--replay-mode', 'kernel', '--nvtx',
+            '--nvtx-include', 'fuse_cublaslt_counters/', '--launch-count', '1',
+            '--clock-control', 'none', '--cache-control', 'none',
+            '--metrics', ','.join(CUTLASS_COUNTER_METRICS),
+            '--export', str(folder / 'cutlass-counters'), *argv, '--cublaslt-counters']
 
 
 def run_counter_tool(argv, env):
@@ -1549,12 +1595,24 @@ def remote(job_path):
                 shape=({key: shapes[0][key] for key in ('m', 'n', 'k')}
                        if not job.get('gemm_matrix_payload') else None),
                 shapes=shapes, geometry_cp=(job['world'] if not job.get('gemm_matrix_payload') else None),
-                measured_ranks=1, math_sms=0,
+                measured_ranks=1, math_sms=job.get('gemm_sm_budget') or job.get('cublaslt_sm_target') or 0,
+                requested_gemm_sm_budget=job.get('gemm_sm_budget'),
+                sm_budget_enforcement=('cuda_green_context' if job.get('gemm_sm_budget') else
+                                       'cublaslt_heuristic_hint_not_hard_partition'),
                 library_sha256=sha(library), correctness='existing_evenly_spaced_64x64_check',
                 cublas_classic_measured=False, distributed_boundary_measured=False))
             if job.get('cutlass_counters'):
                 prepare_cutlass_counters(folder, env)
                 argv = cutlass_counter_argv(folder, argv)
+            elif job.get('cublaslt_counters'):
+                prepare_cutlass_counters(folder, env)
+                write_json(folder / 'cutlass-counter-contract.json', dict(
+                    schema='sm103_cublaslt_counter_contract_v1', backend='cublaslt',
+                    diagnostic_only=True, performance_accepted=False,
+                    nvtx_range='fuse_cublaslt_counters', selected_calls=1,
+                    metrics=list(CUTLASS_COUNTER_METRICS), replay_mode='kernel',
+                    clock_control='none', cache_control='none'))
+                argv = cublaslt_counter_argv(folder, argv)
         elif stage == 'te-build':
             argv = ['bash', str(REMOTE / 'scripts/build_sm103_te.sh')]
         elif stage == 'ub-check':
@@ -1640,7 +1698,7 @@ def remote(job_path):
             build_receipt = cutlass_probe_build_receipt(job, env_id)
             write_json(cutlass_probe_library().parent / '.l20d-build.json', build_receipt)
             write_json(folder / 'cutlass-probe-build.json', build_receipt)
-        elif stage == 'gemm-probe' and job.get('cutlass_counters'):
+        elif stage == 'gemm-probe' and (job.get('cutlass_counters') or job.get('cublaslt_counters')):
             collect_cutlass_counters(folder, env)
         elif stage == 'fused-smoke' and job.get('fused_counters'):
             collect_fused_counters(folder, env, job.get('fused_counter_tool', 'ncu'))
@@ -1666,6 +1724,9 @@ def remote(job_path):
             with tarfile.open(artifact, 'w:gz') as tar:
                 for file in folder.iterdir():
                     if file.is_file() and (file.suffix in ('.json', '.log', '.txt', '.csv') or
+                            ((job.get('cublaslt_sm_target') is not None or job.get('gemm_sm_budget'))
+                             and file.name.startswith('gemm-probe-')
+                             and file.name.endswith('-launch.dot')) or
                             (job.get('cutlass_counters') and file.name == 'cutlass-counters.ncu-rep') or
                             (job.get('fused_counters') and file.name in
                              ('fused-counters.ncu-rep', 'fused-counters.nsys-rep', 'fused-counters.sqlite'))):
@@ -1701,6 +1762,8 @@ def main():
                      help='non-profile fused-smoke: allocate, validate and measure only selected direction')
     run.add_argument('--profile-detail', choices=('full', 'cta'),
                      help='fused-smoke --profile: full peer trace (default), or CTA-only diagnostics')
+    run.add_argument('--oproj-pipeline-probe', action='store_true',
+                     help='full OProj profiling: GPU0 three-worker ready/MMA/epilogue diagnostic')
     run.add_argument('--qkv-epilogue-probe', action='store_true',
                      help='private N256/K64/e32 QKV epilogue diagnostic; requires profile and CTA detail')
     run.add_argument('--rebuild', action='store_true', help='fused-build: explicitly rebuild this workspace-local build directory')
@@ -1737,6 +1800,10 @@ def main():
                      help='fused smoke: explicit host enqueue experiment; preserve full per-rank CUDA-event boundary')
     run.add_argument('--calibrate', action='store_true',
                      help='fused smoke: append independently validated compute/copy calibration for each explicit candidate')
+    run.add_argument('--compute-only', action='store_true',
+                     help='OProj calibration: measure only independent GEMM, never launch fused/copy kernels')
+    run.add_argument('--quick', action='store_true',
+                     help='fused-smoke screening: 1 warmup + 5 samples, no convergence/retries; not formal data')
     run.add_argument('--fused-counters', choices=('fused', 'compute_reference', 'copy_reference'),
                      help='single-process calibrated diagnostic: one warmed app-range on GPU0, all peers active; no performance samples')
     run.add_argument('--fused-counter-tool', choices=('ncu', 'nsys'), default='ncu',
@@ -1762,10 +1829,18 @@ def main():
                      help='stock 1-SM MMA cluster M only (M2 requires E32); leaves 2-SM/Lt unchanged; requires --compare-cutlass')
     run.add_argument('--cutlass-sm-budget', type=int,
                      help='explicit CUTLASS persistent CTA budget, not an SM affinity partition')
+    run.add_argument('--cublaslt-sm-target', type=int,
+                     help='Graph gemm-probe: Lt SM heuristic target (0=full device), saves actual launch graph')
+    run.add_argument('--gemm-sm-budget', type=int,
+                     help='Graph gemm-probe: exact process-local green-context SM budget')
     run.add_argument('--cutlass-full-check', action='store_true',
                      help='explicit small CUTLASS comparison: full output checks, tensors limited to 4194304 elements')
     run.add_argument('--cutlass-counters', action='store_true',
                      help='single-geometry 1-SM NCU diagnostic only, never a performance sample')
+    run.add_argument('--cublaslt-counters', action='store_true',
+                     help='single-geometry tuned Graph NCU diagnostic, not a benchmark result')
+    run.add_argument('--oproj-gap-probe', action='store_true',
+                     help='full independent compute CTA tile-gap coverage, compact profile diagnostic only')
     run.add_argument('--oproj-layout', choices=('legacy', 'causal_dual_chunk_v1'), default='legacy',
                      help='baseline-replay: explicit inverse-A2A physical input contract')
     run.add_argument('--models', default='production_qwen_dense')

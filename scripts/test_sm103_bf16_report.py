@@ -13,6 +13,51 @@ from unittest import mock
 import report_sm103_bf16 as report
 
 
+class GemmReplayTableTests(unittest.TestCase):
+    def inputs(self, fresh_ms=2.0):
+        prior = [dict(direction='oproj', model='test', cp='4', seq='131072',
+                      f='1.0', p='2.0', run='history', config='old')]
+        config = ['m128n256k64e32', 16, 'along_n', 4]
+        task = dict(direction='oproj', cp=4, seq=131072, m=32768, n=8192, k=8192,
+                    old_config=config, config=config,
+                    aliases=[dict(model='test', old_pf=1.0, run='history')])
+        replay = dict(runs=[dict(status='succeeded', run_id='new', task=task)])
+        candidate = dict(component='fused', direction='A2A_GEMM', launch='graph',
+                         m=32768, n=8192, k=8192, world=4, global_seq=131072,
+                         comm_ctas=16, tile_policy=config[0], raster='along_n',
+                         max_swizzle_size=4, problem_gemm_flops=2e12,
+                         timing=dict(p50_ms=fresh_ms, p95_ms=fresh_ms))
+        return prior, replay, {'new': dict(candidates=[candidate])}
+
+    def test_regression_remains_visible_without_overwriting_history(self):
+        rows = report.gemm_replay_rows(*self.inputs(4.0))
+        self.assertEqual(rows[0]['fresh_pflops'], .5)
+        self.assertEqual(rows[0]['fresh_change_pct'], -50)
+        self.assertEqual(rows[0]['f'], 1.0)
+        self.assertEqual(rows[0]['run'], 'history')
+        self.assertEqual(rows[0]['selection'], 'historical_retained')
+
+    def test_improvement_is_explicitly_unpaired(self):
+        row = report.gemm_replay_rows(*self.inputs(1.0))[0]
+        self.assertEqual(row['f'], 2.0)
+        self.assertEqual(row['run'], 'new')
+        self.assertEqual(row['retained_pct'], 100)
+        self.assertEqual(row['comparison'], 'historical_unpaired')
+
+    def test_failed_measurement_does_not_erase_prior(self):
+        prior, replay, audited = self.inputs()
+        replay['runs'][0]['status'] = 'oom'
+        row = report.gemm_replay_rows(prior, replay, audited)[0]
+        self.assertEqual(row['f'], '1.0')
+        self.assertEqual(row['fresh_pflops'], '')
+
+    def test_changed_communication_budget_is_rejected(self):
+        prior, replay, audited = self.inputs()
+        audited['new']['candidates'][0]['comm_ctas'] = 8
+        with self.assertRaises(ValueError):
+            report.gemm_replay_rows(prior, replay, audited)
+
+
 def stable(samples=None, pure=True):
     samples = samples or [2.] * 50
     drift = abs(report.statistics.median(samples[:25]) - report.statistics.median(samples[25:])) / report.statistics.median(samples)
@@ -350,7 +395,7 @@ class ReportContracts(unittest.TestCase):
 
     def test_pure_rejects_native_zero_inputs_forged_stats_and_retuned_graph(self):
         run,original,control = self.pure_fixture()
-        for mutation in ('native','zero','stats','graph_plan','missing_graph','warmup'):
+        for mutation in ('native','zero','stats','graph_plan','missing_graph','warmup','sm_budget'):
             data = copy.deepcopy(original)
             if mutation=='native': data['schema']='sm103_gemm_comparison_v1'
             if mutation=='zero': data['geometries'][0]['inputs']['activation']['sample_nonzero_fraction']=0.
@@ -358,6 +403,7 @@ class ReportContracts(unittest.TestCase):
             if mutation=='graph_plan': data['geometries'][0]['results'][1]['tuning']['algorithm']=8
             if mutation=='missing_graph': data['geometries'][0]['results'].pop()
             if mutation=='warmup': data['geometries'][0]['results'][0]['tune_warmup']=2
+            if mutation=='sm_budget': data['geometries'][0]['results'][0]['tuning']['math_sms']=132
             (control/'gemm-probe.json').write_text(json.dumps(data))
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 report.audit_pure_run(run)

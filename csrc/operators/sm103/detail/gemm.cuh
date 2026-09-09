@@ -187,10 +187,14 @@ struct A2ALhsGemmTypes {
       detail::MonolithicPersistentScheduler>;
 
 #if FUSE_ENABLE_PROFILING
+  using TelemetryPureGemm = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, detail::OprojPureMainloopObserver<typename Dense::Mainloop>,
+      detail::OprojEpilogueObserver<typename Dense::Epilogue>,
+      detail::MonolithicPersistentScheduler>;
   using TelemetryMainloop =
       detail::A2ALhsReadyMainloop<typename Dense::Mainloop, TileShape, true>;
   using TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<
-      ProblemShape, TelemetryMainloop, typename Dense::Epilogue,
+      ProblemShape, TelemetryMainloop, detail::OprojEpilogueObserver<typename Dense::Epilogue>,
       detail::MonolithicPersistentScheduler>;
 #endif
   static_assert(Gemm::MaxThreadsPerBlock == 256);

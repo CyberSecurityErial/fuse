@@ -37,6 +37,9 @@ class EpilogueProbeContracts(unittest.TestCase):
         pipeline = (ROOT / 'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
         begin = pipeline.index('template <class Base, class TileShape>\nstruct SignalingEpilogue')
         body = pipeline[begin:pipeline.index('\n}  // namespace fuse::detail', begin)]
+        ordering = (ROOT / 'csrc/operators/sm103/detail/producer_consumer.cuh').read_text()
+        begin = ordering.index('template <int M, int N>\nstruct PublishedTile')
+        published_tile = ordering[begin:ordering.index('\n};', begin) + len('\n};')]
         source = r'''
 #include "csrc/operators/sm103/detail/epilogue_profiling.cuh"
 #include <array>
@@ -45,6 +48,7 @@ class EpilogueProbeContracts(unittest.TestCase):
 #include <tuple>
 #include <vector>
 #define CUTLASS_DEVICE
+#define CUTLASS_HOST_DEVICE
 #define CHECK(expr) do { if (!(expr)) throw std::runtime_error(#expr); } while (0)
 struct { int x=0; } threadIdx, blockIdx;
 enum Call { Stamp, Store, Wait, Join, Publish, Tail };
@@ -62,7 +66,7 @@ namespace fuse::detail {
 uint64_t epilogue_timestamp() { calls.push_back(Stamp); return ++clock_value; }
 void tma_store_wait_all() { calls.push_back(Wait); clock_value+=wait_delay; }
 void store_release_gpu(uint32_t* ptr, uint32_t value) { calls.push_back(Publish); *ptr=value; clock_value+=3; }
-''' + body + r'''
+''' + published_tile + '\n' + body + r'''
 }
 struct Tile { static constexpr int dims[3]={128,256,64}; };
 struct Base {
@@ -184,6 +188,7 @@ template <class T> constexpr int size(T) { return T::dims[0]; }
 }
 namespace cutlass { template <class T> void device_kernel() {} }
 namespace fuse {
+struct QkvRouteTimeline; // This epilogue-only entry must leave route logging disabled.
 enum class GemmRaster { kHeuristic, kAlongM, kAlongN };
 struct GemmProblem { int m=256,n=512,k=64,l=1; GemmRaster raster=GemmRaster::kHeuristic; };
 struct GemmA2AParams {
@@ -203,9 +208,10 @@ int ceil_div(int a,int b) { return (a+b-1)/b; }
 struct Tile { static constexpr int dims[3]={128,256,64}; };
 struct Cluster { static constexpr int dims[1]={1}; };
 struct Comm {
-  static constexpr int kBlockM=128,kBlockN=256;
-  struct Arguments { GemmA2AParams params; };
+  static constexpr int kBlockM=128,kBlockN=256,kQkvBulkSlots=4;
+  struct Arguments { GemmA2AParams params; bool use_tma=true,use_tma_store=true; };
   static int initialize(Arguments&) { ++comm_calls; return comm_status; }
+  static int64_t route_slots(const GemmA2AParams&) { throw std::runtime_error("unexpected route probe"); }
 };
 struct QkvEpilogueProbeGemm {
   using TileShape=Tile;
@@ -219,6 +225,7 @@ struct QkvEpilogueProbeKernel {
   struct Arguments {
     QkvEpilogueProbeGemm::Arguments gemm; Comm::Arguments comm; int num_comm_ctas=0;
     A2AGemmCtaTimeline* timeline=nullptr; int timeline_capacity=0;
+    QkvRouteTimeline* route_timeline=nullptr;
   };
 };
 struct ProductionKernel {};
@@ -259,6 +266,7 @@ int main(int argc,char** argv) {
     CHECK(captured.gemm.epilogue.records==records && captured.gemm.epilogue.record_capacity==148);
     CHECK(captured.gemm.epilogue.epoch==7 && captured.gemm.epilogue.m_tiles==2 && captured.gemm.epilogue.n_tiles==2);
     CHECK(captured.timeline==timeline && captured.timeline_capacity==148 && captured.num_comm_ctas==12);
+    CHECK(captured.route_timeline==nullptr);
     CHECK(run(nullptr,148,records,148)==cudaErrorInvalidValue);
     CHECK(run(timeline,147,records,148)==cudaErrorInvalidValue);
     CHECK(run(timeline,148,nullptr,148)==cudaErrorInvalidValue);
@@ -320,8 +328,10 @@ int main(int argc,char** argv) {
         source = (ROOT / 'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
         begin = source.index('template <class Base, class TileShape>\nstruct SignalingEpilogue')
         end = source.index('\n#if FUSE_ENABLE_PROFILING', begin)
+        # Production baseline after factoring the shared PublishedTile index;
+        # adapter tests above also exercise its actual ready-address mapping.
         self.assertEqual(hashlib.sha256(source[begin:end].encode()).hexdigest(),
-                         '24e27f8a68ba07fe53238c64c28a50c8fd279b347a5f94c4cc2f24e0a89c288a')
+                         '545fbd215fb0f5da78f5b23e196644c21a92e77e11703e1addb457f8c7506b01')
 
     def test_real_private_entry_and_launch_helper_forward_buffers_and_reject_invalid_scope(self):
         subprocess.run([str(self.entry_probe), 'launch'], check=True, timeout=10)
@@ -360,6 +370,7 @@ struct Grid { void sync() { events.push_back("grid"); } };
 Grid this_grid() { return {}; }
 }
 namespace fuse {
+struct QkvRouteTimeline;
 struct Gemm {
   struct Params { int scheduler=0; };
   void operator()(Params const&,char*) { events.push_back("gemm"); }
@@ -367,6 +378,9 @@ struct Gemm {
 struct Comm {
   static constexpr bool kNeedsGridFinalize=true;
   void operator()(int,char*,int,int) { events.push_back("comm"); }
+  template <bool Instrumented> void run(int,char*,int,int,bool,QkvRouteTimeline*) {
+    throw std::runtime_error("unexpected route probe");
+  }
   void finalize_profile(int,A2AGemmCtaTimeline*) { events.push_back("finalize"); }
 };
 namespace detail {

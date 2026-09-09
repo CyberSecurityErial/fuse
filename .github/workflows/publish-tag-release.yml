@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v16.0
+        default: v17.0
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v16.0");
+              : (process.env.REQUESTED_TAG || "v17.0");
 
             const releases = {
+              "v17.0": {
+                name: "v17.0 — SM103 OProj scheduling and offline tuning baseline",
+                body: [
+                  "OProj delivery order follows the actual GEMM raster/swizzle and compute budget; complete (M,peer) ready semantics are preserved.",
+                  "Adds independent C/R calibration, budget-matched GEMM diagnostics and an offline production/consumption model. Runtime automatic tile/CTA selection remains TODO; configurations are explicit.",
+                  "Five large models, 128K–512K, CP4/8: 23/30 cells pass full two-payload numerical/routing validation; memory-limited and historical missing cells remain blank.",
+                  "Graph 1+5 quick screening, measured selection from model Top2: +15.77% geometric-mean throughput versus the same-run incumbent communication budget; 85.83% of historical full-SM pure cuBLASLt throughput. Five cells have >5% sample drift. Not formal 10+50, a runtime Top1 result, or a v16-to-v17 paired speedup.",
+                  "SM90 unchanged. No new full-matrix QKV performance claim. Tables, explicit configurations, compact raw samples and evidence hashes: results/sm103/v17.0; no profiles, dependencies or intermediate sweep packages.",
+                ].join("\n"),
+              },
               "v16.0": {
                 name: "v16.0 — Large-model long-sequence benchmarks",
                 body: [

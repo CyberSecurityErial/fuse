@@ -1,5 +1,19 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v17.0 — SM103 OProj 通信调度与离线选优基线
+
+通信交货顺序适配实际 GEMM tile、AlongM/AlongN、swizzle 与计算 CTA 预算，
+保留完整 `(M, peer)` ready 粒度；增加独立计算/通信标定和离线生产消费模型。
+运行时自动选择 tile/通信 CTA **仍为 TODO**，本版使用显式配置。
+
+五个大模型、128K/256K/512K、CP4/8：23/30 点通过完整数值和路由校验；
+其余显存不足或历史缺测留空。Graph **1+5 快筛**、模型 Top2 经实测选优，
+相对同轮原通信预算的吞吐比几何平均 1.1577x，相对满 SM 历史纯 cuBLASLt
+吞吐保留率 85.83%。5 点采样漂移超过5%，不冒充正式10+50稳定成绩或默认auto收益。
+SM90 不变；本轮不追加 QKV 全量性能承诺，不覆盖历史正式结果。
+
+[完整表、配置、样本与复现说明](results/sm103/v17.0/README.md)。
+
 ## v16.0 — 大尺寸长序列 benchmark
 
 仅更新 SM103 BF16 Graph benchmark、测量入口及结果，算子实现保持 v15.0。

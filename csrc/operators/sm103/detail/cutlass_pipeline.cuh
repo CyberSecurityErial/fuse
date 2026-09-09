@@ -38,6 +38,7 @@
 #if FUSE_ENABLE_PROFILING
 #include "fuse/profiling/timeline.cuh"
 #include "epilogue_profiling.cuh"
+#include "oproj_profiling.cuh"
 #endif
 
 #include <cute/tensor.hpp>
@@ -67,6 +68,7 @@ struct A2ALhsTimelineArguments {};
 
 template <>
 struct A2ALhsTimelineArguments<true> {
+  OprojPipelineView probe{};
   A2AGemmCtaTimeline* timeline = nullptr;
   int32_t timeline_capacity = 0;
   A2AGemmPeerTimeline* peer_timeline = nullptr;
@@ -135,6 +137,7 @@ struct A2ALhsReadyMainloop : Base {
     params.epoch = args.epoch;
 #if FUSE_ENABLE_PROFILING
     if constexpr (Instrumented) {
+      params.probe = args.probe;
       params.timeline = args.timeline;
       params.timeline_capacity = args.timeline_capacity;
       params.peer_timeline = args.peer_timeline;
@@ -223,12 +226,30 @@ struct A2ALhsReadyMainloop : Base {
           params_->k_tiles_per_peer - first_k % params_->k_tiles_per_peer;
       const int count = k_tiles < to_peer_end ? k_tiles : to_peer_end;
 
-      if (acquired_m_ != m || acquired_peer_ != peer) {
+      const bool cache_hit = acquired_m_ == m && acquired_peer_ == peer;
+#if FUSE_ENABLE_PROFILING
+      OprojReadyRecord* probe = nullptr;
+      uint64_t check_begin = 0, check_end = 0;
+      if constexpr (Instrumented) {
+        const int64_t index = params_->probe.tile_index(tile_coord);
+        if (index >= 0 && threadIdx.x % 32 == 0) {
+          auto* candidate = &params_->probe.tiles[index].ready[peer];
+          if (!candidate->begin) probe = candidate; // First prologue/remainder observation only.
+        }
+        if (probe) check_begin = oproj_timestamp();
+      }
+#endif
+      if (!cache_hit) {
         const uint32_t* flag = params_->ready +
             (static_cast<int64_t>(m) * params_->world_size + peer) *
                 kReadyFlagStride;
         if (threadIdx.x % 32 == 0) {
           wait_acquire_gpu_single_lane(flag, target);
+#if FUSE_ENABLE_PROFILING
+          if constexpr (Instrumented) {
+            if (probe) check_end = oproj_timestamp();
+          }
+#endif
         }
         __syncwarp();
         // The later elected TMA issuer need not be the lane which polled.
@@ -241,6 +262,11 @@ struct A2ALhsReadyMainloop : Base {
 
 #if FUSE_ENABLE_PROFILING
       if constexpr (Instrumented) {
+        if (probe) {
+          const uint64_t joined = oproj_timestamp();
+          *probe = {check_begin, cache_hit ? check_begin : check_end,
+                    joined, static_cast<uint32_t>(cache_hit)};
+        }
         // This is the mainloop-load warp (warp 2), not CTA thread zero.
         // Record cache hits too: another N tile can reuse this peer's ready
         // observation without repeating the semaphore acquire.
@@ -260,6 +286,22 @@ struct A2ALhsReadyMainloop : Base {
     }
     return cute::make_tuple(state, k_iter);
   }
+
+#if FUSE_ENABLE_PROFILING
+  template <class Pipelines, class States, class Accumulators, class Inputs, class Coord>
+  CUTLASS_DEVICE auto mma(Pipelines pipelines, States states, Accumulators accumulators,
+                         Inputs inputs, Coord coord, int k_tiles) {
+    if constexpr (Instrumented) {
+      const int64_t index = params_->probe.tile_index(coord);
+      if (index >= 0) {
+        CUTLASS_ASSERT(k_tiles == params_->probe.k_tiles);
+        return profile_oproj_mma(pipelines, states, accumulators, inputs, k_tiles,
+            params_->probe.tiles + index, params_->probe.stages + index * k_tiles);
+      }
+    }
+    return Base::mma(pipelines, states, accumulators, inputs, coord, k_tiles);
+  }
+#endif
 
  private:
 #if FUSE_ENABLE_PROFILING

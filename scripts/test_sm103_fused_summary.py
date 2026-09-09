@@ -23,6 +23,89 @@ def line(record_kind, label=None, **values):
     return ','.join(parts + [f'{key}={scalar(value)}' for key, value in values.items()])
 
 
+def oproj_probe_records():
+    pipeline = dict(rank=0, index=0, cta=8, mma_begin=100, tmem_acquired=110, mma_return=200,
+        epi_begin=105, acc_wait_begin=115, acc_wait_end=210, tmem_release_begin=220,
+        tmem_release_end=230, epi_return=240, k_tiles=1)
+    for peer in range(4):
+        pipeline.update({f'ready_begin{peer}': 80, f'ready_end{peer}': 90,
+                         f'ready_joined{peer}': 95, f'cache_hit{peer}': 0})
+    return [line('profile_oproj_pipeline', **pipeline),
+            line('profile_oproj_stage', rank=0, index=0, k=0, wait_begin=110, wait_end=120, issue_end=130)]
+
+
+class OProjProbeParsingTests(unittest.TestCase):
+    def parse(self, records, detail='full'):
+        config = line('config', world=4, profile_detail=detail)
+        return summary.parse_log('\n'.join([config] + records), completion='none')
+
+    def test_compact_full_probe_records_omit_detail_without_becoming_samples(self):
+        rows, diagnostics = self.parse(oproj_probe_records())
+        self.assertEqual([row['kind'] for row in rows], ['config'])
+        self.assertEqual(diagnostics, {'profile_oproj_pipeline': 1, 'profile_oproj_stage': 1})
+
+    def test_exception_is_only_for_full_probe_records(self):
+        for detail in ('cta', 'none'):
+            with self.subTest(detail=detail), self.assertRaisesRegex(ValueError, 'requires explicit full profile'):
+                self.parse(oproj_probe_records(), detail)
+        for kind in ('profile_cta', 'profile_peer', 'profile_oproj_unknown'):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, 'Per-record profile detail mismatch'):
+                self.parse([kind + ',rank=0'])
+
+    def test_malformed_probe_records_are_rejected(self):
+        records = oproj_probe_records()
+        mutations = [('rank=0', 'rank=1'), ('index=0', 'index=0,index=0'),
+                     ('k_tiles=1', 'k_tiles=0'), ('cache_hit0=0', 'cache_hit0=2'),
+                     ('mma_begin=100', 'mma_begin=nan'), ('ready_end0=90', 'ready_end0=70'),
+                     ('wait_end=120', 'wait_end=100'), ('wait_end=120', 'wait_end=-1'),
+                     (',cta=8', ''), ('index=0', 'index=0,extra=1'), ('index=0', 'positional')]
+        for before, after in mutations:
+            with self.subTest(mutation=(before, after)), self.assertRaises(ValueError):
+                self.parse([record.replace(before, after) for record in records])
+
+
+class QuickTimingTests(unittest.TestCase):
+    def records(self, graph=False):
+        rows = []
+        values = [1., 1., 1.2, 1.4, 1.6, 1.8]
+        for index, value in enumerate(values):
+            rows.append(dict(kind='warmup' if index == 0 else 'sample',
+                phase='initial' if index == 0 else 'measurement', round=-1 if index == 0 else 0,
+                index=max(0, index - 1), epoch=index + 2, line=index + 1,
+                maxrank_ms=f32(value), rank0_ms=f32(value), rank1_ms=f32(value)))
+        measured = [f32(value) for value in values[1:]]
+        rows.append(dict(kind='summary', line=7, sampling_mode='quick_1_5',
+            verification='pending', formal_eligible=0, warmup=1, samples=5,
+            additional_warmup_calls=0, sample_cadence_warmup=0,
+            minimum_warmup_cuda_ms=0, converged_all_ranks=0, selected_round=0,
+            collector='mpi_graph_rank_events_v1' if graph else 'per_epoch_rank_events_v3_eventsync',
+            boundary='mpi_graph_maxrank_cudaevent' if graph else 'single_process_eager_maxrank_cudaevent',
+            warmup_p50_ms=1., warmup_p95_ms=1., p50_ms=summary.percentile(measured, .5),
+            p95_ms=summary.percentile(measured, .95), half_drift=summary.drift(measured)))
+        if graph:
+            rows[-1].update(launch='graph', graph_epoch_mode=summary.GRAPH_EPOCH_MODE)
+        return rows
+
+    def test_exact_one_plus_five_is_screening_even_when_noisy(self):
+        for graph in (False, True):
+            result = summary.audit_timing(self.records(graph), 2, mpi=graph,
+                launch='graph' if graph else 'eager', quick=True)
+            self.assertFalse(result['formal_eligible'])
+            self.assertEqual(result['warmup_calls'], 1)
+            self.assertEqual(len(result['rounds'][0]['maxrank_ms']), 5)
+            self.assertGreater(result['half_drift'], .05)
+
+    def test_quick_cannot_masquerade_as_formal(self):
+        with self.assertRaises(ValueError):
+            summary.audit_timing(self.records(), 2)
+        for index, field, value in ((0, 'phase', 'sample_cadence'), (2, 'epoch', 999),
+                                    (-1, 'formal_eligible', 1)):
+            rows = self.records()
+            rows[index][field] = value
+            with self.assertRaises(ValueError):
+                summary.audit_timing(rows, 2, quick=True)
+
+
 class FusedSummaryTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='fuse-summary-test-')
@@ -1011,6 +1094,23 @@ class FusedSummaryTests(unittest.TestCase):
         result = summary.audit_run(self.root)
         self.assertEqual(result['profile_diagnostic_records'], {'profile_host': 8, 'profile_cta': 1})
         self.assertEqual(len(result['candidates']), 2)
+
+    def test_oproj_probe_records_require_explicit_complete_probe_scope(self):
+        self.make_fixture(profile=True, profile_schema='host_stages_v1', profile_detail='full')
+        job = json.loads((self.control / 'job.json').read_text())
+        text = self.log.read_text().replace('PASS:', '\n'.join(oproj_probe_records()) + '\nPASS:')
+        with self.assertRaisesRegex(ValueError, 'Unexpected OProj pipeline probe records'):
+            summary.audit_log(text, job)
+        probe_job = job | {'oproj_pipeline_probe': True, 'directions': 'oproj'}
+        result = summary.audit_log(text, probe_job)
+        self.assertEqual(result['profile_diagnostic_records']['profile_oproj_stage'], 1)
+        for override in ({'directions': 'both'}, {'oproj_pipeline_probe': 1}):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, 'OProj pipeline probe'):
+                summary.audit_log(text, probe_job | override)
+        for kind in summary.OPROJ_PROBE_FIELDS:
+            stripped = '\n'.join(row for row in text.splitlines() if not row.startswith(kind + ','))
+            with self.subTest(missing=kind), self.assertRaisesRegex(ValueError, 'incomplete OProj pipeline probe'):
+                summary.audit_log(stripped, probe_job)
 
     def test_cta_only_and_full_diagnostics_have_distinct_peer_contracts(self):
         for detail in ('cta', 'full'):

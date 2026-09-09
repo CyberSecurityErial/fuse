@@ -750,6 +750,80 @@ def build_report(campaign_path, output):
     return report
 
 
+def gemm_replay_rows(prior_rows, replay, audited_runs):
+    """Keep fresh measurements separate from the best-known historical table.
+
+    The caller audits successful runs with fused.audit_run. Historical comparisons
+    are explicitly unpaired: a positive delta is not causal proof of a GEMM gain.
+    Missing/failed new measurements never erase an existing valid benchmark.
+    """
+    entries = {}
+    for record in replay['runs']:
+        if record['status'] != 'succeeded':
+            continue
+        run = audited_runs[record['run_id']]
+        require(len(run['candidates']) == 1, 'Replay must contain exactly one candidate')
+        candidate = run['candidates'][0]
+        require(candidate.get('formal_eligible', True),
+                'Quick screening must not overwrite the formal benchmark table')
+        task = record['task']
+        require(candidate['component'] == 'fused' and candidate['launch'] == 'graph',
+                'Replay is not a production Graph fusion measurement')
+        require(tuple(candidate[k] for k in ('m', 'n', 'k')) ==
+                tuple(task[k] for k in ('m', 'n', 'k')) and
+                candidate['world'] == task['cp'] and candidate['global_seq'] == task['seq'],
+                'Replay geometry mismatch')
+        require(candidate['comm_ctas'] == task['old_config'][1] == task['config'][1],
+                'GEMM replay changed the communication budget')
+        require((candidate['tile_policy'], candidate['raster'], candidate['max_swizzle_size']) ==
+                (task['config'][0], task['config'][2], task['config'][3]),
+                'Replay configuration mismatch')
+        expected_direction = 'A2A_GEMM' if task['direction'] == 'oproj' else 'GEMM_A2A'
+        require(candidate['direction'] == expected_direction, 'Replay direction mismatch')
+        for alias in task['aliases']:
+            key = (task['direction'], alias['model'], task['cp'], task['seq'])
+            require(key not in entries, 'Duplicate successful logical replay')
+            entries[key] = (record, candidate, alias)
+
+    rows = []
+    for prior in prior_rows:
+        row = dict(prior)
+        key = (row['direction'], row['model'], int(row['cp']), int(row['seq']))
+        row.update(fresh_pflops='', fresh_p50_ms='', fresh_p95_ms='', fresh_run='',
+                   fresh_config='', fresh_change_pct='', fresh_retained_pct='',
+                   comparison='historical_unpaired', selection='historical_no_new_measurement')
+        if key in entries:
+            record, candidate, alias = entries[key]
+            task, timing = record['task'], candidate['timing']
+            flops = candidate['problem_gemm_flops']
+            fresh = flops / (timing['p50_ms'] * 1e12)
+            old = alias['old_pf']
+            tile, comm, raster, swizzle = task['config']
+            config = f'{tile}; comm={comm}; raster={raster}; swizzle={swizzle}'
+            row.update(fresh_pflops=fresh, fresh_p50_ms=timing['p50_ms'],
+                       fresh_p95_ms=timing['p95_ms'], fresh_run=record['run_id'],
+                       fresh_config=config, before_pflops=old, before_run=alias['run'],
+                       fresh_change_pct=100 * (fresh / old - 1) if old else '')
+            # A current same-budget historical reference can be newer than the
+            # supplied presentation table. Preserve its identity, not just its PFLOPS.
+            old_tile, old_comm, old_raster, old_swizzle = task['old_config']
+            row.update(f=old or '', run=alias['run'],
+                       config=f'{old_tile}; comm={old_comm}; raster={old_raster}; swizzle={old_swizzle}',
+                       selection='historical_retained')
+            if old is None or fresh > old:
+                row.update(f=fresh, run=record['run_id'], config=config, selection='new_measurement')
+        pure = float(row['p']) if row.get('p') else None
+        if pure:
+            row['retained_pct'] = 100 * float(row['f']) / pure if row.get('f') else ''
+            row['throughput_gap_pct'] = 100 - row['retained_pct'] if row['retained_pct'] != '' else ''
+            if row['fresh_pflops'] != '':
+                row['fresh_retained_pct'] = 100 * row['fresh_pflops'] / pure
+        rows.append(row)
+    require(set(entries) <= {(r['direction'], r['model'], int(r['cp']), int(r['seq']))
+                             for r in rows}, 'Replay points absent from the full table')
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--campaign', type=Path, required=True)

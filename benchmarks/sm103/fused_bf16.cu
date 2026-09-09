@@ -13,6 +13,7 @@
 #if FUSE_ENABLE_PROFILING
 #include "../../csrc/operators/sm103/detail/host_profiling.cuh"
 #include "../../csrc/operators/sm103/detail/epilogue_profiling.cuh"
+#include "../../csrc/operators/sm103/detail/oproj_profiling.cuh"
 #endif
 
 #include <cublas_v2.h>
@@ -72,9 +73,13 @@ struct Options {
   bool causal = false;
   bool profile = false;
   bool qkv_epilogue_probe = false;
+  bool oproj_pipeline_probe = false;
+  bool oproj_gap_probe = false;
   bool cpu_oracle = false;
   bool validation_self_test = false;
   bool calibrate = false;
+  bool compute_only = false;
+  bool quick = false;
   std::string counter_component;
   std::string counter_direction;
   MeasurementComponent component = MeasurementComponent::kFused;
@@ -408,6 +413,10 @@ Options parse_options(int argc, char** argv) {
           options.profile_direction != "oproj") throw std::runtime_error("invalid profile direction");
     } else if (argument == "--qkv-epilogue-probe") {
       options.qkv_epilogue_probe = true;
+    } else if (argument == "--oproj-pipeline-probe") {
+      options.oproj_pipeline_probe = true;
+    } else if (argument == "--oproj-gap-probe") {
+      options.oproj_gap_probe = true;
     } else if (argument == "--profile-detail") {
       if (++index == argc) throw std::runtime_error("missing value for " + argument);
       options.profile_detail = argv[index];
@@ -417,6 +426,10 @@ Options parse_options(int argc, char** argv) {
       }
     } else if (argument == "--calibrate") {
       options.calibrate = true;
+    } else if (argument == "--compute-only") {
+      options.compute_only = true;
+    } else if (argument == "--quick") {
+      options.quick = true;
     } else if (argument == "--counter-component" || argument == "--counter-direction") {
       if (++index == argc) throw std::runtime_error("missing value for " + argument);
       (argument == "--counter-component" ? options.counter_component : options.counter_direction) = argv[index];
@@ -469,6 +482,10 @@ Options parse_options(int argc, char** argv) {
   if (has_comm_sm && has_comm_sm_list) {
     throw std::runtime_error("--comm-sm and --comm-sm-list are mutually exclusive");
   }
+  if (options.quick && (options.profile || options.validation_self_test ||
+      options.oproj_gap_probe || !options.counter_component.empty())) {
+    throw std::runtime_error("--quick is a non-profile performance screening mode");
+  }
   if (options.oproj_comm_layout != "rows" && options.oproj_comm_layout != "columns") {
     throw std::runtime_error("--oproj-comm-layout requires rows or columns");
   }
@@ -496,12 +513,24 @@ Options parse_options(int argc, char** argv) {
   if (has_profile_detail && !options.profile) {
     throw std::runtime_error("--profile-detail requires --profile");
   }
+  if (options.oproj_pipeline_probe && (!options.profile || options.profile_detail != "full" ||
+      options.profile_direction != "oproj" || fused_mpi::enabled || options.qkv_epilogue_probe)) {
+    throw std::runtime_error("OProj pipeline probe requires single-process full OProj profiling");
+  }
+  if (options.oproj_gap_probe && (!options.profile || options.profile_detail != "full" ||
+      options.profile_direction != "oproj" || options.oproj_pipeline_probe || fused_mpi::enabled)) {
+    throw std::runtime_error("OProj gap probe requires standalone full OProj profiling without the K-stage probe");
+  }
   if (options.qkv_epilogue_probe && (!options.profile || options.profile_detail != "cta" ||
                                     options.qkv_policy_list.front() != "m128n256k64e32")) {
     throw std::runtime_error("--qkv-epilogue-probe requires --profile --profile-detail cta and QKV m128n256k64e32");
   }
   if (options.calibrate && (options.profile || options.validation_self_test)) {
     throw std::runtime_error("--calibrate is mutually exclusive with --profile and --validation-self-test");
+  }
+  if (options.compute_only && (!options.calibrate || options.run_qkv() || options.profile ||
+      !options.counter_component.empty())) {
+    throw std::runtime_error("compute-only requires OProj calibration without profiling/counters");
   }
   if (!options.counter_component.empty() || !options.counter_direction.empty()) {
     if (!options.calibrate || options.profile || options.validation_self_test ||
@@ -621,6 +650,7 @@ struct RankRuntime {
   int qkv_route_capacity = 0;
   fuse::A2AGemmPeerTimeline* peer_timeline = nullptr;
   fuse::detail::QkvEpilogueRecord* qkv_epilogue = nullptr;
+  fuse::detail::OprojPipelineView oproj_pipeline{};
   int peer_capacity = 0;
 #endif
 };
@@ -978,7 +1008,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.reference_lhs = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
     }
     runtime.validation = allocate<fused_validation::Scratch>(runtime, 1);
-    if (options.calibrate) {
+    if (options.calibrate || options.oproj_gap_probe) {
       if (options.run_qkv()) {
         runtime.calibration_qkv_ready = allocate<uint32_t>(runtime, runtime.qkv_ready_elements);
         runtime.calibration_route_done = allocate<uint32_t>(runtime, options.world * fuse::kReadyFlagStride);
@@ -1006,6 +1036,23 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
         const int n_tiles = ceil_div(options.hidden, oproj_traits.block_n);
         runtime.peer_capacity = std::max(m_tiles * n_tiles, m_tiles * options.world);
         runtime.peer_timeline = allocate<fuse::A2AGemmPeerTimeline>(runtime, runtime.peer_capacity);
+        if ((options.oproj_pipeline_probe || options.oproj_gap_probe) && rank == 0) {
+          auto& probe = runtime.oproj_pipeline;
+          probe.m_tiles = m_tiles;
+          probe.n_tiles = n_tiles;
+          probe.k_tiles = options.q_width() / oproj_traits.block_k;
+          probe.comm_ctas = options.oproj_gap_probe ? 0 : options.comm_sm;
+          probe.all_workers = options.oproj_gap_probe;
+          probe.compute_ctas = std::min(m_tiles * n_tiles, runtime.sm_count - options.comm_sm);
+          probe.swizzle = options.max_swizzle_size;
+          const size_t tiles = checked_product(m_tiles, n_tiles);
+          const size_t stages = options.oproj_gap_probe ? 0 : checked_product(tiles, probe.k_tiles);
+          const size_t bytes = tiles * sizeof(fuse::detail::OprojPipelineRecord) +
+              stages * sizeof(fuse::detail::OprojMmaStageRecord);
+          if (bytes > (64 << 20)) throw std::runtime_error("OProj pipeline probe exceeds 64 MiB diagnostic limit");
+          probe.tiles = allocate<fuse::detail::OprojPipelineRecord>(runtime, tiles);
+          if (stages) probe.stages = allocate<fuse::detail::OprojMmaStageRecord>(runtime, stages);
+        }
       }
     }
 #endif
@@ -1288,6 +1335,10 @@ void enqueue_operation(const RankLaunch& job, int rank) {
       params.epoch = job.epoch;
       params.ready = runtime.calibration_oproj_ready;
       if (job.component == MeasurementComponent::kComputeReference) {
+#if FUSE_ENABLE_PROFILING
+        fuse::detail::OprojPipelineBinding binding(
+            job.profile && runtime.oproj_pipeline.tiles ? &runtime.oproj_pipeline : nullptr);
+#endif
         CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_reference(params, runtime.stream, job.reserved_comm_ctas));
       } else CUDA_CHECK(fuse::launch_a2a_gemm_copy_reference(params, runtime.stream));
     }
@@ -1308,9 +1359,13 @@ void enqueue_operation(const RankLaunch& job, int rank) {
   } else {
     runtime.oproj.epoch = job.epoch;
 #if FUSE_ENABLE_PROFILING
-    if (job.profile) CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_role_telemetry(
+    if (job.profile) {
+      fuse::detail::OprojPipelineBinding binding(
+          runtime.oproj_pipeline.tiles ? &runtime.oproj_pipeline : nullptr);
+      CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_role_telemetry(
         runtime.oproj, runtime.timeline, runtime.sm_count,
         runtime.peer_timeline, runtime.peer_capacity, runtime.stream));
+    }
     else
 #endif
     CUDA_CHECK(fuse::launch_a2a_gemm_cutlass(runtime.oproj, runtime.stream));
@@ -1872,6 +1927,30 @@ void benchmark(std::vector<RankRuntime>& runtimes, const Options& options,
     return samples;
   };
 
+  if (options.quick) {
+    // User-requested screening: exactly 1 warmup + 5 samples, no convergence
+    // loop, cadence rewarm or noise retries. Full two-payload validation outside
+    // this sampler is unchanged. These samples are NOT a formal benchmark.
+    const auto warmup = collect(1, "initial", -1);
+    const auto samples = collect(5, "measurement", 0);
+    fused_mpi::root_output() << "summary," << direction_name(direction) << context
+              << ",host_launch=" << options.host_launch
+              << ",verification=pending,sampling_mode=quick_1_5,formal_eligible=0"
+              << ",warmup=1,samples=5,additional_warmup_calls=0,minimum_warmup_cuda_ms=0"
+              << ",converged_all_ranks=0,sample_cadence_warmup=0,selected_round=0"
+              << ",warmup_p50_ms=" << warmup.front() << ",warmup_p95_ms=" << warmup.front()
+              << ",p50_ms=" << percentile(samples, 0.5) << ",p95_ms=" << percentile(samples, 0.95)
+              << ",half_drift=" << sample_half_drift(samples)
+              << ",collector=" << (options.launch == "graph" ? "mpi_graph_rank_events_v1" :
+                  (fused_mpi::enabled ? "mpi_rank_events_v1" : "per_epoch_rank_events_v3_eventsync"))
+              << ",boundary=" << (options.launch == "graph" ? "mpi_graph_maxrank_cudaevent" :
+                  (fused_mpi::enabled ? "mpi_eager_maxrank_cudaevent" : "single_process_eager_maxrank_cudaevent"));
+    if (options.launch == "graph") {
+      fused_mpi::root_output() << ",launch=graph,graph_epoch_mode=recapture_update_v1";
+    }
+    fused_mpi::root_output() << '\n' << std::flush;
+    return;
+  }
   const auto initial_warmup = collect(kWarmup, "initial", -1);
   const auto warm_started = std::chrono::steady_clock::now();
   auto warm_wall_seconds = [&]() {
@@ -2228,6 +2307,74 @@ void profile_host_stages(std::vector<RankRuntime>& runtimes, const Options& opti
   if (!valid) throw std::runtime_error("incomplete or unordered host-stage diagnostic records");
 }
 
+void profile_compute_gaps(std::vector<RankRuntime>& runtimes, const Options& options) {
+  // This is independent C, not F: materialize the whole lhs before launching.
+  // Retain the production tile/scheduler and reduced compute CTA budget.
+  Options reference = options;
+  reference.component = MeasurementComponent::kComputeReference;
+  uint32_t epoch = 0;
+  prepare_component(runtimes, reference, Direction::kOproj);
+  run_epoch(runtimes, reference, Direction::kOproj, ++epoch);
+  validate(runtimes, reference, Direction::kOproj, ",gap_phase=pre");
+  benchmark(runtimes, reference, Direction::kOproj, epoch, ",component=compute_reference,gap_phase=warm");
+  std::vector<float> plain, observed;
+  for (bool instrumented : {false, true}) {
+    double warm_ms = 0;
+    const auto begun = std::chrono::steady_clock::now();
+    for (int i = 0; i < kWarmup || warm_ms < 100; ++i) {
+      const auto times = run_epoch(runtimes, reference, Direction::kOproj, ++epoch, instrumented);
+      warm_ms += times[0];
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count() > 5)
+        throw std::runtime_error("gap probe warmup timeout");
+    }
+    auto& samples = instrumented ? observed : plain;
+    for (int i = 0; i < 50; ++i) {
+      const auto times = run_epoch(runtimes, reference, Direction::kOproj, ++epoch, instrumented);
+      samples.push_back(times[0]);
+      std::cout << "profile_gemm_gap_sample,component=compute_reference,rank=0,instrumented="
+                << instrumented << ",sample=" << i << ",event_ms=" << times[0] << '\n';
+    }
+    validate(runtimes, reference, Direction::kOproj,
+             instrumented ? ",gap_phase=instrumented" : ",gap_phase=plain");
+  }
+  CUDA_CHECK(cudaSetDevice(runtimes[0].device));
+  const auto& probe = runtimes[0].oproj_pipeline;
+  const auto records = download(probe.tiles, probe.m_tiles * probe.n_tiles);
+  size_t visited = 0;
+  // Never sum parallel CTA gaps into E2E time. Save each chain independently;
+  // its signed gaps include overlap (negative values) and observer latency.
+  // Even the last-finishing chain's gap is not a measured a-b contribution:
+  // cuBLASLt has its own gaps, and removing one chain's waits can change the
+  // critical path. The analysis must label any zero-Lt-gap estimate explicitly.
+  for (int cta = 0; cta < probe.compute_ctas; ++cta) {
+    std::vector<const fuse::detail::OprojPipelineRecord*> tiles;
+    for (const auto& record : records) if (record.first_input && record.cta == cta) tiles.push_back(&record);
+    if (tiles.empty()) throw std::runtime_error("missing compute CTA gap records");
+    std::sort(tiles.begin(), tiles.end(), [](auto lhs, auto rhs) { return lhs->first_input < rhs->first_input; });
+    int64_t service = 0, gaps = 0, positive = 0;
+    for (size_t i = 0; i < tiles.size(); ++i) {
+      const auto& tile = *tiles[i];
+      if (tile.acc_wait_end < tile.first_input) throw std::runtime_error("invalid tile observation order");
+      service += tile.acc_wait_end - tile.first_input;
+      if (i) {
+        const int64_t gap = static_cast<int64_t>(tile.first_input) - static_cast<int64_t>(tiles[i-1]->acc_wait_end);
+        gaps += gap;
+        positive += std::max(int64_t{0}, gap);
+      }
+    }
+    const auto span = tiles.back()->acc_wait_end - tiles.front()->first_input;
+    if (service + gaps != static_cast<int64_t>(span)) throw std::runtime_error("gap timeline does not close");
+    std::cout << "profile_gemm_gap,component=compute_reference,rank=0,cta=" << cta
+              << ",tiles=" << tiles.size() << ",first_input_ns=" << tiles.front()->first_input
+              << ",last_completion_ns=" << tiles.back()->acc_wait_end
+              << ",service_ns=" << service << ",signed_gap_ns=" << gaps
+              << ",positive_gap_ns=" << positive << ",span_ns=" << span
+              << ",trace_event_ms=" << observed.back() << '\n';
+    visited += tiles.size();
+  }
+  if (visited != records.size()) throw std::runtime_error("incomplete logical tile coverage");
+}
+
 void profile(std::vector<RankRuntime>& runtimes, const Options& options, Direction direction, uint32_t& epoch) {
   ::alarm(options.timeout_seconds);
   auto clear_diagnostics = [&]() {
@@ -2241,6 +2388,12 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       }
       if (options.profile_detail == "full") {
         CUDA_CHECK(cudaMemsetAsync(runtime.peer_timeline, 0, runtime.peer_capacity * sizeof(*runtime.peer_timeline), runtime.stream));
+      }
+      if (runtime.oproj_pipeline.tiles) {
+        const auto& probe = runtime.oproj_pipeline;
+        const size_t count = static_cast<size_t>(probe.m_tiles) * probe.n_tiles;
+        CUDA_CHECK(cudaMemsetAsync(probe.tiles, 0, count * sizeof(*probe.tiles), runtime.stream));
+        CUDA_CHECK(cudaMemsetAsync(probe.stages, 0, count * probe.k_tiles * sizeof(*probe.stages), runtime.stream));
       }
     }
     finish_all(runtimes); // Never reset cumulative ready flags.
@@ -2411,6 +2564,42 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       continue;
     }
     if (options.profile_detail == "cta") continue;
+    if (runtime.oproj_pipeline.tiles) {
+      const auto& probe = runtime.oproj_pipeline;
+      const int count = probe.m_tiles * probe.n_tiles;
+      const auto records = download(probe.tiles, count);
+      const auto stages = download(probe.stages, static_cast<size_t>(count) * probe.k_tiles);
+      for (int tile = 0; tile < count; ++tile) {
+        const auto& r = records[tile];
+        if (!r.mma_begin) continue;
+        if (!(r.mma_begin <= r.tmem_acquired && r.tmem_acquired <= r.mma_return &&
+              r.epi_begin <= r.acc_wait_begin && r.acc_wait_begin <= r.acc_wait_end &&
+              r.acc_wait_end <= r.tmem_release_begin && r.tmem_release_begin <= r.tmem_release_end &&
+              r.tmem_release_end <= r.epi_return)) throw std::runtime_error("invalid OProj pipeline phase order");
+        std::cout << "profile_oproj_pipeline,rank=" << rank << ",index=" << tile << ",cta=" << r.cta
+                  << ",mma_begin=" << r.mma_begin << ",tmem_acquired=" << r.tmem_acquired
+                  << ",mma_return=" << r.mma_return << ",epi_begin=" << r.epi_begin
+                  << ",acc_wait_begin=" << r.acc_wait_begin << ",acc_wait_end=" << r.acc_wait_end
+                  << ",tmem_release_begin=" << r.tmem_release_begin << ",tmem_release_end=" << r.tmem_release_end
+                  << ",epi_return=" << r.epi_return << ",k_tiles=" << probe.k_tiles;
+        for (int peer = 0; peer < options.world; ++peer) {
+          const auto& ready = r.ready[peer];
+          if (!ready.begin || ready.begin > ready.end || ready.end > ready.joined)
+            throw std::runtime_error("invalid OProj ready check interval");
+          std::cout << ",ready_begin" << peer << '=' << ready.begin << ",ready_end" << peer << '=' << ready.end
+                    << ",ready_joined" << peer << '=' << ready.joined << ",cache_hit" << peer << '=' << ready.cache_hit;
+        }
+        std::cout << '\n';
+        for (int k = 0; k < probe.k_tiles; ++k) {
+          const auto& s = stages[static_cast<size_t>(tile) * probe.k_tiles + k];
+          if (!s.wait_begin || s.wait_begin > s.wait_end || s.wait_end > s.issue_end)
+            throw std::runtime_error("invalid OProj MMA stage interval");
+          std::cout << "profile_oproj_stage,rank=" << rank << ",index=" << tile << ",k=" << k
+                    << ",wait_begin=" << s.wait_begin << ",wait_end=" << s.wait_end
+                    << ",issue_end=" << s.issue_end << '\n';
+        }
+      }
+    }
     const auto peers = download(runtime.peer_timeline, runtime.peer_capacity);
     for (int index = 0; index < runtime.peer_capacity; ++index) {
       const auto& event = peers[index];
@@ -2512,7 +2701,7 @@ int main(int argc, char** argv) {
     ::alarm(options.timeout_seconds);
     const auto candidates = make_candidates(options);
     std::ostringstream contract;
-    contract << options.world << ' ' << options.seq_local << ' ' << options.hidden << ' '
+    contract << options.quick << ' ' << options.world << ' ' << options.seq_local << ' ' << options.hidden << ' '
              << options.q_heads << ' ' << options.kv_heads << ' ' << options.head_dim << ' '
              << options.seed << ' ' << options.causal << ' ' << options.input_generator << ' '
              << options.host_launch << ' ' << options.calibrate << ' ' << options.cpu_oracle << ' '
@@ -2533,7 +2722,9 @@ int main(int argc, char** argv) {
               << ",global_seq=" << options.global_seq() << ",seq_local=" << options.seq_local
               << ",q_heads=" << options.q_heads << ",kv_heads=" << options.kv_heads
               << ",head_dim=" << options.head_dim << ",hidden=" << options.hidden << ",causal=" << options.causal
-              << ",seed=" << options.seed << ",warmup=" << kWarmup << ",samples=" << kSamples
+              << ",seed=" << options.seed << ",warmup=" << (options.quick ? 1 : kWarmup)
+              << ",samples=" << (options.quick ? 5 : kSamples)
+              << ",sampling_mode=" << (options.quick ? "quick_1_5" : "formal_10_50")
               << ",input_generator=" << options.input_generator
               << ",host_launch=" << options.host_launch
               << ",max_swizzle_size=" << options.max_swizzle_size
@@ -2600,6 +2791,11 @@ int main(int argc, char** argv) {
         Options candidate_options = options;
         candidate_options.comm_sm = candidate.comm_sm;
         uint32_t& epoch = candidate.direction == Direction::kQkv ? qkv_epoch : oproj_epoch;
+        const int direction_index = candidate.direction == Direction::kQkv ? 0 : 1;
+        // Pure-GEMM search does not launch communication roles or select by F.
+        // Keep the same tile, scheduler and reserved compute budget for C.
+        if (options.compute_only) select_candidate(runtimes, candidate, context);
+        if (!options.compute_only) {
         {
           StageTimer timer{"validate", context + ",includes=select_poison_fused_epoch_gpu_full_checks_small_stats"
               + (options.cpu_oracle ? "_and_full_cpu_oracle" : "")};
@@ -2610,7 +2806,6 @@ int main(int argc, char** argv) {
           run_epoch(runtimes, candidate_options, candidate.direction, ++epoch);
           validate(runtimes, candidate_options, candidate.direction, context);
         }
-        const int direction_index = candidate.direction == Direction::kQkv ? 0 : 1;
         if (options.validation_self_test && !self_tested[direction_index]) {
           StageTimer timer{"validation_self_test", context + ",includes=fault_detection_restore_full_gpu_cpu_checks"};
           validation_self_test(runtimes, candidate_options, candidate.direction, context);
@@ -2625,6 +2820,7 @@ int main(int argc, char** argv) {
           validate(runtimes, candidate_options, candidate.direction, context + ",validation_phase=post");
         }
         report_graph_preparation(runtimes, candidate_options, candidate.direction, context);
+        }
         if (options.calibrate) {
           // Only separate calibration flags are reset. Production counters
           // continue across candidates and both payload generations.
@@ -2636,6 +2832,7 @@ int main(int argc, char** argv) {
           reference_epochs[direction_index][1] = 0;
           for (const auto component : {MeasurementComponent::kComputeReference,
                                        MeasurementComponent::kCopyReference}) {
+            if (options.compute_only && component != MeasurementComponent::kComputeReference) continue;
             Options reference_options = candidate_options;
             reference_options.component = component;
             const std::string reference_context = candidate_payload + ",component=" + component_name(component);
@@ -2669,7 +2866,8 @@ int main(int argc, char** argv) {
         const auto& candidate = candidates[index];
         select_candidate(runtimes, candidate, candidate_context(index, candidate));
         uint32_t& epoch = candidate.direction == Direction::kQkv ? qkv_epoch : oproj_epoch;
-        profile(runtimes, options, candidate.direction, epoch);
+        if (options.oproj_gap_probe) profile_compute_gaps(runtimes, options);
+        else profile(runtimes, options, candidate.direction, epoch);
         if (options.qkv_epilogue_probe && candidate.direction == Direction::kQkv) {
           profile_qkv_epilogue(runtimes, options, epoch);
         }
@@ -2688,6 +2886,7 @@ int main(int argc, char** argv) {
       for (const auto component : {MeasurementComponent::kFused, MeasurementComponent::kComputeReference,
                                    MeasurementComponent::kCopyReference}) {
         if (!options.calibrate && component != MeasurementComponent::kFused) continue;
+        if (options.compute_only && component != MeasurementComponent::kComputeReference) continue;
         fused_mpi::root_output() << "candidate_verified," << direction_name(candidates[index].direction)
                   << candidate_context(index, candidates[index]) << ",component=" << component_name(component)
                   << ",host_launch=" << options.host_launch << ",payload_generations=2"

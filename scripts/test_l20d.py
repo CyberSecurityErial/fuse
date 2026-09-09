@@ -21,6 +21,15 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_quick_sampling_is_explicit_and_not_profile_or_build(self):
+        job = self.fused_job(quick=True)
+        l20d.validate_job(job)
+        self.assertIn('--quick', l20d.fused_argv(job))
+        for change in (dict(profile=True), dict(stage='fused-build'),
+                       dict(validation_self_test=True), dict(oproj_gap_probe=True)):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+
     def test_qkv_rank_swizzle_build_isolation(self):
         plain = self.fused_job(stage='fused-build', mpi=True)
         rotated = plain | dict(qkv_rank_swizzle=True)
@@ -217,6 +226,41 @@ int main() {
         l20d.validate_job(job | {'cutlass_sm_budget': 131, 'cutlass_counters': True})
         with self.assertRaises(ValueError):
             l20d.validate_job(job | {'cutlass_sm_budget': 132, 'compare_cutlass': False})
+
+    def test_cublaslt_target_is_explicit_graph_diagnostic(self):
+        job = self.fused_job(stage='gemm-probe', directions='oproj', launches='graph')
+        self.assertNotIn('--cublaslt-sm-target', l20d.gemm_probe_argv(job, self.root))
+        for target in (0, 116, 132, 148):
+            configured = job | {'cublaslt_sm_target': target}
+            l20d.validate_job(configured)
+            argv = l20d.gemm_probe_argv(configured, self.root)
+            self.assertEqual(argv[argv.index('--cublaslt-sm-target') + 1], str(target))
+        for change in ({'cublaslt_sm_target': -1}, {'cublaslt_sm_target': 149},
+                       {'cublaslt_sm_target': True}, {'launches': 'eager'},
+                       {'stage': 'fused-smoke'}, {'compare_cutlass': True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | {'cublaslt_sm_target': 132} | change)
+
+    def test_green_gemm_budget_requires_exact_unambiguous_target(self):
+        job = self.fused_job(stage='gemm-probe', directions='oproj', launches='graph', gemm_sm_budget=132)
+        l20d.validate_job(job)
+        args = l20d.gemm_probe_argv(job, self.root)
+        self.assertEqual(args[args.index('--gemm-sm-budget') + 1], '132')
+        for change in ({'gemm_sm_budget': 0}, {'gemm_sm_budget': 149}, {'gemm_sm_budget': True},
+                       {'launches': 'eager'}, {'cublaslt_sm_target': 128}, {'stage': 'fused-smoke'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+
+    def test_oproj_pipeline_probe_is_bounded_diagnostic_only(self):
+        job = self.fused_job(profile=True, profile_detail='full', directions='oproj',
+                             oproj_pipeline_probe=True)
+        l20d.validate_job(job)
+        self.assertIn('--oproj-pipeline-probe', l20d.fused_argv(job))
+        for change in ({'profile': False}, {'profile_detail': 'cta'}, {'mpi': True},
+                       {'directions': 'qkv'}, {'qkv_epilogue_probe': True},
+                       {'oproj_pipeline_probe': 1}, {'stage': 'fused-build'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
 
     def test_cutlass_probe_is_explicit_isolated_and_never_changes_default_lt(self):
         matrix = {'schema': 'sm103_gemm_matrix_v1', 'shapes': [dict(id='small', m=128, n=256, k=64)]}

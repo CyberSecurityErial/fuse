@@ -31,6 +31,7 @@ struct A2ALhsKernelBinding {
   using Kernel = detail::MonolithicGemm<Gemm, Comm>;
 #if FUSE_ENABLE_PROFILING
   using TelemetryGemm = typename Types::TelemetryGemm;
+  using TelemetryPureGemm = typename Types::TelemetryPureGemm;
   using TelemetryComm = A2ALhsInputCommT<
       cute::size<0>(TileShape{}), cute::size<2>(TileShape{}), true>;
   using TelemetryKernel = detail::RoleTelemetryKernel<
@@ -402,6 +403,16 @@ cudaError_t launch_a2a_lhs_gemm_policy(
     args.mainloop.peer_timeline = peer_timeline;
     args.mainloop.peer_timeline_capacity = peer_timeline_capacity;
     args.mainloop.n_tiles = n_tiles;
+    if (const auto* probe = detail::oproj_pipeline_sink) {
+      if (!probe->tiles || !probe->stages || probe->m_tiles != args.mainloop.m_tiles ||
+          probe->n_tiles != n_tiles || probe->k_tiles != params.gemm.k / tile_k ||
+          probe->comm_ctas != params.num_comm_ctas ||
+          probe->compute_ctas != std::min(probe->m_tiles * n_tiles, info.sm_count - params.num_comm_ctas)) {
+        return cudaErrorInvalidValue;
+      }
+      args.mainloop.probe = *probe;
+      args.epilogue.probe = *probe;
+    }
   }
 #endif
   typename Kernel::Arguments launch_args{};

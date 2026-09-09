@@ -67,6 +67,12 @@ int64_t a2a_lhs_gemm_ready_elements(const GemmProblem& p, const UlyssesRoute& ro
 
 // SM90's auto-selection API is retained as a query, but SM103 has no
 // automatic communication budget. A zero recommendation must not be launched.
+// TODO(runtime autotune): Jointly select GEMM tile/epilogue, raster/swizzle
+// and communication CTAs using independently calibrated C/R service curves.
+// Recompute delivery windows/cohorts for every candidate's actual GEMM schedule
+// and SM split. Validate model-selected configurations before enabling this;
+// offline top-2 selection by measurement is not a validated runtime selector.
+// Until then, retain explicit parameters and the existing order adaptation.
 int32_t recommended_a2a_lhs_gemm_comm_ctas(const GemmProblem&, const UlyssesRoute&) {
   return 0;
 }

@@ -1058,6 +1058,250 @@ def score_pipeline(direction, *, compute_service_us=None, route_service_us=None,
             "producer_wait_is_tensor_core_stall": False}
 
 
+def _oproj_delivery_plan(m_tiles, n_tiles, swizzle, compute_ctas, raster,
+                         world, chunks, cohort_m_tiles):
+    """Enumerate the current cluster-1 scheduler and communication priorities.
+
+    Invalid padded GEMM coordinates retain their logical index but do no MMA.
+    Unlike the device decoder this explicit oracle needs no prefix inversion.
+    """
+    pm, pn = ceil_div(m_tiles, swizzle) * swizzle, ceil_div(n_tiles, swizzle) * swizzle
+    along_n = raster == "along_n"
+    tiles, windows, seen = [], {}, set()
+    for group in range(0, pm if along_n else pn, swizzle):
+        for major in range(pn if along_n else pm):
+            for offset in range(swizzle):
+                m, n = (group + offset, major) if along_n else (major, group + offset)
+                logical = len(tiles)
+                valid = m < m_tiles and n < n_tiles
+                tiles.append((m, n) if valid else None)
+                if valid and m not in seen:
+                    windows.setdefault(logical // compute_ctas, []).append(m)
+                    seen.add(m)
+    use_cohorts = not along_n and pn > swizzle
+    copies = []
+    for ms in windows.values():
+        width = cohort_m_tiles if use_cohorts else max(swizzle, ceil_div(len(ms), world))
+        groups = [ms[start:start + width] for start in range(0, len(ms), width)]
+        if use_cohorts:
+            cells = ((group, peer) for group in range(len(groups)) for peer in range(world))
+        else:
+            cells = ((diagonal - peer, peer)
+                     for diagonal in range(len(groups) + world - 1)
+                     for peer in range(world) if 0 <= diagonal - peer < len(groups))
+        for group, peer in cells:
+            copies.extend((m, peer, chunk) for m in groups[group] for chunk in range(chunks))
+    require(len(seen) == m_tiles and len(copies) == m_tiles * world * chunks,
+            "Incomplete OProj delivery plan")
+    return tiles, windows, copies, use_cohorts
+
+
+def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
+                         tile_m, tile_n, tile_k, raster, resolved_swizzle,
+                         copy_chunks, copy_slots, cohort_m_tiles,
+                         tile_cycle_us, copy_bandwidth_gb_s,
+                         launch_us, copy_start_us, tail_us,
+                         copy_chunk_bytes=None, include_trace=False,
+                         service_basis="measured_cycle_and_steady_copy"):
+    """Offline OProj service model, separate from the older calibrated APIs.
+
+    All service constants are supplied by the caller from measured evidence;
+    this function neither fits winners nor provides B300 timing defaults.
+    ``tile_cycle_us`` is the no-feed-wait start-to-start interval, including
+    necessary epilogue/pipeline work. It is split uniformly across peer K
+    segments: no exact producer-prefetch, TMEM or Tensor Core busy claim.
+    Supply the measured cycle for THIS actual compute-CTA budget. SM count
+    changes the schedule below, never a linear throughput extrapolation;
+    a caller using a measured budget curve retains its diminishing returns.
+
+    ``copy_bandwidth_gb_s`` is the aggregate useful delivery rate for ALL A
+    bytes (decimal GB/s), not remote-only NVLink bandwidth. A slot receives
+    1/copy_slots of that rate. Fixed-stride tasks model last-chunk readiness,
+    not dynamic bandwidth sharing or contention feedback. Use a measured
+    steady service rate, not a total time already charged with startup/tail.
+    An optional byte vector specifies the actual chunks of one full (M,peer);
+    otherwise equal chunk sizes are an explicit approximation.
+
+    launch_us is common startup; copy_start_us is additional producer startup;
+    tail_us is only the unmodeled final drain. All are charged once. M must
+    consist of complete M128 ready units; padded N work retains static CTA
+    ownership. Non-cluster1, cyclic peer ordering and other precisions are not
+    modeled. This is a prediction, not proof of overlap or a runtime selector.
+    ``amortized_full_boundary`` instead accepts C/waves and A_bytes/R from
+    independent whole-boundary measurements. It requires all three additional
+    startup/tail terms to be zero to avoid adding them again; their separately
+    measured values remain UNKNOWN, not measured zero. Such effective services
+    do not become observed per-tile cycles or pure fabric bandwidth.
+    """
+    geometry = dict(m=m, n=n, k=k, world=world, sm_count=sm_count, comm_ctas=comm_ctas,
+                    tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                    resolved_swizzle=resolved_swizzle, copy_chunks=copy_chunks,
+                    copy_slots=copy_slots, cohort_m_tiles=cohort_m_tiles)
+    for field in geometry:
+        require(integer(geometry, field) <= 2**31 - 1, "OProj model geometry exceeds int32")
+    require(world in (4, 8) and comm_ctas < sm_count and tile_m == 128 and
+            tile_n in (128, 256) and tile_k in (64, 128) and m % tile_m == 0 and
+            k % (world * tile_k) == 0, "Unsupported OProj model geometry/ready boundary")
+    require(raster in ("along_m", "along_n") and resolved_swizzle in (1, 2, 4, 8),
+            "Unsupported resolved OProj schedule")
+    require(copy_slots in (comm_ctas, 4 * comm_ctas), "Copy slots differ from vector/bulk CTA capacity")
+    require(type(include_trace) is bool, "include_trace must be a bool")
+    cycle = positive(tile_cycle_us, "tile cycle us")
+    bandwidth = positive(copy_bandwidth_gb_s, "copy payload bandwidth GB/s")
+    launch = nonnegative(launch_us, "common launch us")
+    copy_start = nonnegative(copy_start_us, "copy startup us")
+    tail = nonnegative(tail_us, "final tail us")
+    require(service_basis in ("measured_cycle_and_steady_copy", "amortized_full_boundary"),
+            "Unknown OProj service calibration basis")
+    amortized = service_basis == "amortized_full_boundary"
+    require(not amortized or launch == copy_start == tail == 0,
+            "Amortized services cannot add startup/tail a second time")
+    mt, nt = m // tile_m, ceil_div(n, tile_n)
+    pm, pn = ceil_div(mt, resolved_swizzle) * resolved_swizzle, ceil_div(nt, resolved_swizzle) * resolved_swizzle
+    require(pm * pn <= 1_000_000 and mt * world * copy_chunks <= 1_000_000 and copy_slots <= 1_000_000,
+            "OProj model enumeration exceeds bounded offline scope")
+    compute = min(pm * pn, sm_count - comm_ctas)
+    ready_bytes = 2 * tile_m * k // world
+    if copy_chunk_bytes is None:
+        chunk_bytes = [ready_bytes / copy_chunks] * copy_chunks
+    else:
+        require(isinstance(copy_chunk_bytes, (tuple, list)) and len(copy_chunk_bytes) == copy_chunks,
+                "Copy chunk byte vector has the wrong length")
+        require(all(type(value) is int and value > 0 for value in copy_chunk_bytes) and
+                sum(copy_chunk_bytes) == ready_bytes, "Copy chunks do not cover one complete (M,peer)")
+        chunk_bytes = list(copy_chunk_bytes)
+    tiles, windows, copies, use_cohorts = _oproj_delivery_plan(
+        mt, nt, resolved_swizzle, compute, raster, world, copy_chunks, cohort_m_tiles)
+    # Physical slot s processes task s, s+S, ... independently; no cohort barrier.
+    slots = [launch + copy_start] * copy_slots
+    releases = [[launch + copy_start] * world for _ in range(mt)]
+    arrivals = [[0] * world for _ in range(mt)]
+    for index, (mi, peer, chunk) in enumerate(copies):
+        slot = index % copy_slots
+        slots[slot] += chunk_bytes[chunk] / bandwidth * (copy_slots / 1000.0)
+        releases[mi][peer] = max(releases[mi][peer], slots[slot])
+        arrivals[mi][peer] += 1
+    require(all(count == copy_chunks for peers in arrivals for count in peers),
+            "Ready unit missing a copy arrival")
+    copy_end = max(slots)
+    peer_service = cycle / world
+    worker_finishes, worker_waits, worker_services, worker_initial_waits = [], [], [], []
+    phase_finishes, phase_services, phase_counts = [], [], []
+    waits_by_peer = [0.0] * world
+    consumption = []
+    first_peers = []
+    for worker in range(compute):
+        now, waited, service, phase_service, phase_count = launch, 0.0, 0.0, 0.0, 0
+        phase_end, initial_wait = launch, 0.0
+        first = True
+        for logical in range(worker, len(tiles), compute):
+            coordinate = tiles[logical]
+            if coordinate is None:
+                continue
+            mi, ni = coordinate
+            if first:
+                first_peers.append(releases[mi][0])
+                initial_wait = max(0.0, releases[mi][0] - launch)
+                first = False
+            begin, tile_wait = now, 0.0
+            for peer in range(world):
+                wait = max(0.0, releases[mi][peer] - now)
+                now += wait + peer_service
+                waited += wait
+                tile_wait += wait
+                waits_by_peer[peer] += wait
+            service += cycle
+            # AlongM has a front-loaded N-band phase. AlongN interleaves N
+            # reuse while progressing through M, so its feed phase is the
+            # whole computation, not a fictitious early global N band.
+            if raster == "along_n" or ni < resolved_swizzle:
+                phase_service += cycle
+                phase_count += 1
+                phase_end = now
+            if include_trace:
+                consumption.append(dict(worker=worker, logical_tile=logical, m_tile=mi, n_tile=ni,
+                                        begin_us=begin, finish_us=now, feed_wait_us=tile_wait))
+        worker_finishes.append(now)
+        worker_waits.append(waited)
+        worker_services.append(service)
+        worker_initial_waits.append(initial_wait)
+        phase_finishes.append(phase_end)
+        phase_services.append(phase_service)
+        phase_counts.append(phase_count)
+    critical_worker = max(range(compute), key=lambda worker: worker_finishes[worker])
+    compute_end = worker_finishes[critical_worker]
+    first_ready = min(first_peers)
+    work_tiles = mt * nt
+    waves = ceil_div(work_tiles, compute)
+    # Keep the old integer-wave/start/drain estimate alongside the explicit DAG.
+    # Padding can distribute valid tiles unevenly; the actual strided worker
+    # service provides another necessary bound within this service model.
+    wave_service = waves * cycle
+    ideal = max(first_ready + wave_service, copy_end) + tail
+    strided_service = max(worker_services)
+    critical_path = max(compute_end, copy_end) + tail
+    score = max(ideal, critical_path)
+    payload = 2 * m * k
+    production_span = copy_end - launch
+    require(math.isfinite(production_span) and production_span > 0,
+            "Copy service duration cannot be represented safely")
+    phase_service = max(phase_services)
+    demand_rate = payload / phase_service / 1000.0
+    delivery_rate = payload / production_span / 1000.0
+    result = dict(
+        model="oproj_static_feed_service_v1", direction="A2A_GEMM", geometry=geometry,
+        raster=raster, compute_ctas=compute, padded_m_tiles=pm, padded_n_tiles=pn,
+        valid_work_tiles=work_tiles, scheduled_work_tiles=len(tiles), integer_waves=waves,
+        delivery_policy="ready_cohorts" if use_cohorts else "group_peer_diagonal",
+        first_use_windows=len(windows), base_cohort_m_tiles=max(1, copy_slots // copy_chunks),
+        copy_tasks=len(copies), unique_payload_bytes=payload,
+        remote_payload_bytes=payload * (world - 1) // world,
+        tile_cycle_us=cycle, peer_service_us=peer_service, copy_bandwidth_gb_s=bandwidth,
+        tile_cycle_budget_assumed=compute, linear_sm_throughput_scaling_applied=False,
+        service_basis=service_basis,
+        separately_calibrated_startup_tail_us=None if amortized else
+            dict(launch=launch, copy_start=copy_start, tail=tail),
+        launch_us=launch, copy_start_us=copy_start, tail_us=tail,
+        copy_finish_us=copy_end, compute_finish_us=compute_end,
+        first_ready_us=first_ready, wave_compute_service_us=wave_service,
+        strided_compute_service_us=strided_service,
+        ideal_overlap_us=ideal, critical_path_us=critical_path, score_us=score,
+        critical_worker=critical_worker, critical_worker_service_us=worker_services[critical_worker],
+        critical_worker_feed_wait_us=worker_waits[critical_worker],
+        critical_worker_initial_wait_us=worker_initial_waits[critical_worker],
+        critical_worker_later_feed_wait_us=max(0.0, worker_waits[critical_worker] - worker_initial_waits[critical_worker]),
+        exposed_feed_us=max(0.0, compute_end - first_ready - strided_service),
+        worker_wait_sum_us=sum(worker_waits), peer_wait_sum_us=waits_by_peer,
+        first_n_band_compute_fraction=min(resolved_swizzle, nt) / nt,
+        first_n_band_is_temporal_phase=(raster == "along_m"),
+        feed_phase="first_n_band" if raster == "along_m" else "whole_gemm",
+        feed_phase_compute_fraction=min(resolved_swizzle, nt) / nt if raster == "along_m" else 1.0,
+        feed_phase_tiles=sum(phase_counts), feed_phase_ideal_compute_us=phase_service,
+        feed_phase_predicted_finish_us=max(phase_finishes),
+        feed_phase_requires_all_unique_a=True,
+        feed_phase_demand_gb_s=demand_rate, effective_delivery_gb_s=delivery_rate,
+        production_consumption_ratio=delivery_rate / demand_rate,
+        whole_workload_production_consumption_ratio=delivery_rate / (payload / strided_service / 1000.0),
+        services_supplied_by_caller=True, externally_validated=False,
+        worker_wait_sum_is_global_stall=False, tensor_core_busy_inferred=False,
+        assumptions=["uniform peer-K share of the caller-supplied tile service",
+                     "caller supplies budget-matched measured services; no across-budget SM scaling",
+                     "effective C/waves and A_bytes/R include amortized startup/tail" if amortized else
+                     "measured no-feed-wait cycle and independently separated steady copy service",
+                     "fixed slot bandwidth; no contention/prefetch feedback simulation",
+                     "whole (M,peer) release after every original chunk; no new ready granularity",
+                     "integer-wave score is a model scenario, not a measured hardware lower bound",
+                     "equal copy chunks" if copy_chunk_bytes is None else "explicit copy chunk bytes"])
+    require(all(math.isfinite(value) for value in (score, demand_rate, delivery_rate)),
+            "OProj service arithmetic is not finite")
+    if include_trace:
+        result.update(copy_order=copies, ready_us_by_m_peer=releases,
+                      first_use_m_windows=list(windows.values()),
+                      worker_finish_us=worker_finishes, worker_service_us=worker_services,
+                      worker_feed_wait_us=worker_waits, tile_consumption=consumption)
+    return result
+
+
 def comparison_problem_key(row):
     """Bind the normalized boundary to real model dimensions, not its label."""
     key = primitive_problem_key(row)

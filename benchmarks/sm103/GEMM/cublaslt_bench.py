@@ -174,6 +174,8 @@ def prepare_inputs(geometry, uniform):
 
 def run_geometry(a, lib, geometry, index, total):
     m, n, k = (geometry["shape"][key] for key in ("m", "n", "k"))
+    sm_target = getattr(a, "cublaslt_sm_target", None)
+    budget = getattr(a, "sm_budget_context", None)
     source, weight = prepare_inputs(geometry, a.matrix_json is not None)
     for precision in a.precisions.split(","):
         x, w = Operand(lib, source, precision), Operand(lib, weight, precision)
@@ -190,31 +192,65 @@ def run_geometry(a, lib, geometry, index, total):
                     plan = None
                 # Native candidate capture cannot use CUDA's legacy default
                 # stream. Join input initialization, then tune on a side stream.
-                tuning_stream = torch.cuda.Stream() if launch == 'graph' else None
+                tuning_stream = (budget.stream if budget else torch.cuda.Stream()) if launch == 'graph' else None
                 if tuning_stream is not None:
                     torch.cuda.synchronize()
                 with (torch.cuda.stream(tuning_stream) if tuning_stream is not None
                       else contextlib.nullcontext()):
                     plan = Plan(lib, x, w, output, candidates=a.candidates, workspace_mib=a.workspace_mib,
-                                warmup=a.tune_warmup, iterations=a.tune_iterations, graph=launch == 'graph')
+                                warmup=a.tune_warmup, iterations=a.tune_iterations, graph=launch == 'graph',
+                                math_sms=sm_target or 0)
                 if tuning_stream is not None:
                     tuning_stream.synchronize()
                 correctness = check_gemm(plan)
                 run, graph = plan.run, None
+                launch_evidence = None
                 try:
                     if launch == "graph":
                         for _ in range(a.warmup):
                             plan.run()
                         torch.cuda.synchronize()
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
+                        # Keep the exact measured graph for a post-timing launch
+                        # audit. SM_COUNT_TARGET is a heuristic hint, not affinity.
+                        graph = (torch.cuda.CUDAGraph(keep_graph=True) if sm_target is not None
+                                 else torch.cuda.CUDAGraph())
+                        with (torch.cuda.graph(graph, stream=budget.stream) if budget
+                              else torch.cuda.graph(graph)):
                             plan.run()
+                        if sm_target is not None:
+                            graph.instantiate()
                         run = graph.replay
                         # Check the captured callable, not a fresh eager GEMM
                         # that would overwrite and mask a broken graph output.
                         correctness = check_gemm(argparse.Namespace(
                             x=plan.x, weight=plan.weight, output=plan.output, run=run))
                     samples, evidence = measure(run, a.warmup, a.iterations)
+                    if getattr(a, "cublaslt_counters", False):
+                        # Select the warmed, tuned callable (including its green
+                        # context), never an unrelated heuristic/eager launch.
+                        torch.cuda.synchronize()
+                        torch.cuda.nvtx.range_push("fuse_cublaslt_counters")
+                        try:
+                            run()
+                            torch.cuda.synchronize()
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+                        geometry["counter_diagnostic"] = {
+                            "backend": "cublaslt", "launch": launch,
+                            "diagnostic_only": True, "range_launches": 1,
+                            "nvtx_range": "fuse_cublaslt_counters",
+                            "correctness_post": check_gemm(argparse.Namespace(
+                                x=plan.x, weight=plan.weight, output=plan.output,
+                                run=lambda: plan.output))}
+                    if graph is not None and sm_target is not None:
+                        dot = a.output.with_name(f"{a.output.stem}-{index}-{precision}-launch.dot")
+                        graph.debug_dump(str(dot))
+                        if not dot.is_file() or not dot.stat().st_size:
+                            raise RuntimeError("measured GEMM launch audit was not written")
+                        launch_evidence = {"file": dot.name,
+                            "sha256": hashlib.sha256(dot.read_bytes()).hexdigest(),
+                            "source": "measured_cuda_graph_verbose_dot",
+                            "hard_sm_partition_verified": False}
                 except MeasurementFailure as error:
                     geometry["failed_measurement"] = {"precision": precision, "launch": launch,
                                                        "error": str(error), "measurement": error.evidence}
@@ -228,6 +264,12 @@ def run_geometry(a, lib, geometry, index, total):
                     "tune_warmup": a.tune_warmup, "tune_iterations": a.tune_iterations,
                     "measurement": evidence, "tflops_p50": 2 * m * n * k / p50 / 1e9,
                     "pflops_per_gpu_p50": 2 * m * n * k / p50 / 1e12}
+                if sm_target is not None:
+                    record["sm_budget"] = {"requested_sm_target": sm_target,
+                        "enforcement": "cublaslt_heuristic_hint_not_hard_partition",
+                        "launch_evidence": launch_evidence}
+                    if budget:
+                        record["sm_budget"].update(budget.info)
                 geometry["results"].append(record)
                 print(f"{precision} DONE {index}/{total} shape={m}x{n}x{k} launch={launch} "
                       f"p50={p50:.6f}ms p95={record['p95_ms']:.6f}ms "
@@ -467,6 +509,8 @@ def main():
                    help="explicit BF16 matrix/eager comparison: cuBLASLt vs stock CUTLASS 1-SM/2-SM")
     p.add_argument("--cutlass-counters", action="store_true",
                    help="counter-only 1-SM NVTX launch; requires comparison library and one BF16/eager geometry")
+    p.add_argument("--cublaslt-counters", action="store_true",
+                   help="NCU diagnostic of the warmed tuned Graph; timings are not benchmark results")
     p.add_argument("--cutlass-swizzle-size", type=int, choices=(1, 2, 4, 8),
                    help="explicit max swizzle for both CUTLASS plans only (default: 1)")
     p.add_argument("--cutlass-epilogue-n", type=int, choices=(32, 64),
@@ -475,6 +519,10 @@ def main():
                    help="1-SM MMA multicast cluster M only; 2-SM stays cluster2 (default: 1)")
     p.add_argument("--cutlass-sm-budget", type=int, default=0,
                    help="persistent CUTLASS CTA budget; zero uses all SMs, no SM affinity")
+    p.add_argument("--cublaslt-sm-target", type=int,
+                   help="explicit Graph-only Lt SM heuristic target; 0=full device; audit launch grid")
+    p.add_argument("--gemm-sm-budget", type=int,
+                   help="Graph-only process-local green-context SM budget; exact count required")
     p.add_argument("--cutlass-full-check", action="store_true",
                    help="explicit small BF16 comparison: check every output, outside timing")
     p.add_argument("--output", type=Path, required=True)
@@ -498,8 +546,19 @@ def main():
         p.error("CUTLASS comparison requires explicit BF16 matrix and eager only")
     if a.cutlass_sm_budget < 0 or (a.cutlass_sm_budget and not a.compare_cutlass_library):
         p.error("--cutlass-sm-budget requires comparison library and a nonnegative budget")
+    if a.cublaslt_sm_target is not None and (a.cublaslt_sm_target < 0 or a.launches != "graph"
+                                           or a.compare_cutlass_library):
+        p.error("--cublaslt-sm-target requires standalone Graph GEMM and a nonnegative target")
+    if a.gemm_sm_budget is not None:
+        if (a.gemm_sm_budget < 1 or a.launches != 'graph' or a.compare_cutlass_library or
+                a.cublaslt_sm_target not in (None, a.gemm_sm_budget)):
+            p.error('--gemm-sm-budget requires standalone Graph and a matching Lt target')
+        a.cublaslt_sm_target = a.gemm_sm_budget
     if a.cutlass_counters and not a.compare_cutlass_library:
         p.error("--cutlass-counters requires --compare-cutlass-library")
+    if a.cublaslt_counters and (a.compare_cutlass_library or a.launches != 'graph'
+                              or a.precisions != 'bf16'):
+        p.error("--cublaslt-counters requires standalone BF16 Graph")
     if a.cutlass_swizzle_size is not None and not a.compare_cutlass_library:
         p.error("--cutlass-swizzle-size requires --compare-cutlass-library")
     if a.cutlass_swizzle_size is None:
@@ -540,6 +599,8 @@ def main():
     prop = torch.cuda.get_device_properties(0)
     if (prop.major, prop.minor) != (10, 3):
         p.error("requires Runtime compute 10.3")
+    if a.cublaslt_sm_target is not None and a.cublaslt_sm_target > prop.multi_processor_count:
+        p.error("cuBLASLt SM target exceeds the Runtime SM count")
     lib = Library(a.library)
     cutlass_library = None
     if a.compare_cutlass_library:
@@ -553,6 +614,11 @@ def main():
         "output_dtype": "bf16", "measurement": "single_gpu_pure_cublaslt",
         "measured_ranks": 1, "distributed_boundary_measured": False, "cublas_classic_measured": False,
         "quantization_timing": "excluded; prequantized operands; NVFP4 tensor scale=1"}
+    if a.cublaslt_sm_target is not None:
+        # Reduced-budget diagnostics must not overwrite unrestricted table rows.
+        result.update(cublaslt_sm_target=a.cublaslt_sm_target,
+                      comparison_scope="sm_target_diagnostic" if a.cublaslt_sm_target else "full_device",
+                      hard_sm_partition_verified=False)
     if cutlass_library:
         result.update(schema="sm103_gemm_comparison_v1", measurement="single_gpu_cutlass_cublaslt_comparison",
                       cutlass_library=str(cutlass_library.path),
@@ -565,6 +631,10 @@ def main():
                       frontend_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                       nvtx_range=COUNTER_RANGE, formal_sampling_performed=False,
                       ncu_metrics_verified=False)
+    if a.cublaslt_counters:
+        result.update(diagnostic_only=True, performance_accepted=False,
+                      measurement="single_gpu_cublaslt_counters",
+                      nvtx_range="fuse_cublaslt_counters", ncu_metrics_verified=False)
     if a.matrix_json:
         result.update(matrix_sha256=hashlib.sha256(matrix_data).hexdigest(),
                       logical_shapes=sum(len(item["aliases"]) for item in shapes),
@@ -572,7 +642,12 @@ def main():
     else:
         result.update(shape=shapes[0]["shape"], results=[])
     save_result(a.output, result, initial=True)
+    a.sm_budget_context = None
     try:
+        if a.gemm_sm_budget is not None:
+            from cublaslt import SmBudget
+            a.sm_budget_context = SmBudget(lib, a.gemm_sm_budget)
+            result.update(sm_budget=a.sm_budget_context.info, comparison_scope='sm_budget_diagnostic')
         for index, shape in enumerate(shapes, 1):
             geometry = dict(shape, results=[], state="running")
             if a.cutlass_counters:
@@ -587,7 +662,9 @@ def main():
                 elif cutlass_library:
                     run_cutlass_comparison(a, lib, geometry, index, len(shapes), cutlass_library)
                 else:
-                    run_geometry(a, lib, geometry, index, len(shapes))
+                    with (torch.cuda.stream(a.sm_budget_context.stream) if a.sm_budget_context
+                          else contextlib.nullcontext()):
+                        run_geometry(a, lib, geometry, index, len(shapes))
             except Exception:
                 geometry["state"] = "failed"
                 if not a.matrix_json:
@@ -602,7 +679,11 @@ def main():
         result.update(state="failed", error=str(error))
         raise
     finally:
-        save_result(a.output, result)
+        try:
+            if a.sm_budget_context:
+                a.sm_budget_context.close()
+        finally:
+            save_result(a.output, result)
 
 
 if __name__ == "__main__":

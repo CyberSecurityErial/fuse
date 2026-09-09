@@ -20,7 +20,7 @@ inline cudaError_t reference_device_info(DeviceInfo* info, int32_t reserved_ctas
       ? cudaSuccess : cudaErrorInvalidValue;
 }
 
-template <class Binding>
+template <class Binding, class Gemm = typename Binding::PureGemm, bool Instrumented = false>
 cudaError_t launch_gemm_reference_impl(
     const GemmProblem& problem, const Bf16* lhs, const Bf16* rhs_nt,
     Bf16* output, float alpha, int32_t reserved_comm_ctas,
@@ -32,13 +32,19 @@ cudaError_t launch_gemm_reference_impl(
       !aligned(lhs) || !aligned(rhs_nt) || !aligned(output)) {
     return cudaErrorInvalidValue;
   }
-  using Gemm = typename Binding::PureGemm;
   using Kernel = detail::GemmReferenceKernel<Gemm, typename Binding::Kernel>;
   auto args = gemm_arguments<Gemm>(
       problem, lhs, rhs_nt, output, alpha, reserved_comm_ctas, info, fallback);
   // Keep the reduced compute budget and scheduler stride. Only the physical
   // CTA prefix disappears: worker 0 now starts at blockIdx.x == 0.
   args.scheduler.block_offset = 0;
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Instrumented) {
+    if (!detail::oproj_pipeline_sink) return cudaErrorInvalidValue;
+    args.mainloop.probe = *detail::oproj_pipeline_sink;
+    args.epilogue.probe = *detail::oproj_pipeline_sink;
+  }
+#endif
   if (!Gemm::can_implement(args) || Gemm::get_workspace_size(args) != 0) {
     return cudaErrorNotSupported;
   }
@@ -97,6 +103,13 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
   }
   auto launch = [&](auto binding_tag) {
     using Binding = typename decltype(binding_tag)::type;
+#if FUSE_ENABLE_PROFILING
+    if (detail::oproj_pipeline_sink) {
+      return launch_gemm_reference_impl<Binding, typename Binding::TelemetryPureGemm, true>(
+          params.gemm, params.input_staging, params.rhs_nt, params.output,
+          params.alpha, reserved_comm_ctas, info, GemmRaster::kAlongN, stream);
+    }
+#endif
     return launch_gemm_reference_impl<Binding>(
         params.gemm, params.input_staging, params.rhs_nt, params.output,
         params.alpha, reserved_comm_ctas, info, GemmRaster::kAlongN, stream);

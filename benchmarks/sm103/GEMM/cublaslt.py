@@ -30,6 +30,33 @@ class Library:
             raise RuntimeError(self.lib.sm103_last_error().decode())
 
 
+class SmBudget:
+    """Own a process-local green context and its stream; no system configuration."""
+    def __init__(self, library, sms):
+        self.library, self.handle = library, None
+        api = library.lib
+        for name, args, result in (
+                ('create', [ct.c_int], ct.c_void_p), ('stream', [ct.c_void_p], ct.c_void_p),
+                ('info', [ct.c_void_p], ct.c_char_p), ('destroy', [ct.c_void_p], None)):
+            function = getattr(api, 'sm103_sm_budget_' + name)
+            function.argtypes, function.restype = args, result
+        torch.cuda.synchronize()
+        self.handle = api.sm103_sm_budget_create(sms)
+        if not self.handle:
+            raise RuntimeError(api.sm103_last_error().decode())
+        try:
+            self.info = json.loads(api.sm103_sm_budget_info(self.handle))
+            self.stream = torch.cuda.ExternalStream(api.sm103_sm_budget_stream(self.handle), device=0)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        if self.handle:
+            self.library.lib.sm103_sm_budget_destroy(self.handle)
+            self.handle = None
+
+
 class Operand:
     def __init__(self, library, source, precision):
         if source.ndim != 2 or source.dtype != torch.bfloat16 or not source.is_contiguous():

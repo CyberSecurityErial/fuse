@@ -1,10 +1,12 @@
 #include <cublasLt.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -18,6 +20,24 @@ namespace {
 thread_local std::string error;
 void ck(cudaError_t s) { if(s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s)); }
 void ck(cublasStatus_t s) { if(s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cuBLAS status " + std::to_string(s)); }
+void ck(CUresult s) {
+  if(s != CUDA_SUCCESS) {
+    const char* message = nullptr;
+    cuGetErrorString(s, &message);
+    throw std::runtime_error(message ? message : "CUDA Driver error");
+  }
+}
+// Benchmark-local resource restriction, not a machine-wide MIG/MPS change.
+// Graph tuning, capture and replay must all use this owned nonblocking stream.
+struct SmBudget {
+  CUgreenCtx context{};
+  CUstream stream{};
+  std::string info;
+  ~SmBudget() {
+    if(stream) { cuStreamSynchronize(stream); cuStreamDestroy(stream); }
+    if(context) cuGreenCtxDestroy(context);
+  }
+};
 struct Plan {
   cublasLtHandle_t handle{};
   cublasLtMatmulDesc_t op{};
@@ -116,6 +136,50 @@ __global__ void quant4(const __nv_bfloat16* x, unsigned char* y,
 }
 }
 extern "C" const char* sm103_last_error() { return error.c_str(); }
+extern "C" void* sm103_sm_budget_create(int requested) {
+  try {
+    if(std::getenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"))
+      throw std::runtime_error("MPS active-thread override can expand green-context resources; refusing comparison");
+    ck(cudaFree(nullptr));
+    CUdevice device{};
+    ck(cuCtxGetDevice(&device));
+    CUdevResource full{}, group{}, actual{};
+    ck(cuDeviceGetDevResource(device, &full, CU_DEV_RESOURCE_TYPE_SM));
+    if(requested < 1 || unsigned(requested) > full.sm.smCount)
+      throw std::runtime_error("SM budget outside device resource range");
+    // Preserve normal cluster co-scheduling whenever the requested count fits.
+    // Finer partitions may limit large-cluster algorithms; record this choice,
+    // and retune in the real restricted stream rather than reuse a full-card plan.
+    unsigned flags = (full.sm.smCoscheduledAlignment &&
+                      unsigned(requested) % full.sm.smCoscheduledAlignment)
+        ? CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING : 0;
+    unsigned groups = 1;
+    ck(cuDevSmResourceSplitByCount(&group, &groups, &full, nullptr, flags, requested));
+    if(groups != 1 || group.sm.smCount != unsigned(requested))
+      throw std::runtime_error("Driver rounded SM budget to " + std::to_string(group.sm.smCount) +
+                               "; refusing an unequal-budget result");
+    CUdevResourceDesc desc{};
+    ck(cuDevResourceGenerateDesc(&desc, &group, 1));
+    auto budget = std::make_unique<SmBudget>();
+    ck(cuGreenCtxCreate(&budget->context, desc, device, CU_GREEN_CTX_DEFAULT_STREAM));
+    ck(cuGreenCtxStreamCreate(&budget->stream, budget->context, CU_STREAM_NON_BLOCKING, 0));
+    CUgreenCtx stream_context{};
+    ck(cuStreamGetGreenCtx(budget->stream, &stream_context));
+    if(stream_context != budget->context) throw std::runtime_error("Stream escaped SM budget");
+    ck(cuGreenCtxGetDevResource(stream_context, &actual, CU_DEV_RESOURCE_TYPE_SM));
+    if(actual.sm.smCount != unsigned(requested)) throw std::runtime_error("Green context SM count mismatch");
+    std::ostringstream info;
+    info << "{\"requested_sms\":" << requested << ",\"provisioned_sms\":" << actual.sm.smCount
+         << ",\"device_sms\":" << full.sm.smCount << ",\"split_flags\":" << flags
+         << ",\"coscheduled_alignment\":" << actual.sm.smCoscheduledAlignment
+         << ",\"stream_resource_verified\":true,\"enforcement\":\"cuda_green_context\"}";
+    budget->info = info.str();
+    return budget.release();
+  } catch(const std::exception& e) { error=e.what(); return nullptr; }
+}
+extern "C" void* sm103_sm_budget_stream(void* budget) { return static_cast<SmBudget*>(budget)->stream; }
+extern "C" const char* sm103_sm_budget_info(void* budget) { return static_cast<SmBudget*>(budget)->info.c_str(); }
+extern "C" void sm103_sm_budget_destroy(void* budget) { delete static_cast<SmBudget*>(budget); }
 extern "C" const char* sm103_plan_info(void* plan) { return static_cast<Plan*>(plan)->info.c_str(); }
 extern "C" void sm103_destroy(void* plan) { delete static_cast<Plan*>(plan); }
 extern "C" int sm103_run(void* plan,const void* x,const void* w,void* y,void* stream) {

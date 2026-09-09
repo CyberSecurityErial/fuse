@@ -2,10 +2,12 @@
 #include "fuse/operators/primitives/a2a_gemm.h"
 #include "fuse/operators/primitives/gemm_a2a.h"
 #include "detail/host_profiling.cuh"
+#include "detail/oproj_profiling.cuh"
 
 #if FUSE_ENABLE_PROFILING
 namespace fuse::detail {
 thread_local HostLaunchRecord* host_launch_sink = nullptr;
+thread_local const OprojPipelineView* oproj_pipeline_sink = nullptr;
 }  // namespace fuse::detail
 #endif
 

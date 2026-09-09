@@ -682,7 +682,20 @@ class GemmTileParameterContracts(unittest.TestCase):
         self.assertIn("OutputGemm::MaxThreadsPerBlock == 256", family)
         inverse = source[source.index("struct A2ALhsGemmTypes {"):]
         self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN>;", inverse)
-        self.assertEqual(inverse.count("typename Dense::Epilogue"), 2)  # Fused + telemetry.
+        # All three paths share the selected dense epilogue. Diagnostics wrap
+        # that same type; production must remain the uninstrumented collective.
+        expected_epilogues = {
+            "Gemm": "typename Dense::Epilogue",
+            "TelemetryPureGemm": "detail::OprojEpilogueObserver<typename Dense::Epilogue>",
+            "TelemetryGemm": "detail::OprojEpilogueObserver<typename Dense::Epilogue>",
+        }
+        for name, epilogue in expected_epilogues.items():
+            with self.subTest(collective=name):
+                binding = inverse.split(f"using {name} =", 1)[1].split(";", 1)[0]
+                self.assertIn(f", {epilogue},", " ".join(binding.split()))
+                self.assertNotIn("SignalingEpilogue", binding)
+        production = inverse.split("#if FUSE_ENABLE_PROFILING", 1)[0]
+        self.assertNotIn("Observer", production)
         for path, name in (("a2a_gemm.h", "A2AGemmParams"), ("gemm_a2a.h", "GemmA2AParams")):
             public = (ROOT / "include/fuse/operators/primitives" / path).read_text()
             params = public[public.index(f"struct {name} {{"):]

@@ -169,6 +169,56 @@ class PureGemmContracts(unittest.TestCase):
         for row in geometry['results']:
             self.assertEqual(row['pflops_per_gpu_p50'], 2 * 128 * 192 * 64 / 4 / 1e12)
 
+    def test_lt_target_reaches_tuning_and_audits_the_measured_graph_after_timing(self):
+        for target, restricted in ((0, False), (132, False), (132, True)):
+            a = argparse.Namespace(matrix_json=None, precisions='bf16', launches='graph',
+                candidates=256, workspace_mib=256, tune_warmup=10, tune_iterations=50,
+                warmup=10, iterations=50, cublaslt_sm_target=target, output=self.root / 'probe.json')
+            geometry = dict(bench.matrix_shapes(self.payload())[0], results=[])
+            plan = mock.Mock(info={'valid': 8, 'math_sms': target})
+            graph, torch = mock.Mock(), mock.Mock()
+            if restricted:
+                a.sm_budget_context = mock.Mock(info={'enforcement': 'cuda_green_context',
+                                                      'provisioned_sms': 132})
+            torch.cuda.CUDAGraph.return_value = graph
+            torch.cuda.graph.return_value = contextlib.nullcontext()
+            torch.cuda.stream.return_value = contextlib.nullcontext()
+            order = []
+
+            def measure(run, warmup, iterations):
+                self.assertIs(run, graph.replay)
+                graph.instantiate.assert_called_once()
+                order.append('measure')
+                return [4.] * 50, {'protocol': bench.PROTOCOL}
+
+            def dump(path):
+                self.assertEqual(order, ['measure'])
+                Path(path).write_text('digraph G { kernel [label="grid: 132,1,1"]; }')
+
+            graph.debug_dump.side_effect = dump
+            with mock.patch.object(bench, 'torch', torch), \
+                    mock.patch.object(bench, 'prepare_inputs', return_value=('x', 'w')), \
+                    mock.patch.object(bench, 'Operand'), \
+                    mock.patch.object(bench, 'Plan', return_value=plan) as create, \
+                    mock.patch.object(bench, 'check_gemm', return_value={}), \
+                    mock.patch.object(bench, 'measure', side_effect=measure), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                bench.run_geometry(a, object(), geometry, 1, 1)
+            self.assertEqual(create.call_args.kwargs['math_sms'], target)
+            torch.cuda.CUDAGraph.assert_called_once_with(keep_graph=True)
+            budget = geometry['results'][0]['sm_budget']
+            if restricted:
+                torch.cuda.Stream.assert_not_called()
+                torch.cuda.graph.assert_called_once_with(graph, stream=a.sm_budget_context.stream)
+                torch.cuda.stream.assert_called_once_with(a.sm_budget_context.stream)
+                self.assertEqual(budget['enforcement'], 'cuda_green_context')
+                self.assertEqual(budget['provisioned_sms'], 132)
+            self.assertEqual(budget['requested_sm_target'], target)
+            audit = budget['launch_evidence']
+            self.assertFalse(audit['hard_sm_partition_verified'])
+            self.assertTrue((self.root / audit['file']).is_file())
+            self.assertEqual(len(audit['sha256']), 64)
+
     def test_cutlass_comparison_shares_inputs_keeps_both_orders_and_closes_plans(self):
         a = argparse.Namespace(candidates=256, workspace_mib=256, tune_warmup=10,
                                tune_iterations=50, warmup=10, iterations=50, cutlass_swizzle_size=4, cutlass_epilogue_n=64, cutlass_1sm_cluster_m=1, cutlass_full_check=False)
@@ -556,6 +606,14 @@ class PureGemmContracts(unittest.TestCase):
                  'prepare_inputs', 'run_geometry')
         nodes = {node.name: node for node in ast.parse(ENTRY.read_text()).body
                  if isinstance(node, ast.FunctionDef)}
+        # The opt-in NCU call occurs after formal sampling. Removing only this
+        # explicit disabled-by-default branch must recover the old sampler AST.
+        class WithoutLtCounters(ast.NodeTransformer):
+            def visit_If(self, node):
+                if ast.unparse(node.test) == "getattr(a, 'cublaslt_counters', False)":
+                    return None
+                return self.generic_visit(node)
+        nodes['run_geometry'] = WithoutLtCounters().visit(nodes['run_geometry'])
         # Python 3.12 adds empty type_params to FunctionDef; ignore that
         # parser-only addition so the v23 contract also runs on the GPU host.
         for name in names:
@@ -563,10 +621,11 @@ class PureGemmContracts(unittest.TestCase):
                 nodes[name]._fields = tuple(field for field in nodes[name]._fields if field != 'type_params')
         digest = hashlib.sha256('\n'.join(ast.dump(nodes[name], include_attributes=False)
                                           for name in names).encode()).hexdigest()
-        # v3 deliberately tunes per launch mode; sampler/input contracts remain
-        # unchanged. Plan mode, reuse and lifetime are tested independently above.
+        # v3 deliberately tunes per launch mode; the explicit SM-target branch
+        # now audits that same Graph after timing. Sampler/input bodies remain
+        # unchanged; target forwarding and audit order are tested above.
         self.assertEqual(bench.PROTOCOL, 'single_gpu_pure_gemm_stable_v3_launch_tuned')
-        self.assertEqual(digest, '4f086ba38cbe8fbefdf903af47f774c3d67a80bca276fdf1a3c5a58afb9fc705')
+        self.assertEqual(digest, '16338d428dde831adcbe6113960a3e90aaf3e92174e277b92546736fa9465d46')
 
     def test_counter_warmup_body_matches_production_sampler_exactly(self):
         nodes = {node.name: node for node in ast.parse(ENTRY.read_text()).body

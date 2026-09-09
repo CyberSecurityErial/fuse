@@ -241,6 +241,7 @@ struct A2ALhsInputCommT {
     if (!can_implement(args)) {
       return cudaErrorNotSupported;
     }
+    initialize_input_order(args);
     if (!args.use_bulk || row_bytes > 1024) {
       return cudaSuccess;
     }
@@ -296,6 +297,7 @@ struct A2ALhsInputCommT {
     args.use_bulk = true;
     args.use_tensor_store = true;
     if (!can_implement(args)) return cudaErrorNotSupported;
+    initialize_input_order(args);
 
     // UINT64 [16, K/64, M] is only a byte-preserving view of BF16. Tensor G2S
     // is required: consecutive source rows have stride peer-K, not CopyK;
@@ -323,6 +325,17 @@ struct A2ALhsInputCommT {
       }
     }
     return cudaSuccess;
+  }
+
+  static void initialize_input_order(Arguments& args) {
+    // Share capacity lowering between fusion and the independent copy reference.
+    // Rows/columns and peer width have already resolved the real chunk count.
+    // Bulk has four independent warp slots; vector fallback one task per CTA.
+    // No GEMM layout, CTA budget or complete (M,peer) publication is changed.
+    const int32_t copy_slots = args.params.num_comm_ctas *
+        (args.use_bulk ? kA2ALhsBulkSlots : 1);
+    args.input_order.ready_group_m_tiles = std::max(
+        int32_t{1}, copy_slots / arrivals_per_peer(args));
   }
 
   static bool can_implement(const Arguments& args) {

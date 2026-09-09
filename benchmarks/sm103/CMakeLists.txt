@@ -20,7 +20,7 @@ foreach(target fuse_cublaslt_runner cublaslt_bench cublaslt_smoke)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
 endforeach()
 add_library(fuse_sm103_cublaslt SHARED "${FUSE_ROOT}/csrc/baselines/sm103/cublaslt_training.cu")
-target_link_libraries(fuse_sm103_cublaslt PRIVATE CUDA::cublasLt CUDA::cudart)
+target_link_libraries(fuse_sm103_cublaslt PRIVATE CUDA::cublasLt CUDA::cudart CUDA::cuda_driver)
 target_compile_options(fuse_sm103_cublaslt PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
 
 # Optional, independent pure-GEMM experiment. Existing baseline builds do not

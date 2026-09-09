@@ -218,6 +218,13 @@ struct QkvGqaPackCommT {
   }
 
   static bool can_implement(const Arguments& args) {
+    // TODO(sm103-segmented-routing): KDA/MLA packed projections need explicit
+    // per-segment ownership (head-sharded or replicated latent), not relaxed
+    // GQA divisibility checks or synthetic heads. Choose the MLA exchange
+    // boundary before/after latent expansion explicitly. Share segment offsets
+    // with backward; the adjoint of replication must sum consumer gradients.
+    // Add independent route/numeric tests before accepting those layouts here.
+    // Deferred while this campaign measures existing large/long-sequence paths.
     const auto& p = args.params;
     const auto& route = p.route;
     if (route.world_size <= 0 || route.world_size > kMaxWorldSize ||

@@ -235,6 +235,7 @@ template <int N, int K = 64, int E = 0> struct Bf16GemmTypes {
 template <int N, int K = 64, int E = 0> struct A2ALhsGemmTypes : Bf16GemmTypes<N,K,E> {
   using Gemm = typename Bf16GemmTypes<N,K,E>::OutputGemm;
   using TelemetryGemm = Gemm;
+  using TelemetryPureGemm = Gemm;
 };
 template <int N> struct QkvComm { static constexpr int kBlockM = 128, kBlockN = N; };
 using QkvGqaPackCommN64 = QkvComm<64>;
@@ -594,6 +595,7 @@ void benchmark(std::vector<RankRuntime>& runtimes, const Options& options, Direc
   std::cout << "mock,component_benchmark," << direction_name(direction) << context
             << ",selected_component=" << component_name(options.component) << '\n';
 }
+void profile_compute_gaps(std::vector<RankRuntime>&, const Options&) {}
 void profile(std::vector<RankRuntime>& runtimes, const Options& options,
              Direction direction, uint32_t& epoch) {
   const int index = direction == Direction::kQkv ? 0 : 1;
@@ -1217,6 +1219,16 @@ Options parse_options(int argc, char** argv) {
                 self.assertNotIn("candidate_verified,", result.stdout)
                 self.assertNotIn("PASS:", result.stdout)
 
+    def test_compute_only_never_launches_fused_or_copy_components(self):
+        result = self.run_flow('--calibrate', '--compute-only', '--fused-direction', 'oproj')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        epochs = [line for line in result.stdout.splitlines() if line.startswith('mock,component_epoch,')]
+        self.assertTrue(epochs)
+        self.assertTrue(all(',component=compute_reference,' in line for line in epochs))
+        accepted = [line for line in result.stdout.splitlines() if line.startswith('candidate_verified,')]
+        self.assertTrue(accepted)
+        self.assertTrue(all(',component=compute_reference,' in line for line in accepted))
+
 
 class NoResidualHostContracts(unittest.TestCase):
     """Execute the shared real argument builder, not a numerical GEMM model."""
@@ -1421,19 +1433,27 @@ int main(int argc, char** argv) {
         route_header = (ROOT / "include/fuse/profiling/qkv_route.cuh").read_text()
         route_record = route_header[route_header.index("struct QkvRouteTimeline {"):
                                     route_header.index("\ncudaError_t")]
-        profile_probe = header + '\nnamespace fuse {\n' + route_record + '}\n' + r"""
+        pipeline_header = (ROOT / "csrc/operators/sm103/detail/oproj_profiling.cuh").read_text()
+        pipeline_records = pipeline_header[pipeline_header.index("struct OprojReadyRecord {"):
+                                           pipeline_header.index("// Bind only on the host")]
+        profile_probe = (header + '\nnamespace fuse {\n' + route_record + '}\n' +
+                         '\nnamespace fuse::detail {\n' + pipeline_records + '}\n') + r"""
 constexpr int kWarmup = 10;
 enum class Direction { kQkv, kOproj };
 const char* direction_name(Direction d) { return d == Direction::kQkv ? "GEMM_A2A" : "A2A_GEMM"; }
 struct Options {
   bool profile = true;
   bool qkv_epilogue_probe = false;
+  bool oproj_pipeline_probe = false;
+  bool oproj_gap_probe = false;
+  int max_swizzle_size = 1;
   int world = 4, comm_sm = 1, seq_local = 128, hidden = 128;
   int q_heads = 8, kv_heads = 4;
   std::string profile_direction = "oproj"; // This probe exercises CTA/peer records.
   unsigned timeout_seconds = 0;
   std::string host_launch = "sequential", profile_detail = "full";
   int projection_width() const { return 384; }
+  int q_width() const { return 512; }
 };
 namespace fuse::detail { struct QkvEpilogueRecord {}; }
 struct RankRuntime {
@@ -1444,9 +1464,10 @@ struct RankRuntime {
   fuse::A2AGemmCtaTimeline* timeline = nullptr;
   fuse::A2AGemmPeerTimeline* peer_timeline = nullptr;
   fuse::detail::QkvEpilogueRecord* qkv_epilogue = nullptr;
+  fuse::detail::OprojPipelineView oproj_pipeline{};
 };
 namespace fuse {
-struct Traits { int block_m = 128, block_n = 128; };
+struct Traits { int block_m = 128, block_n = 128, block_k = 64; };
 Traits cutlass_kernel_traits() { return {}; }
 template <class... T> Traits qkv_cutlass_kernel_traits(T...) { return {}; }
 template <class T> int query_gemm_a2a_route_timeline_capacity(const T&, int* capacity) { *capacity = 64; return 0; }
@@ -1472,6 +1493,7 @@ template <class T> T* allocate(RankRuntime&, int count) {
 }
 #define CUDA_CHECK(expression) do { if (expression) throw std::runtime_error("CUDA stand-in failure"); } while (0)
 void allocate_profile(RankRuntime& runtime, const Options& options) {
+  const int rank = runtime.device;
 """ + allocation + r"""
 }
 unsigned alarm(unsigned) { return 0; }
@@ -1593,7 +1615,8 @@ class HostStageContracts(unittest.TestCase):
         entry = (ROOT / "csrc/operators/sm103/entry.cu").read_text()
         start = entry.index("namespace fuse::detail {\nthread_local HostLaunchRecord*")
         definition = entry[start:entry.index("#endif", start)]
-        support = '#include "host_profiling.cuh"\n' + definition + r"""
+        support = ('#include "host_profiling.cuh"\n'
+                   'namespace fuse::detail { struct OprojPipelineView; }\n') + definition + r"""
 void record_stages(int status) {
   FUSE_SM103_HOST_BEGIN();
   FUSE_SM103_HOST_MARK(kCommunicationPrepare);
@@ -1705,7 +1728,7 @@ int main() { return operation(); }
             "-DFUSE_ENABLE_PROFILING=0", "-I", str(cls.header_dir), "-Wall", "-Wextra", "-Werror")
         harness = (ROOT / "benchmarks/sm103/fused_bf16.cu").read_text()
         diagnostic = harness[harness.index("void profile_host_stages("):
-                             harness.index("\nvoid profile(")]
+                             harness.index("\nvoid profile_compute_gaps(")]
         timing = harness[harness.index("struct HostLaunchTiming {"):
                          harness.index("\nstruct RankLaunch {")]
         collector = r"""
@@ -1804,6 +1827,10 @@ struct Options {
 };
 namespace fuse {
 struct Params { uint32_t epoch = 0; void* ready = nullptr; void* peer_route_done_epoch[8]{}; };
+namespace detail {
+struct OprojPipelineView { void* tiles = nullptr; };
+struct OprojPipelineBinding { explicit OprojPipelineBinding(const OprojPipelineView*) {} };
+}
 template <class... T> int launch_batched_cutlass_reference(T...) { return 0; }
 template <class... T> int launch_gemm_a2a_copy_reference(T...) { return 0; }
 template <class... T> int launch_a2a_gemm_cutlass_reference(T...) { return 0; }
@@ -1826,6 +1853,7 @@ struct RankRuntime {
   void* calibration_oproj_ready = nullptr;
   void* calibration_route_done = nullptr;
   fuse::Params qkv, oproj;
+  fuse::detail::OprojPipelineView oproj_pipeline{};
   fused_launch::Team* launch_team = nullptr;
 };
 int cudaSetDevice(int) { return 0; }

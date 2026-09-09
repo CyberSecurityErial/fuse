@@ -1,6 +1,9 @@
 # Benchmark Index
 
-当前版本：v16.0
+当前版本：v17.0
+
+- [SM103 OProj：离线选优与生产消费调度，23/30 点 Graph 1+5 快筛](results/sm103/v17.0/README.md)
+  （不是运行时自动选优或正式10+50复测；历史正式基线保留）
 
 - [SM103 大尺寸长序列：融合 vs 纯 cuBLASLt](results/sm103/v16.0/README.md)
 

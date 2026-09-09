@@ -940,5 +940,165 @@ class BadcaseTargetTests(unittest.TestCase):
             model.badcase_targets([value])
 
 
+class OprojFeedScheduleTests(unittest.TestCase):
+    """Synthetic service constants; exact queue arithmetic checked against C++."""
+
+    @staticmethod
+    def arguments(**changes):
+        values = dict(m=128 * 13, n=256 * 7, k=4096, world=4,
+                      sm_count=148, comm_ctas=8, tile_m=128, tile_n=256, tile_k=64,
+                      raster="along_m", resolved_swizzle=4, copy_chunks=11,
+                      copy_slots=32, cohort_m_tiles=2, tile_cycle_us=40.0,
+                      copy_bandwidth_gb_s=400.0, launch_us=0.0,
+                      copy_start_us=0.0, tail_us=0.0)
+        values.update(changes)
+        return values
+
+    def test_exact_queue_matches_current_device_decoder(self):
+        # Reuse the existing host-only C++ stand-in, not a second copy of the
+        # device decoder. No CUDA compiler, GPU, cloud or screen is involved.
+        path = ROOT / "scripts/test_sm103_producer_consumer.py"
+        spec = importlib.util.spec_from_file_location("oproj_queue_oracle", path)
+        oracle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oracle)
+        host = oracle.ProducerConsumerTests
+        host.setUpClass()
+        self.addCleanup(host.doClassCleanups)
+        import subprocess
+        for mt, nt, swizzle, comm, slots, chunks, world in (
+                (13, 7, 4, 8, 32, 11, 4),
+                (128, 16, 8, 16, 64, 11, 4),
+                (128, 28, 4, 16, 64, 16, 4),
+                (33, 8, 4, 24, 96, 6, 8),
+                (13, 3, 4, 3, 3, 11, 8)):
+            for raster in ("along_m", "along_n"):
+                with self.subTest(mt=mt, nt=nt, raster=raster, comm=comm, world=world):
+                    result = model.score_oproj_schedule(**self.arguments(
+                        m=mt*128, n=nt*256, resolved_swizzle=swizzle, raster=raster,
+                        comm_ctas=comm, copy_slots=slots, copy_chunks=chunks, world=world,
+                        cohort_m_tiles=max(1, slots//chunks), include_trace=True))
+                    expected = [tuple(map(int, line.split())) for line in subprocess.check_output(
+                        [str(host.binary), "input", str(mt), str(nt), str(swizzle),
+                         str(int(raster == "along_n")), str(148-comm), str(world),
+                         str(chunks), str(slots)], text=True).splitlines()]
+                    self.assertEqual(result["copy_order"], expected)
+                    self.assertEqual(len(set(expected)), mt*world*chunks)
+
+    def test_tail_cohort_padding_and_static_worker_stride(self):
+        result = model.score_oproj_schedule(**self.arguments(cohort_m_tiles=3, include_trace=True))
+        self.assertEqual(result["delivery_policy"], "ready_cohorts")
+        self.assertEqual((result["padded_m_tiles"], result["padded_n_tiles"]), (16, 8))
+        self.assertEqual(result["scheduled_work_tiles"], 128)
+        self.assertEqual(result["valid_work_tiles"], 91)
+        self.assertEqual(result["copy_order"][-44:], [(12, p, c) for p in range(4) for c in range(11)])
+        coordinates = set()
+        for tile in result["tile_consumption"]:
+            self.assertEqual(tile["worker"], tile["logical_tile"] % result["compute_ctas"])
+            coordinates.add((tile["m_tile"], tile["n_tile"]))
+        self.assertEqual(coordinates, {(m, n) for m in range(13) for n in range(7)})
+        for finish, service, wait in zip(result["worker_finish_us"], result["worker_service_us"],
+                                         result["worker_feed_wait_us"]):
+            self.assertAlmostEqual(finish, service + wait)
+
+    def test_full_ready_uses_last_chunk_and_peer_k_order(self):
+        result = model.score_oproj_schedule(**self.arguments(
+            m=128, n=128, k=256, tile_n=128, comm_ctas=1, copy_slots=1,
+            resolved_swizzle=1, copy_chunks=2, cohort_m_tiles=1,
+            copy_chunk_bytes=[4096, 12288], copy_bandwidth_gb_s=1,
+            include_trace=True))
+        for actual, expected in zip(result["ready_us_by_m_peer"][0], (16.384, 32.768, 49.152, 65.536)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(result["compute_finish_us"], 75.536)
+        self.assertAlmostEqual(result["critical_worker_feed_wait_us"], 35.536)
+        self.assertAlmostEqual(result["critical_worker_later_feed_wait_us"], 19.152)
+        self.assertGreater(result["score_us"], result["ideal_overlap_us"])
+        self.assertFalse(result["tensor_core_busy_inferred"])
+
+    def test_independent_slots_can_complete_later_peer_before_earlier_chunk(self):
+        result = model.score_oproj_schedule(**self.arguments(
+            m=128, n=128, k=256, tile_n=128, comm_ctas=1, copy_slots=4,
+            resolved_swizzle=1, copy_chunks=2, cohort_m_tiles=1,
+            copy_chunk_bytes=[4096, 12288], copy_bandwidth_gb_s=1,
+            include_trace=True))
+        self.assertEqual(result["ready_us_by_m_peer"][0], [49.152, 49.152, 98.304, 98.304])
+
+    def test_fast_delivery_reduces_to_integer_wave_service(self):
+        result = model.score_oproj_schedule(**self.arguments(
+            m=32768, n=4096, resolved_swizzle=8, comm_ctas=16, copy_slots=64,
+            cohort_m_tiles=5, copy_bandwidth_gb_s=1e12, launch_us=3, tail_us=2))
+        self.assertEqual(result["integer_waves"], 32)
+        self.assertAlmostEqual(result["score_us"], 3 + 32*40 + 2, places=5)
+        self.assertAlmostEqual(result["exposed_feed_us"], 0, places=5)
+
+    def test_budget_changes_compute_window_and_copy_cohort_together(self):
+        old = model.score_oproj_schedule(**self.arguments(
+            m=32768, n=4096, resolved_swizzle=8, comm_ctas=16, copy_slots=64,
+            cohort_m_tiles=5, include_trace=True))
+        new = model.score_oproj_schedule(**self.arguments(
+            m=32768, n=4096, resolved_swizzle=8, comm_ctas=24, copy_slots=96,
+            cohort_m_tiles=8, include_trace=True))
+        self.assertEqual((old["compute_ctas"], new["compute_ctas"]), (132, 124))
+        self.assertEqual((len(old["first_use_m_windows"][0]), len(new["first_use_m_windows"][0])), (17, 16))
+        self.assertEqual((old["base_cohort_m_tiles"], new["base_cohort_m_tiles"]), (5, 8))
+        self.assertNotEqual(old["copy_order"], new["copy_order"])
+        self.assertEqual(set(old["copy_order"]), set(new["copy_order"]))
+
+    def test_along_n_has_no_fictitious_early_global_n_band(self):
+        result = model.score_oproj_schedule(**self.arguments(raster="along_n"))
+        self.assertEqual(result["feed_phase"], "whole_gemm")
+        self.assertEqual(result["feed_phase_compute_fraction"], 1)
+        self.assertEqual(result["feed_phase_tiles"], result["valid_work_tiles"])
+        self.assertEqual(result["feed_phase_ideal_compute_us"], result["strided_compute_service_us"])
+        self.assertFalse(result["first_n_band_is_temporal_phase"])
+        same = model.score_oproj_schedule(**self.arguments(raster="along_n", cohort_m_tiles=10))
+        self.assertEqual(result["score_us"], same["score_us"])
+
+    def test_more_n_reuse_does_not_duplicate_a_bytes(self):
+        narrow = model.score_oproj_schedule(**self.arguments(m=32768, n=4096, k=8192, resolved_swizzle=8))
+        wide = model.score_oproj_schedule(**self.arguments(m=32768, n=8192, k=8192, resolved_swizzle=8))
+        self.assertEqual(narrow["unique_payload_bytes"], 512*1024*1024)
+        self.assertEqual(wide["unique_payload_bytes"], narrow["unique_payload_bytes"])
+        self.assertEqual(wide["remote_payload_bytes"], 384*1024*1024)
+        self.assertEqual(narrow["copy_tasks"], wide["copy_tasks"])
+        self.assertEqual(narrow["copy_finish_us"], wide["copy_finish_us"])
+        self.assertEqual((narrow["feed_phase_compute_fraction"], wide["feed_phase_compute_fraction"]), (.5, .25))
+
+    def test_start_tail_and_ratio_use_one_common_time_origin(self):
+        base = model.score_oproj_schedule(**self.arguments())
+        shifted = model.score_oproj_schedule(**self.arguments(launch_us=10, tail_us=7))
+        self.assertAlmostEqual(shifted["score_us"], base["score_us"] + 17)
+        self.assertAlmostEqual(shifted["production_consumption_ratio"], base["production_consumption_ratio"])
+        self.assertAlmostEqual(base["production_consumption_ratio"],
+                               base["feed_phase_ideal_compute_us"] / base["copy_finish_us"])
+        self.assertNotIn("copy_order", base)
+        self.assertFalse(base["externally_validated"])
+        json.dumps(base, allow_nan=False)
+
+    def test_budget_matched_cycles_are_not_linearly_scaled_by_sms(self):
+        small = model.score_oproj_schedule(**self.arguments(comm_ctas=16, copy_slots=64, tile_cycle_us=43))
+        large = model.score_oproj_schedule(**self.arguments(comm_ctas=32, copy_slots=128, tile_cycle_us=41))
+        self.assertEqual((small["tile_cycle_us"], large["tile_cycle_us"]), (43, 41))
+        self.assertEqual(large["wave_compute_service_us"], large["integer_waves"] * 41)
+        self.assertFalse(large["linear_sm_throughput_scaling_applied"])
+
+    def test_amortized_services_keep_unmeasured_startup_unknown(self):
+        result = model.score_oproj_schedule(**self.arguments(service_basis="amortized_full_boundary"))
+        self.assertIsNone(result["separately_calibrated_startup_tail_us"])
+        for term in ("launch_us", "copy_start_us", "tail_us"):
+            with self.subTest(term=term), self.assertRaisesRegex(ValueError, "second time"):
+                model.score_oproj_schedule(**self.arguments(service_basis="amortized_full_boundary", **{term: 1}))
+
+    def test_invalid_geometry_services_and_chunk_vectors_fail_closed(self):
+        for changes in (dict(m=129), dict(k=4097), dict(comm_ctas=148), dict(copy_chunks=0),
+                        dict(copy_slots=33), dict(cohort_m_tiles=0), dict(resolved_swizzle=3),
+                        dict(raster="heuristic"), dict(tile_cycle_us=0), dict(copy_bandwidth_gb_s=float("inf")),
+                        dict(launch_us=-1), dict(copy_start_us=-1), dict(tail_us=float("nan")),
+                        dict(copy_chunk_bytes=[1]), dict(copy_chunk_bytes=[1]*11),
+                        dict(include_trace=1), dict(m=128_000_000), dict(world=3),
+                        dict(sm_count=2_000_002, comm_ctas=2_000_001, copy_slots=2_000_001)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                model.score_oproj_schedule(**self.arguments(**changes))
+
+
 if __name__ == "__main__":
     unittest.main()

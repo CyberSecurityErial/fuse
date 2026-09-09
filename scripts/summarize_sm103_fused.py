@@ -69,6 +69,12 @@ SCHEDULE_ROW_FIELDS = ('raster', 'max_swizzle_size', 'effective_swizzle_size',
 # prevents a stripped new default log from masquerading as a legacy log.
 # Explicit job/log fields activate the contract for later source versions too.
 SCHEDULE_HARNESS_SHA256 = {'766bb5da2a2b20319a744c74af06495a092ffe3eeaac231ebb467a520693e064'}
+OPROJ_PROBE_FIELDS = {
+    'profile_oproj_pipeline': ('rank', 'index', 'cta', 'mma_begin', 'tmem_acquired', 'mma_return',
+        'epi_begin', 'acc_wait_begin', 'acc_wait_end', 'tmem_release_begin', 'tmem_release_end',
+        'epi_return', 'k_tiles'),
+    'profile_oproj_stage': ('rank', 'index', 'k', 'wait_begin', 'wait_end', 'issue_end'),
+}
 
 
 def require(condition, message):
@@ -333,9 +339,39 @@ def audit_mpi_receipts(job, records, data, attempt):
             'MPI evidence contains unexpected rank streams')
 
 
+def audit_oproj_probe_record(parts, world, line_number):
+    """Validate compact probe records; full tile coverage belongs to the trace exporter."""
+    kind, values = parts[0], {}
+    for part in parts[1:]:
+        require('=' in part, f'Malformed OProj probe field at line {line_number}')
+        key, value = part.split('=', 1)
+        require(key not in values, f'Duplicate OProj probe field at line {line_number}')
+        values[key] = integer(value, f'OProj probe {key}')
+    fields = set(OPROJ_PROBE_FIELDS[kind])
+    if kind == 'profile_oproj_pipeline':
+        fields.update(f'{name}{peer}' for peer in range(world)
+                      for name in ('ready_begin', 'ready_end', 'ready_joined', 'cache_hit'))
+    require(set(values) == fields and values['rank'] == 0,
+            f'OProj probe field/rank mismatch at line {line_number}')
+    chains = [('wait_begin', 'wait_end', 'issue_end')]
+    if kind == 'profile_oproj_pipeline':
+        require(values['k_tiles'] > 0 and all(values[f'cache_hit{peer}'] in (0, 1) for peer in range(world)),
+                f'Invalid OProj probe K count/cache hit at line {line_number}')
+        chains = [('mma_begin', 'tmem_acquired', 'mma_return'),
+                  ('epi_begin', 'acc_wait_begin', 'acc_wait_end', 'tmem_release_begin',
+                   'tmem_release_end', 'epi_return')]
+        chains += [tuple(f'{name}{peer}' for name in ('ready_begin', 'ready_end', 'ready_joined'))
+                   for peer in range(world)]
+    for chain in chains:
+        times = [values[field] for field in chain]
+        require(0 < times[0] and times == sorted(times) and times[-1] < 2**64,
+                f'Invalid OProj probe phase order at line {line_number}')
+
+
 def parse_log(text, *, completion='last'):
     rows, diagnostics = [], Counter()
     profile_detail = None  # Old logs predate explicit full/CTA-only selection.
+    profile_world = 0
     lines = text.splitlines()
     require(completion in ('last', 'any', 'none'), 'Unknown log completion contract')
     passes = [index for index, line in enumerate(lines)
@@ -352,7 +388,13 @@ def parse_log(text, *, completion='last'):
                 f'Unknown epilogue record at line {line_number}')
         require(not kind.startswith('graph_') or kind == 'graph_prepare',
                 f'Unknown Graph record at line {line_number}')
-        if kind.startswith('profile') or kind == 'host_stage':
+        if kind in OPROJ_PROBE_FIELDS:
+            # These two compact emitters omit profile_detail intentionally;
+            # they are full-only records, not a blanket exception for profiles.
+            require(profile_detail == 'full' and profile_world > 0,
+                    f'OProj probe requires explicit full profile at line {line_number}')
+            audit_oproj_probe_record(parts, profile_world, line_number)
+        elif kind.startswith('profile') or kind == 'host_stage':
             detail_fields = [part for part in parts[1:] if part.startswith('profile_detail=')]
             require(detail_fields == ([] if profile_detail is None else ['profile_detail=' + profile_detail]),
                     f'Per-record profile detail mismatch at line {line_number}')
@@ -384,6 +426,7 @@ def parse_log(text, *, completion='last'):
         require(row.get('component', 'fused') in COMPONENTS, 'Unsupported measurement component')
         if kind == 'config':
             profile_detail = row.get('profile_detail')
+            profile_world = count(row, 'world', 1)
         rows.append(row)
     return rows, dict(diagnostics)
 
@@ -434,7 +477,47 @@ def fused_launch(job):
     return launch
 
 
-def audit_timing(rows, world, mpi=False, launch='eager'):
+def audit_quick_timing(rows, world, mpi, launch):
+    summaries = [r for r in rows if r['kind'] == 'summary']
+    require(len(summaries) == 1, 'Quick mode requires one summary')
+    summary = summaries[0]
+    require(summary.get('sampling_mode') == 'quick_1_5' and
+            summary.get('verification') == 'pending' and count(summary, 'formal_eligible') == 0 and
+            count(summary, 'warmup') == 1 and count(summary, 'samples') == 5 and
+            count(summary, 'additional_warmup_calls') == count(summary, 'sample_cadence_warmup') == 0 and
+            count(summary, 'minimum_warmup_cuda_ms') == count(summary, 'converged_all_ranks') == 0 and
+            count(summary, 'selected_round') == 0,
+            'Invalid 1+5 screening contract')
+    expected_collector = ('mpi_graph_rank_events_v1' if launch == 'graph' else 'mpi_rank_events_v1') if mpi else 'per_epoch_rank_events_v3_eventsync'
+    require(summary.get('collector') == expected_collector and
+            summary.get('boundary') == (f'mpi_{launch}_maxrank_cudaevent' if mpi else
+                                       'single_process_eager_maxrank_cudaevent'), 'Quick boundary mismatch')
+    require((summary.get('launch') == 'graph' and summary.get('graph_epoch_mode') == GRAPH_EPOCH_MODE)
+            if launch == 'graph' else 'graph_epoch_mode' not in summary, 'Quick Graph mode mismatch')
+    warm = [r for r in rows if r['kind'] == 'warmup']
+    samples = [r for r in rows if r['kind'] == 'sample']
+    require(all(r.get('phase') == 'initial' and count(r, 'round', -1) == -1 for r in warm) and
+            all(r.get('phase') == 'measurement' and count(r, 'round') == 0 for r in samples),
+            'Quick mode has extra warmup/measurement phases')
+    initial = audit_samples(warm, world, 1, 'quick warmup')
+    values = audit_samples(samples, world, 5, 'quick samples')
+    require(values['epoch_first'] == initial['epoch_last'] + 1 and
+            initial['lines'][-1] < values['lines'][0] < values['lines'][-1] < summary['line'],
+            'Quick epochs/records are not consecutive')
+    close(number(summary, 'warmup_p50_ms'), initial['maxrank_ms'][0], 'quick warmup p50')
+    close(number(summary, 'warmup_p95_ms'), initial['maxrank_ms'][0], 'quick warmup p95')
+    p50, p95, half = percentile(values['maxrank_ms'], .5), percentile(values['maxrank_ms'], .95), drift(values['maxrank_ms'])
+    for key, value in (('p50_ms', p50), ('p95_ms', p95), ('half_drift', half)):
+        close(number(summary, key), value, key)
+    return dict(p50_ms=p50, p95_ms=p95, half_drift=half, selected_round=0,
+                collector=expected_collector, boundary=summary['boundary'], warmup_calls=1,
+                minimum_warmup_cuda_ms=0, sampling_mode='quick_1_5', formal_eligible=False,
+                rounds=[values | dict(round=0, half_drift=half, accepted=True)], summary_line=summary['line'])
+
+
+def audit_timing(rows, world, mpi=False, launch='eager', quick=False):
+    if quick:
+        return audit_quick_timing(rows, world, mpi, launch)
     summaries = [r for r in rows if r['kind'] == 'summary']
     require(len(summaries) == 1, 'Requires exactly one pending timing summary per candidate')
     summary = summaries[0]
@@ -1028,6 +1111,13 @@ def audit_log(text, job):
                 'CTA-only diagnostics must not contain peer traces')
     elif profile_detail == 'full' and 'profile_detail' in config:
         require(profile_records.get('profile_peer', 0) > 0, 'Full diagnostics require peer traces')
+    oproj_probe = job.get('oproj_pipeline_probe', False)
+    require(type(oproj_probe) is bool, 'OProj pipeline probe job option must be boolean')
+    probe_records = {kind for kind in OPROJ_PROBE_FIELDS if profile_records.get(kind, 0)}
+    require(not probe_records or oproj_probe, 'Unexpected OProj pipeline probe records')
+    require(not oproj_probe or (job.get('profile') and profile_detail == 'full' and
+            job.get('directions') == 'oproj' and not job.get('mpi') and not epilogue_probe and
+            probe_records == set(OPROJ_PROBE_FIELDS)), 'Unsupported/incomplete OProj pipeline probe')
     shape = fused_geometry(job)
     require(config.get('fused_direction', 'both') == job.get('fused_direction', 'both'),
             'Fused direction mismatch')
@@ -1037,7 +1127,10 @@ def audit_log(text, job):
     calibrate = bool(job.get('calibrate'))
     require(integer(config.get('calibrate', 0), 'calibrate') == int(calibrate) and
             not (calibrate and (diagnostic or job.get('profile'))), 'Calibration config mismatch')
-    components = COMPONENTS if calibrate else ('fused',)
+    compute_only = bool(job.get('compute_only'))
+    require(not compute_only or (calibrate and job.get('fused_direction') == 'oproj'),
+            'Compute-only requires explicit OProj calibration')
+    components = ('compute_reference',) if compute_only else COMPONENTS if calibrate else ('fused',)
     for key, expected in (('causal', bool(job.get('causal'))), ('profile', bool(job.get('profile'))),
                           ('validation_self_test', diagnostic),
                           ('cpu_oracle', diagnostic or bool(job.get('cpu_oracle')))):
@@ -1053,8 +1146,12 @@ def audit_log(text, job):
     else:
         require(host_launch in ('sequential', 'per_gpu_thread') and host_launch == job.get('host_launch', 'sequential'),
                 'Host launch contract mismatch')
-    require(count(config, 'seed') == job.get('seed', 20260906) and count(config, 'warmup') >= 10 and
-            count(config, 'samples') == 50, 'Seed/warmup/sample config mismatch')
+    quick = bool(job.get('quick'))
+    require(config.get('sampling_mode', 'formal_10_50') == ('quick_1_5' if quick else 'formal_10_50'),
+            'Sampling mode differs from job')
+    require(count(config, 'seed') == job.get('seed', 20260906) and
+            (count(config, 'warmup') == 1 if quick else count(config, 'warmup') >= 10) and
+            count(config, 'samples') == (5 if quick else 50), 'Seed/warmup/sample config mismatch')
     comm, qkv, oproj = fused_candidates(job)
     require(not epilogue_probe or (job.get('profile') and profile_detail == 'cta' and
             profile_schema == 'host_stages_v1' and not job.get('mpi') and not diagnostic and not calibrate and
@@ -1080,7 +1177,8 @@ def audit_log(text, job):
         if 'host_launch' in row:
             require(row['host_launch'] == host_launch, 'Per-record host launch mismatch')
         component = row.get('component', 'fused')
-        require(component in components, 'Component not enabled by job/config')
+        require(component in components or (compute_only and row['kind'] == 'candidate' and component == 'fused'),
+                'Component not enabled by job/config')
         if 'candidate' not in row:
             require(bool(job.get('profile')) and row['kind'] in ('correctness', 'route', 'validation_oracle'),
                     'Unscoped measurement/validation record')
@@ -1120,7 +1218,8 @@ def audit_log(text, job):
         require(row['kind'] != 'candidate' or component == 'fused', 'Resolved candidate resources must be shared production records')
         grouped[index, component].append(row)
     require(set(grouped) == {(index, component) for index in range(1, len(expected) + 1)
-                            for component in components}, 'Missing candidate/component group')
+                            for component in (('fused',) + components if compute_only else components)},
+            'Missing candidate/component group')
     require(not profile_records or bool(job.get('profile')), 'Unexpected profiling diagnostics')
     results = []
     for index, component in ((i, comp) for i in range(1, len(expected) + 1) for comp in components):
@@ -1185,7 +1284,7 @@ def audit_log(text, job):
         timings = [r for r in records if r['kind'] in ('warmup', 'sample', 'summary')]
         require(all(count(r, 'generation') == 0 for r in timings), 'Unexpected timed payload generation')
         require(not diagnostic or not timings, 'Diagnostic-only run contains performance records')
-        timing = None if diagnostic else audit_timing(timings, shape['world'], mpi=bool(job.get('mpi')), launch=launch)
+        timing = None if diagnostic else audit_timing(timings, shape['world'], mpi=bool(job.get('mpi')), launch=launch, quick=quick)
         if timing:
             first_warmup_line = min(r['line'] for r in timings if r['kind'] == 'warmup')
             require(all(checks[kind, 0, 'pre', rank]['line'] < first_warmup_line
@@ -1232,6 +1331,8 @@ def audit_log(text, job):
                 'Missing component resource rank/generation')
         payload = 2 * m * (n if qkv_direction else k)
         results.append({'candidate': index, 'direction': direction, 'component': component,
+            'sampling_mode': 'quick_1_5' if quick else 'formal_10_50',
+            'formal_eligible': not quick and not diagnostic,
             'measurement_role': 'production' if component == 'fused' else 'calibration',
             'qkv_rank_swizzle': rank_swizzle if qkv_direction else 'off',
             'oproj_comm_layout': 'not_applicable' if qkv_direction else oproj_comm_layout,
@@ -1355,6 +1456,7 @@ def summarize(directories, output):
               'diagnostic_rows': sum(len(run['candidates']) for run in runs if run['diagnostic_only']),
               'runs': runs}
     columns = ('run_id', 'node', 'source_id', 'binary_sha256', 'environment_fingerprint', 'direction', 'component', 'measurement_role',
+               'sampling_mode', 'formal_eligible',
                'world', 'global_seq', 'seq_local', 'hidden', 'q_heads', 'kv_heads', 'head_dim',
                'm', 'n', 'k', 'layout', 'host_launch', 'launch', 'graph_epoch_mode', 'collector', 'precision', 'sm_count',
                'candidate', 'comm_ctas', 'tile_policy', 'tile_m', 'tile_n', 'tile_k',
