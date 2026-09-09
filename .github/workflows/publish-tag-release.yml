@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v17.0
+        default: v18.0
 
 permissions:
   contents: write
@@ -27,9 +27,20 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v17.0");
+              : (process.env.REQUESTED_TAG || "v18.0");
 
             const releases = {
+              "v18.0": {
+                name: "v18.0 — SM103 OProj runtime CTA autotune",
+                body: [
+                  "Adds runtime communication-CTA selection from independent GEMM/COPY services and the actual production/consumption schedule, with a physical-request cache. No model names or per-shape winner lookup.",
+                  "Public auto mode keeps GEMM tile/raster/swizzle fixed: num_comm_ctas=0 selects a calibrated budget, positive budgets retain explicit behavior. Joint GEMM/CTA planning remains TODO; unsupported calibration requests are rejected. SM90, QKV and device synchronization are unchanged.",
+                  "Five large models, 128K–512K, CP4/8: 23/30 cells, 46 A/B runs pass full two-payload numerical/routing validation. Seven historical missing cells remain blank.",
+                  "Graph 1+5 quick screening: Auto versus v17-final configurations replayed on the same v18 binary is -1.21% geometric mean; 85.28% of historical full-148-SM pure cuBLASLt throughput. Known Qwen3 CP8/512K regression: -10.62% with 32 to 48 communication CTAs. Seven cells have >5% sample drift; no formal 10+50 or per-point optimality claim.",
+                  "Auto versus earliest comparable historical archives (Llama v14, other models v16): +11.46% geometric mean, 20 improvements and 3 regressions. This historical comparison is not a same-session A/B.",
+                  "Complete colored table, explicit/auto configurations, compact raw samples and evidence hashes: results/sm103/v18.0. No profiles, dependencies or intermediate sweep packages.",
+                ].join("\n"),
+              },
               "v17.0": {
                 name: "v17.0 — SM103 OProj scheduling and offline tuning baseline",
                 body: [

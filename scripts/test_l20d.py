@@ -366,6 +366,27 @@ int main() {
                     comm_sm=8, devices='0,1,2,3,4,5,6,7', profile=False,
                     qkv_policy='m128n128', files={}) | changes
 
+    def test_auto_oproj_comm_passes_zero_request_only_to_runtime(self):
+        job = self.fused_job(auto_oproj_comm=True, comm_sm=0, mpi=True, fused_direction='oproj',
+            fused_launch='graph', causal=True, max_swizzle_size=8, seq_local=16384,
+            hidden=8192, q_heads=64, oproj_policy_list='m128n256,m128n256k64e32', calibrate=True)
+        l20d.validate_job(job)
+        argv = l20d.fused_argv(job)
+        self.assertIn('--auto-oproj-comm', argv)
+        self.assertIn('--calibrate', argv)
+        self.assertNotIn('--comm-sm', argv)
+        self.assertNotIn('--comm-sm-list', argv)
+        self.assertEqual(l20d.fused_candidates(job)[0], [0])
+        self.assertEqual(l20d.fused_device_memory(job)['flag_bytes'],
+                         l20d.fused_device_memory(job | {'auto_oproj_comm': False, 'comm_sm': 48})['flag_bytes'])
+        for change in ({'comm_sm': 8}, {'comm_sm_list': '8'}, {'compute_only': True},
+                       {'profile': True}, {'mpi': False}, {'fused_launch': 'eager'},
+                       {'causal': False}, {'fused_direction': 'both'}, {'oproj_comm_layout': 'columns'},
+                       {'max_swizzle_size': 2}, {'oproj_policy_list': 'm128n128'}, {'q_heads': 32},
+                       {'seq_local': 16640 + 128}, {'auto_oproj_comm': 1}, {'stage': 'fused-build'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+
     def test_mpi_is_explicit_fused_only_and_uses_separate_target(self):
         for stage in l20d.FUSED_STAGES:
             job = self.fused_job(stage=stage, mpi=True)
@@ -642,6 +663,8 @@ int main() {
 
     def test_fused_candidate_cli_does_not_silently_combine_single_and_list(self):
         for flags in (['--comm-sm', '8', '--comm-sm-list', '8,16'],
+                      ['--auto-oproj-comm', '--comm-sm', '8'],
+                      ['--comm-sm-list', '8,16', '--auto-oproj-comm'],
                       ['--qkv-policy', 'auto', '--qkv-policy-list', 'm128n256'],
                       ['--qkv-policy', 'm128n128', '--qkv-policy-list', 'm128n256'],
                       ['--oproj-policy', 'auto', '--oproj-policy-list', 'm128n256']):
@@ -1444,6 +1467,7 @@ int main() {
     def test_fused_progress_is_live_but_raw_profile_stays_in_log(self):
         path = self.root / 'fused-progress.log'
         concise = ('config,world=8\ninput,lhs,seed=1\ncorrectness,QKV,max_abs=0\n'
+                   'auto_comm,A2A_GEMM,candidate=1,comm_sm=16,rank=0,launch_comm=0\n'
                    'warmup,GEMM_A2A,iteration=1\nsample,GEMM_A2A,max_rank_ms=0.1\n'
                    'summary,GEMM_A2A,p50_ms=0.1\nprofile_resources,rank=0,threads=256\n'
                    'component_resources,GEMM_A2A,component=compute_reference,compute_budget=132\n'

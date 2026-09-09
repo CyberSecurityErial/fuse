@@ -64,6 +64,49 @@ class OProjProbeParsingTests(unittest.TestCase):
                 self.parse([record.replace(before, after) for record in records])
 
 
+class AutoCommunicationTests(unittest.TestCase):
+    def fixture(self):
+        job = dict(auto_oproj_comm=True, fused_direction='oproj', fused_launch='graph', mpi=True,
+                   causal=True, oproj_comm_layout='rows')
+        config = dict(auto_oproj_comm=1, comm_sm=0)
+        expected = [('A2A_GEMM', 0, 'm128n256k64e32')]
+        devices = [dict(sms=148) for _ in range(4)]
+        rows = []
+        for rank in range(4):
+            rows += [dict(kind='auto_comm', line=rank*10+1, label='A2A_GEMM', candidate=1,
+                          comm_sm=24, tile='m128n256k64e32', rank=rank, query_us=12.4,
+                          repeat_query_us=.3, launch_comm=0),
+                     dict(kind='candidate', line=rank*10+2, candidate=1, rank=rank)]
+        return rows, job, config, expected, devices
+
+    def test_actual_budget_not_default_or_zero_drives_downstream_audit(self):
+        expected, metadata = summary.audit_auto_comm(*self.fixture())
+        self.assertEqual(expected, [('A2A_GEMM', 24, 'm128n256k64e32')])
+        self.assertEqual(metadata[1]['requested_comm_ctas'], 0)
+        self.assertEqual(metadata[1]['resolved_comm_ctas'], 24)
+        self.assertEqual(len(metadata[1]['rank_queries']), 4)
+
+    def test_missing_duplicate_or_inconsistent_rank_and_invalid_timings_fail(self):
+        mutations = [lambda rows: rows.pop(0), lambda rows: rows.append(dict(rows[0])),
+            lambda rows: rows[2].update(comm_sm=32), lambda rows: rows[0].update(comm_sm=0),
+            lambda rows: rows[0].update(comm_sm=25), lambda rows: rows[0].update(launch_comm=24),
+            lambda rows: rows[0].update(query_us=-1), lambda rows: rows[0].update(repeat_query_us=float('nan')),
+            lambda rows: rows[0].update(line=3), lambda rows: rows[0].update(tile='m128n128')]
+        for mutate in mutations:
+            arguments = self.fixture()
+            mutate(arguments[0])
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                summary.audit_auto_comm(*arguments)
+
+    def test_explicit_path_does_not_accept_auto_evidence(self):
+        rows, job, config, expected, devices = self.fixture()
+        job['auto_oproj_comm'] = False
+        config['auto_oproj_comm'] = 0
+        with self.assertRaisesRegex(ValueError, 'Unexpected automatic'):
+            summary.audit_auto_comm(rows, job, config, expected, devices)
+        self.assertEqual(summary.audit_auto_comm([], job, config, expected, devices), (expected, {}))
+
+
 class QuickTimingTests(unittest.TestCase):
     def records(self, graph=False):
         rows = []

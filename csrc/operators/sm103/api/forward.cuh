@@ -4,7 +4,9 @@
 namespace fuse {
 
 cudaError_t launch_a2a_gemm_cutlass(const A2AGemmParams& params, cudaStream_t stream) {
-  return launch_oproj_forward_policy(params, stream);
+  A2AGemmParams resolved{};
+  const cudaError_t status = resolve_oproj_communication(params, &resolved);
+  return status == cudaSuccess ? launch_oproj_forward_policy(resolved, stream) : status;
 }
 
 cudaError_t launch_gemm_a2a_cutlass(const GemmA2AParams& params, cudaStream_t stream) {
@@ -19,8 +21,11 @@ cudaError_t launch_a2a_gemm_cutlass_role_telemetry(
     A2AGemmPeerTimeline* peer_timeline,
     int32_t peer_timeline_capacity,
     cudaStream_t stream) {
+  A2AGemmParams resolved{};
+  const cudaError_t status = resolve_oproj_communication(params, &resolved);
+  if (status != cudaSuccess) return status;
   return launch_oproj_forward_policy<true>(
-      params, stream, timeline, timeline_capacity,
+      resolved, stream, timeline, timeline_capacity,
       peer_timeline, peer_timeline_capacity);
 }
 

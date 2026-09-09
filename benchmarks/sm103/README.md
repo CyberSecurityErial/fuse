@@ -299,16 +299,14 @@ green context。NCU 使用现有六项计数器及同一导出/校验器（输�
 
 ## OProj：生产消费统一性能模型
 
-当前收口（2026-09-09）：保留现有离线选优与显式传参，运行时自动选择作为
-TODO，暂不继续调优或部署。后续将GEMM tile/epilogue、AlongM/AlongN、swizzle
-与通信CTA纳入统一选择；用独立C/R实测预算曲线评分，并按每个候选重新计算
-通信窗口、cohort及交货顺序。必须保留显式参数覆盖，不能按模型名硬编码。
-现有窗口/cohort自动适配是确定性调度规则，不是运行时参数寻优。
-模型Top1尚有退化，Top2经实测选优不能替代运行期自动选择的验证。
+v17.0 保留离线选优和显式参数；v18.0 在此基础上提供运行时通信 CTA 模型，
+[验证结果](../../results/sm103/v18.0/README.md)与 v17 发布表分开。
+SM90、ready 粒度、device kernel 与同步协议保持不变。
+主机选择器不使用模型名或逐 shape 赢家表，也不在每次 launch 前实跑候选。
 
 核心同时约束两件事：**数值上的生产/消费速率**，以及**位置上的交货/消费
-布局和顺序**。SM103 的旧固定 `auto` 入口不等于运行期成本模型；新模型先以
-离线预测和留出 workload 验证，不把未验证的预测直接设为生产默认值。
+布局和顺序**。SM103 的旧固定 GEMM `auto` 入口不等于运行期成本模型；
+本版通过通信预算 0 显式请求新模型，不改变旧的默认 GEMM tile。
 
 `fused_model.py::score_oproj_schedule` 保留 tile、计算 CTA、整数波、启动与收尾项，
 并显式展开与算子一致的调度：
@@ -324,7 +322,10 @@ candidate = GEMM tile/raster/swizzle + communication CTAs + cohort
 
 每个预算使用**对应实测的 GEMM 服务曲线**，不假设吞吐与 SM 数线性增长。
 增加通信 CTA 同时会改变计算预算、窗口、copy 槽位与 cohort，必须重新评分。
-有效通信带宽包含全部独立 A 字节（本地和远端），不是仅远端 NVLink 带宽。
+通信服务标定包含独立 A 搬运（本地和远端），不是仅远端 NVLink 带宽。
+按真实队列计算各 copy slot 的字节量，使用 `max(slot_bytes) / R_time` 得到
+等效单槽服务率，目标队列再计算自己的槽位尾差；不能先用 `A_bytes/R_time`
+作为槽位总服务率、再重复计入标定尺寸原有的槽位不均衡。
 同一个 `(M, peer)` 被多个 N tile 复用，交货量只计一次；所有原 chunk 完成
 才可发布 ready，不引入 K 细粒度信号、额外 fence 或全局队列屏障。
 
@@ -339,3 +340,46 @@ candidate = GEMM tile/raster/swizzle + communication CTAs + cohort
 各 peer 的计算服务均分、固定 copy-slot 服务、未模拟资源竞争反馈是当前
 明确的近似；预测误差与留出尺寸结果必须单独报告。Profile 诊断与 Graph
 性能不直接相减，1+5 快筛不能覆盖为正式 10+50 bench。
+
+### v18 主机选择与显式覆盖
+
+实现保持三个职责：`detail/model_calibration.cuh` 只存独立 C/R 服务点；
+`detail/performance_model.cuh` 复用算子的生产消费映射计算完成时间；
+`detail/autotune.cuh` 枚举允许的候选并缓存选择结果。CPU/Python 使用同一
+评分语义，冷选择只发生于新物理请求，16 项线程局部缓存不包含 tensor 指针或 epoch。
+
+当前标定域：Runtime CC 10.3、148 SM、BF16/FP32/BF16、CP4/8、causal rows-pull；
+GEMM 为 `m128n256` 或 `m128n256k64e32`，有效 swizzle 为 4/8，通信 CTA 为
+8/16/24/32/48。K 仅在 8192–16384 的独立标定点间插值，每个通信/计算预算
+使用自己的服务曲线；M/N 改变会重算实际 tile、padding、队列和波数，不改变
+标定数据。K 域外、不同实际计算预算或未标定 collective 不偷偷外推。
+
+公开入口第一步只自动选择通信 CTA，GEMM tile/epilogue、raster/swizzle 仍由
+调用者显式指定。`A2AGemmParams::num_comm_ctas > 0` 保持原路径；设为 0 时
+以当前 GEMM 配置请求模型选择。`recommended_a2a_lhs_gemm_comm_ctas` 与生产、
+role telemetry、copy reference 共用 resolver，查询返回 0 表示不可自动选择；
+自动 launch 对域外请求返回 `cudaErrorNotSupported`。不要把查询失败的 0
+当作一个合法显式预算。默认 GEMM `auto` 仍选 N128，不暗改旧的 shapeless
+traits/内存分配合同；N128 当前需要显式通信预算。
+
+独立 GEMM reference 的 `reserved_comm_ctas=0` 仍表示全 SM，不表示自动通信。
+同预算对照需先查询正预算并显式传给 reference。输入的外部 ready acquire
+保持不变；标定以所有上游输入已经发布为前提，不估算未完成上游的额外等待。
+
+内部主机选择器也能联合预测两种 collective × 两种 raster × 两种 swizzle ×
+五档通信 CTA（最多40候选）。它的联合预测与公开入口“固定 GEMM、自动 CTA”
+是两种范围，不能混称。TODO：留出尺寸验证后，通过 shape-aware 的公开 plan
+接口统一 allocation/query/launch 的联合选择；再扩展 QKV、精度和新标定域。
+无 shape 的资源查询不能依赖“上次某个 shape 的缓存结果”。
+
+验证先冻结 C/R 标定、候选集和预测，再运行未参与标定的矩阵。固定 GEMM 的
+五档通信实测可衡量 Top1/Top2 相对该五档最优的损失；仅测联合 Top2 不能声称
+40候选穷举最优。控制点与留出点分开，显存不足留空，预测误差不回填成该点的
+特殊规则。所有性能数值必须来自已完成的完整边界校验，主机测试不替代 GPU 验证。
+
+本轮固定 GEMM 的公开自动入口与 v17 最终显式预算重放完成23点、46次A/B，
+Graph 1+5、两组随机payload完整校验。Auto相对显式配置几何平均−1.21%；
+Qwen3 CP8/512K的32→48 CTA选择退化10.62%，没有按模型名覆盖该选择。
+7点存在采样漂移，7个历史缺测未重试；这些是快测，不是正式稳定性能承诺。
+控制器可用 `--auto-oproj-comm` 请求真实零预算入口，不能同时给显式通信预算，
+也不能与profiling/独立C/R标定混用。首次主机查询和Graph构建不计入Graph吞吐。

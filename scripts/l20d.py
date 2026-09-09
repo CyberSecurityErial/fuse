@@ -94,7 +94,7 @@ def relay_progress(path, stop):
             if line:
                 if line.startswith(('EXECUTOR ', 'BATCH ', 'RUN ', 'DONE ', 'RETRY ', 'BATCH_AB ', 'IMPORTED ',
                                     'config,', 'resolved_qkv,', 'device,', 'input,', 'correctness,', 'route,',
-                                    'candidate,', 'candidate_verified,', 'component_resources,', 'stage_time,',
+                                    'candidate,', 'auto_comm,', 'candidate_verified,', 'component_resources,', 'stage_time,',
                                     'validation_oracle,', 'validation_self_test,', 'validation_error,',
                                     'input_oracle,',
                                     'warmup,', 'sample,',
@@ -148,9 +148,12 @@ def fused_policy_tile(policy):
 
 
 def fused_candidates(job):
-    """Explicit same-shape candidates; no implicit grid expansion or autotune."""
-    comm = [str(job.get('comm_sm', 8))] if job.get('comm_sm_list') is None else job['comm_sm_list'].split(',')
-    if not comm or any(not re.fullmatch(r'[0-9]+', value) or not 1 <= int(value) <= 1024 for value in comm):
+    """Explicit same-shape candidates; auto zero is resolved only by the C++ API."""
+    auto = job.get('auto_oproj_comm', False)
+    if auto and (job.get('comm_sm_list') is not None or job.get('comm_sm', 0) not in (None, 0)):
+        raise ValueError('--auto-oproj-comm excludes explicit --comm-sm/list')
+    comm = ['0'] if auto else ([str(job.get('comm_sm', 8))] if job.get('comm_sm_list') is None else job['comm_sm_list'].split(','))
+    if not comm or any(not re.fullmatch(r'[0-9]+', value) or not (0 if auto else 1) <= int(value) <= 1024 for value in comm):
         raise ValueError('Communication CTA list must contain positive integers')
     comm = list(dict.fromkeys(int(value) for value in comm))
     def policies(direction, supported):
@@ -214,6 +217,16 @@ def fused_geometry(job):
         raise ValueError('Requires GQA/CP-divisible heads, BF16 8-element alignment, '
                          'and OProj K shards divisible by 64')
     _, _, oproj_policies = fused_candidates(job)
+    if job.get('auto_oproj_comm'):
+        if (job.get('stage') != 'fused-smoke' or direction != 'oproj' or
+                job.get('fused_launch') != 'graph' or not job.get('mpi') or not job.get('causal') or
+                job.get('profile') or job.get('validation_self_test') or job.get('compute_only') or job.get('fused_counters') or
+                job.get('oproj_comm_layout', 'rows') != 'rows' or job.get('max_swizzle_size', 1) not in (4, 8) or
+                any(policy not in ('m128n256', 'm128n256k64e32') for policy in oproj_policies)):
+            raise ValueError('Automatic OProj CTAs require non-profile Graph causal rows with explicit N256/e32 and sw4/8')
+        if (seq_local % 256 or not 8192 <= q_width <= 16384 or
+                fused_scheduler_geometry(seq_local, hidden, 256, job['max_swizzle_size'])[0] < 4):
+            raise ValueError('Automatic OProj CTA geometry outside calibrated ready/K/swizzle domain')
     if any((q_width // world) % fused_policy_tile(policy)[2] for policy in oproj_policies):
         raise ValueError('OProj K shards must be divisible by every explicitly selected tile K')
     m_tiles = (seq_local + 127) // 128
@@ -280,6 +293,10 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 def validate_job(job, hostname=None):
     node = job_node(job)
+    if type(job.get('auto_oproj_comm', False)) is not bool:
+        raise ValueError('Automatic OProj CTA selection must be a boolean')
+    if job.get('auto_oproj_comm') and job['stage'] != 'fused-smoke':
+        raise ValueError('Automatic OProj CTAs require fused-smoke')
     if job.get('compute_only') and (job['stage'] != 'fused-smoke' or not job.get('calibrate') or
             job.get('fused_direction') != 'oproj' or job.get('profile') or job.get('fused_counters')):
         raise ValueError('Compute-only requires non-profile OProj calibration')
@@ -472,7 +489,7 @@ def validate_job(job, hostname=None):
                     raise ValueError('Padded fused scheduling grid exceeds int32')
                 if job.get('profile') and padded:
                     raise ValueError('Profile does not yet validate padded swizzle CTA ownership; use an unpadded geometry')
-        if not 1 <= job.get('comm_sm', 8) <= 1024:
+        if not job.get('auto_oproj_comm') and not 1 <= job.get('comm_sm', 8) <= 1024:
             raise ValueError('Invalid --comm-sm')
         if job.get('qkv_policy', 'auto') not in QKV_POLICIES:
             raise ValueError('Unknown QKV policy')
@@ -1001,7 +1018,9 @@ def fused_argv(job):
         argv += ['--fused-direction', job['fused_direction']]
     if job.get('fused_launch', 'eager') != 'eager':
         argv += ['--launch', job['fused_launch']]
-    if job.get('comm_sm_list') is not None:
+    if job.get('auto_oproj_comm'):
+        argv.append('--auto-oproj-comm')
+    elif job.get('comm_sm_list') is not None:
         argv += ['--comm-sm-list', ','.join(map(str, comm))]
     else:
         argv += ['--comm-sm', str(comm[0])]
@@ -1782,6 +1801,8 @@ def main():
     communication = run.add_mutually_exclusive_group()
     communication.add_argument('--comm-sm', type=int, help='fused smoke explicit communication CTA count (default 8)')
     communication.add_argument('--comm-sm-list', help='fused smoke: explicit same-process CTA candidates')
+    communication.add_argument('--auto-oproj-comm', action='store_true',
+                               help='OProj Graph: exercise runtime automatic CTA selection with explicit GEMM layout')
     tiles = run.add_mutually_exclusive_group()
     tiles.add_argument('--qkv-policy', choices=QKV_POLICIES, help='fused smoke tile (default auto)')
     tiles.add_argument('--qkv-policy-list', help='fused smoke: explicit same-process QKV tile candidates')
@@ -1872,7 +1893,7 @@ def main():
         # checking mutually exclusive actions (e.g. interned int 8). Resolve
         # defaults only after parsing, so --comm-sm 8 still conflicts with list.
         if args.comm_sm is None:
-            args.comm_sm = 8
+            args.comm_sm = 0 if args.auto_oproj_comm else 8
         if args.qkv_policy is None:
             args.qkv_policy = 'auto'
         if args.oproj_policy is None:

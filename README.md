@@ -1,5 +1,21 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v18.0 — SM103 OProj 运行时通信 CTA autotune
+
+以独立 GEMM/COPY 标定和实际生产消费队列预测通信预算，不使用模型名或逐
+shape 赢家表。固定调用者的 GEMM tile/raster/swizzle，`num_comm_ctas=0`
+自动选择通信 CTA；正预算保持显式路径。当前支持域和域外处理见
+[使用说明](benchmarks/sm103/README.md#v18-主机选择与显式覆盖)。联合自动选择
+GEMM 配置仍为 TODO；SM90、QKV 和设备端同步协议不变。
+
+五个大模型、128K/256K/512K、CP4/8：23/30 点、46 次 A/B 完整数值/路由
+校验通过，7 个历史缺项保留。Graph **1+5 快测**：Auto 相对本轮重放的 v17
+离线配置几何平均 **−1.21%**，达到历史满148SM纯 cuBLASLt 吞吐的 **85.28%**。
+相对各模型最早可比归档（Llama v14，其余 v16）为 **+11.46%**，不是同场 A/B。
+保留 Qwen3 CP8/512K **−10.62%** 回退及7点采样漂移标记，不宣称逐点最优。
+
+[完整彩色表、配置、样本及复现说明](results/sm103/v18.0/README.md)。
+
 ## v17.0 — SM103 OProj 通信调度与离线选优基线
 
 通信交货顺序适配实际 GEMM tile、AlongM/AlongN、swizzle 与计算 CTA 预算，

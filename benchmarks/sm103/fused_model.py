@@ -1062,7 +1062,8 @@ def _oproj_delivery_plan(m_tiles, n_tiles, swizzle, compute_ctas, raster,
                          world, chunks, cohort_m_tiles):
     """Enumerate the current cluster-1 scheduler and communication priorities.
 
-    Invalid padded GEMM coordinates retain their logical index but do no MMA.
+    CUTLASS executes the padded scheduler grid, including OOB MMA coordinates.
+    Only valid M blocks create communication tasks; N padding still consumes A.
     Unlike the device decoder this explicit oracle needs no prefix inversion.
     """
     pm, pn = ceil_div(m_tiles, swizzle) * swizzle, ceil_div(n_tiles, swizzle) * swizzle
@@ -1074,7 +1075,7 @@ def _oproj_delivery_plan(m_tiles, n_tiles, swizzle, compute_ctas, raster,
                 m, n = (group + offset, major) if along_n else (major, group + offset)
                 logical = len(tiles)
                 valid = m < m_tiles and n < n_tiles
-                tiles.append((m, n) if valid else None)
+                tiles.append((m, n))
                 if valid and m not in seen:
                     windows.setdefault(logical // compute_ctas, []).append(m)
                     seen.add(m)
@@ -1114,9 +1115,9 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
     changes the schedule below, never a linear throughput extrapolation;
     a caller using a measured budget curve retains its diminishing returns.
 
-    ``copy_bandwidth_gb_s`` is the aggregate useful delivery rate for ALL A
-    bytes (decimal GB/s), not remote-only NVLink bandwidth. A slot receives
-    1/copy_slots of that rate. Fixed-stride tasks model last-chunk readiness,
+    ``copy_bandwidth_gb_s`` is the effective all-slot service rate (decimal
+    GB/s), not remote-only NVLink bandwidth or necessarily A_bytes/R. A slot
+    receives 1/copy_slots of that rate. Fixed-stride tasks model last-chunk readiness,
     not dynamic bandwidth sharing or contention feedback. Use a measured
     steady service rate, not a total time already charged with startup/tail.
     An optional byte vector specifies the actual chunks of one full (M,peer);
@@ -1124,11 +1125,15 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
 
     launch_us is common startup; copy_start_us is additional producer startup;
     tail_us is only the unmodeled final drain. All are charged once. M must
-    consist of complete M128 ready units; padded N work retains static CTA
-    ownership. Non-cluster1, cyclic peer ordering and other precisions are not
+    consist of complete M128 ready units; padded M/N coordinates retain static
+    CTA ownership AND MMA service. OOB M skips ready waits, OOB N still reads
+    valid A. Equal service for a padded tile is an approximation (its epilogue
+    stores are masked), not evidence that padding is free. Non-cluster1,
+    cyclic peer ordering and other precisions are not
     modeled. This is a prediction, not proof of overlap or a runtime selector.
-    ``amortized_full_boundary`` instead accepts C/waves and A_bytes/R from
-    independent whole-boundary measurements. It requires all three additional
+    ``amortized_full_boundary`` instead accepts C/padded_waves and
+    max_slot_bytes*slots/R from independent whole-boundary measurements.
+    It requires all three additional
     startup/tail terms to be zero to avoid adding them again; their separately
     measured values remain UNKNOWN, not measured zero. Such effective services
     do not become observed per-tile cycles or pure fabric bandwidth.
@@ -1195,17 +1200,15 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
         phase_end, initial_wait = launch, 0.0
         first = True
         for logical in range(worker, len(tiles), compute):
-            coordinate = tiles[logical]
-            if coordinate is None:
-                continue
-            mi, ni = coordinate
+            mi, ni = tiles[logical]
             if first:
-                first_peers.append(releases[mi][0])
-                initial_wait = max(0.0, releases[mi][0] - launch)
+                if mi < mt:
+                    first_peers.append(releases[mi][0])
+                    initial_wait = max(0.0, releases[mi][0] - launch)
                 first = False
             begin, tile_wait = now, 0.0
             for peer in range(world):
-                wait = max(0.0, releases[mi][peer] - now)
+                wait = max(0.0, releases[mi][peer] - now) if mi < mt else 0.0
                 now += wait + peer_service
                 waited += wait
                 tile_wait += wait
@@ -1232,10 +1235,10 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
     compute_end = worker_finishes[critical_worker]
     first_ready = min(first_peers)
     work_tiles = mt * nt
-    waves = ceil_div(work_tiles, compute)
+    waves = ceil_div(len(tiles), compute)
     # Keep the old integer-wave/start/drain estimate alongside the explicit DAG.
-    # Padding can distribute valid tiles unevenly; the actual strided worker
-    # service provides another necessary bound within this service model.
+    # Every padded work tile also issues MMA; masking output stores does not
+    # remove its compute service or ownership from the persistent worker chain.
     wave_service = waves * cycle
     ideal = max(first_ready + wave_service, copy_end) + tail
     strided_service = max(worker_services)
@@ -1249,7 +1252,7 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
     demand_rate = payload / phase_service / 1000.0
     delivery_rate = payload / production_span / 1000.0
     result = dict(
-        model="oproj_static_feed_service_v1", direction="A2A_GEMM", geometry=geometry,
+        model="oproj_static_feed_service_v2_padded_mma", direction="A2A_GEMM", geometry=geometry,
         raster=raster, compute_ctas=compute, padded_m_tiles=pm, padded_n_tiles=pn,
         valid_work_tiles=work_tiles, scheduled_work_tiles=len(tiles), integer_waves=waves,
         delivery_policy="ready_cohorts" if use_cohorts else "group_peer_diagonal",
@@ -1272,10 +1275,10 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
         critical_worker_later_feed_wait_us=max(0.0, worker_waits[critical_worker] - worker_initial_waits[critical_worker]),
         exposed_feed_us=max(0.0, compute_end - first_ready - strided_service),
         worker_wait_sum_us=sum(worker_waits), peer_wait_sum_us=waits_by_peer,
-        first_n_band_compute_fraction=min(resolved_swizzle, nt) / nt,
+        first_n_band_compute_fraction=min(resolved_swizzle, pn) / pn,
         first_n_band_is_temporal_phase=(raster == "along_m"),
         feed_phase="first_n_band" if raster == "along_m" else "whole_gemm",
-        feed_phase_compute_fraction=min(resolved_swizzle, nt) / nt if raster == "along_m" else 1.0,
+        feed_phase_compute_fraction=min(resolved_swizzle, pn) / pn if raster == "along_m" else 1.0,
         feed_phase_tiles=sum(phase_counts), feed_phase_ideal_compute_us=phase_service,
         feed_phase_predicted_finish_us=max(phase_finishes),
         feed_phase_requires_all_unique_a=True,
@@ -1286,7 +1289,7 @@ def score_oproj_schedule(*, m, n, k, world, sm_count, comm_ctas,
         worker_wait_sum_is_global_stall=False, tensor_core_busy_inferred=False,
         assumptions=["uniform peer-K share of the caller-supplied tile service",
                      "caller supplies budget-matched measured services; no across-budget SM scaling",
-                     "effective C/waves and A_bytes/R include amortized startup/tail" if amortized else
+                     "effective C/padded_waves and max_slot_bytes*slots/R include amortized startup/tail" if amortized else
                      "measured no-feed-wait cycle and independently separated steady copy service",
                      "fixed slot bandwidth; no contention/prefetch feedback simulation",
                      "whole (M,peer) release after every original chunk; no new ready granularity",

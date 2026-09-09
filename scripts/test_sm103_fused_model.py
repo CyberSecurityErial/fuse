@@ -995,7 +995,10 @@ class OprojFeedScheduleTests(unittest.TestCase):
         for tile in result["tile_consumption"]:
             self.assertEqual(tile["worker"], tile["logical_tile"] % result["compute_ctas"])
             coordinates.add((tile["m_tile"], tile["n_tile"]))
-        self.assertEqual(coordinates, {(m, n) for m in range(13) for n in range(7)})
+        self.assertEqual(coordinates, {(m, n) for m in range(16) for n in range(8)})
+        self.assertEqual(sum(result['worker_service_us']), 128 * 40.)
+        self.assertTrue(all(tile['feed_wait_us'] == 0 for tile in result['tile_consumption']
+                            if tile['m_tile'] >= 13))
         for finish, service, wait in zip(result["worker_finish_us"], result["worker_service_us"],
                                          result["worker_feed_wait_us"]):
             self.assertAlmostEqual(finish, service + wait)
@@ -1047,7 +1050,7 @@ class OprojFeedScheduleTests(unittest.TestCase):
         result = model.score_oproj_schedule(**self.arguments(raster="along_n"))
         self.assertEqual(result["feed_phase"], "whole_gemm")
         self.assertEqual(result["feed_phase_compute_fraction"], 1)
-        self.assertEqual(result["feed_phase_tiles"], result["valid_work_tiles"])
+        self.assertEqual(result["feed_phase_tiles"], result["scheduled_work_tiles"])
         self.assertEqual(result["feed_phase_ideal_compute_us"], result["strided_compute_service_us"])
         self.assertFalse(result["first_n_band_is_temporal_phase"])
         same = model.score_oproj_schedule(**self.arguments(raster="along_n", cohort_m_tiles=10))

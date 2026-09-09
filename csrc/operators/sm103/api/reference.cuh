@@ -88,6 +88,9 @@ cudaError_t launch_batched_cutlass_reference(
 
 cudaError_t launch_a2a_gemm_cutlass_reference(
     const A2AGemmParams& params, cudaStream_t stream, int32_t reserved_comm_ctas) {
+  // Independent GEMM: reserved=0 means every SM, never automatic communication.
+  // For a budget-matched reference, obtain the positive reservation with
+  // recommended_a2a_lhs_gemm_comm_ctas and pass it explicitly after checking it.
   if (params.lhs_policy != A2ALhsGemmPolicy::kAuto) {
     return cudaErrorNotSupported;
   }
@@ -118,13 +121,16 @@ cudaError_t launch_a2a_gemm_cutlass_reference(
 }
 
 cudaError_t launch_a2a_gemm_copy_reference(
-    const A2AGemmParams& params, cudaStream_t stream) {
+    const A2AGemmParams& input, cudaStream_t stream) {
+  A2AGemmParams params{};
+  cudaError_t status = resolve_oproj_communication(input, &params);
+  if (status != cudaSuccess) return status;
   if (params.num_comm_ctas <= 0 || params.epoch == 0 ||
       !std::isfinite(params.alpha) || params.lhs_policy != A2ALhsGemmPolicy::kAuto) {
     return cudaErrorInvalidValue;
   }
   DeviceInfo info{};
-  cudaError_t status = reference_device_info(&info, params.num_comm_ctas);
+  status = reference_device_info(&info, params.num_comm_ctas);
   if (status != cudaSuccess) {
     return status;
   }

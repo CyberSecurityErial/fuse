@@ -439,6 +439,9 @@ int main(int argc, char** argv) {
 #include <memory>
 #include <unistd.h>
 struct RankRuntime {};
+void resolve_auto_candidates(std::vector<RankRuntime>&, std::vector<Candidate>&) {
+  throw std::runtime_error("auto CTA resolution requires its dedicated API stand-in test");
+}
 void bind_graph(std::vector<RankRuntime>&, const Options& options, uint32_t epoch) {
   if (options.launch == "graph") std::cout << "mock,graph_bind," << epoch << '\n';
 }

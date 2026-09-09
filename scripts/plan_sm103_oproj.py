@@ -8,10 +8,14 @@ Cases: {"schema":"sm103_oproj_model_cases_v1", "cases":[{"id":"case",
 
 Calibration contains complete run objects already audited by summarize_sm103_fused.
 Only same-candidate independent C/R totals supply service estimates. C/waves and
-unique A bytes/R are *amortized effective* services, not measured steady-state
-Tensor Core/transport rates. The schedule model therefore adds no separately
+copy-slot workload/R are *amortized effective* services, not measured steady-state
+Tensor Core/transport rates. Each anchor's actual queue determines its busiest
+slot; this removes double-counted slot imbalance, not real startup or contention.
+The target queue still determines its own imbalance. The model adds no separately
 calibrated startup/drain term; this does not assert real startup/drain is zero.
 F is used only in calibration reconstruction checks, never to fit or rank.
+Export an independent C/R-only C++ table with --calibration FILE --export-cpp HEADER;
+this mode does not accept --cases or --output and never overwrites an existing file.
 """
 
 import argparse
@@ -30,6 +34,7 @@ import fused_model as model
 CALIBRATION_SCHEMA = 'sm103_oproj_primitive_calibration_runs_v1'
 CASES_SCHEMA = 'sm103_oproj_model_cases_v1'
 POLICIES = ('m128n256', 'm128n256k64e32')
+COPY_SERVICE_MODEL = 'oproj_static_slot_service_v2'
 FIXED = dict(precision='bf16_accfp32_bf16', layout='causal_dual_chunk_v1',
              oproj_comm_layout='rows', launch='graph', direction='A2A_GEMM')
 PAIR_FIELDS = ('m', 'n', 'k', 'world', 'sm_count', 'comm_ctas', 'tile_policy', 'tile_m',
@@ -73,6 +78,43 @@ def resource_signature(row):
     return dict(policy=row['tile_policy'], cluster_ctas=row['cluster_ctas'],
                 production=resources['production'], actual_epilogue_tile=None,
                 ab_stages=None, accumulator_stages=None)
+
+
+def rows_copy_geometry(k, world, comm):
+    """The existing BF16 pull path: four 48-KiB warp slots per comm CTA."""
+    row_bytes = 2 * k // world
+    rows = min(128, 48 * 1024 // row_bytes)
+    require(rows > 0, 'Vector copy fallback is not calibrated')
+    chunks, slots = model.ceil_div(128, rows), 4 * comm
+    return dict(copy_chunks=chunks, copy_slots=slots, cohort_m_tiles=max(1, slots // chunks),
+                copy_chunk_bytes=[row_bytes * min(rows, 128 - i * rows) for i in range(chunks)])
+
+
+def calibrate_copy_slots(m, n, world, compute, raster, swizzle, geometry, r_us):
+    """Invert the fixed-slot service model using independent R only.
+
+    R already includes the slowest slot's chunk/tail distribution. Using
+    unique_bytes/R as aggregate slot bandwidth would charge that imbalance a
+    second time. Instead, per-slot service = max(slot_bytes)/R; multiply by the
+    slot count for the scorer's aggregate-bandwidth convention. This guarantees
+    anchor R reconstruction under the model, not a measured physical bandwidth
+    or a guarantee that slots remain equally serviced during fused execution.
+    """
+    mt, nt = model.ceil_div(m, 128), model.ceil_div(n, 256)
+    chunks, slots = geometry['copy_chunks'], geometry['copy_slots']
+    padded = model.ceil_div(mt, swizzle) * swizzle * model.ceil_div(nt, swizzle) * swizzle
+    require(max(padded, mt * world * chunks, slots) <= 1_000_000, 'Copy calibration plan is too large')
+    _, _, tasks, _ = model._oproj_delivery_plan(
+        mt, nt, swizzle, compute, raster, world, chunks, geometry['cohort_m_tiles'])
+    loads = [0] * slots
+    for index, (_, _, chunk) in enumerate(tasks):
+        loads[index % slots] += geometry['copy_chunk_bytes'][chunk]
+    payload, busiest = sum(loads), max(loads)
+    return dict(model=COPY_SERVICE_MODEL, copy_slots=slots, copy_chunks=chunks,
+        max_slot_bytes=busiest, payload_bytes=payload,
+        imbalance_factor=busiest * slots / payload,
+        observed_payload_gb_s=payload / r_us / 1000,
+        copy_bandwidth_gb_s=busiest * slots / r_us / 1000)
 
 
 def read_calibration(document):
@@ -141,10 +183,13 @@ def read_calibration(document):
             require(k not in anchors[key], 'Duplicate K anchor: select explicit audited evidence first')
             c_us = positive(c['timing']['p50_ms'], 'C p50') * 1000
             r_us = positive(r['timing']['p50_ms'], 'R p50') * 1000
+            copy_service = calibrate_copy_slots(m, n, world, compute, c['raster'], c['swizzle'],
+                                               rows_copy_geometry(k, world, comm), r_us)
+            require(copy_service['payload_bytes'] == payload, 'Copy plan changed the independent R payload')
             anchors[key][k] = dict(m=m, n=n, k=k, candidate=c['candidate'], run_id=run_id,
                 source_id=run['source_id'], signature=signature, compute_ctas=compute,
-                c_us=c_us, r_us=r_us, tile_cycle_us=c_us / model.ceil_div(work, compute),
-                copy_bandwidth_gb_s=payload / r_us / 1000,
+                c_us=c_us, r_us=r_us, tile_cycle_us=c_us / model.ceil_div(scheduled, compute),
+                copy_bandwidth_gb_s=copy_service['copy_bandwidth_gb_s'], copy_service=copy_service,
                 sampling_mode=c['sampling_mode'], formal_eligible=c['formal_eligible'],
                 fused_p50_us=(positive(group['fused']['timing']['p50_ms'], 'F p50') * 1000
                               if 'fused' in group else None))
@@ -184,30 +229,33 @@ def predict(calibration, case, candidate, comm):
         service, evidence = interpolate(calibration['anchors'][key], k)
     except ValueError as error:
         return unsupported | {'reason': str(error)}
-    row_bytes = 2 * k // world
-    rows_per_chunk = min(128, 48 * 1024 // row_bytes)
-    if rows_per_chunk == 0:
-        return unsupported | {'reason': 'Vector copy fallback is not calibrated'}
-    chunks = model.ceil_div(128, rows_per_chunk)
-    slots = 4 * comm
-    chunk_bytes = [row_bytes * min(rows_per_chunk, 128 - i * rows_per_chunk) for i in range(chunks)]
+    scheduled = (model.ceil_div(model.ceil_div(m, 128), resolved) * resolved *
+                 model.ceil_div(model.ceil_div(n, 256), resolved) * resolved)
+    compute = min(scheduled, sm - comm)
+    if any(anchor['compute_ctas'] != compute for anchor in evidence):
+        return unsupported | {'reason': 'Actual compute CTA budget differs from the independent C anchors'}
+    try:
+        copy_geometry = rows_copy_geometry(k, world, comm)
+    except ValueError as error:
+        return unsupported | {'reason': str(error)}
     score = model.score_oproj_schedule(m=m, n=n, k=k, world=world, sm_count=sm, comm_ctas=comm,
         tile_m=128, tile_n=256, tile_k=64, raster=params['raster'], resolved_swizzle=resolved,
-        copy_chunks=chunks, copy_slots=slots, cohort_m_tiles=max(1, slots // chunks),
-        **service, launch_us=0.0, copy_start_us=0.0, tail_us=0.0, copy_chunk_bytes=chunk_bytes,
+        **copy_geometry, **service, launch_us=0.0, copy_start_us=0.0, tail_us=0.0,
         service_basis='amortized_full_boundary')
     for field in ('launch_us', 'copy_start_us', 'tail_us'):
         score.pop(field)  # API zero addends are not separately measured zero-latency estimates.
     return dict(status='predicted', parameters=params | {'resolved_swizzle': resolved}, prediction=score,
         service_estimates=service, signature=evidence[0]['signature'],
         evidence=[{key: anchor[key] for key in ('run_id', 'source_id', 'candidate', 'm', 'n', 'k',
-                  'compute_ctas', 'c_us', 'r_us', 'sampling_mode', 'formal_eligible')} for anchor in evidence],
+                  'compute_ctas', 'c_us', 'r_us', 'copy_service', 'sampling_mode', 'formal_eligible')} for anchor in evidence],
         interpolation='exact_K' if len(evidence) == 1 else 'linear_K_bracket',
         cross_mn=any((anchor['m'], anchor['n']) != (m, n) for anchor in evidence),
         externally_validated=False, measured_startup_us=None,
-        service_semantics='effective_cycle_and_delivery_rate_amortized_from_independent_totals',
+        service_semantics='effective_cycle_and_slot_service_amortized_from_independent_totals',
+        copy_service_model=COPY_SERVICE_MODEL,
         caveats=['C/waves includes launch, drain and load imbalance; not a measured steady Tensor Core cycle',
-                 'R-derived bandwidth is all useful A delivery, including local traffic and amortized startup',
+                 'R-derived slot service includes local traffic and startup; it is not observed aggregate payload bandwidth',
+                 'anchor slot imbalance is inverted once; target geometry retains its own slot imbalance',
                  'no separate startup/drain addend: uncalibrated, not measured zero',
                  'cross-M/N reuse and joint resource contention need external fused validation'])
 
@@ -284,6 +332,7 @@ def plan(calibration_document, cases_document):
         calibration_reconstruction_summary=reconstruction_summary(checks),
         globally_optimal=False, externally_validated=False, runtime_selector=False,
         model_code_sha256=digest(Path(model.__file__).read_text()),
+        planner_code_sha256=digest(Path(__file__).read_text()), copy_service_model=COPY_SERVICE_MODEL,
         assumptions=['K-only interpolation within measured [8192,16384] brackets',
                      'exact measured compute budget per candidate; no throughput proportional to SM assumption',
                      'M/N transfer is an unvalidated effective-cycle approximation',
@@ -291,12 +340,77 @@ def plan(calibration_document, cases_document):
                      'F reconstruction is diagnostic only; top2 are model proposals for measurement'])
 
 
-def main():
+def export_cpp(document):
+    """Export primitive anchors, never a shape-winner table or F-derived digest."""
+    cr_document = dict(schema=document.get('schema'), runs=[run | {'candidates': [
+        row for row in run['candidates'] if row.get('component') != 'fused']}
+        for run in document.get('runs', [])])
+    calibration = read_calibration(cr_document)
+    points, evidence, identities = [], [], set()
+    for key, anchors in sorted(calibration['anchors'].items()):
+        world, _, policy, raster, _, swizzle, comm = key
+        for k, anchor in sorted(anchors.items()):
+            point = dict(world=world, policy_index=POLICIES.index(policy), along_n=raster == 'along_n',
+                swizzle=swizzle, comm_ctas=comm, k=k, reference_m=anchor['m'], reference_n=anchor['n'],
+                compute_ctas=anchor['compute_ctas'], tile_cycle_us=anchor['tile_cycle_us'],
+                copy_slot_bandwidth_gb_s=anchor['copy_bandwidth_gb_s'])
+            identity = tuple(point[name] for name in
+                             ('world', 'policy_index', 'along_n', 'swizzle', 'comm_ctas', 'k'))
+            require(identity not in identities, 'Duplicate physical C++ calibration anchor')
+            identities.add(identity)
+            points.append(point)
+            evidence.append({name: anchor[name] for name in ('run_id', 'source_id', 'candidate',
+                'm', 'n', 'k', 'compute_ctas', 'c_us', 'r_us', 'copy_service', 'signature',
+                'sampling_mode', 'formal_eligible')})
+    version = digest(dict(model=COPY_SERVICE_MODEL, scope=FIXED,
+                          execution=calibration['contract'], points=points, evidence=evidence))
+    runs = sorted({row['run_id'] for row in evidence})
+    require(all(run and all(c.isascii() and (c.isalnum() or c in '._-') for c in run) for run in runs),
+            'Unsafe calibration run identifier')
+    lines = ['// SPDX-License-Identifier: BSD-3-Clause', '#pragma once', '#include <cstdint>', '',
+        '// Generated by scripts/plan_sm103_oproj.py --export-cpp; do not edit by hand.',
+        '// Independent C/R only; every physical anchor is retained, with no F/winner fitting.',
+        '// Domain: 148 SM, CUDA-reported compute capability 10.3 (sm_103a), BF16/FP32/BF16,',
+        '// CUTLASS 57e3cfb47a2d9e0d46eb6335c3dc411498efa198, CP4/8, causal rows-pull, Graph.',
+        '// Match collective/raster/resolved swizzle and actual compute budget; do not extrapolate.',
+        '// C/waves and max-slot-bytes/R are amortized services, including startup/drain.',
+        '// Aggregate slot service is NOT pure NVLink or observed aggregate payload bandwidth.',
+        '// The target queue retains its own slot imbalance; fused contention needs validation.',
+        '// policy_index: 0 = m128n256, 1 = m128n256k64e32.',
+        '// Version hashes C/R values, geometry, resources, execution identity and source evidence.',
+        '// Primitive source runs:'] + [f'//   {run}' for run in runs] + [
+        '', 'namespace fuse::detail {', '', 'struct OprojCalibrationPoint {',
+        '  int32_t world, policy_index;', '  bool along_n;',
+        '  int32_t swizzle, comm_ctas, k, reference_m, reference_n, compute_ctas;',
+        '  double tile_cycle_us, copy_slot_bandwidth_gb_s;', '};', '',
+        f'inline constexpr char kOprojCalibrationVersion[] = "{version}";',
+        'inline constexpr OprojCalibrationPoint kOprojCalibrationPoints[] = {']
+    for point in points:
+        values = [('true' if value else 'false') if type(value) is bool else
+                  format(value, '.17g') if type(value) is float else str(value) for value in point.values()]
+        lines.append('  {' + ', '.join(values) + '},')
+    lines.extend(['};', '', '}  // namespace fuse::detail', ''])
+    return '\n'.join(lines)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--calibration', type=Path, required=True)
-    parser.add_argument('--cases', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument('--cases', type=Path)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--export-cpp', type=Path)
+    args = parser.parse_args(argv)
+    if args.export_cpp:
+        if args.cases or args.output:
+            parser.error('--export-cpp cannot be combined with --cases or --output')
+        header = export_cpp(json.loads(args.calibration.read_text()))
+        args.export_cpp.parent.mkdir(parents=True, exist_ok=True)
+        with args.export_cpp.open('x') as stream:
+            stream.write(header)
+        print(json.dumps(dict(export_cpp=str(args.export_cpp))))
+        return
+    if not args.cases or not args.output:
+        parser.error('Planning requires both --cases and --output, or use --export-cpp alone')
     result = plan(json.loads(args.calibration.read_text()), json.loads(args.cases.read_text()))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('x') as stream:

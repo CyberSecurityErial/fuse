@@ -38,7 +38,7 @@ CONTROL_FILES = ('job.json', 'status.json', 'source-installed.json', 'environmen
 KINDS = {'config', 'device', 'input', 'candidate', 'component_resources', 'correctness', 'route', 'warmup',
          'sample', 'summary', 'candidate_verified', 'validation_self_test', 'validation_oracle',
          'profile_host', 'host_stage', 'input_oracle', 'epilogue_resources', 'epilogue_sample', 'epilogue_cta',
-         'graph_prepare'}
+         'graph_prepare', 'auto_comm'}
 GRAPH_EPOCH_MODE = 'recapture_update_v1'
 GRAPH_PREPARE_FIELDS = {'kind', 'line', 'label', 'candidate', 'comm_sm', 'tile', 'generation',
     'component', 'rank', 'launch', 'graph_epoch_mode', 'calls', 'first_epoch', 'last_epoch',
@@ -317,7 +317,7 @@ def audit_mpi_receipts(job, records, data, attempt):
             require(len(configs) == (1 if row['rank'] == 0 else 0), 'MPI root config count mismatch')
             native_generations = defaultdict(list)
             for entry in parsed:
-                native = entry['kind'] in ('device', 'input', 'candidate', 'component_resources', 'graph_prepare') or (
+                native = entry['kind'] in ('device', 'input', 'candidate', 'component_resources', 'graph_prepare', 'auto_comm') or (
                     entry['kind'] == 'input_oracle' and 'rank' in entry)
                 if native:
                     require(count(entry, 'rank') == row['rank'], 'MPI native record belongs to another rank')
@@ -1067,6 +1067,59 @@ def audit_schedule_row(row, schedule, compute_ctas):
             'Scheduling resources disagree with request/geometry/budget')
 
 
+def audit_auto_comm(rows, job, config, expected, devices):
+    """Resolve automatic budgets from rank-owned evidence, not a default CTA count.
+
+    Selection precedes the first launch and both payloads. Existing candidate,
+    resource, reference and numerical checks then use this actual positive
+    budget; zero denotes only the API request, never zero communication work.
+    """
+    enabled = job.get('auto_oproj_comm', False)
+    require(type(enabled) is bool and
+            integer(config.get('auto_oproj_comm', 0), 'auto_oproj_comm') == int(enabled),
+            'Automatic OProj communication job/config mismatch')
+    records = [r for r in rows if r['kind'] == 'auto_comm']
+    if not enabled:
+        require(not records, 'Unexpected automatic communication records')
+        return expected, {}
+    require(job.get('fused_direction') == 'oproj' and fused_launch(job) == 'graph' and
+            job.get('causal') and job.get('oproj_comm_layout', 'rows') == 'rows' and
+            not job.get('profile') and not job.get('compute_only') and
+            count(config, 'comm_sm') == 0 and all(count(d, 'sms') == 148 for d in devices),
+            'Unsupported automatic communication measurement scope')
+    required_fields = {'kind', 'line', 'label', 'candidate', 'comm_sm', 'tile', 'rank',
+                       'query_us', 'repeat_query_us', 'launch_comm'}
+    groups = defaultdict(dict)
+    for row in records:
+        require(set(row) == required_fields, 'Automatic communication record fields mismatch')
+        index, rank, comm = count(row, 'candidate', 1), count(row, 'rank'), count(row, 'comm_sm', 1)
+        require(index <= len(expected) and rank < len(devices) and rank not in groups[index],
+                'Duplicate/unknown automatic communication candidate/rank')
+        direction, requested, tile = expected[index - 1]
+        require(direction == row['label'] == 'A2A_GEMM' and requested == 0 and row['tile'] == tile and
+                comm in (8, 16, 24, 32, 48) and count(row, 'launch_comm') == 0,
+                'Automatic communication request/resolved configuration mismatch')
+        number(row, 'query_us', 0)
+        number(row, 'repeat_query_us', 0)
+        bindings = [r for r in rows if r['kind'] == 'candidate' and
+                    count(r, 'candidate', 1) == index and count(r, 'rank') == rank]
+        require(bindings and row['line'] < min(r['line'] for r in bindings),
+                'Automatic communication selection must precede native binding')
+        groups[index][rank] = row
+    require(set(groups) == set(range(1, len(expected) + 1)), 'Missing automatic communication candidate')
+    resolved, metadata = [], {}
+    for index, (direction, _, tile) in enumerate(expected, 1):
+        ranks = groups[index]
+        require(set(ranks) == set(range(len(devices))), 'Missing automatic communication rank')
+        budgets = {count(row, 'comm_sm') for row in ranks.values()}
+        require(len(budgets) == 1, 'Automatic communication ranks disagree on budget')
+        comm = budgets.pop()
+        resolved.append((direction, comm, tile))
+        metadata[index] = dict(mode='runtime_model', requested_comm_ctas=0, resolved_comm_ctas=comm,
+            launch_comm_ctas=0, rank_queries=[ranks[rank] for rank in range(len(devices))])
+    return resolved, metadata
+
+
 def audit_log(text, job):
     rows, profile_records = parse_log(text, completion='any' if job.get('mpi') else 'last')
     configs = [r for r in rows if r['kind'] == 'config']
@@ -1161,13 +1214,14 @@ def audit_log(text, job):
                 if job.get('fused_direction', 'both') in ('both', 'qkv' if direction == DIRECTIONS[0] else 'oproj')
                 for tile in policies for c in comm]
     require(count(config, 'candidates') == len(expected), 'Candidate plan count mismatch')
-    require(count(config, 'comm_sm', 1) == comm[0], 'Resolved default communication CTA mismatch')
+    require(count(config, 'comm_sm') == comm[0], 'Resolved default communication CTA mismatch')
     inputs = audit_inputs(rows, config, shape)
     devices = [r for r in rows if r['kind'] == 'device']
     require([count(r, 'rank') for r in devices] == list(range(shape['world'])), 'Missing/duplicate device rank')
     require(all(r.get('runtime_cc') == '10.3' and count(r, 'sms', 1) > max(comm) for r in devices),
             'Invalid runtime architecture or communication budget')
     sm_counts = [count(r, 'sms') for r in devices]
+    expected, auto_comm = audit_auto_comm(rows, job, config, expected, devices)
     grouped = defaultdict(list)
     profile_validation = []
     for row in rows:
@@ -1331,6 +1385,7 @@ def audit_log(text, job):
                 'Missing component resource rank/generation')
         payload = 2 * m * (n if qkv_direction else k)
         results.append({'candidate': index, 'direction': direction, 'component': component,
+            'communication_selection': auto_comm.get(index, {'mode': 'explicit'}),
             'sampling_mode': 'quick_1_5' if quick else 'formal_10_50',
             'formal_eligible': not quick and not diagnostic,
             'measurement_role': 'production' if component == 'fused' else 'calibration',

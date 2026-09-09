@@ -79,6 +79,7 @@ struct Options {
   bool validation_self_test = false;
   bool calibrate = false;
   bool compute_only = false;
+  bool auto_oproj_comm = false;
   bool quick = false;
   std::string counter_component;
   std::string counter_direction;
@@ -177,6 +178,7 @@ struct Candidate {
   Direction direction;
   int comm_sm;
   std::string tile_policy;
+  bool auto_comm = false;
 };
 
 std::vector<Candidate> make_candidates(const Options& options) {
@@ -188,7 +190,7 @@ std::vector<Candidate> make_candidates(const Options& options) {
   }
   for (const auto& policy : options.oproj_policy_list) {
     for (int comm_sm : options.comm_sm_list) {
-      candidates.push_back({Direction::kOproj, comm_sm, policy});
+      candidates.push_back({Direction::kOproj, comm_sm, policy, options.auto_oproj_comm});
     }
   }
   candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
@@ -311,6 +313,8 @@ Options parse_options(int argc, char** argv) {
       options.world = static_cast<int>(value);
     } else if (argument == "--world4" || argument == "--world8") {
       options.world = argument == "--world4" ? 4 : 8;
+    } else if (argument == "--auto-oproj-comm") {
+      options.auto_oproj_comm = true;
     } else if (argument == "--comm-sm") {
       const uint64_t value = number();
       if (value == 0 || value > 1024) throw std::runtime_error("invalid --comm-sm");
@@ -450,6 +454,7 @@ Options parse_options(int argc, char** argv) {
                    "[--oproj-comm-layout rows|columns] "
                    "[--host-launch sequential|per_gpu_thread] [--launch eager|graph] "
                    "[--cpu-oracle] [--validation-self-test] [--calibrate]\n"
+                   "--auto-oproj-comm: runtime CTA selection; Graph OProj causal rows, explicit N256/e32 and sw4/8 only; excludes --comm-sm/list.\n"
                    "BF16 GQA; warmup=10, samples=50. Global sequence must divide evenly across ranks.\n"
                    "--causal changes OProj gather; QKV output remains rank-major, matching SM90.\n"
                    "Candidates reuse one shape and two payload generations; each direction expands tile x comm.\n"
@@ -482,6 +487,9 @@ Options parse_options(int argc, char** argv) {
   if (has_comm_sm && has_comm_sm_list) {
     throw std::runtime_error("--comm-sm and --comm-sm-list are mutually exclusive");
   }
+  if (options.auto_oproj_comm && (has_comm_sm || has_comm_sm_list)) {
+    throw std::runtime_error("--auto-oproj-comm and --comm-sm/list are mutually exclusive");
+  }
   if (options.quick && (options.profile || options.validation_self_test ||
       options.oproj_gap_probe || !options.counter_component.empty())) {
     throw std::runtime_error("--quick is a non-profile performance screening mode");
@@ -496,6 +504,7 @@ Options parse_options(int argc, char** argv) {
   if (options.launch == "graph" && (!fused_mpi::enabled || options.profile || options.qkv_epilogue_probe)) {
     throw std::runtime_error("Graph requires the MPI target and excludes profiling/epilogue diagnostics");
   }
+  if (options.auto_oproj_comm) options.comm_sm = 0; // Unresolved request, never a measured 8-CTA default.
   if (options.comm_sm_list.empty()) options.comm_sm_list.push_back(options.comm_sm);
   options.comm_sm = options.comm_sm_list.front();
   if (options.qkv_policy_list.empty()) {
@@ -505,6 +514,15 @@ Options parse_options(int argc, char** argv) {
   if (options.oproj_policy_list.empty()) {
     const char* policy = std::getenv("FUSE_SM103_OPROJ_POLICY");
     options.oproj_policy_list.push_back(normalize_oproj_policy(policy ? policy : "auto"));
+  }
+  if (options.auto_oproj_comm && (options.profile || options.validation_self_test || options.compute_only ||
+      !options.counter_component.empty() || options.fused_direction != "oproj" || options.launch != "graph" ||
+      !options.causal || options.oproj_comm_layout != "rows" ||
+      (options.max_swizzle_size != 4 && options.max_swizzle_size != 8) ||
+      std::any_of(options.oproj_policy_list.begin(), options.oproj_policy_list.end(), [](const auto& policy) {
+        return policy != "m128n256" && policy != "m128n256k64e32";
+      }))) {
+    throw std::runtime_error("--auto-oproj-comm requires non-profile OProj Graph causal rows with explicit N256/e32 and sw4/8");
   }
   if (options.profile && (options.comm_sm_list.size() != 1 || options.qkv_policy_list.size() != 1 ||
                          options.oproj_policy_list.size() != 1)) {
@@ -570,6 +588,11 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("requires GQA/CP-divisible heads, BF16 8-element alignment, and OProj K shards divisible by 64");
   }
   const int64_t m_tiles = ceil_div(options.seq_local, 128);
+  if (options.auto_oproj_comm && (options.seq_local % 256 || q_width < 8192 || q_width > 16384 ||
+      schedule_geometry(static_cast<int>(m_tiles), ceil_div(options.hidden, 256), options.max_swizzle_size)
+          .effective_swizzle_size < 4)) {
+    throw std::runtime_error("--auto-oproj-comm geometry is outside the calibrated ready/K/swizzle domain");
+  }
   if (m_tiles * ceil_div(options.projection_width(), 64) > int_limit ||
       m_tiles * ceil_div(options.hidden, 128) > int_limit ||
       m_tiles * options.world > int_limit) {
@@ -1189,7 +1212,7 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
     auto& runtime = runtimes[rank];
     const bool qkv = candidate.direction == Direction::kQkv;
     if (qkv) runtime.qkv.num_comm_ctas = candidate.comm_sm;
-    else runtime.oproj.num_comm_ctas = candidate.comm_sm;
+    else runtime.oproj.num_comm_ctas = candidate.auto_comm ? 0 : candidate.comm_sm;
     const auto& problem = qkv ? runtime.qkv.gemm : runtime.oproj.gemm;
     const auto traits = qkv
         ? fuse::qkv_cutlass_kernel_traits(runtime.qkv.gemm, runtime.qkv.route,
@@ -1211,6 +1234,37 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
               << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm});
     if (!qkv) std::cout << ",oproj_comm_layout=" << std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT");
     std::cout << '\n';
+  }
+  std::cout << std::flush;
+}
+
+void resolve_auto_candidates(std::vector<RankRuntime>& runtimes, std::vector<Candidate>& candidates) {
+  // Query once per tile/rank before either payload generation. Keep the actual
+  // positive budget in result/compute-reference metadata, but leave production
+  // and copy-reference params at zero so their real API resolver is exercised.
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    auto& candidate = candidates[index];
+    if (!candidate.auto_comm) continue;
+    set_tile_policy(candidate.direction, candidate.tile_policy);
+    int resolved = 0;
+    for (int rank : fused_mpi::owned_ranks(static_cast<int>(runtimes.size()))) {
+      const auto& runtime = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(runtime.device));
+      const auto begin = std::chrono::steady_clock::now();
+      const int comm = fuse::recommended_a2a_lhs_gemm_comm_ctas(runtime.oproj.gemm, runtime.oproj.route);
+      const auto first = std::chrono::steady_clock::now();
+      const int repeat = fuse::recommended_a2a_lhs_gemm_comm_ctas(runtime.oproj.gemm, runtime.oproj.route);
+      const auto end = std::chrono::steady_clock::now();
+      if (comm <= 0 || comm >= runtime.sm_count || repeat != comm || (resolved && resolved != comm)) {
+        throw std::runtime_error("automatic OProj CTA query is unsupported or disagrees across ranks/repeated calls");
+      }
+      resolved = comm;
+      candidate.comm_sm = comm;
+      std::cout << "auto_comm,A2A_GEMM" << candidate_context(index, candidate) << ",rank=" << rank
+                << ",launch_comm=0,query_us=" << std::chrono::duration<double, std::micro>(first - begin).count()
+                << ",repeat_query_us=" << std::chrono::duration<double, std::micro>(end - first).count() << '\n';
+    }
+    fused_mpi::agree("auto_comm" + candidate_context(index, candidate));
   }
   std::cout << std::flush;
 }
@@ -2699,7 +2753,7 @@ int main(int argc, char** argv) {
     fused_mpi::initialize(argc, argv);
     const Options options = parse_options(argc, argv);
     ::alarm(options.timeout_seconds);
-    const auto candidates = make_candidates(options);
+    auto candidates = make_candidates(options);
     std::ostringstream contract;
     contract << options.quick << ' ' << options.world << ' ' << options.seq_local << ' ' << options.hidden << ' '
              << options.q_heads << ' ' << options.kv_heads << ' ' << options.head_dim << ' '
@@ -2707,7 +2761,8 @@ int main(int argc, char** argv) {
              << options.host_launch << ' ' << options.calibrate << ' ' << options.cpu_oracle << ' '
              << options.validation_self_test << ' ' << options.profile << ' ' << options.timeout_seconds << ' '
              << options.max_swizzle_size << ' ' << options.qkv_raster << ' ' << options.oproj_raster
-             << ' ' << options.launch << ' ' << options.fused_direction << ' ' << options.oproj_comm_layout;
+             << ' ' << options.launch << ' ' << options.fused_direction << ' ' << options.oproj_comm_layout
+             << ' ' << options.auto_oproj_comm;
     for (size_t index = 0; index < candidates.size(); ++index) {
       contract << ' ' << direction_name(candidates[index].direction) << candidate_context(index, candidates[index]);
     }
@@ -2719,6 +2774,7 @@ int main(int argc, char** argv) {
     }
     std::cout << std::setprecision(9); // Also retain full input statistics on non-root ranks.
     fused_mpi::root_output() << std::setprecision(9) << "config,world=" << options.world << ",comm_sm=" << options.comm_sm
+              << ",auto_oproj_comm=" << options.auto_oproj_comm
               << ",global_seq=" << options.global_seq() << ",seq_local=" << options.seq_local
               << ",q_heads=" << options.q_heads << ",kv_heads=" << options.kv_heads
               << ",head_dim=" << options.head_dim << ",hidden=" << options.hidden << ",causal=" << options.causal
@@ -2765,6 +2821,7 @@ int main(int argc, char** argv) {
       runtimes = create_runtimes(options);
       launch_team = start_launch_team(runtimes, options);
     }
+    if (options.auto_oproj_comm) resolve_auto_candidates(runtimes, candidates);
     uint32_t qkv_epoch = 0, oproj_epoch = 0;
     uint32_t reference_epochs[2][2]{}; // Per direction: pure compute, actual copy launches.
     bool self_tested[2] = {false, false};
