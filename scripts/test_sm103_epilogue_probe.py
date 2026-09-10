@@ -341,7 +341,7 @@ int main(int argc,char** argv) {
 
     def test_real_telemetry_template_keeps_default_join_and_gates_private_timestamp(self):
         source = (ROOT / 'csrc/operators/sm103/detail/gemm_a2a.cuh').read_text()
-        start = source.index('template <class GemmKernel, class CommOp, bool OrderedRoleTimestamp = false>')
+        start = source.index('template <class GemmKernel, class CommOp, bool OrderedRoleTimestamp = false,')
         wrapper = source[start:source.index('\n#endif', start)]
         launch = (ROOT / 'csrc/operators/sm103/detail/launch.cuh').read_text()
         start = launch.index('using QkvEpilogueProbeKernel = GemmA2ARoleTelemetryKernel<')

@@ -62,6 +62,11 @@ CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
   }
 }
 
+CUTLASS_DEVICE void wait_acquire_system_single_lane(const uint32_t* flag, uint32_t target) {
+  CUTLASS_PRAGMA_NO_UNROLL
+  while (load_acquire_system(flag) < target) __nanosleep(64);
+}
+
 #if FUSE_ENABLE_PROFILING
 template <bool Instrumented>
 struct A2ALhsTimelineArguments {};
@@ -85,8 +90,13 @@ template <
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
+    , bool SystemScope = false
     >
 struct A2ALhsReadyMainloop : Base {
+#if FUSE_ENABLE_PROFILING
+  static_assert(!SystemScope || !Instrumented,
+                "Head-granular backward uses outer CTA telemetry, not fixed-size peer records");
+#endif
   static constexpr int kTileM = cute::size<0>(TileShape{});
   static constexpr int kTileN = cute::size<1>(TileShape{});
   static constexpr int kTileK = cute::size<2>(TileShape{});
@@ -179,7 +189,7 @@ struct A2ALhsReadyMainloop : Base {
     // The ready layout has no batch dimension. The host flattens batch into
     // M; multiple independent L batches would alias the same arrivals.
     return args.ready && args.world_size > 0 &&
-        args.world_size <= kMaxWorldSize && args.arrivals_per_peer > 0 &&
+        (SystemScope || args.world_size <= kMaxWorldSize) && args.arrivals_per_peer > 0 &&
         args.k_tiles_per_peer > 0 && args.epoch > 0 &&
         static_cast<uint64_t>(args.epoch) * args.arrivals_per_peer <=
             std::numeric_limits<uint32_t>::max() &&
@@ -244,7 +254,8 @@ struct A2ALhsReadyMainloop : Base {
             (static_cast<int64_t>(m) * params_->world_size + peer) *
                 kReadyFlagStride;
         if (threadIdx.x % 32 == 0) {
-          wait_acquire_gpu_single_lane(flag, target);
+          if constexpr (SystemScope) wait_acquire_system_single_lane(flag, target);
+          else wait_acquire_gpu_single_lane(flag, target);
 #if FUSE_ENABLE_PROFILING
           if constexpr (Instrumented) {
             if (probe) check_end = oproj_timestamp();

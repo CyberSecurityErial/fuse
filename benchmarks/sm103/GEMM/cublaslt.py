@@ -59,8 +59,11 @@ class SmBudget:
 
 class Operand:
     def __init__(self, library, source, precision):
-        if source.ndim != 2 or source.dtype != torch.bfloat16 or not source.is_contiguous():
-            raise ValueError("source must be contiguous 2D CUDA BF16")
+        if source.ndim != 2 or source.dtype != torch.bfloat16 or not source.is_cuda:
+            raise ValueError("source must be 2D CUDA BF16")
+        self.transposed = not source.is_contiguous()
+        if self.transposed and (precision != 'bf16' or not source.T.is_contiguous()):
+            raise ValueError("only BF16 contiguous or zero-copy transpose operands are supported")
         self.library, self.source, self.precision = library, source, precision
         self.rows, self.k = source.shape
         self.scales = None
@@ -109,13 +112,20 @@ class Plan:
         if output.shape != (x.rows, weight.rows) or output.dtype != torch.bfloat16:
             raise ValueError("output must be BF16 [M,N]")
         self.library, self.x, self.weight, self.output = library, x, weight, output
-        self.handle = library.lib.sm103_create(
+        create = library.lib.sm103_create
+        extra = []
+        if x.transposed or weight.transposed:
+            create = library.lib.sm103_create_strided
+            create.argtypes = library.lib.sm103_create.argtypes + [ct.c_int, ct.c_int]
+            create.restype = ct.c_void_p
+            extra = [int(x.transposed), int(weight.transposed)]
+        self.handle = create(
             PRECISIONS[x.precision],x.rows,weight.rows,x.k,
             x.data.data_ptr(),weight.data.data_ptr(),output.data_ptr(),
             x.scales.data_ptr() if x.scales is not None else None,
             weight.scales.data_ptr() if weight.scales is not None else None,
             torch.cuda.current_stream().cuda_stream,candidates,workspace_mib,warmup,
-            iterations,int(graph),math_sms,ct.c_float(beta))
+            iterations,int(graph),math_sms,ct.c_float(beta),*extra)
         if not self.handle:
             raise RuntimeError(library.lib.sm103_last_error().decode())
         self.info = json.loads(library.lib.sm103_plan_info(self.handle))
@@ -147,7 +157,12 @@ def check_gemm(plan, tolerance=0.02, *, full=False):
         rows = torch.linspace(0,plan.x.rows-1,min(64,plan.x.rows),device=plan.output.device).long()
         cols = torch.linspace(0,plan.weight.rows-1,min(64,plan.weight.rows),device=plan.output.device).long()
     torch.backends.cuda.matmul.allow_tf32 = False
-    ref = plan.x.decode()[rows] @ plan.weight.decode()[cols].T
+    # Select BF16 rows before conversion, keeping long-K backward checks
+    # bounded without materializing either full transposed operand.
+    if plan.x.precision == plan.weight.precision == 'bf16':
+        ref = plan.x.data[rows].float() @ plan.weight.data[cols].float().T
+    else:
+        ref = plan.x.decode()[rows] @ plan.weight.decode()[cols].T
     actual = plan.output[rows[:,None],cols].float()
     difference = actual-ref
     relative_rms = (difference.square().mean().sqrt()/ref.square().mean().sqrt().clamp_min(1e-12)).item()

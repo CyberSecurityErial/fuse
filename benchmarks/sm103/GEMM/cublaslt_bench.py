@@ -172,11 +172,41 @@ def prepare_inputs(geometry, uniform):
     return source, weight
 
 
+def prepare_backward_inputs(geometry, uniform, operand_layout):
+    if operand_layout not in ('nn', 'tn'):
+        raise ValueError('backward operands require NN or TN layout')
+    m, n, k = (geometry["shape"][key] for key in ("m", "n", "k"))
+    torch.manual_seed(103)
+    # Logical operation stays X[M,K] * W[N,K]^T. Only allocation/view strides
+    # change: NN dgrad reads stored forward weights; TN wgrad reads dY^T/X.
+    source = input_tensor((k, m) if operand_layout == 'tn' else (m, k), .125, uniform)
+    weight = input_tensor((k, n), .02, uniform)
+    # Inspect physical storage before creating views; reshape(logical_view)
+    # would silently materialize a long-sequence transpose just for statistics.
+    source_stats, weight_stats = input_statistics(source), input_statistics(weight)
+    if operand_layout == 'tn':
+        source = source.T
+    weight = weight.T
+    geometry["inputs"] = {"seed": 103, "generator": "torch_cuda",
+        "distribution": "uniform" if uniform else "normal",
+        "activation_magnitude": .125, "weight_magnitude": .02,
+        "magnitude_meaning": "uniform_half_range" if uniform else "normal_stddev",
+        "fused_bitwise_identical": False,
+        "operand_layout": operand_layout, "transpose_materialized": False,
+        "activation_stride": list(source.stride()), "weight_stride": list(weight.stride()),
+        "activation_storage": source_stats, "weight_storage": weight_stats,
+        "activation_shape": list(source.shape), "weight_shape": list(weight.shape)}
+    return source, weight
+
+
 def run_geometry(a, lib, geometry, index, total):
     m, n, k = (geometry["shape"][key] for key in ("m", "n", "k"))
     sm_target = getattr(a, "cublaslt_sm_target", None)
     budget = getattr(a, "sm_budget_context", None)
-    source, weight = prepare_inputs(geometry, a.matrix_json is not None)
+    if getattr(a, 'operand_layout', 'nt') != 'nt':
+        source, weight = prepare_backward_inputs(geometry, a.matrix_json is not None, a.operand_layout)
+    else:
+        source, weight = prepare_inputs(geometry, a.matrix_json is not None)
     for precision in a.precisions.split(","):
         x, w = Operand(lib, source, precision), Operand(lib, weight, precision)
         output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
@@ -503,6 +533,8 @@ def main():
         p.add_argument("--" + name, type=int, default=default)
     p.add_argument("--matrix-json", type=Path)
     p.add_argument("--precisions")
+    p.add_argument('--operand-layout', choices=('nt', 'nn', 'tn'), default='nt',
+                   help='BF16 row-major logical GEMM: forward NT, dgrad NN, wgrad TN; zero-copy views')
     p.add_argument("--launches", default="eager,graph")
     p.add_argument("--library", type=Path)
     p.add_argument("--compare-cutlass-library", type=Path,
@@ -535,6 +567,9 @@ def main():
         p.error("invalid precision")
     if not set(a.launches.split(",")) <= {"eager", "graph"}:
         p.error("invalid launch")
+    if a.operand_layout != 'nt' and (a.precisions != 'bf16' or a.compare_cutlass_library or
+                                    a.cutlass_counters or a.cublaslt_counters):
+        p.error('backward operand views require standalone BF16 GEMM without counters')
     if (len(set(a.launches.split(","))) != len(a.launches.split(",")) or
             len(set(a.precisions.split(","))) != len(a.precisions.split(","))):
         p.error("duplicate precision or launch")
@@ -607,6 +642,7 @@ def main():
         from cutlass import Library as CutlassLibrary
         cutlass_library = CutlassLibrary(a.compare_cutlass_library)
     result = {"schema": "sm103_gemm_matrix_v1" if a.matrix_json else "sm103_gemm_v1",
+        "operand_layout": a.operand_layout, "transpose_materialized": False,
         "state": "running", "measurement_protocol": PROTOCOL,
         "torch": torch.__version__, "cuda": torch.version.cuda, "compute": "10.3",
         "sms": prop.multi_processor_count, "device": prop.name,

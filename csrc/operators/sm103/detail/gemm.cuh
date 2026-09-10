@@ -3,6 +3,8 @@
 
 #include "fuse/types.h"
 #include "fuse/layout/gemm.h"
+#include "fuse/operators/ulysses/qkv_backward.h"
+#include "fuse/operators/ulysses/oproj_backward.h"
 
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
@@ -72,11 +74,43 @@ inline auto raster_option(GemmRaster value, GemmRaster fallback) {
       ? Raster::AlongM : Raster::AlongN;
 }
 
+// Backward dgrad reads the stored forward weight [K,N], without a pack or
+// transpose kernel. Strides describe physical storage, as in the SM90 API.
+inline bool supported_transpose_b_problem(const GemmProblem& p) {
+  GemmProblem normalized = p;
+  normalized.transpose_b = false;
+  normalized.stride_b.row = p.k;
+  return p.transpose_b && supported_problem(normalized) &&
+      (p.stride_b.row < 0 ? p.n : p.stride_b.row) >= p.n &&
+      (p.stride_b.row < 0 ? p.n : p.stride_b.row) % kAlignment == 0;
+}
+
+struct QkvBackwardKernelParams {
+  const Bf16* local_q = nullptr;
+  const Bf16* local_k = nullptr;
+  const Bf16* local_v = nullptr;
+  Bf16* peer_staging[kMaxWorldSize]{};
+  uint32_t* peer_ready[kMaxWorldSize]{};
+  uint32_t* peer_done_epoch[kMaxWorldSize]{};
+  const Bf16* weight = nullptr;
+  Bf16* grad_input = nullptr;
+  GemmProblem gemm;
+  UlyssesRoute route;
+  int32_t num_comm_ctas = 0;
+  uint32_t epoch = 0;
+  float alpha = 1.0f;
+};
+
+// Distinct semantic type selects one head segment, not synthetic Q/K/V heads.
+struct OprojBackwardKernelParams : GemmA2AParams {};
+
 // TODO: These Hopper tile widths are starting points; tune them on B300 after
 // correctness and resource validation, keeping communication SMs explicit.
 // TODO: Calibrate B300 compute costs for the required performance-model tuner;
 // do not reuse Hopper's measured wave tables or treat these defaults as optimal.
-template <int BlockN, int BlockK = 64, int EpilogueN = 0>
+template <int BlockN, int BlockK = 64, int EpilogueN = 0,
+          class InputLayout = LayoutA, class WeightLayout = LayoutB,
+          class ResidualElement = void>
 struct Bf16GemmTypes {
   // Precision-specific family, not a generic BF16-versus-FP8 branch. A future
   // block-scaled family needs its actual operand/scale contract and CUTLASS
@@ -84,7 +118,7 @@ struct Bf16GemmTypes {
   using Element = Bf16;
   using Accumulator = float;
   // Both forward APIs compute D = alpha * A * B; neither accepts a C source.
-  using ElementC = void;
+  using ElementC = ResidualElement;
   static constexpr int kAlignment = 16 / sizeof(Element);
   static_assert(BlockN == 64 || BlockN == 128 || BlockN == 160 ||
                 BlockN == 192 || BlockN == 256, "Unsupported BF16 tile width");
@@ -123,8 +157,8 @@ struct Bf16GemmTypes {
 
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, cutlass::arch::OpClassTensorOp,
-      Element, LayoutA, kAlignment,
-      Element, LayoutB, kAlignment,
+      Element, InputLayout, kAlignment,
+      Element, WeightLayout, kAlignment,
       Accumulator, TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<
           static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,

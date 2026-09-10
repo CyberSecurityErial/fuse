@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v18.0
+        default: v19.0
 
 permissions:
   contents: write
@@ -27,9 +27,20 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v18.0");
+              : (process.env.REQUESTED_TAG || "v19.0");
 
             const releases = {
+              "v19.0": {
+                name: "v19.0 — SM103 BF16 forward and backward baseline",
+                body: [
+                  "Ships BF16 QKV and OProj forward/backward entry points on Blackwell SM103. Forward behavior is inherited from v18.0; the cancelled QKV forward-autotune experiment is excluded.",
+                  "Adds persistent reverse routes, NN data gradients and TN local weight gradients, including immediate/deferred B/W interfaces. Local dW does not include cross-CP reduction; special MLA/KDA/gated routing remains TODO.",
+                  "Integrates per-shape offline GEMM winners through explicit N256, epilogue and raster/swizzle settings. Communication stays at 16 CTAs in the comparison; ready indexing and output routing follow the selected tile. Default settings retain the original baseline.",
+                  "Graph 10+50 with complete two-payload numerical/routing validation: 20 unique matrices / 23 logical fused A/B points. Fifteen paired points are stable, with +19.64% geometric-mean throughput; eight remain unstable after one retry. Known production_qwen_dense OProj CP4/256K regression: -6.7%.",
+                  "Final results only: 1080 pure-cuBLASLt backward rows, the 540-row final fused catalog, configurations and validity under results/sm103/v19.0. Memory and unsupported-route gaps stay explicit. No candidate history, raw samples, profiles, dependencies or intermediate sweep packages.",
+                  "This is a BF16 baseline release, not a claim that every projection route is implemented or every large shape has a valid measurement. MXFP8 is subsequent work.",
+                ].join("\n"),
+              },
               "v18.0": {
                 name: "v18.0 — SM103 OProj runtime CTA autotune",
                 body: [

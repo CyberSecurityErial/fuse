@@ -1240,7 +1240,7 @@ class NoResidualHostContracts(unittest.TestCase):
     def setUpClass(cls):
         gemm = (ROOT / "csrc/operators/sm103/detail/gemm.cuh").read_text()
         helpers = gemm[gemm.index("__host__ __device__ constexpr int64_t a_row_stride("):
-                       gemm.index("// TODO: These Hopper tile widths")]
+                       gemm.index("// Backward dgrad reads the stored forward weight")]
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
         begin = launch.index("template <class Kernel>\ntypename Kernel::Arguments gemm_arguments(")
         # Extract this function only, not unrelated helpers inserted after it.

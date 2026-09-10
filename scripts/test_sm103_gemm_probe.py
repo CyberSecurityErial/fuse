@@ -74,6 +74,37 @@ class PureGemmContracts(unittest.TestCase):
         self.assertEqual(groups[0]['aliases'], ['qkv-a', 'qkv-alias'])
         self.assertEqual(groups[1]['shape'], {'m': 128, 'n': 64, 'k': 192})
 
+    def test_backward_inputs_are_transpose_views_without_hidden_pack(self):
+        class Tensor:
+            def __init__(self, shape, storage=None, transposed=False):
+                self.shape, self.storage, self.transposed = shape, storage or object(), transposed
+            @property
+            def T(self):
+                return Tensor(tuple(reversed(self.shape)), self.storage, not self.transposed)
+            def stride(self):
+                return (1, self.shape[0]) if self.transposed else (self.shape[1], 1)
+        for layout in ('nn', 'tn'):
+            allocations, statistics = [], []
+            def allocate(shape, magnitude, uniform):
+                allocations.append(Tensor(shape))
+                return allocations[-1]
+            def stats(tensor):
+                self.assertFalse(tensor.transposed)
+                statistics.append(tensor)
+                return {'shape': list(tensor.shape)}
+            geometry = {'shape': {'m': 32, 'n': 48, 'k': 64}}
+            with mock.patch.object(bench, 'torch', types.SimpleNamespace(manual_seed=mock.Mock())), \
+                    mock.patch.object(bench, 'input_tensor', side_effect=allocate), \
+                    mock.patch.object(bench, 'input_statistics', side_effect=stats):
+                x, w = bench.prepare_backward_inputs(geometry, True, layout)
+            self.assertEqual((x.shape, w.shape), ((32, 64), (48, 64)))
+            self.assertIs(x.storage, allocations[0].storage)
+            self.assertIs(w.storage, allocations[1].storage)
+            self.assertEqual(x.stride(), (1, 32) if layout == 'tn' else (64, 1))
+            self.assertEqual(w.stride(), (1, 48))
+            self.assertEqual(statistics, allocations)
+            self.assertFalse(geometry['inputs']['transpose_materialized'])
+
     def test_matrix_rejects_bad_schema_ids_dimensions_and_extra_fields(self):
         row = self.payload()['shapes'][0]
         bad_rows = [row | {'m': True}, row | {'n': 1.5}, row | {'k': 0}, row | {'m': 2**31},
@@ -434,6 +465,7 @@ class PureGemmContracts(unittest.TestCase):
         output = Matrix([[1.] * 264 for _ in range(257)])
         x = types.SimpleNamespace(rows=257, k=1, precision='bf16', decode=lambda: Matrix([[1.]] * 257))
         w = types.SimpleNamespace(rows=264, k=1, precision='bf16', decode=lambda: Matrix([[1.]] * 264))
+        x.data, w.data = x.decode(), w.decode()
         run = mock.Mock(return_value=output)
         plan = types.SimpleNamespace(x=x, weight=w, output=output, run=run)
         sampled = check(plan)
@@ -612,6 +644,9 @@ class PureGemmContracts(unittest.TestCase):
             def visit_If(self, node):
                 if ast.unparse(node.test) == "getattr(a, 'cublaslt_counters', False)":
                     return None
+                if ast.unparse(node.test) == "getattr(a, 'operand_layout', 'nt') != 'nt'":
+                    # Backward is opt-in; retain the original forward branch.
+                    return node.orelse
                 return self.generic_visit(node)
         nodes['run_geometry'] = WithoutLtCounters().visit(nodes['run_geometry'])
         # Python 3.12 adds empty type_params to FunctionDef; ignore that

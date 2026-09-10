@@ -44,12 +44,19 @@ if(FUSE_BUILD_KERNELS)
   set_target_properties(fuse_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
   find_package(Threads REQUIRED)
+  # Reuse the actual BF16 reverse-route correctness harness, unchanged.
+  add_executable(backward_smoke benchmarks/sm90/backward/backward_smoke.cu)
+  target_link_libraries(backward_smoke PRIVATE fuse_kernels CUDA::cudart)
+  target_compile_options(backward_smoke PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr>)
   add_executable(fused_bf16 benchmarks/sm103/fused_bf16.cu)
   target_link_libraries(fused_bf16 PRIVATE fuse_kernels CUDA::cublas CUDA::cudart Threads::Threads)
   target_compile_options(fused_bf16 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
   if(FUSE_BUILD_MPI_BENCH)
     find_package(MPI REQUIRED COMPONENTS CXX)
+    add_executable(backward_mpi_bench benchmarks/sm90/backward/backward_mpi_bench.cu)
+    target_link_libraries(backward_mpi_bench PRIVATE fuse_kernels CUDA::cudart CUDA::cublas MPI::MPI_CXX)
+    target_compile_options(backward_mpi_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr>)
     add_executable(fused_bf16_mpi benchmarks/sm103/fused_bf16.cu)
     target_compile_definitions(fused_bf16_mpi PRIVATE FUSE_BENCH_MPI=1)
     target_link_libraries(fused_bf16_mpi PRIVATE

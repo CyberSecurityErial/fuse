@@ -660,7 +660,7 @@ class GemmTileParameterContracts(unittest.TestCase):
 
     def test_real_family_threads_k_and_epilogue_through_one_compute_definition(self):
         source = (ROOT / "csrc/operators/sm103/detail/gemm.cuh").read_text()
-        family = source[source.index("template <int BlockN, int BlockK = 64, int EpilogueN = 0>"):]
+        family = source[source.index("template <int BlockN, int BlockK = 64, int EpilogueN = 0,"):]
         self.assertIn("static constexpr int kTileK = BlockK;", family)
         self.assertIn("EpilogueN == 32 || BlockN == 160", family)
         self.assertIn("using Dense = Bf16GemmTypes<BlockN, BlockK, EpilogueN>;", family)
@@ -674,10 +674,12 @@ class GemmTileParameterContracts(unittest.TestCase):
         family = source[source.index("struct Bf16GemmTypes {"):source.index("using N64TileShape")]
         self.assertIn("using Element = Bf16;", family)
         self.assertIn("using Accumulator = float;", family)
-        self.assertIn("using ElementC = void;", family)
+        self.assertIn("class ResidualElement = void>", source)
+        self.assertIn("using ElementC = ResidualElement;", family)
         self.assertIn("Accumulator, Accumulator,\n      ElementC, LayoutD, kAlignment,\n"
                       "      Element, LayoutD, kAlignment,", family)
-        self.assertIn("Element, LayoutA, kAlignment,\n      Element, LayoutB, kAlignment,", family)
+        self.assertIn("class InputLayout = LayoutA, class WeightLayout = LayoutB", source)
+        self.assertIn("Element, InputLayout, kAlignment,\n      Element, WeightLayout, kAlignment,", family)
         self.assertIn("Mainloop::DispatchPolicy::Stages == 4", family)
         self.assertIn("OutputGemm::MaxThreadsPerBlock == 256", family)
         inverse = source[source.index("struct A2ALhsGemmTypes {"):]

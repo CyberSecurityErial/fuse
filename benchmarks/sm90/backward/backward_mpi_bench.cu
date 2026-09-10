@@ -3,6 +3,11 @@
 
 #include <cuda_runtime.h>
 #include <mpi.h>
+#if FUSE_ARCH_SM103
+#include <cublas_v2.h>
+#include <sstream>
+#include "fuse/profiling/backward.cuh"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -89,10 +94,15 @@ struct Options {
   bool run_all_modes = false;
 #if FUSE_ENABLE_PROFILING
   bool role_profile = false;
+  bool gemm_sweep = false;
   std::string trace_out;
 #endif
   std::string json_out;
   std::string json_prefix;
+#if FUSE_ARCH_SM103
+  std::string case_matrix;
+  fuse::BackwardGemmTuning gemm_tuning{};
+#endif
 };
 
 const char* operator_name(OperatorKind kind) {
@@ -238,6 +248,10 @@ Options parse_options(int argc, char** argv) {
       options.check = true;
     } else if (argument == "--no-check") {
       options.check = false;
+#if FUSE_ARCH_SM103
+    } else if (argument == "--case-matrix") {
+      options.case_matrix = take("--case-matrix");
+#endif
     } else if (argument == "--json-out") {
       options.json_out = take("--json-out");
     } else if (argument == "--json-prefix") {
@@ -247,6 +261,8 @@ Options parse_options(int argc, char** argv) {
 #if FUSE_ENABLE_PROFILING
     } else if (argument == "--role-profile") {
       options.role_profile = true;
+    } else if (argument == "--gemm-sweep") {
+      options.gemm_sweep = true;
     } else if (argument == "--trace-out") {
       options.trace_out = take("--trace-out");
       options.role_profile = true;
@@ -327,6 +343,13 @@ RankContext initialize_rank_context() {
     context.device = context.rank;
   }
   CUDA_CHECK(cudaSetDevice(context.device));
+#if FUSE_ARCH_SM103
+  cudaDeviceProp properties{};
+  CUDA_CHECK(cudaGetDeviceProperties(&properties,context.device));
+  std::cout << "device,rank=" << context.rank << ",device=" << context.device
+            << ",sm=" << properties.multiProcessorCount << ",cc=" << properties.major
+            << "." << properties.minor << "\n" << std::flush;
+#endif
 
   std::array<char, 32> local_bus_id{};
   CUDA_CHECK(cudaDeviceGetPCIBusId(
@@ -393,8 +416,16 @@ __global__ void fill_kernel(Bf16* data, int64_t elements, int seed) {
   for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
        index < elements;
        index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+#if FUSE_ARCH_SM103
+    uint64_t x = static_cast<uint64_t>(index) + (static_cast<uint64_t>(seed) << 32);
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    data[index] = Bf16((static_cast<int>(x & 65535) - 32768) / 131072.0f);
+#else
     const int value = static_cast<int>((index * 17 + seed * 13) % 19) - 9;
     data[index] = Bf16(static_cast<float>(value) / 128.0f);
+#endif
   }
 }
 
@@ -645,6 +676,9 @@ OperatorState make_operator_state(
     data.rank = context.rank;
     data.num_comm_ctas = options.comm_ctas;
     data.gemm_policy = options.gemm_policy;
+#if FUSE_ARCH_SM103
+    data.gemm_tuning = options.gemm_tuning;
+#endif
     data.epoch = 1;
     data.causal_load_balanced = options.causal_load_balanced;
     state.resolved_comm_ctas = options.comm_ctas == 0
@@ -689,6 +723,9 @@ OperatorState make_operator_state(
     data.rank = context.rank;
     data.num_comm_ctas = options.comm_ctas;
     data.gemm_policy = options.gemm_policy;
+#if FUSE_ARCH_SM103
+    data.gemm_tuning = options.gemm_tuning;
+#endif
     data.epoch = 1;
     data.causal_load_balanced = options.causal_load_balanced;
     state.resolved_comm_ctas = options.comm_ctas == 0
@@ -847,11 +884,19 @@ std::vector<float> time_graph(
   // stream-capture chain before inserting event nodes around whole B or B+W
   // steps.
   size_t edge_count = 0;
-  CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr, &edge_count));
+  CUDA_CHECK(cudaGraphGetEdges(graph, nullptr, nullptr,
+#if CUDART_VERSION >= 13000
+      nullptr,
+#endif
+      &edge_count));
   std::vector<cudaGraphNode_t> edge_from(edge_count);
   std::vector<cudaGraphNode_t> edge_to(edge_count);
   CUDA_CHECK(cudaGraphGetEdges(
-      graph, edge_from.data(), edge_to.data(), &edge_count));
+      graph, edge_from.data(), edge_to.data(),
+#if CUDART_VERSION >= 13000
+      nullptr,
+#endif
+      &edge_count));
   if (edge_count + 1 != node_count) {
     throw std::runtime_error("captured kernels do not form one linear chain");
   }
@@ -893,7 +938,11 @@ std::vector<float> time_graph(
   }
   if (edge_count != 0) {
     CUDA_CHECK(cudaGraphRemoveDependencies(
-        graph, edge_from.data(), edge_to.data(), edge_count));
+        graph, edge_from.data(), edge_to.data(),
+#if CUDART_VERSION >= 13000
+        nullptr,
+#endif
+        edge_count));
   }
 
   cudaGraphNode_t previous = nullptr;
@@ -913,7 +962,11 @@ std::vector<float> time_graph(
       const cudaGraphNode_t kernel =
           kernels[static_cast<size_t>(step) * kernels_per_step + part];
       if (previous) {
-        CUDA_CHECK(cudaGraphAddDependencies(graph, &previous, &kernel, 1));
+        CUDA_CHECK(cudaGraphAddDependencies(graph, &previous, &kernel,
+#if CUDART_VERSION >= 13000
+            nullptr,
+#endif
+            1));
       }
       previous = kernel;
     }
@@ -1526,9 +1579,17 @@ unsigned long long count_pattern(
 }
 
 Bf16 generated_value(int64_t index, int seed) {
+#if FUSE_ARCH_SM103
+  uint64_t x = static_cast<uint64_t>(index) + (static_cast<uint64_t>(seed) << 32);
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return Bf16((static_cast<int>(x & 65535) - 32768) / 131072.0f);
+#else
   const int value =
       static_cast<int>((index * 17 + seed * 13) % 19) - 9;
   return Bf16(static_cast<float>(value) / 128.0f);
+#endif
 }
 
 int source_sequence_row(
@@ -1774,8 +1835,16 @@ void write_json(
          << "  \"weight_mode\": \"" << weight_mode_name(options.weight_mode)
          << "\",\n"
          << "  \"backward_schema\": \"v10_b_w_split_v1\",\n"
+#if FUSE_ARCH_SM103
+         << "  \"backward_policy_model\": \"explicit_gemm_fixed_comm_budget\",\n"
+         << "  \"gemm_epilogue_n\": " << options.gemm_tuning.epilogue_n << ",\n"
+         << "  \"gemm_swizzle\": " << options.gemm_tuning.max_swizzle_size << ",\n"
+         << "  \"gemm_along_m\": " << (options.gemm_tuning.along_m?"true":"false") << ",\n"
+         << "  \"input_generator\": \"splitmix_index_seed_uniform_bf16_v1\",\n"
+#else
          << "  \"backward_policy_model\": "
             "\"route_task_wave_compute_residency_v3\",\n"
+#endif
          << "  \"launch_plan_cache\": \"per_process_v1\",\n"
          << "  \"zero_bubble_contract\": \""
          << (options.weight_mode == WeightMode::kDeferred
@@ -1835,6 +1904,9 @@ void write_json(
          << "  \"causal_load_balanced\": "
          << (options.causal_load_balanced ? "true" : "false") << ",\n"
          << "  \"correctness\": \""
+#if FUSE_ARCH_SM103
+         << (options.check ? "two_payload_full_gemm_and_exact_route" : "not_run")
+#else
          << (!options.check
                  ? "not_run"
                  : (options.operator_kind == OperatorKind::kQkv &&
@@ -1845,6 +1917,7 @@ void write_json(
                         : (options.weight_beta == 0
                                ? "protocol_and_full_overwrite"
                                : "protocol_outputs_and_main_grad_touched")))
+#endif
          << "\",\n"
          << "  \"timing\": \""
          << (options.launch_mode == LaunchMode::kGraph
@@ -1919,6 +1992,10 @@ void validate_shape(const Options& options, const RankContext& context) {
   }
 }
 
+#if FUSE_ARCH_SM103
+#include "../../sm103/backward/validation.cuh"
+#endif
+
 int run(
     const Options& options,
     RankContext& context) {
@@ -1980,6 +2057,9 @@ int run(
   MPI_CHECK(MPI_Barrier(context.local_comm));
 
   std::vector<float> data_samples;
+#if FUSE_ARCH_SM103
+  if (options.check) validate_full_backward(options, context, runtime, buffers, 0);
+#endif
   std::vector<float> weight_samples;
   std::vector<float> total_samples;
   Summary data_stats{};
@@ -2028,14 +2108,78 @@ int run(
   }
 
 #if FUSE_ENABLE_PROFILING
-  if (options.role_profile) {
-    run_backward_role_profile(
+  if (options.role_profile || options.gemm_sweep) {
+#if FUSE_ARCH_SM103
+    const bool qkv = options.operator_kind == OperatorKind::kQkv;
+    const int n = qkv ? options.hidden : projection_width;
+    const int k = qkv ? projection_width : options.hidden;
+    auto measure = [&](int tile_n, int tile_k, int epilogue_n, int swizzle, bool along_m) {
+    auto compute_only = [&](int) {
+      CUDA_CHECK(fuse::launch_backward_gemm_reference(qkv,options.m,n,k,
+          qkv ? buffers.local_intermediate : buffers.grad_output,
+          buffers.weight,buffers.grad_input,state.resolved_comm_ctas,runtime.stream,
+          tile_n,tile_k,epilogue_n,swizzle,along_m));
+    };
+    const auto samples = time_graph(options,context,runtime,1,compute_only);
+    validate_full_backward(options,context,runtime,buffers,0,options.gemm_sweep);
+    return samples;
+    };
+    if (options.gemm_sweep) {
+      // One resident MPI group and one allocation serve all candidates.
+      // Every candidate keeps the same reserved communication budget; the
+      // actual measured graph contains only the pre-materialized NN GEMM.
+      std::ofstream out;
+      if (context.rank == 0) out.open(options.json_out+".gemm-sweep.jsonl");
+      const int tiles[][3]={{128,64,0},{192,64,0},{256,64,0},{128,128,0},{256,128,32},{256,64,64}};
+      int completed=0;
+      double best=1e30;
+      for (const auto& tile : tiles) for (bool along_m : {false,true}) for (int swizzle : {1,2,4,8}) {
+        const auto samples=measure(tile[0],tile[1],tile[2],swizzle,along_m);
+        const auto stats=summarize(samples);
+        best=std::min(best,static_cast<double>(stats.p50));
+        if (context.rank==0) {
+          out << "{\"tile_n\":" << tile[0] << ",\"tile_k\":" << tile[1]
+              << ",\"epilogue_n\":" << tile[2] << ",\"swizzle\":" << swizzle
+              << ",\"along_m\":" << (along_m?"true":"false") << ",\"reserved_ctas\":"
+              << state.resolved_comm_ctas << ",\"warmup\":" << options.warmup << ",";
+          write_summary_fields(out,"compute_only",stats,samples,false);
+          out << "}\n"; out.flush();
+          std::cout << "GEMM " << ++completed << "/48 N" << tile[0] << " K" << tile[1]
+                    << " E" << tile[2] << " along=" << (along_m?"M":"N") << " sw=" << swizzle
+                    << " p50=" << stats.p50 << " p95=" << stats.p95 << " best=" << best << " ms\n" << std::flush;
+        }
+      }
+    } else {
+    const auto samples=measure(128,64,0,1,false);
+    if(context.rank==0 && !options.trace_out.empty()) {
+      std::ofstream ref(options.trace_out+".gemm.json");
+      ref << "{\"boundary\":\"pre_materialized_NN_no_ready_or_communication\","
+          << "\"warmup\":" << options.warmup << ",\"samples\":" << options.iterations
+          << ",\"reserved_ctas\":" << state.resolved_comm_ctas << ",";
+      write_summary_fields(ref,"compute_only",summarize(samples),samples,false);
+      ref << "}\n";
+      std::cout << "backward_reference p50_ms=" << summarize(samples).p50 << "\n" << std::flush;
+    }
+    }
+#endif
+    if (options.role_profile) run_backward_role_profile(
         options, context, runtime, state, epoch);
   }
 #endif
 
   if (options.check) {
+#if FUSE_ARCH_SM103
+    // A changed payload checks stale ready/data reuse outside the timed region.
+    refill_backward(options, context, runtime, buffers, 1000);
+    MPI_CHECK(MPI_Barrier(context.local_comm));
+    launch_data(options, state, ++epoch, runtime.stream);
+    launch_weight(options, state, runtime.stream);
+    CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+    MPI_CHECK(MPI_Barrier(context.local_comm));
+    validate_full_backward(options, context, runtime, buffers, 1000);
+#else
     validate_qkv_route_exact(options, context, runtime, buffers);
+#endif
     validate_protocol(options, context, runtime, buffers, epoch);
   }
 
@@ -2135,6 +2279,53 @@ int main(int argc, char** argv) {
     }
     RankContext context = initialize_rank_context();
     int result = 0;
+#if FUSE_ARCH_SM103
+    if (!options.case_matrix.empty()) {
+      std::ifstream matrix(options.case_matrix);
+      if (!matrix) throw std::runtime_error("cannot open backward case matrix");
+      std::string id, direction;
+      Options v=options;
+      int completed=0;
+      std::string line;
+      while (std::getline(matrix,line)) {
+        if (line.empty()) continue;
+        std::istringstream record(line);
+        if (!(record >> id >> direction >> v.m >> v.hidden >> v.q_heads >> v.kv_heads >> v.head_dim))
+          throw std::runtime_error("invalid backward matrix row");
+        v.gemm_tuning={}; v.gemm_policy=options.gemm_policy;
+        int tile_n=128,along_m=0;
+        if (record >> tile_n) {
+          if (!(record >> v.gemm_tuning.epilogue_n >> v.gemm_tuning.max_swizzle_size >> along_m) ||
+              (tile_n!=128 && tile_n!=256) || (along_m!=0 && along_m!=1))
+            throw std::runtime_error("invalid backward GEMM tuning row");
+          v.gemm_policy=tile_n==256?fuse::BackwardGemmPolicy::kM128N256:fuse::BackwardGemmPolicy::kM128N128;
+          v.gemm_tuning.along_m=along_m!=0;
+        }
+        v.operator_kind=direction=="qkv" ? OperatorKind::kQkv : OperatorKind::kOproj;
+        v.json_out=options.json_prefix+id+".json";
+        validate_shape(v,context);
+        const int64_t width=(v.q_heads+(direction=="qkv" ? 2*v.kv_heads : 0))*int64_t(v.head_dim);
+        int64_t elements=direction=="qkv" ? 2*v.m*width+2LL*v.m*v.hidden+2*width*v.hidden
+            : 3*v.m*width+v.m*int64_t(v.hidden)+2*width*v.hidden;
+        size_t free=0,total=0;
+        CUDA_CHECK(cudaMemGetInfo(&free,&total));
+        int available=free>static_cast<uint64_t>(2*elements+(2LL<<30)), all_available=0;
+        MPI_CHECK(MPI_Allreduce(&available,&all_available,1,MPI_INT,MPI_MIN,context.local_comm));
+        if(!all_available) {
+          if(rank==0) {
+            std::ofstream(v.json_out) << "{\"status\":\"skipped_memory_precheck\"}\n";
+            std::cout << "BACKWARD " << ++completed << " " << id << " SKIP memory\n" << std::flush;
+          }
+          continue;
+        }
+        if(rank==0) std::cout << "BACKWARD RUN " << id << "\n" << std::flush;
+        result=run(v,context);
+        if(rank==0) std::cout << "BACKWARD " << ++completed << " " << id << " DONE\n" << std::flush;
+        if(result) break;
+      }
+      if(!matrix.eof()) throw std::runtime_error("malformed backward case matrix");
+    } else
+#endif
     if (options.run_all_modes) {
       if (options.json_prefix.empty() || !options.json_out.empty()) {
         throw std::runtime_error(

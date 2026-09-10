@@ -99,7 +99,8 @@ def relay_progress(path, stop):
                                     'input_oracle,',
                                     'warmup,', 'sample,',
                                     'summary,', 'counter_epoch,', 'warning,', 'profile_resources,', 'profile_host,',
-                                    'profile_dispatch,', 'PASS:', 'fused_bf16:', 'bf16 ')):
+                                    'profile_dispatch,', 'PASS:', 'fused_bf16:', 'bf16 ',
+                                    'BACKWARD ', 'backward_validation ', 'B: p50=', 'W: p50=')):
                     print(line.rstrip(), flush=True)
             elif stop.is_set():
                 return
@@ -179,7 +180,7 @@ def fused_geometry(job):
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj'):
         raise ValueError('Invalid --fused-direction')
-    if direction != 'both' and (job.get('stage') != 'fused-smoke' or job.get('profile')):
+    if direction != 'both' and (job.get('stage') != 'fused-smoke' or (job.get('profile') and not job.get('backward'))):
         raise ValueError('--fused-direction requires non-profile fused-smoke')
     if job.get('profile') and job.get('directions') == 'oproj':
         direction = 'oproj'
@@ -292,6 +293,21 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 
 def validate_job(job, hostname=None):
+    if job.get('backward_gemm_sweep') and not (job.get('backward') and job.get('profile') and job.get('mpi')):
+        raise ValueError('Backward GEMM sweep requires isolated backward profile MPI build')
+    if job.get('backward_matrix') or job.get('backward_matrix_payload'):
+        if not job.get('backward') or not job.get('mpi') or job['stage']!='fused-smoke':
+            raise ValueError('Backward matrix requires backward MPI measurement')
+    if job.get('backward'):
+        if job['stage'] not in FUSED_STAGES or any(job.get(k) for k in ('quick','calibrate','fused_counters','auto_qkv_comm','auto_oproj_comm','compute_only','producer_only')):
+            raise ValueError('Backward baseline requires isolated build/smoke without forward tuning or diagnostics')
+        if job.get('profile') and not job.get('backward_gemm_sweep') and (not job.get('mpi') or job.get('backward_matrix') or job.get('backward_matrix_payload')):
+            raise ValueError('Backward role profiling requires one MPI case')
+        if job['stage'] == 'fused-smoke' and not job.get('mpi') and job.get('world',8) != 8:
+            raise ValueError('Shared backward smoke validates CP4 and CP8 with eight visible GPUs')
+        if job['stage'] == 'fused-smoke' and job.get('mpi'):
+            if job.get('fused_direction') not in ('qkv','oproj') or job.get('warmup',10)<10 or job.get('iterations',50)<50:
+                raise ValueError('Backward MPI requires one direction and at least 10+50')
     node = job_node(job)
     if type(job.get('auto_oproj_comm', False)) is not bool:
         raise ValueError('Automatic OProj CTA selection must be a boolean')
@@ -310,7 +326,7 @@ def validate_job(job, hostname=None):
         raise ValueError('cuBLASLt counters require one standalone Graph geometry')
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj') or (direction != 'both' and
-            (job['stage'] != 'fused-smoke' or job.get('profile'))):
+            (job['stage'] != 'fused-smoke' or (job.get('profile') and not job.get('backward')))):
         raise ValueError('--fused-direction requires non-profile fused-smoke and both/qkv/oproj')
     if job['stage'] not in STAGES:
         raise ValueError('Unknown stage')
@@ -345,12 +361,12 @@ def validate_job(job, hostname=None):
     launch = job.get('fused_launch', 'eager')
     if launch not in ('eager', 'graph'):
         raise ValueError('Fused launch must be eager or graph')
-    if launch == 'graph' and (job['stage'] != 'fused-smoke' or not job.get('mpi') or job.get('profile')):
+    if launch == 'graph' and (job['stage'] != 'fused-smoke' or not job.get('mpi') or (job.get('profile') and not job.get('backward'))):
         raise ValueError('Fused Graph requires fused-smoke --mpi without profiling')
     if job.get('mpi'):
         if job['stage'] not in FUSED_STAGES:
             raise ValueError('--mpi is only valid for fused-build/fused-smoke')
-        if job.get('profile') or job.get('host_launch_explicit') or job.get('host_launch', 'sequential') != 'sequential':
+        if (job.get('profile') and not job.get('backward')) or job.get('host_launch_explicit') or job.get('host_launch', 'sequential') != 'sequential':
             raise ValueError('MPI does not support profile or host-launch overrides')
     if job.get('oproj_layout', 'legacy') not in ('legacy', 'causal_dual_chunk_v1'):
         raise ValueError('Unknown OProj baseline layout')
@@ -413,6 +429,15 @@ def validate_job(job, hostname=None):
                                     REMOTE if hostname is not None else REPO)
     elif job.get('winners') or job.get('baseline_replay'):
         raise ValueError('--winners is only valid for baseline-replay')
+    operand_layout = job.get('gemm_operand_layout', 'nt')
+    gemm_candidates = job.get('gemm_candidates')
+    if operand_layout not in ('nt', 'nn', 'tn') or (operand_layout != 'nt' and
+            (job['stage'] != 'gemm-probe' or job.get('compare_cutlass') or
+             job.get('cutlass_counters') or job.get('cublaslt_counters'))):
+        raise ValueError('Backward operand views require standalone gemm-probe')
+    if gemm_candidates is not None and (type(gemm_candidates) is not int or
+            not 1 <= gemm_candidates <= 1024 or job['stage'] != 'gemm-probe'):
+        raise ValueError('GEMM candidates require gemm-probe and 1..1024')
     if job['stage'] == 'gemm-probe':
         matrix = job.get('gemm_matrix') or job.get('gemm_matrix_payload')
         if job.get('profile') or (not matrix and job.get('directions') not in ('qkv', 'oproj')):
@@ -948,10 +973,16 @@ def fused_build_dir(job):
             'sm103-fused-profile' if job.get('profile', False) else 'sm103-fused')
     if job.get('qkv_rank_swizzle'):
         name += '-rank-swizzle'
+    if job.get('backward'):
+        name += '-backward'
+        if job.get('mpi') and job.get('profile'):
+            name += '-profile'
     return REMOTE / 'build' / name
 
 
 def fused_binary(job):
+    if job.get('backward'):
+        return fused_build_dir(job) / ('backward_mpi_bench' if job.get('mpi') else 'backward_smoke')
     return fused_build_dir(job) / ('fused_bf16_mpi' if job.get('mpi') else 'fused_bf16')
 
 
@@ -983,6 +1014,8 @@ def fused_build_inputs(job):
     # Documentation/controller edits do not invalidate an otherwise current binary.
     selected = {name: digest for name, digest in job['files'].items()
                 if name in ('CMakeLists.txt', 'benchmarks/sm103/fused_bf16.cu') or
+                (job.get('backward') and name.startswith('benchmarks/sm90/backward/') and name.endswith('.cu')) or
+                (job.get('backward') and name.startswith('benchmarks/sm103/backward/') and name.endswith('.cuh')) or
                 (name.startswith('benchmarks/sm103/fused_') and
                  PurePosixPath(name).suffix in ('.h', '.hpp', '.cuh')) or
                 (name.startswith(('cmake/', 'include/', 'csrc/operators/sm103/')) and
@@ -1009,6 +1042,19 @@ def fused_argv(job):
         return ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_command)]
     if job['stage'] != 'fused-smoke':
         raise ValueError('Expected a fused stage')
+    if job.get('backward'):
+        if not job.get('mpi'):
+            return [str(fused_binary(job))]
+        s = fused_geometry(job)
+        argv = [str(fused_binary(job)), '--operator', job['fused_direction'],
+                '--m', str(s['seq_local']), '--hidden', str(s['hidden']),
+                '--q-heads', str(s['q_heads']), '--kv-heads', str(s['kv_heads']),
+                '--head-dim', str(s['head_dim']), '--comm-ctas', str(job.get('comm_sm') or 16),
+                '--gemm-policy', 'm128n128', '--weight-mode', 'deferred', '--weight-beta', '0',
+                '--launch', job.get('fused_launch','eager'), '--warmup', str(job.get('warmup',10)),
+                '--iterations', str(job.get('iterations',50)), '--check']
+        if job.get('causal'): argv.append('--causal-load-balanced')
+        return argv
     shape = fused_geometry(job)
     comm, qkv, oproj = fused_candidates(job)
     argv = [str(fused_binary(job)), '--world', str(shape['world'])]
@@ -1189,6 +1235,10 @@ def gemm_probe_argv(job, folder):
             '--tune-warmup', '10', '--tune-iterations', '50',
             '--library', str(REMOTE / 'build/sm103/libfuse_sm103_cublaslt.so'),
             '--output', str(folder / 'gemm-probe.json')]
+    if job.get('gemm_operand_layout', 'nt') != 'nt':
+        argv += ['--operand-layout', job['gemm_operand_layout']]
+    if job.get('gemm_candidates') is not None:
+        argv += ['--candidates', str(job['gemm_candidates'])]
     if job.get('cublaslt_sm_target') is not None:
         argv += ['--cublaslt-sm-target', str(job['cublaslt_sm_target'])]
     if job.get('gemm_sm_budget') is not None:
@@ -1558,7 +1608,30 @@ def remote(job_path):
             argv = fused_argv(job)
             if stage == 'fused-smoke':
                 check_fused_build(job, env_id, folder)
-                env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder)
+                backward_memory = None
+                if job.get('backward') and job.get('mpi'):
+                    s = fused_geometry(job)
+                    m,h = s['seq_local'],s['hidden']
+                    w = (s['q_heads']+(2*s['kv_heads'] if job['fused_direction']=='qkv' else 0))*s['head_dim']
+                    elements = 2*m*w+2*m*h+2*w*h
+                    if job['fused_direction']=='oproj': elements = 2*m*h+3*m*w+2*w*h
+                    backward_memory = dict(minimum_free_bytes=2*elements+(2<<30), note='backward live tensors plus bounded reference and 2 GiB headroom')
+                    if job.get('backward_matrix_payload'):
+                        backward_memory = dict(minimum_free_bytes=2<<30, note='per-case collective device memory checks in backward batch')
+                        fields=('id','direction','m','hidden','q_heads','kv_heads','head_dim')
+                        (folder/'backward-matrix.txt').write_text(''.join(
+                            ' '.join([str(row[k]) for k in fields]+[str(row.get('tile_n',128)),
+                                str(row.get('epilogue_n',0)),str(row.get('swizzle',1)),
+                                str(int(row.get('along_m',False)))])+'\n' for row in job['backward_matrix_payload']))
+                        argv += ['--case-matrix',str(folder/'backward-matrix.txt'),
+                                 '--json-prefix',str(folder/'backward-')]
+                    else:
+                        argv += ['--json-out',str(folder/'backward-result.json')]
+                    if job.get('backward_gemm_sweep'):
+                        argv += ['--gemm-sweep']
+                    elif job.get('profile'):
+                        argv += ['--role-profile','--trace-out',str(folder/'backward-perfetto.json')]
+                env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, memory=backward_memory)
                 env['FUSE_QKV_GEMM_POLICY'] = job.get('qkv_policy', 'auto')
                 env['FUSE_SM103_OPROJ_POLICY'] = job.get('oproj_policy', 'auto')
                 env['FUSE_SM103_OPROJ_COMM_LAYOUT'] = job.get('oproj_comm_layout', 'rows')
@@ -1604,6 +1677,13 @@ def remote(job_path):
                                    for row in shapes)
             memory = dict(minimum_free_bytes=max(8 << 30, 8 * maximum_elements + (1 << 30)),
                           guarantees_fit=False, note='Single GPU pure-GEMM diagnostic allowance')
+            if job.get('gemm_operand_layout', 'nt') != 'nt':
+                # BF16 views have no packing allocation. Row-selected checker
+                # uses only 64 rows of each operand, including long-K wgrad.
+                minimum = max(2*(r['m']*r['k']+r['n']*r['k']+r['m']*r['n']) +
+                    4*(min(64,r['m'])+min(64,r['n']))*r['k'] for r in shapes)
+                memory = dict(minimum_free_bytes=minimum+(2 << 30), guarantees_fit=False,
+                              note='BF16 zero-copy backward views and bounded checker plus 2 GiB headroom')
             selected = fused_devices(job)[:1]
             env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, selected, memory)
             write_json(folder / 'gemm-probe-contract.json', dict(
@@ -1614,6 +1694,8 @@ def remote(job_path):
                 shape=({key: shapes[0][key] for key in ('m', 'n', 'k')}
                        if not job.get('gemm_matrix_payload') else None),
                 shapes=shapes, geometry_cp=(job['world'] if not job.get('gemm_matrix_payload') else None),
+                operand_layout=job.get('gemm_operand_layout', 'nt'),
+                transpose_materialized=False, candidates_requested=job.get('gemm_candidates'),
                 measured_ranks=1, math_sms=job.get('gemm_sm_budget') or job.get('cublaslt_sm_target') or 0,
                 requested_gemm_sm_budget=job.get('gemm_sm_budget'),
                 sm_budget_enforcement=('cuda_green_context' if job.get('gemm_sm_budget') else
@@ -1743,6 +1825,7 @@ def remote(job_path):
             with tarfile.open(artifact, 'w:gz') as tar:
                 for file in folder.iterdir():
                     if file.is_file() and (file.suffix in ('.json', '.log', '.txt', '.csv') or
+                            (job.get('backward_gemm_sweep') and file.name.endswith('.gemm-sweep.jsonl')) or
                             ((job.get('cublaslt_sm_target') is not None or job.get('gemm_sm_budget'))
                              and file.name.startswith('gemm-probe-')
                              and file.name.endswith('-launch.dot')) or
@@ -1775,6 +1858,9 @@ def main():
     run.add_argument('--node', choices=tuple(NODES), default='09')
     run.add_argument('--profile', action='store_true', help='fused stages: separate instrumented build/run')
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
+    run.add_argument('--backward', action='store_true', help='reuse BF16 reverse-route harness, separate build directory')
+    run.add_argument('--backward-matrix', help='BF16 backward same-CP case list; persistent MPI ranks')
+    run.add_argument('--backward-gemm-sweep', action='store_true', help='isolated pure NN GEMM candidate sweep; production overlap unchanged')
     run.add_argument('--fused-launch', choices=('eager', 'graph'), default='eager',
                      help='fused-smoke: Graph is explicit MPI-only, with epoch preparation outside CUDA events')
     run.add_argument('--fused-direction', choices=('both', 'qkv', 'oproj'), default='both',
@@ -1840,6 +1926,10 @@ def main():
     run.add_argument('--experiment', type=identifier)
     run.add_argument('--winners', help='baseline-replay: local verified complete-group winners.json; all supplied rows replayed')
     run.add_argument('--gemm-matrix', help='gemm-probe: explicit local MNK matrix JSON, reused within one GPU process')
+    run.add_argument('--gemm-operand-layout', choices=('nt', 'nn', 'tn'), default='nt',
+                     help='gemm-probe: forward NT, backward dgrad NN or wgrad TN zero-copy operands')
+    run.add_argument('--gemm-candidates', type=int,
+                     help='gemm-probe: explicit cuBLASLt candidate limit (default unchanged)')
     run.add_argument('--compare-cutlass', action='store_true',
                      help='gemm-probe BF16/eager matrix: independent stock 1-SM/2-SM/Lt diagnostic, not fused reference')
     run.add_argument('--cutlass-swizzle-size', type=int, choices=(1, 2, 4, 8),
@@ -1905,6 +1995,26 @@ def main():
         return remote(args.job_path)
     if args.action == 'run':
         validate_job(vars(args))
+        backward_payload = None
+        if args.backward_matrix:
+            backward_payload=json.loads(Path(args.backward_matrix).read_text())
+            if not isinstance(backward_payload,list) or not 1<=len(backward_payload)<=256:
+                raise ValueError('Backward matrix must contain 1..256 cases')
+            seen=set()
+            for row in backward_payload:
+                if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,160}',row.get('id','')) or row['id'] in seen:
+                    raise ValueError('Invalid or duplicate backward case ID')
+                seen.add(row['id'])
+                if row.get('direction') not in ('qkv','oproj'):
+                    raise ValueError('Invalid backward direction')
+                if (row.get('tile_n',128) not in (128,256) or row.get('epilogue_n',0) not in (0,64) or
+                    (row.get('epilogue_n',0)==64 and row.get('tile_n',128)!=256) or
+                    row.get('swizzle',1) not in (1,2,4,8) or type(row.get('along_m',False)) is not bool):
+                    raise ValueError('Invalid backward GEMM tuning')
+                if any(type(row.get(k)) is not int or not 0<row[k]<1<<30 for k in ('m','hidden','q_heads','kv_heads','head_dim')):
+                    raise ValueError('Invalid backward geometry')
+                fused_geometry(vars(args)|dict(seq_local=row['m'],global_seq=None,
+                    fused_direction=row['direction'],**{k:row[k] for k in ('hidden','q_heads','kv_heads','head_dim')}))
         replay_payload = load_replay_winners(args.winners, args.devices) if args.stage == 'baseline-replay' else None
         gemm_payload = (validate_gemm_matrix(json.loads(Path(args.gemm_matrix).read_text()))
                         if args.gemm_matrix else None)
@@ -1925,6 +2035,9 @@ def main():
         if gemm_payload is not None:
             job.pop('gemm_matrix', None)
             job['gemm_matrix_payload'] = gemm_payload
+        if backward_payload is not None:
+            job.pop('backward_matrix',None)
+            job['backward_matrix_payload']=backward_payload
         write_json(folder / 'job.json', job)
         shutil.copy2(__file__, folder / 'runner.py')
         print(json.dumps({k: job[k] for k in ('run_id', 'node', 'stage', 'experiment', 'source_id')}, indent=2))

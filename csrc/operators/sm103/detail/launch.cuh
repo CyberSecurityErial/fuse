@@ -98,6 +98,7 @@ cudaError_t visit_oproj_forward_policy(OprojGemmPolicy policy, Visitor& visitor)
 // The geometry is the actual producer-ready tile, not the MMA atom or cluster.
 template <class GemmTypes, class CommType>
 struct GemmA2AKernelBinding {
+  using Types = GemmTypes;
   using Gemm = typename GemmTypes::OutputGemm;
   using Comm = CommType;
   using TileShape = typename Gemm::TileShape;

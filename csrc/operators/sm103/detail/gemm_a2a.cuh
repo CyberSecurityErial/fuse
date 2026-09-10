@@ -54,8 +54,8 @@ struct QkvGqaPackCommT {
   using SM100_BULK_COPY_S2G = cute::SM90_BULK_COPY_S2G;
   using CommElement = std::remove_cv_t<std::remove_pointer_t<
       decltype(ParamsType{}.local_output)>>;
-  static_assert(std::is_same_v<ParamsType, GemmA2AParams>,
-                "SM103 currently implements BF16 QKV projection parameters.");
+  static constexpr bool kHeadOnly = std::is_same_v<ParamsType, OprojBackwardKernelParams>;
+  static_assert(std::is_same_v<ParamsType, GemmA2AParams> || kHeadOnly);
   static_assert(std::is_same_v<CommElement, Bf16>);
   static constexpr int32_t kBlockM = BlockM;
   static constexpr int32_t kBlockN = BlockN;
@@ -113,6 +113,15 @@ struct QkvGqaPackCommT {
     const auto& route = p.route;
     const int32_t batch = source_row / route.seq_local;
     const int32_t local_sequence = source_row - batch * route.seq_local;
+    if constexpr (kHeadOnly) {
+      if (route.causal_load_balanced) {
+        const int32_t half = route.seq_local / 2;
+        const int32_t chunk = local_sequence < half
+            ? route.rank : 2 * route.world_size - route.rank - 1;
+        return static_cast<int64_t>(batch) * route.global_seq +
+            chunk * half + local_sequence % half;
+      }
+    }
     const int32_t sequence_begin = route.rank * route.seq_local;
     return static_cast<int64_t>(batch) * route.global_seq +
         sequence_begin + local_sequence;
@@ -167,6 +176,10 @@ struct QkvGqaPackCommT {
 
     args.use_tma_store = p.gemm.m % kQkvBulkRows == 0 &&
         p.route.seq_local % kQkvBulkRows == 0;
+    if constexpr (kHeadOnly) {
+      if (p.route.causal_load_balanced && (p.route.seq_local / 2) % kQkvBulkRows)
+        args.use_tma_store = false;
+    }
     if (!args.use_tma_store) {
       return cudaSuccess;
     }
@@ -179,7 +192,7 @@ struct QkvGqaPackCommT {
     FUSE_SM103_HOST_DESCRIPTOR_SCOPE(peer_descriptors, 1);
     for (int32_t peer = 0; peer < p.route.world_size; ++peer) {
       const int32_t descriptor_count =
-          p.route.defer_v_a2a ? 1 : 3;
+          kHeadOnly || p.route.defer_v_a2a ? 1 : 3;
       for (int32_t segment = 0; segment < descriptor_count; ++segment) {
         const int32_t segment_width = p.route.defer_v_a2a
             ? q_local_width + kv_local_width
@@ -230,18 +243,22 @@ struct QkvGqaPackCommT {
     if (route.world_size <= 0 || route.world_size > kMaxWorldSize ||
         route.rank < 0 || route.rank >= route.world_size || route.batch <= 0 ||
         route.seq_local <= 0 || route.global_seq <= 0 || route.q_heads <= 0 ||
-        route.kv_heads <= 0 || route.head_dim <= 0 || p.num_comm_ctas <= 0 ||
-        p.epoch == 0 || !supported_problem(p.gemm) ||
-        route.kind != RouteKind::kQkvGqaPack ||
+        (kHeadOnly ? route.kv_heads != 0 || route.defer_v_a2a : route.kv_heads <= 0) ||
+        route.head_dim <= 0 || p.num_comm_ctas <= 0 ||
+        p.epoch == 0 || !(kHeadOnly ? supported_transpose_b_problem(p.gemm) : supported_problem(p.gemm)) ||
+        route.kind != (kHeadOnly ? RouteKind::kHeadToSequence : RouteKind::kQkvGqaPack) ||
         route.direction != RouteDirection::kForward || route.channel_count != 1 ||
         route.cyclic_peer_order || route.packed_source_row ||
         route.packed_row_granularity != 0 ||
         (p.completion_epoch && !route.defer_v_a2a) ||
         route.qkv_peer_interleaved != PeerInterleaved ||
         (route.qkv_peer_interleaved && p.gemm.raster == GemmRaster::kAlongN) ||
-        route.q_heads % route.kv_heads != 0 || route.q_heads % route.world_size != 0 ||
+        (!kHeadOnly && route.q_heads % route.kv_heads != 0) || route.q_heads % route.world_size != 0 ||
         route.kv_heads % route.world_size != 0 || route.head_dim % kCommAlignment != 0) {
       return false;
+    }
+    if constexpr (kHeadOnly) {
+      if (route.causal_load_balanced && route.seq_local % 2) return false;
     }
     if (static_cast<int64_t>(route.seq_local) * route.world_size != route.global_seq ||
         static_cast<int64_t>(route.batch) * route.seq_local != p.gemm.m ||
@@ -761,7 +778,8 @@ using QkvGqaPackCommWide = QkvGqaPackCommT<
 using QkvGqaPackComm = QkvGqaPackCommSmall;
 
 #if FUSE_ENABLE_PROFILING
-template <class GemmKernel, class CommOp, bool OrderedRoleTimestamp = false>
+template <class GemmKernel, class CommOp, bool OrderedRoleTimestamp = false,
+          bool RouteDetail = true>
 struct GemmA2ARoleTelemetryKernel
     : detail::MonolithicGemm<GemmKernel, CommOp> {
   using BaseKernel = detail::MonolithicGemm<GemmKernel, CommOp>;
@@ -832,9 +850,13 @@ struct GemmA2ARoleTelemetryKernel
 
     const bool is_comm = cta < params.num_comm_ctas;
     if (is_comm) {
+      if constexpr (RouteDetail) {
       if (params.route_timeline) {
         CommOp{}.template run<true>(params.comm, smem, cta,
             params.num_comm_ctas, true, params.route_timeline);
+      } else {
+        CommOp{}(params.comm, smem, cta, params.num_comm_ctas);
+      }
       } else {
         CommOp{}(params.comm, smem, cta, params.num_comm_ctas);
       }

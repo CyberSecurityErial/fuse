@@ -1,5 +1,19 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v19.0 — SM103 BF16 前向与反向基线
+
+交付 QKVProj / OProj 的 BF16 前向与反向入口。前向沿用 v18；新增真实反向
+路由、NN 数据梯度及 TN 本地权重梯度，复用 persistent kernel、CTA 分工和
+全局 ready 同步。逐 shape 的 GEMM 优胜参数通过显式接口接入，不统一参数。
+
+Graph 10+50，新旧融合对照23逻辑点数值/路由校验通过；15点成对稳定，
+几何平均提升19.64%，8点仍漂移。显存缺测、特殊路由 TODO 和退化点均保留。
+本地 dW 不包含跨 CP 归约；不将此版本称为所有 attention 路由已适配。
+MXFP8 留待后续版本，取消交付的 QKV 前向 autotune 未混入。
+
+[反向使用说明](benchmarks/sm103/backward/README.md) ·
+[完整结果与测量边界](results/sm103/v19.0/README.md)
+
 ## v18.0 — SM103 OProj 运行时通信 CTA autotune
 
 以独立 GEMM/COPY 标定和实际生产消费队列预测通信预算，不使用模型名或逐

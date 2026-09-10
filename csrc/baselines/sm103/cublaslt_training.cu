@@ -202,10 +202,10 @@ extern "C" int sm103_quantize(int precision,const void* x,void* y,void* scales,
     ck(cudaGetLastError());return 0;
   } catch(const std::exception& e) {error=e.what();return -1;}
 }
-extern "C" void* sm103_create(int precision,int64_t m,int64_t n,int64_t k,
+extern "C" void* sm103_create_strided(int precision,int64_t m,int64_t n,int64_t k,
     const void* x,const void* w,void* y,const void* xscale,const void* wscale,
     void* stream_ptr,int candidates,int workspace_mib,int warmup,int iters,
-    int graph,int math_sms,float beta) {
+    int graph,int math_sms,float beta,int transpose_x,int transpose_w) {
   try {
     if(m<=0||n<=0||k<=0||candidates<1||candidates>1024||iters<1||warmup<0||workspace_mib<0)
       throw std::runtime_error("invalid tuning arguments");
@@ -213,8 +213,15 @@ extern "C" void* sm103_create(int precision,int64_t m,int64_t n,int64_t k,
     auto stream=(cudaStream_t)stream_ptr;
     cudaDataType_t dtype=precision==16?CUDA_R_16BF:precision==8?CUDA_R_8F_E4M3:CUDA_R_4F_E2M1;
     if(precision!=16&&precision!=8&&precision!=4) throw std::runtime_error("precision must be 16,8,4");
+    if ((transpose_x != 0 && transpose_x != 1) || (transpose_w != 0 && transpose_w != 1) ||
+        (precision != 16 && (transpose_x || transpose_w)))
+      throw std::runtime_error("transpose views require BF16 operands");
     ck(cublasLtCreate(&p->handle)); ck(cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F));
-    cublasOperation_t ta=CUBLAS_OP_T,tb=CUBLAS_OP_N;
+    // Row-major Y = X * W^T becomes column-major Y^T = W * X^T.
+    // Backward accepts zero-copy transpose views, never a timed/offline copy:
+    // dX: X=dY contiguous, W=forward_weight.T; dW: X=dY.T, W=saved_X.T.
+    cublasOperation_t ta=transpose_w?CUBLAS_OP_N:CUBLAS_OP_T;
+    cublasOperation_t tb=transpose_x?CUBLAS_OP_T:CUBLAS_OP_N;
     ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSA,&ta,sizeof(ta)));
     ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_TRANSB,&tb,sizeof(tb)));
     if(math_sms>0) ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,&math_sms,sizeof(math_sms)));
@@ -228,8 +235,8 @@ extern "C" void* sm103_create(int precision,int64_t m,int64_t n,int64_t k,
       int8_t fast_accum=0;
       ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_FAST_ACCUM,&fast_accum,sizeof(fast_accum)));
     }
-    ck(cublasLtMatrixLayoutCreate(&p->a,dtype,k,n,k));
-    ck(cublasLtMatrixLayoutCreate(&p->b,dtype,k,m,k));
+    ck(cublasLtMatrixLayoutCreate(&p->a,dtype,transpose_w?n:k,transpose_w?k:n,transpose_w?n:k));
+    ck(cublasLtMatrixLayoutCreate(&p->b,dtype,transpose_x?m:k,transpose_x?k:m,transpose_x?m:k));
     ck(cublasLtMatrixLayoutCreate(&p->c,CUDA_R_16BF,n,m,n));
     ck(cublasLtMatrixLayoutCreate(&p->d,CUDA_R_16BF,n,m,n));
     p->capacity=size_t(workspace_mib)<<20;
@@ -267,8 +274,18 @@ extern "C" void* sm103_create(int precision,int64_t m,int64_t n,int64_t k,
        <<",\"returned\":"<<returned<<",\"valid\":"<<valid<<",\"rejected\":"<<rejected
        <<",\"graph_tuning\":"<<graph
        <<",\"workspace_capacity\":"<<p->capacity<<",\"math_sms\":"<<math_sms
-       <<",\"beta\":"<<beta<<",\"best_ms\":"<<best<<",\"algorithm\":"
+       <<",\"beta\":"<<beta<<",\"transpose_x\":"<<transpose_x<<",\"transpose_w\":"<<transpose_w
+       <<",\"best_ms\":"<<best<<",\"algorithm\":"
        <<attr(p->winner,CUBLASLT_ALGO_CONFIG_ID)<<",\"candidates\":"<<records.str()<<"]}";
     p->info=info.str();return p.release();
   } catch(const std::exception& e) {error=e.what();return nullptr;}
+}
+
+// Preserve the original contiguous-operand ABI used by published forward baselines.
+extern "C" void* sm103_create(int precision,int64_t m,int64_t n,int64_t k,
+    const void* x,const void* w,void* y,const void* xscale,const void* wscale,
+    void* stream_ptr,int candidates,int workspace_mib,int warmup,int iters,
+    int graph,int math_sms,float beta) {
+  return sm103_create_strided(precision,m,n,k,x,w,y,xscale,wscale,stream_ptr,
+      candidates,workspace_mib,warmup,iters,graph,math_sms,beta,0,0);
 }

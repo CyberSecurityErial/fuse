@@ -27,4 +27,14 @@ enum class BackwardGemmPolicy : int32_t {
   kM128N64ClusterM2 = 6,
 };
 
+#if FUSE_ARCH_SM103
+// Explicit per-GEMM tuning, independent of the communication budget. Defaults
+// preserve the initial backward baseline; callers own offline shape selection.
+struct BackwardGemmTuning {
+  int32_t epilogue_n = 0;
+  int32_t max_swizzle_size = 1;
+  bool along_m = false;
+};
+#endif
+
 }  // namespace fuse

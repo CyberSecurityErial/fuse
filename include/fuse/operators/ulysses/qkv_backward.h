@@ -40,6 +40,9 @@ struct QkvBackwardDataParams {
   int32_t rank = 0;
   int32_t num_comm_ctas = 0;
   BackwardGemmPolicy gemm_policy = BackwardGemmPolicy::kAuto;
+#if FUSE_ARCH_SM103
+  BackwardGemmTuning gemm_tuning{};
+#endif
   uint32_t epoch = 0;
   bool causal_load_balanced = false;
   float alpha = 1.0f;
