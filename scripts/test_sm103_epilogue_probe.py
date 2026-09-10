@@ -41,7 +41,7 @@ class EpilogueProbeContracts(unittest.TestCase):
         begin = ordering.index('template <int M, int N>\nstruct PublishedTile')
         published_tile = ordering[begin:ordering.index('\n};', begin) + len('\n};')]
         source = r'''
-#include "csrc/operators/sm103/detail/epilogue_profiling.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -173,7 +173,7 @@ int main(int argc,char** argv) {
         forward = (ROOT / 'csrc/operators/sm103/api/forward.cuh').read_text()
         entries = forward[forward.index('namespace detail {'):forward.index('}  // namespace detail')]
         cls.entry_probe = cls.compile(r'''
-#include "csrc/operators/sm103/detail/epilogue_profiling.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -351,7 +351,7 @@ int main(int argc,char** argv) {
         # stand-in. This checks dispatch/control flow only: CUDA reduction and
         # timer ordering must still be checked in actual SASS and on the GPU.
         probe = self.compile(r'''
-#include "csrc/operators/sm103/detail/epilogue_profiling.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -437,8 +437,8 @@ int main() {
 
     def test_macro_off_private_header_has_no_record_or_entry(self):
         result = subprocess.run([*self.compiler, '-std=c++17', '-DFUSE_ENABLE_PROFILING=0',
-            '-I', str(ROOT), '-E', '-P', '-x', 'c++', '-'],
-            input='#include "csrc/operators/sm103/detail/epilogue_profiling.cuh"\n',
+            '-I', str(ROOT / 'include'), '-E', '-P', '-x', 'c++', '-'],
+            input='#include "fuse/profiling/sm103/epilogue.cuh"\n',
             text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('QkvEpilogue', result.stdout)

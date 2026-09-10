@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v19.0
+        default: v19.1
 
 permissions:
   contents: write
@@ -27,9 +27,18 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v19.0");
+              : (process.env.REQUESTED_TAG || "v19.1");
 
             const releases = {
+              "v19.1": {
+                name: "v19.1 — SM103 profiling code cleanup",
+                body: [
+                  "Code-organization release on top of v19.0. Moves SM103 host, OProj pipeline and QKV epilogue profiling support from csrc/operators/sm103/detail to include/fuse/profiling/sm103/{host,oproj,epilogue}.cuh.",
+                  "Updates operator, benchmark and test includes; removes the old private header paths without duplicate compatibility shims. Profiling record layouts, instrumentation logic, namespaces, kernel algorithms and tuning defaults are unchanged. SM90 and cancelled QKV-autotune experiments are not part of this change.",
+                  "Host regression suite: 616 tests, five skipped. Header bodies were checked against v19.0 apart from a directory-scope comment. CUDA compilation and GPU performance were not rerun for this relocation.",
+                  "Reuses the final benchmark tables and configurations in results/sm103/v19.0 without duplicating archives or claiming new measurements. Existing coverage limitations remain unchanged.",
+                ].join("\n"),
+              },
               "v19.0": {
                 name: "v19.0 — SM103 BF16 forward and backward baseline",
                 body: [

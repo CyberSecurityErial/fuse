@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+// SM103-specific diagnostics; shared profiling records remain one directory up.
+
 // Opt-in OProj pipeline diagnostics. No production ready granularity, MMA
 // schedule, or synchronization changes. The harness samples GPU0 and three
 // persistent workers only; records belong to logical (M,N,K), not clock bins.

@@ -1090,5 +1090,27 @@ class QkvFamilyContractTests(unittest.TestCase):
             self.assertEqual(2 * TILE_K * (TILE_M + n), raw_stage_kib * 1024)
 
 
+class ProfilingLayoutContracts(unittest.TestCase):
+    def test_sm103_diagnostics_live_under_shared_profiling_tree(self):
+        for name in ("host", "oproj", "epilogue"):
+            header = ROOT / "include/fuse/profiling/sm103" / f"{name}.cuh"
+            self.assertTrue(header.is_file(), str(header))
+            old = ROOT / "csrc/operators/sm103/detail" / f"{name}_profiling.cuh"
+            self.assertFalse(old.exists(), "Do not retain duplicate private headers")
+
+    def test_disabled_host_and_oproj_headers_compile_without_cuda_or_cutlass(self):
+        compiler = shlex.split(os.environ.get("CXX", "c++"))
+        if not compiler or shutil.which(compiler[0]) is None:
+            self.skipTest("a host C++ compiler is required")
+        source = "\n".join(
+            f'#include "fuse/profiling/sm103/{name}.cuh"'
+            for name in ("host", "oproj"))
+        result = subprocess.run(
+            [*compiler, "-std=c++17", "-DFUSE_ENABLE_PROFILING=0",
+             "-I", str(ROOT / "include"), "-x", "c++", "-fsyntax-only", "-"],
+            input=source, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

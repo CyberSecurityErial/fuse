@@ -1436,7 +1436,7 @@ int main(int argc, char** argv) {
         route_header = (ROOT / "include/fuse/profiling/qkv_route.cuh").read_text()
         route_record = route_header[route_header.index("struct QkvRouteTimeline {"):
                                     route_header.index("\ncudaError_t")]
-        pipeline_header = (ROOT / "csrc/operators/sm103/detail/oproj_profiling.cuh").read_text()
+        pipeline_header = (ROOT / "include/fuse/profiling/sm103/oproj.cuh").read_text()
         pipeline_records = pipeline_header[pipeline_header.index("struct OprojReadyRecord {"):
                                            pipeline_header.index("// Bind only on the host")]
         profile_probe = (header + '\nnamespace fuse {\n' + route_record + '}\n' +
@@ -1614,11 +1614,11 @@ class HostStageContracts(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.header_dir = ROOT / "csrc/operators/sm103/detail"
+        cls.header_dir = ROOT / "include"
         entry = (ROOT / "csrc/operators/sm103/entry.cu").read_text()
         start = entry.index("namespace fuse::detail {\nthread_local HostLaunchRecord*")
         definition = entry[start:entry.index("#endif", start)]
-        support = ('#include "host_profiling.cuh"\n'
+        support = ('#include "fuse/profiling/sm103/host.cuh"\n'
                    'namespace fuse::detail { struct OprojPipelineView; }\n') + definition + r"""
 void record_stages(int status) {
   FUSE_SM103_HOST_BEGIN();
@@ -1654,7 +1654,7 @@ void record_stages(int status) {
         if result.returncode:
             raise AssertionError(result.stderr)
         source = r"""
-#include "host_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -1717,7 +1717,7 @@ int main(int argc, char** argv) {
         cls.probe = compile_host_probe(cls, source, "host-stage-tls", "-pthread",
             "-DFUSE_ENABLE_PROFILING=1", "-I", str(cls.header_dir), str(cls.support_object))
         disabled = r"""
-#include "host_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
 int operation() {
   FUSE_SM103_HOST_BEGIN();
   FUSE_SM103_HOST_MARK(intentionally_undefined_stage);
@@ -1735,7 +1735,7 @@ int main() { return operation(); }
         timing = harness[harness.index("struct HostLaunchTiming {"):
                          harness.index("\nstruct RankLaunch {")]
         collector = r"""
-#include "host_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -1809,7 +1809,7 @@ int main(int argc, char** argv) {
         enqueue = harness[harness.index("struct HostLaunchTiming {"):
                           harness.index("\nvoid cublas_nt(")]
         launch_probe = r"""
-#include "host_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
 #include "fused_launch.cuh"
 #include <array>
 #include <chrono>

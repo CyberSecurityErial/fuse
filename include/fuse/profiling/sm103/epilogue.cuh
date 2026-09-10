@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+// SM103-specific diagnostics; shared profiling records remain one directory up.
+
 // Private, opt-in QKV diagnostics. Public timeline layouts and production
 // launch arguments are unchanged. Never publish these timings as MPI results.
 #if FUSE_ENABLE_PROFILING

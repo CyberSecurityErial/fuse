@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "fuse/operators/primitives/a2a_gemm.h"
 #include "fuse/operators/primitives/gemm_a2a.h"
-#include "detail/host_profiling.cuh"
-#include "detail/oproj_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
+#include "fuse/profiling/sm103/oproj.cuh"
 
 #if FUSE_ENABLE_PROFILING
 namespace fuse::detail {

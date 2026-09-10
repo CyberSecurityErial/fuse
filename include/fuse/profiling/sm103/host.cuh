@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+// SM103-specific diagnostics; shared profiling records remain one directory up.
+
 // Private host diagnostics. Nothing is declared or executed in production
 // builds; enabled builds record only when the owning launch thread binds a sink.
 #if FUSE_ENABLE_PROFILING

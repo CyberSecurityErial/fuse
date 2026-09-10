@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "host_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
 #include "producer_consumer.cuh"
 
 // Blackwell scheduling, CTA roles, and cooperative launch resources.

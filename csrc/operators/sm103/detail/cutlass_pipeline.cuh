@@ -37,8 +37,8 @@
 #include "fuse/types.h"
 #if FUSE_ENABLE_PROFILING
 #include "fuse/profiling/timeline.cuh"
-#include "epilogue_profiling.cuh"
-#include "oproj_profiling.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
+#include "fuse/profiling/sm103/oproj.cuh"
 #endif
 
 #include <cute/tensor.hpp>

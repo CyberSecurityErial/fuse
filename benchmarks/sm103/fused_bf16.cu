@@ -11,9 +11,9 @@
 #include "fused_graph.cuh"
 #endif
 #if FUSE_ENABLE_PROFILING
-#include "../../csrc/operators/sm103/detail/host_profiling.cuh"
-#include "../../csrc/operators/sm103/detail/epilogue_profiling.cuh"
-#include "../../csrc/operators/sm103/detail/oproj_profiling.cuh"
+#include "fuse/profiling/sm103/host.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
+#include "fuse/profiling/sm103/oproj.cuh"
 #endif
 
 #include <cublas_v2.h>

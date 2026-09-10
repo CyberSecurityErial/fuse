@@ -1,5 +1,15 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v19.1 — SM103 profiling 代码整理
+
+将 SM103 的 host、OProj pipeline、QKV epilogue profiling 支持统一放到
+[`include/fuse/profiling/sm103/`](include/fuse/profiling/sm103)，移除旧私有路径，
+同步更新算子、benchmark 和测试引用。仅整理目录，不改变打点逻辑、算子算法
+或调优默认值，不包含未发布的 QKV autotune 实验。
+
+主机回归 616 项、5 项跳过；本次未重跑 CUDA 编译或 GPU 测量。
+性能数据继续引用 [v19.0 最终结果](results/sm103/v19.0/README.md)，不复制归档。
+
 ## v19.0 — SM103 BF16 前向与反向基线
 
 交付 QKVProj / OProj 的 BF16 前向与反向入口。前向沿用 v18；新增真实反向

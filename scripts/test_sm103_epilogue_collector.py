@@ -43,7 +43,7 @@ class EpilogueCollectorContracts(unittest.TestCase):
         begin = harness.index("void profile_qkv_epilogue(")
         collector = harness[begin:harness.index("void profile_host_stages(", begin)]
         source = r'''
-#include "csrc/operators/sm103/detail/epilogue_profiling.cuh"
+#include "fuse/profiling/sm103/epilogue.cuh"
 #include <algorithm>
 #include <cstring>
 #include <iostream>
