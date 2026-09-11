@@ -9,6 +9,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/arch/arch.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/float_subbyte.h>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/layout/matrix.h>
@@ -112,7 +113,7 @@ template <int BlockN, int BlockK = 64, int EpilogueN = 0,
           class InputLayout = LayoutA, class WeightLayout = LayoutB,
           class ResidualElement = void>
 struct Bf16GemmTypes {
-  // Precision-specific family, not a generic BF16-versus-FP8 branch. A future
+  // Precision-specific family, not a generic BF16-versus-FP8 branch. A
   // block-scaled family needs its actual operand/scale contract and CUTLASS
   // collective; changing Element or alpha alone would not implement it.
   using Element = Bf16;
@@ -185,6 +186,51 @@ struct Bf16GemmTypes {
                  PureGemm::AccumulatorPipelineStageCount == 2),
                 "E64 must retain two D buffers and two TMEM accumulator stages");
 };
+
+inline bool supported_mxfp8_problem(const GemmProblem& p) {
+  // Geometry/strides retain the projection contract; MXFP8 storage is explicit.
+  return supported_problem(p) && p.k % 128 == 0;
+}
+
+template <int BlockN = 256, int BlockK = 128, int EpilogueN = 64, int Stages = 0>
+struct Mxfp8GemmFamily {
+  using Input = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using TileShape = cute::Shape<cute::_128, cute::Int<BlockN>, cute::Int<BlockK>>;
+  using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, TileShape, ClusterShape,
+      cute::Shape<cute::_128, cute::Int<EpilogueN>>, float, float,
+      void, LayoutD, kAlignment, Bf16, LayoutD, kAlignment,
+      cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
+  using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, Input, LayoutA, 16, Input, LayoutB, 16,
+      float, TileShape, ClusterShape,
+      cute::conditional_t<Stages == 0,
+          cutlass::gemm::collective::StageCountAutoCarveout<
+              static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+          cutlass::gemm::collective::StageCount<Stages>>,
+      cutlass::gemm::KernelTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+  using OutputGemm = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, detail::WeightReadyMainloop<Mainloop>, detail::SignalingEpilogue<Epilogue, TileShape>,
+      detail::MonolithicPersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
+  using ServiceGemm = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, detail::Mxfp8ServiceMainloop<Mainloop>,
+      detail::Mxfp8ServiceEpilogue<Epilogue, TileShape>, detail::MonolithicPersistentScheduler>;
+#endif
+  using PureGemm = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, Mainloop, Epilogue, detail::MonolithicPersistentScheduler>;
+  static_assert(cute::size(typename Mainloop::AtomThrShapeMNK{}) == 1);
+  static_assert(OutputGemm::MaxThreadsPerBlock == 256);
+  // TODO: independently tune MXFP8 tile/epilogue and compute/route services.
+  // The first baseline uses explicit communication/raster/swizzle settings;
+  // BF16 service curves must not silently drive MXFP8 decisions.
+};
+
+// Production remains exactly the original collective. Independent GEMM
+// searches may instantiate the family without changing quantization/route
+// geometry or publishing their winners into the fused path implicitly.
+using Mxfp8GemmTypes = Mxfp8GemmFamily<>;
 
 #if FUSE_ENABLE_PROFILING
 // One explicitly bounded probe, not a new production policy or a second

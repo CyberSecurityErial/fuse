@@ -1,5 +1,26 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v20.0 — SM103 MXFP8 QKVProj 前向与离线通信 Auto
+
+新增已量化 MXFP8 activation + BF16 master weight 的 QKVProj→A2A：持久化
+kernel 内量化权重，MXFP8 E4M3/UE8M0、FP32 累加、BF16 输出及通信。
+K32 块量化与完整 panel ready，通信 CTA 同时推进量化和路由。
+上游 activation 量化不计入该融合边界；BF16 与 SM90 既有实现保留。
+
+固定已调 GEMM tile/epilogue/raster/swizzle，`num_comm_ctas=0` 从独立计算与
+量化/通信服务做离线主机选优；正值严格手动覆盖。无在线试跑、模型名特判、
+融合赢家反拟合；未标定布局明确不支持，不声称任意 shape 自动泛化。
+
+33 个已适配物理点全部 Graph 10+50、双 payload 完整数值/路由验收。
+相对同场重放手工最优配置，Auto 几何平均 **96.69%**、最低 **90.09%**；
+256K/512K holdout 为 **97.33%**。最低点接近验收边界；对历史原值的
+QwenDense CP4/512K 仍只有 **88.39%**，两种比较分开保留。
+
+[最终表、独立手工最优与纯 cuBLASLt](results/sm103/v20.0/README.md) ·
+[接口、离线规则及适用域](benchmarks/sm103/README.md#mxfp8-qkv-communication-autotune)
+
+本版本不包含 MXFP8 OProj 或反向。Kimi 仅 QKV-only，Qwen3 CP8 特殊路由未适配。
+
 ## v19.1 — SM103 profiling 代码整理
 
 将 SM103 的 host、OProj pipeline、QKV epilogue profiling 支持统一放到

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "fuse/operators/primitives/a2a_gemm.h"
 #include "fuse/operators/primitives/gemm_a2a.h"
+#include "fuse/operators/primitives/gemm_a2a_mxfp8.h"
 #include "fuse/profiling/sm103/host.cuh"
 #include "fuse/profiling/sm103/oproj.cuh"
 
@@ -16,11 +17,13 @@ thread_local const OprojPipelineView* oproj_pipeline_sink = nullptr;
 #include "detail/cutlass_pipeline.cuh"
 #include "detail/persistent_gemm.cuh"
 #include "detail/gemm.cuh"
+#include "detail/quantization.cuh"
 #include "detail/a2a_gemm.cuh"
 #include "detail/gemm_a2a.cuh"
 #include "detail/backward.cuh"
 #include "detail/launch.cuh"
 #include "api/policy.cuh"
 #include "api/forward.cuh"
+#include "api/forward_mxfp8.cuh"
 #include "api/reference.cuh"
 #include "api/backward.cuh"

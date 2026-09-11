@@ -39,6 +39,7 @@
 #include "fuse/profiling/timeline.cuh"
 #include "fuse/profiling/sm103/epilogue.cuh"
 #include "fuse/profiling/sm103/oproj.cuh"
+#include "fuse/profiling/sm103/mxfp8.cuh"
 #endif
 
 #include <cute/tensor.hpp>
@@ -67,7 +68,130 @@ CUTLASS_DEVICE void wait_acquire_system_single_lane(const uint32_t* flag, uint32
   while (load_acquire_system(flag) < target) __nanosleep(64);
 }
 
+// Weight producers quantize a complete N panel across K once, then publish
+// it for every M tile that reuses it. This is ONE acquire per new N panel,
+// not a ready check at each 32-element quantization group or MMA K iteration.
+// Both CUTLASS load calls (prologue/remainder) retain the same acquired panel.
+template <class Base>
+struct WeightReadyMainloop : Base {
+  struct Arguments : Base::Arguments {
+    const uint32_t* weight_ready = nullptr;
+    int weight_panels = 0;
+    uint32_t weight_epoch = 0;
 #if FUSE_ENABLE_PROFILING
+    Mxfp8ProfileView weight_probe{};
+#endif
+  };
+  struct Params : Base::Params {
+    const uint32_t* weight_ready = nullptr;
+    int weight_panels = 0;
+    uint32_t weight_epoch = 0;
+#if FUSE_ENABLE_PROFILING
+    Mxfp8ProfileView weight_probe{};
+#endif
+  };
+  template <class Problem>
+  static Params to_underlying_arguments(const Problem& problem, const Arguments& args,
+      void* workspace, const cutlass::KernelHardwareInfo& hardware = {}) {
+    Params p{};
+    static_cast<typename Base::Params&>(p) = Base::to_underlying_arguments(
+        problem, static_cast<const typename Base::Arguments&>(args), workspace, hardware);
+    p.weight_ready = args.weight_ready;
+    p.weight_panels = args.weight_panels;
+    p.weight_epoch = args.weight_epoch;
+#if FUSE_ENABLE_PROFILING
+    p.weight_probe = args.weight_probe;
+#endif
+    return p;
+  }
+  template <class Problem>
+  static bool can_implement(const Problem& problem, const Arguments& args) {
+    return (!args.weight_ready || (args.weight_panels > 0 && args.weight_epoch > 0)) &&
+        Base::can_implement(problem, static_cast<const typename Base::Arguments&>(args));
+  }
+  using Cluster = typename Base::DispatchPolicy::ClusterShape;
+  CUTLASS_DEVICE WeightReadyMainloop(const Params& p, Cluster cluster, uint32_t rank)
+      : Base(static_cast<const typename Base::Params&>(p), cluster, rank), params_(&p) {}
+  template <class LoadParams, class TileCoord, class KIterator>
+  CUTLASS_DEVICE auto load(typename Base::MainloopPipeline pipeline,
+      typename Base::MainloopPipelineState state, const LoadParams& inputs,
+      const TileCoord& tile, KIterator k, int count) {
+    const int n = static_cast<int>(cute::get<1>(tile));
+    if (params_->weight_ready && n >= 0 && n < params_->weight_panels && n != acquired_n_) {
+#if FUSE_ENABLE_PROFILING
+      Mxfp8WaitRecord* record = nullptr;
+      const int64_t index = int64_t{static_cast<int>(cute::get<0>(tile))} * params_->weight_panels + n;
+      if (params_->weight_probe.waits && index >= 0 && index < params_->weight_probe.wait_capacity &&
+          threadIdx.x % 32 == 0) {
+        record = params_->weight_probe.waits + index;
+        record->cta = blockIdx.x;
+        record->warp = threadIdx.x / 32;
+        record->begin = read_global_timer();
+      }
+#endif
+      if (threadIdx.x % 32 == 0)
+        wait_acquire_gpu_single_lane(params_->weight_ready + n * kReadyFlagStride,
+                                    params_->weight_epoch);
+      __syncwarp();
+      fence_proxy_async_global();
+#if FUSE_ENABLE_PROFILING
+      if (record) record->end = read_global_timer();
+#endif
+      acquired_n_ = n;
+    }
+    return Base::load(pipeline, state, inputs, tile, k, count);
+  }
+ private:
+  const Params* params_;
+  int acquired_n_ = -1;
+};
+
+#if FUSE_ENABLE_PROFILING
+// Service-only adapter. Preserve the original panel acquire and CUTLASS
+// prologue/remainder calls; capture only the first load call of each tile.
+template <class Base>
+struct Mxfp8ServiceMainloop : WeightReadyMainloop<Base> {
+  using Parent = WeightReadyMainloop<Base>;
+  struct Arguments : Parent::Arguments { Mxfp8ServiceView service{}; };
+  struct Params : Parent::Params { Mxfp8ServiceView service{}; };
+  template <class Problem>
+  static Params to_underlying_arguments(const Problem& problem, const Arguments& args,
+      void* workspace, const cutlass::KernelHardwareInfo& hardware = {}) {
+    Params p{};
+    static_cast<typename Parent::Params&>(p) = Parent::to_underlying_arguments(
+        problem, static_cast<const typename Parent::Arguments&>(args), workspace, hardware);
+    p.service = args.service;
+    return p;
+  }
+  CUTLASS_DEVICE Mxfp8ServiceMainloop(const Params& p,
+      typename Parent::Cluster cluster, uint32_t rank)
+      : Parent(static_cast<const typename Parent::Params&>(p), cluster, rank), params_(&p) {}
+  template <class LoadParams, class TileCoord, class KIterator>
+  CUTLASS_DEVICE auto load(typename Base::MainloopPipeline pipeline,
+      typename Base::MainloopPipelineState state, const LoadParams& inputs,
+      const TileCoord& tile, KIterator k, int count) {
+    const int m = static_cast<int>(cute::get<0>(tile));
+    const int n = static_cast<int>(cute::get<1>(tile));
+    const int64_t index = int64_t{m} * params_->weight_panels + n;
+    Mxfp8ServiceTileRecord* record = nullptr;
+    if (m >= 0 && n >= 0 && n < params_->weight_panels && index != last_tile_ &&
+        threadIdx.x % 32 == 0 && params_->service.tiles &&
+        index >= 0 && index < params_->service.tile_capacity) {
+      record = params_->service.tiles + index;
+      record->cta = blockIdx.x; record->warp = threadIdx.x / 32;
+      record->m = m; record->n = n;
+      record->first_load = read_global_timer();
+    }
+    auto result = Parent::load(pipeline, state, inputs, tile, k, count);
+    if (record) record->load_return = read_global_timer();
+    last_tile_ = index;
+    return result;
+  }
+ private:
+  const Params* params_;
+  int64_t last_tile_ = -1;
+};
+
 template <bool Instrumented>
 struct A2ALhsTimelineArguments {};
 
@@ -502,6 +626,53 @@ struct SignalingEpilogue : Base {
 };
 
 #if FUSE_ENABLE_PROFILING
+// The production store/drain/release bridge is called, not reproduced. The
+// post-return stamp bounds publication from above; it does not move release.
+template <class Base, class TileShape>
+struct Mxfp8ServiceEpilogue : SignalingEpilogue<Base, TileShape> {
+  using Parent = SignalingEpilogue<Base, TileShape>;
+  struct Arguments : Parent::Arguments { Mxfp8ServiceView service{}; };
+  struct Params : Parent::Params { Mxfp8ServiceView service{}; };
+  template <class Problem>
+  static Params to_underlying_arguments(const Problem& problem,
+      const Arguments& args, void* workspace) {
+    Params p{};
+    static_cast<typename Parent::Params&>(p) = Parent::to_underlying_arguments(
+        problem, static_cast<const typename Parent::Arguments&>(args), workspace);
+    p.service = args.service;
+    return p;
+  }
+  CUTLASS_DEVICE Mxfp8ServiceEpilogue(const Params& p, typename Base::TensorStorage& storage)
+      : Parent(static_cast<const typename Parent::Params&>(p), storage), params_(&p) {}
+  template <bool ReuseTmem = false, class AccumulatorPipeline,
+      class AccumulatorPipelineState, class Problem, class CtaTile,
+      class TileCoord, class MmaTile, class TiledMma, class AccEngine, class AccLayout>
+  CUTLASS_DEVICE auto store(typename Base::LoadPipeline load_pipeline,
+      typename Base::LoadPipelineState load_state, typename Base::StorePipeline store_pipeline,
+      typename Base::StorePipelineState store_state, AccumulatorPipeline acc_pipeline,
+      AccumulatorPipelineState acc_state, Problem problem, CtaTile cta_tile,
+      TileCoord tile_coord, MmaTile mma_tile, TiledMma tiled_mma,
+      cute::Tensor<AccEngine, AccLayout> accumulators, typename Base::TensorStorage& storage) {
+    const int m = static_cast<int>(cute::get<0>(tile_coord));
+    const int n = static_cast<int>(cute::get<1>(tile_coord));
+    const int64_t index = int64_t{m} * params_->n_tiles + n;
+    Mxfp8ServiceTileRecord* record = nullptr;
+    if (m >= 0 && m < params_->m_tiles && n >= 0 && n < params_->n_tiles &&
+        threadIdx.x % Base::ThreadCount == 0 && params_->service.tiles &&
+        index >= 0 && index < params_->service.tile_capacity) {
+      record = params_->service.tiles + index;
+      record->store_begin = read_global_timer();
+    }
+    auto result = Parent::template store<ReuseTmem>(load_pipeline, load_state,
+        store_pipeline, store_state, acc_pipeline, acc_state, problem, cta_tile,
+        tile_coord, mma_tile, tiled_mma, accumulators, storage);
+    if (record) record->ready_after = read_global_timer();
+    return result;
+  }
+ private:
+  const Params* params_;
+};
+
 // The original SignalingEpilogue above is deliberately unchanged. This
 // diagnostic adapter duplicates only its narrow store/drain/publish bridge,
 // calling the same CUTLASS Base::store and preserving the 32-lane drain.

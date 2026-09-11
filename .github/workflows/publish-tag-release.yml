@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v19.1
+        default: v20.0
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v19.1");
+              : (process.env.REQUESTED_TAG || "v20.0");
 
             const releases = {
+              "v20.0": {
+                name: "v20.0 — SM103 MXFP8 QKV forward and offline CTA autotune",
+                body: [
+                  "Prequantized MXFP8 activation plus BF16 master weights: dynamic in-kernel K32 weight quantization, MXFP8 E4M3/UE8M0 GEMM with FP32 accumulation, BF16 output all-to-all. Activation quantization is upstream, outside this measured fused boundary.",
+                  "Fixed caller-selected GEMM tile/epilogue/raster/swizzle; num_comm_ctas=0 evaluates compiled independent compute and whole quantization/route services on the host. No online candidate launches, fitted hyperparameters or model-name winner lookup. Positive budgets override; unsupported calibration keys are rejected.",
+                  "33/33 adapted physical points, CP4/8 and 128K/256K/512K, Graph 10+50 with complete two-payload numerical/routing validation. Auto versus the same-run replay of independently selected manual configurations: geometric mean 96.6929%, minimum 90.0858%. The 22 held-out sequence points average 97.3253%.",
+                  "The minimum is close to the acceptance boundary, not a guaranteed floor. Historical snapshots remain separate: QwenDense CP4/512K is 88.3915% of its older saved throughput. Finite offline best is not a global-optimum claim.",
+                  "Final Auto/manual/pure-cuBLASLt tables, exact configurations and evidence hashes: results/sm103/v20.0. No search history, profiles or dependency packages. Qwen72/Llama70 share physical measurements; Kimi is QKV-only and Qwen3 CP8 is not adapted. MXFP8 OProj/backward are not part of this release.",
+                ].join("\n"),
+              },
               "v19.1": {
                 name: "v19.1 — SM103 profiling code cleanup",
                 body: [

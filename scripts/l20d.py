@@ -27,6 +27,7 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[1]
 LOCAL = Path('/Users/admin/workspace/fuse_midfile/l20d')
+WORKSPACE = Path('/root/workspace_wct')  # Legacy receipts retain their original location.
 REMOTE = Path('/root/workspace_wct/fuse')
 CONTROL = Path('/root/workspace_wct/.l20d')
 PYTHON = '/root/workspace_wct/bench-env/bin/python'
@@ -59,6 +60,31 @@ FUSED_COUNTER_METRICS = CUTLASS_COUNTER_METRICS + (
     'lts__throughput.avg.pct_of_peak_sustained_elapsed',
     'nvlrx__bytes_data_user.sum', 'nvltx__bytes_data_user.sum',
 )
+
+
+def workspace_path(value):
+    """Only a named user-owned workspace; never a home/root directory itself."""
+    if not isinstance(value, str) or not re.fullmatch(
+            r'/(?:root|home/[a-z_][a-z0-9_-]*)/workspace_wct', value):
+        raise ValueError('Workspace must be /root/workspace_wct or /home/USER/workspace_wct')
+    return Path(value)
+
+
+def configure_workspace(value):
+    global WORKSPACE, REMOTE, CONTROL, PYTHON, CUTLASS, MPI_PREFIX
+    WORKSPACE = workspace_path(value)
+    REMOTE, CONTROL = WORKSPACE / 'fuse', WORKSPACE / '.l20d'
+    PYTHON = str(WORKSPACE / 'bench-env/bin/python')
+    CUTLASS = str(WORKSPACE / 'deps/cutlass-57e3cfb47a2d9e0d46eb6335c3dc411498efa198')
+    MPI_PREFIX = WORKSPACE / 'toolchain/mpich-5.0.1.post1'
+
+
+def workspace_user():
+    return 'root' if WORKSPACE.parent == Path('/root') else WORKSPACE.parent.name
+
+
+def source_environment():
+    return 'source ' + shlex.quote(str(WORKSPACE / 'env.sh'))
 
 
 def command(argv, **kwargs):
@@ -98,7 +124,7 @@ def relay_progress(path, stop):
                                     'validation_oracle,', 'validation_self_test,', 'validation_error,',
                                     'input_oracle,',
                                     'warmup,', 'sample,',
-                                    'summary,', 'counter_epoch,', 'warning,', 'profile_resources,', 'profile_host,',
+                                    'summary,', 'precision,', 'counter_epoch,', 'warning,', 'profile_resources,', 'profile_host,',
                                     'profile_dispatch,', 'PASS:', 'fused_bf16:', 'bf16 ',
                                     'BACKWARD ', 'backward_validation ', 'B: p50=', 'W: p50=')):
                     print(line.rstrip(), flush=True)
@@ -151,12 +177,18 @@ def fused_policy_tile(policy):
 def fused_candidates(job):
     """Explicit same-shape candidates; auto zero is resolved only by the C++ API."""
     auto = job.get('auto_oproj_comm', False)
+    mxfp8_auto = job.get('auto_mxfp8_comm', False)
     if auto and (job.get('comm_sm_list') is not None or job.get('comm_sm', 0) not in (None, 0)):
         raise ValueError('--auto-oproj-comm excludes explicit --comm-sm/list')
     comm = ['0'] if auto else ([str(job.get('comm_sm', 8))] if job.get('comm_sm_list') is None else job['comm_sm_list'].split(','))
-    if not comm or any(not re.fullmatch(r'[0-9]+', value) or not (0 if auto else 1) <= int(value) <= 1024 for value in comm):
+    zero_request = auto or (mxfp8_auto and job.get('comm_sm_list') is None and job.get('comm_sm', 0) in (None, 0))
+    if mxfp8_auto and zero_request:
+        comm = ['0']
+    if not comm or any(not re.fullmatch(r'[0-9]+', value) or not (0 if zero_request else 1) <= int(value) <= 1024 for value in comm):
         raise ValueError('Communication CTA list must contain positive integers')
     comm = list(dict.fromkeys(int(value) for value in comm))
+    if mxfp8_auto and 0 not in comm:
+        comm.append(0)  # Unresolved production candidate, after explicit controls.
     def policies(direction, supported):
         single, multiple = direction + '_policy', direction + '_policy_list'
         values = [job.get(single, 'auto')] if job.get(multiple) is None else job[multiple].split(',')
@@ -180,7 +212,7 @@ def fused_geometry(job):
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj'):
         raise ValueError('Invalid --fused-direction')
-    if direction != 'both' and (job.get('stage') != 'fused-smoke' or (job.get('profile') and not job.get('backward'))):
+    if direction != 'both' and (job.get('stage') != 'fused-smoke' or (job.get('profile') and not (job.get('backward') or job.get('mxfp8')))):
         raise ValueError('--fused-direction requires non-profile fused-smoke')
     if job.get('profile') and job.get('directions') == 'oproj':
         direction = 'oproj'
@@ -257,17 +289,28 @@ def fused_device_memory(job):
     # Count only selected directions, including their independent full references.
     buffer_bytes = 2 * (qkv * (m * h + 3 * m * p + h * p) +
                         oproj * (3 * m * q + 2 * m * h + h * q))
+    if job.get('mxfp8'):
+        # Packed FP8 A/W + independent BF16 decoded-oracle A/W + native scales.
+        buffer_bytes += 3 * (m * h + p * h)
+        buffer_bytes += ((m + 127) // 128 + (p + 127) // 128) * ((h + 127) // 128) * 512 + 1024
+        buffer_bytes += 2 * ((p + 255) // 256) * 32 * 4 + 512  # Per-call panel counters/ready.
     m_tiles = (m + 127) // 128
     flag_bytes = 4 * 32 * (qkv * (m_tiles * ((p + 63) // 64) + shape['world']) +
                           oproj * (m_tiles * shape['world'] + 1))
     # Calibration duplicates only the ready/done flags, never full tensors.
-    calibration_flag_bytes = flag_bytes if job.get('calibrate') else 0
+    calibration_flag_bytes = flag_bytes if (job.get('calibrate') or job.get('mxfp8_service_probe')) else 0
     profile_bytes = 0
     if job.get('profile', False):
         peer_capacity = max(m_tiles * ((h + 127) // 128), m_tiles * shape['world'])
         # Current peer events fit in 256 bytes; 1 MiB also covers CTA records.
         # Update this allowance if the profiling record/layout contract changes.
         profile_bytes = (0 if job.get('profile_detail') == 'cta' else peer_capacity * 256) + (1 << 20)
+        if job.get('mxfp8'):
+            # Mxfp8QuantRecord includes publication timestamps and the aggregated
+            # chunk contribution (72 bytes); Mxfp8WaitRecord remains 24 bytes.
+            profile_bytes += ((p + 255) // 256) * (h // 4) * 72 + m_tiles * ((p + 255) // 256) * 24
+            if job.get('mxfp8_service_probe'):
+                profile_bytes += m_tiles * ((p + 255) // 256) * 48 + 148 * 24 + ((p + 255) // 256) * 16
         if job.get('oproj_pipeline_probe') or job.get('oproj_gap_probe'):
             profile_bytes += 64 << 20  # GPU0-only bounded private probe; conservative per-rank allowance.
     allocated_bytes = buffer_bytes + flag_bytes + calibration_flag_bytes + profile_bytes
@@ -293,6 +336,67 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 
 def validate_job(job, hostname=None):
+    search = job.get('mxfp8_gemm_search', False)
+    if search and (job['stage'] not in ('build', 'gemm-probe') or
+            (job['stage'] == 'gemm-probe' and
+             (job.get('gemm_precision') != 'mxfp8' or not job.get('gemm_sm_budget')))):
+        raise ValueError('MXFP8 CUTLASS search requires build or MXFP8 gemm-probe with explicit compute budget')
+    if job.get('workspace') is not None:
+        workspace_path(job['workspace'])
+    if job.get('gemm_precision', 'bf16') == 'mxfp8':
+        if (job['stage'] != 'gemm-probe' or job.get('launches') != 'graph' or
+                job.get('gemm_operand_layout', 'nt') != 'nt' or any(job.get(k) for k in
+                ('compare_cutlass', 'cutlass_counters', 'cublaslt_counters')) or
+                (job.get('gemm_sm_budget') and not search) or
+                job.get('cublaslt_sm_target') is not None):
+            raise ValueError('Pure MXFP8 requires Graph NT full-device GEMM without BF16 diagnostics')
+    if job.get('mxfp8_prequantized') and not job.get('mxfp8'):
+        raise ValueError('--mxfp8-prequantized requires --mxfp8')
+    if job.get('mxfp8_weight_preparation') and not job.get('mxfp8'):
+        raise ValueError('--mxfp8-weight-preparation requires --mxfp8')
+    if job.get('mxfp8_epilogue_n') is not None and (
+            not job.get('mxfp8') or job['mxfp8_epilogue_n'] not in (32, 64)):
+        raise ValueError('--mxfp8-epilogue-n requires MXFP8 and 32 or 64')
+    if type(job.get('auto_mxfp8_comm', False)) is not bool:
+        raise ValueError('Automatic MXFP8 CTA selection must be a boolean')
+    if type(job.get('mxfp8_service_probe', False)) is not bool:
+        raise ValueError('MXFP8 service probe must be a boolean')
+    if job.get('mxfp8_service_probe') and (
+            not job.get('mxfp8') or job['stage'] != 'fused-smoke' or not job.get('profile') or
+            job.get('mpi') or job.get('world', 8) not in (4, 8) or job.get('fused_launch', 'eager') != 'eager' or
+            job.get('host_launch') != 'per_gpu_thread' or
+            job.get('profile_detail', 'full') not in (None, 'full') or job.get('calibrate') or
+            job.get('auto_mxfp8_comm') or job.get('auto_oproj_comm') or job.get('mxfp8_prequantized') or
+            job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') or
+            job.get('qkv_raster') not in ('along_m', 'along_n')):
+        raise ValueError('MXFP8 service probe requires single-process CP4/8 full profiling with explicit ordinary comm/layout')
+    if job.get('auto_mxfp8_comm') and (
+            not job.get('mxfp8') or job['stage'] != 'fused-smoke' or not job.get('mpi') or
+            job.get('fused_launch') != 'graph' or job.get('profile') or job.get('auto_oproj_comm') or
+            job.get('mxfp8_prequantized') or job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') or
+            job.get('qkv_raster') not in ('along_m', 'along_n')):
+        raise ValueError('Automatic MXFP8 CTAs require MPI Graph dynamic-weight ordinary comm and explicit raster')
+    if job.get('mxfp8'):
+        if job['stage'] not in FUSED_STAGES or any(job.get(k) for k in (
+                'backward', 'quick', 'compute_only', 'cpu_oracle',
+                'validation_self_test', 'fused_counters', 'auto_oproj_comm', 'qkv_rank_swizzle')):
+            raise ValueError('MXFP8 baseline requires isolated forward build/smoke without BF16 tuning/diagnostics')
+        if job['stage'] == 'fused-smoke' and job.get('fused_direction') != 'qkv':
+            raise ValueError('MXFP8 requires QKV-only')
+        if job.get('calibrate') and (job.get('mxfp8_prequantized') or
+                job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm')):
+            raise ValueError('MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps')
+        if job.get('profile') and (job.get('mpi') or job.get('mxfp8_prequantized') or
+                (job['stage'] == 'fused-smoke' and job.get('directions') != 'qkv')):
+            raise ValueError('MXFP8 profiling requires single-process dynamic-weight QKV')
+        if job.get('qkv_policy', 'auto') not in ('auto', 'm128n256') or job.get('qkv_policy_list') not in (None, 'm128n256'):
+            raise ValueError('MXFP8 baseline uses the fixed M128/N256/K128 collective')
+        if job.get('hidden', 1024) % 128:
+            raise ValueError('MXFP8 baseline hidden dimension must be divisible by 128')
+        if job.get('head_dim', 128) != 128:
+            raise ValueError('MXFP8 communication-side quantization requires the head_dim=128 TMA route')
+        if job.get('mxfp8_weight_preparation') not in (None, 'comm', 'all', 'comm_warp'):
+            raise ValueError('MXFP8 weight preparation requires comm, all, or comm_warp')
     if job.get('backward_gemm_sweep') and not (job.get('backward') and job.get('profile') and job.get('mpi')):
         raise ValueError('Backward GEMM sweep requires isolated backward profile MPI build')
     if job.get('backward_matrix') or job.get('backward_matrix_payload'):
@@ -326,7 +430,7 @@ def validate_job(job, hostname=None):
         raise ValueError('cuBLASLt counters require one standalone Graph geometry')
     direction = job.get('fused_direction', 'both')
     if direction not in ('both', 'qkv', 'oproj') or (direction != 'both' and
-            (job['stage'] != 'fused-smoke' or (job.get('profile') and not job.get('backward')))):
+            (job['stage'] != 'fused-smoke' or (job.get('profile') and not (job.get('backward') or job.get('mxfp8'))))):
         raise ValueError('--fused-direction requires non-profile fused-smoke and both/qkv/oproj')
     if job['stage'] not in STAGES:
         raise ValueError('Unknown stage')
@@ -512,9 +616,9 @@ def validate_job(job, hostname=None):
                 _, pm, pn, padded = fused_scheduler_geometry(shape['seq_local'], width, tile_n, swizzle)
                 if pm * pn > (1 << 31) - 1:
                     raise ValueError('Padded fused scheduling grid exceeds int32')
-                if job.get('profile') and padded:
+                if job.get('profile') and not job.get('mxfp8_service_probe') and padded:
                     raise ValueError('Profile does not yet validate padded swizzle CTA ownership; use an unpadded geometry')
-        if not job.get('auto_oproj_comm') and not 1 <= job.get('comm_sm', 8) <= 1024:
+        if not (job.get('auto_oproj_comm') or job.get('auto_mxfp8_comm')) and not 1 <= job.get('comm_sm', 8) <= 1024:
             raise ValueError('Invalid --comm-sm')
         if job.get('qkv_policy', 'auto') not in QKV_POLICIES:
             raise ValueError('Unknown QKV policy')
@@ -738,7 +842,9 @@ def screen_ready(node='09'):
     snapshot = screen_snapshot(screen_id)
     host = NODES[node][1]
     lines = [line.strip() for line in snapshot.splitlines() if line.strip()]
-    if not lines or not re.fullmatch(r'root@' + re.escape(host) + r' .*#', lines[-1]):
+    user = workspace_user()
+    ending = r'#' if user == 'root' else r'\$'
+    if not lines or not re.fullmatch(re.escape(user + '@' + host) + r' .*' + ending, lines[-1]):
         raise RuntimeError('Screen is not at the expected idle cluster prompt. '
                            f'Inspect {screen_id} window 0; no command was sent.\n' +
                            '\n'.join(lines[-4:]))
@@ -775,12 +881,15 @@ def source_package(directory):
 
 
 def submit(job):
+    if job.get('workspace') is not None:
+        configure_workspace(job['workspace'])
     node = validate_job(job)
     screen_id = screen_ready(node)
     dest = CONTROL / 'jobs' / job['run_id']
     cloud = prefix(job['run_id'])
     remote_command = (
-        f'test "$(hostname)" = {shlex.quote(NODES[node][1])} && mkdir -p {shlex.quote(str(dest))} && '
+        f'test "$(hostname)" = {shlex.quote(NODES[node][1])} && '
+        f'test "$(id -un)" = {shlex.quote(workspace_user())} && mkdir -p {shlex.quote(str(dest))} && '
         f'timeout 60 mc cp {shlex.quote(cloud + "/runner.py")} {shlex.quote(str(dest / "runner.py"))} && '
         f'timeout 60 mc cp {shlex.quote(cloud + "/job.json")} {shlex.quote(str(dest / "job.json"))} && '
         f'{PYTHON} {shlex.quote(str(dest / "runner.py"))} remote {shlex.quote(str(dest / "job.json"))}'
@@ -940,7 +1049,7 @@ def install_source(job, folder):
     write_json(folder / 'source-installed.json', {'source_id': job['source_id'], 'files': job['files']})
 
 
-def environment_receipt():
+def environment_receipt(require_te=True):
     packages = {}
     for name in ('torch', 'triton', 'transformer-engine', 'pydantic', 'importlib-metadata'):
         try:
@@ -948,24 +1057,30 @@ def environment_receipt():
         except importlib.metadata.PackageNotFoundError:
             packages[name] = 'missing'
     libraries = {}
-    loaded = json.loads(read_command([PYTHON, '-c',
-        'import json,transformer_engine,transformer_engine.pytorch,transformer_engine_torch; '
-        'print(json.dumps({"te":transformer_engine.__file__,"tex":transformer_engine_torch.__file__}))']))
-    libraries[str(Path(loaded['tex']).resolve())] = sha(loaded['tex'])
-    for site in (Path(PYTHON).parent.parent / 'lib/python3.12/site-packages',):
-        for lib in (site / 'transformer_engine').glob('*.so'):
-            libraries[str(lib.resolve())] = sha(lib)
+    loaded = {}
+    if require_te:
+        loaded = json.loads(read_command([PYTHON, '-c',
+            'import json,transformer_engine,transformer_engine.pytorch,transformer_engine_torch; '
+            'print(json.dumps({"te":transformer_engine.__file__,"tex":transformer_engine_torch.__file__}))']))
+        libraries[str(Path(loaded['tex']).resolve())] = sha(loaded['tex'])
+        for site in (Path(PYTHON).parent.parent / 'lib/python3.12/site-packages',):
+            for lib in (site / 'transformer_engine').glob('*.so'):
+                libraries[str(lib.resolve())] = sha(lib)
     tools = {}
     for name, path in [('nvcc', '/usr/local/cuda/bin/nvcc'), ('ptxas', '/usr/local/cuda/bin/ptxas')]:
         tools[name] = read_command([path, '--version'])
     tools['gcc'] = read_command(['bash', '-c',
-        'source /root/workspace_wct/env.sh && command -v gcc && gcc --version'])
+        source_environment() + ' && command -v gcc && gcc --version'])
     tools['driver'] = read_command(['nvidia-smi', '--id=0', '--query-gpu=driver_version',
                                    '--format=csv,noheader'])
+    overrides = {'TRITON_PTXAS_PATH': '/usr/local/cuda/bin/ptxas', 'UB_SKIPMC': '1'}
+    headers = WORKSPACE / 'deps/python-headers-3.12.7'
+    if headers.is_dir():
+        overrides['CPATH'] = str(headers)
     return dict(host=socket.gethostname(), python=sys.version, executable=sys.executable,
+                workspace=str(WORKSPACE), te_required=require_te,
                 packages=packages, libraries=libraries, modules=loaded, compilers=tools,
-                overrides={'CPATH': '/root/workspace_wct/deps/python-headers-3.12.7',
-                           'TRITON_PTXAS_PATH': '/usr/local/cuda/bin/ptxas', 'UB_SKIPMC': '1'})
+                overrides=overrides)
 
 
 def fused_build_dir(job):
@@ -973,6 +1088,8 @@ def fused_build_dir(job):
             'sm103-fused-profile' if job.get('profile', False) else 'sm103-fused')
     if job.get('qkv_rank_swizzle'):
         name += '-rank-swizzle'
+    if job.get('mxfp8'):
+        name += '-mxfp8'
     if job.get('backward'):
         name += '-backward'
         if job.get('mpi') and job.get('profile'):
@@ -981,6 +1098,8 @@ def fused_build_dir(job):
 
 
 def fused_binary(job):
+    if job.get('mxfp8'):
+        return fused_build_dir(job) / ('fused_mxfp8_mpi' if job.get('mpi') else 'fused_mxfp8')
     if job.get('backward'):
         return fused_build_dir(job) / ('backward_mpi_bench' if job.get('mpi') else 'backward_smoke')
     return fused_build_dir(job) / ('fused_bf16_mpi' if job.get('mpi') else 'fused_bf16')
@@ -989,7 +1108,7 @@ def fused_binary(job):
 def mpi_toolchain_receipt():
     """Workspace-only MPI identity; no installation or global environment edits."""
     compiler = read_command(['bash', '-c',
-        'source /root/workspace_wct/env.sh && command -v g++ && g++ -dumpfullversion']).splitlines()
+        source_environment() + ' && command -v g++ && g++ -dumpfullversion']).splitlines()
     if len(compiler) != 2 or not compiler[0].startswith('/') or compiler[1].split('.')[0] != '12':
         raise RuntimeError('MPI requires the workspace environment GCC 12 C++ compiler')
     required = [MPI_PREFIX / name for name in ('include/mpi.h', 'bin/mpicxx', 'bin/mpiexec', 'bin/hydra_pmi_proxy')]
@@ -1058,6 +1177,14 @@ def fused_argv(job):
     shape = fused_geometry(job)
     comm, qkv, oproj = fused_candidates(job)
     argv = [str(fused_binary(job)), '--world', str(shape['world'])]
+    if job.get('mxfp8_prequantized'):
+        argv.append('--mxfp8-prequantized')
+    if job.get('mxfp8_weight_preparation'):
+        argv += ['--mxfp8-weight-preparation', job['mxfp8_weight_preparation']]
+    if job.get('mxfp8_epilogue_n') is not None:
+        argv += ['--mxfp8-epilogue-n', str(job['mxfp8_epilogue_n'])]
+    if job.get('mxfp8_service_probe'):
+        argv.append('--mxfp8-service-probe')
     if job.get('quick'):
         argv += ['--quick']
     if job.get('fused_direction', 'both') != 'both':
@@ -1066,6 +1193,11 @@ def fused_argv(job):
         argv += ['--launch', job['fused_launch']]
     if job.get('auto_oproj_comm'):
         argv.append('--auto-oproj-comm')
+    elif job.get('auto_mxfp8_comm'):
+        argv.append('--auto-mxfp8-comm')
+        manual = [value for value in comm if value > 0]
+        if manual:
+            argv += ['--comm-sm-list', ','.join(map(str, manual))]
     elif job.get('comm_sm_list') is not None:
         argv += ['--comm-sm-list', ','.join(map(str, comm))]
     else:
@@ -1110,7 +1242,7 @@ def fused_build_receipt(job, env_id):
     # as the benchmark. In particular, record where a direct libcuda link resolves;
     # a successful link against a toolkit stub is not runtime-driver validation.
     dependencies = read_command(['bash', '-c',
-        'source /root/workspace_wct/env.sh && exec ldd "$1"', 'l20d-link-audit', str(binary)])
+        source_environment() + ' && exec ldd "$1"', 'l20d-link-audit', str(binary)])
     # Loader addresses are randomized between inspections; compare resolutions,
     # not ASLR virtual addresses, when validating an existing build receipt.
     dependencies = re.sub(r' \(0x[0-9a-fA-F]+\)', '', dependencies)
@@ -1229,6 +1361,12 @@ def gemm_probe_shapes(job):
 
 
 def gemm_probe_argv(job, folder):
+    if job.get('gemm_precision') == 'mxfp8':
+        if job.get('mxfp8_gemm_search'):
+            return [str(REMOTE / 'build/sm103-mxfp8-search/mxfp8_cutlass_search'),
+                    str(folder / 'mxfp8-matrix.txt'), '1', str(job['gemm_sm_budget'])]
+        return [str(REMOTE / 'build/sm103/mxfp8_gemm_bench'), str(folder / 'mxfp8-matrix.txt'),
+                str(job.get('gemm_candidates') or 32)]
     argv = [PYTHON, '-u', str(REMOTE / 'benchmarks/sm103/GEMM/cublaslt_bench.py'),
             '--precisions', 'bf16',
             '--launches', job['launches'], '--warmup', '10', '--iterations', '50',
@@ -1284,7 +1422,7 @@ def cublaslt_counter_argv(folder, argv):
 
 
 def run_counter_tool(argv, env):
-    return command(['bash', '-c', 'source /root/workspace_wct/env.sh && exec "$@"',
+    return command(['bash', '-c', source_environment() + ' && exec "$@"',
                     'l20d-counter', *argv], env=env, capture_output=True, text=True)
 
 
@@ -1443,13 +1581,24 @@ def cutlass_probe_build_receipt(job, env_id):
     if not library.is_file():
         raise RuntimeError('Build the optional CUTLASS GEMM probe library first')
     dependencies = read_command(['bash', '-c',
-        'source /root/workspace_wct/env.sh && exec ldd "$1"', 'cutlass-probe-link', str(library)])
+        source_environment() + ' && exec ldd "$1"', 'cutlass-probe-link', str(library)])
     dependencies = re.sub(r' \(0x[0-9a-fA-F]+\)', '', dependencies)
     if 'not found' in dependencies or 'libcuda.so' not in dependencies:
         raise RuntimeError('CUTLASS probe has unresolved or absent driver linkage')
     return dict(node=job_node(job), environment_fingerprint=env_id, library=str(library),
                 library_sha256=sha(library), inputs={name: job['files'][name] for name in names},
                 dynamic_dependencies=dependencies)
+
+
+def mxfp8_search_receipt(job, env_id):
+    binary = REMOTE / 'build/sm103-mxfp8-search/mxfp8_cutlass_search'
+    names = {name: digest for name, digest in job['files'].items()
+             if name.startswith(('include/fuse/', 'csrc/operators/sm103/',
+                                 'benchmarks/sm103/GEMM/', 'benchmarks/sm103/fused_'))
+             or name in ('benchmarks/sm103/CMakeLists.txt', 'csrc/baselines/sm103/cublaslt_training.cu')}
+    return dict(node=job_node(job), environment_fingerprint=env_id,
+                binary=str(binary), binary_sha256=sha(binary), inputs=names,
+                library_sha256=sha(binary.parent / 'libfuse_sm103_cublaslt.so'))
 
 
 def check_fused_devices(job, folder, devices=None, memory=None):
@@ -1511,6 +1660,13 @@ def remote(job_path):
     import fcntl
     import signal
     job = json.loads(Path(job_path).read_text())
+    if job.get('workspace') is not None:
+        configure_workspace(job['workspace'])
+        import pwd
+        if pwd.getpwuid(os.geteuid()).pw_name != workspace_user():
+            raise RuntimeError('Job user does not own the selected workspace')
+        if WORKSPACE.resolve() != WORKSPACE or WORKSPACE.stat().st_uid != os.geteuid():
+            raise RuntimeError('Workspace is not an owned real directory')
     identifier(job['run_id'])
     identifier(job['experiment'])
     node = validate_job(job, socket.gethostname())
@@ -1579,7 +1735,8 @@ def remote(job_path):
                 actual = 'link:' + os.readlink(path) if path.is_symlink() else sha(path)
                 if actual != value:
                     raise RuntimeError(f'Source changed since this run: {name}; submit a new run')
-        receipt = environment_receipt()
+        receipt = environment_receipt(require_te=job['stage'] not in
+            (*FUSED_STAGES, 'build', 'gemm-probe', 'gemm-cutlass-build'))
         if job.get('mpi'):
             receipt['mpi_toolchain'] = mpi_toolchain_receipt()
         env_id = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
@@ -1602,12 +1759,22 @@ def remote(job_path):
                     '--output', str(folder / f"overhead-attempt{state['attempt']}.json")]
         elif stage == 'build':
             argv = ['bash', str(REMOTE / 'scripts/build_sm103_bench.sh')]
+            if job.get('mxfp8_gemm_search'):
+                build_dir = REMOTE / 'build/sm103-mxfp8-search'
+                configure = ['cmake', '-S', str(REMOTE / 'benchmarks/sm103'), '-B', str(build_dir),
+                    '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=103a',
+                    '-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc',
+                    '-DFUSE_SM103_BUILD_MXFP8_SEARCH=ON', '-DCUTLASS_ROOT=' + CUTLASS]
+                compile_argv = ['cmake', '--build', str(build_dir), '--target', 'mxfp8_cutlass_search', '--parallel', '2']
+                argv = ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_argv)]
         elif stage == 'gemm-cutlass-build':
             argv = cutlass_probe_build_argv()
         elif stage in FUSED_STAGES:
             argv = fused_argv(job)
             if stage == 'fused-smoke':
                 check_fused_build(job, env_id, folder)
+                if job.get('mxfp8_service_probe'):
+                    argv += ['--mxfp8-service-output', str(folder / 'services-rank-0.jsonl')]
                 backward_memory = None
                 if job.get('backward') and job.get('mpi'):
                     s = fused_geometry(job)
@@ -1670,6 +1837,19 @@ def remote(job_path):
                     raise RuntimeError('CUTLASS diagnostic build changed; run gemm-cutlass-build before comparison')
                 write_json(folder / 'cutlass-probe-build.json', cutlass_receipt)
             shapes = gemm_probe_shapes(job)
+            if job.get('gemm_precision') == 'mxfp8':
+                binary = REMOTE / 'build/sm103/mxfp8_gemm_bench'
+                if job.get('mxfp8_gemm_search'):
+                    binary = REMOTE / 'build/sm103-mxfp8-search/mxfp8_cutlass_search'
+                    receipt = mxfp8_search_receipt(job, env_id)
+                    saved = binary.parent / '.l20d-build.json'
+                    if not saved.is_file() or json.loads(saved.read_text()) != receipt:
+                        raise RuntimeError('MXFP8 search build changed; rebuild the isolated target')
+                    write_json(folder / 'mxfp8-search-build.json', receipt)
+                if not binary.is_file():
+                    raise RuntimeError('Native MXFP8 benchmark missing; run build first')
+                (folder / 'mxfp8-matrix.txt').write_text(''.join(
+                    ' '.join(str(row[k]) for k in ('id', 'm', 'n', 'k')) + '\n' for row in shapes))
             if job.get('gemm_matrix_payload'):
                 write_json(folder / 'gemm-matrix.json', job['gemm_matrix_payload'])
             # BF16 operands/output plus FP32 checker temporaries and workspace.
@@ -1677,6 +1857,9 @@ def remote(job_path):
                                    for row in shapes)
             memory = dict(minimum_free_bytes=max(8 << 30, 8 * maximum_elements + (1 << 30)),
                           guarantees_fit=False, note='Single GPU pure-GEMM diagnostic allowance')
+            if job.get('gemm_precision') == 'mxfp8':
+                memory = dict(minimum_free_bytes=2 << 30,
+                    note='Native MXFP8 checks each case against its live buffers plus 2 GiB before allocation')
             if job.get('gemm_operand_layout', 'nt') != 'nt':
                 # BF16 views have no packing allocation. Row-selected checker
                 # uses only 64 rows of each operand, including long-K wgrad.
@@ -1689,6 +1872,7 @@ def remote(job_path):
             write_json(folder / 'gemm-probe-contract.json', dict(
                 node=node, measurement=('single_gpu_cutlass_counters' if job.get('cutlass_counters') else
                     'single_gpu_cutlass_cublaslt_comparison' if cutlass_receipt else
+                    'single_gpu_pure_cutlass_search' if job.get('mxfp8_gemm_search') else
                     'single_gpu_pure_cublaslt'), physical_devices=selected,
                 cuda_visible_devices=env['CUDA_VISIBLE_DEVICES'],
                 shape=({key: shapes[0][key] for key in ('m', 'n', 'k')}
@@ -1698,9 +1882,13 @@ def remote(job_path):
                 transpose_materialized=False, candidates_requested=job.get('gemm_candidates'),
                 measured_ranks=1, math_sms=job.get('gemm_sm_budget') or job.get('cublaslt_sm_target') or 0,
                 requested_gemm_sm_budget=job.get('gemm_sm_budget'),
-                sm_budget_enforcement=('cuda_green_context' if job.get('gemm_sm_budget') else
+                precision=job.get('gemm_precision', 'bf16'),
+                sm_budget_enforcement=('persistent_grid_one_resident_cta_per_sm' if job.get('mxfp8_gemm_search') else
+                                       'full_device_no_restriction' if job.get('gemm_precision') == 'mxfp8' else
+                                       'cuda_green_context' if job.get('gemm_sm_budget') else
                                        'cublaslt_heuristic_hint_not_hard_partition'),
-                library_sha256=sha(library), correctness='existing_evenly_spaced_64x64_check',
+                library_sha256=sha(library), correctness=('full_output_two_payloads' if
+                    job.get('gemm_precision') == 'mxfp8' else 'existing_evenly_spaced_64x64_check'),
                 cublas_classic_measured=False, distributed_boundary_measured=False))
             if job.get('cutlass_counters'):
                 prepare_cutlass_counters(folder, env)
@@ -1746,7 +1934,7 @@ def remote(job_path):
             # Apply after env.sh as well, so no inherited UCX default can select
             # RDMA for this same-host CPU-only MPI control plane.
             argv = ['env', *[f'{key}={value}' for key, value in receipt['mpi_toolchain']['overrides'].items()], *argv]
-        argv = ['bash', '-c', 'source /root/workspace_wct/env.sh && exec "$@"', 'l20d', *argv]
+        argv = ['bash', '-c', source_environment() + ' && exec "$@"', 'l20d', *argv]
         publish(phase=stage)
         with log_path.open('w') as log, contextlib.ExitStack() as monitors:
             if stage == 'fused-smoke':
@@ -1791,6 +1979,10 @@ def remote(job_path):
                 progress_thread.join(timeout=2)
         if rc:
             state['error'] = '\n'.join(log_path.read_text(errors='replace').splitlines()[-30:])
+        elif stage == 'build' and job.get('mxfp8_gemm_search'):
+            receipt = mxfp8_search_receipt(job, env_id)
+            write_json(REMOTE / 'build/sm103-mxfp8-search/.l20d-build.json', receipt)
+            write_json(folder / 'mxfp8-search-build.json', receipt)
         elif stage == 'fused-build':
             build_receipt = fused_build_receipt(job, env_id)
             write_json(fused_build_dir(job) / '.l20d-build.json', build_receipt)
@@ -1825,6 +2017,7 @@ def remote(job_path):
             with tarfile.open(artifact, 'w:gz') as tar:
                 for file in folder.iterdir():
                     if file.is_file() and (file.suffix in ('.json', '.log', '.txt', '.csv') or
+                            (job.get('mxfp8_service_probe') and file.name == 'services-rank-0.jsonl') or
                             (job.get('backward_gemm_sweep') and file.name.endswith('.gemm-sweep.jsonl')) or
                             ((job.get('cublaslt_sm_target') is not None or job.get('gemm_sm_budget'))
                              and file.name.startswith('gemm-probe-')
@@ -1856,10 +2049,16 @@ def main():
     run = sub.add_parser('run')
     run.add_argument('stage', choices=STAGES)
     run.add_argument('--node', choices=tuple(NODES), default='09')
+    run.add_argument('--workspace', type=str, help='Remote user workspace; saved in the job for safe resume')
     run.add_argument('--profile', action='store_true', help='fused stages: separate instrumented build/run')
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
     run.add_argument('--backward', action='store_true', help='reuse BF16 reverse-route harness, separate build directory')
     run.add_argument('--backward-matrix', help='BF16 backward same-CP case list; persistent MPI ranks')
+    run.add_argument('--mxfp8', action='store_true', help='QKV MXFP8 activation + BF16 W -> fused weight quantization/GEMM/BF16 A2A')
+    run.add_argument('--mxfp8-prequantized', action='store_true', help='MXFP8 diagnostic: exclude weight preparation')
+    run.add_argument('--mxfp8-epilogue-n', type=int, choices=(32, 64),
+                     help='MXFP8 CUTLASS epilogue subtile; default 64 preserves baseline')
+    run.add_argument('--mxfp8-weight-preparation', choices=('comm', 'all', 'comm_warp'), help='Weight quantization by communication CTAs (default), all CTAs at startup, or comm_warp: warps 0..3 route immediately; warps 4..7 quantize then join routing (warp_then_route_v1)')
     run.add_argument('--backward-gemm-sweep', action='store_true', help='isolated pure NN GEMM candidate sweep; production overlap unchanged')
     run.add_argument('--fused-launch', choices=('eager', 'graph'), default='eager',
                      help='fused-smoke: Graph is explicit MPI-only, with epoch preparation outside CUDA events')
@@ -1889,6 +2088,10 @@ def main():
     communication.add_argument('--comm-sm-list', help='fused smoke: explicit same-process CTA candidates')
     communication.add_argument('--auto-oproj-comm', action='store_true',
                                help='OProj Graph: exercise runtime automatic CTA selection with explicit GEMM layout')
+    run.add_argument('--auto-mxfp8-comm', action='store_true',
+                     help='MXFP8 Graph QKV: runtime auto CTA candidate, optionally paired with --comm-sm/list')
+    run.add_argument('--mxfp8-service-probe', action='store_true',
+                     help='MXFP8 single-process CP4/8 profile: independent C/Q/R/QR services; GPU0-only detail artifact')
     tiles = run.add_mutually_exclusive_group()
     tiles.add_argument('--qkv-policy', choices=QKV_POLICIES, help='fused smoke tile (default auto)')
     tiles.add_argument('--qkv-policy-list', help='fused smoke: explicit same-process QKV tile candidates')
@@ -1926,6 +2129,10 @@ def main():
     run.add_argument('--experiment', type=identifier)
     run.add_argument('--winners', help='baseline-replay: local verified complete-group winners.json; all supplied rows replayed')
     run.add_argument('--gemm-matrix', help='gemm-probe: explicit local MNK matrix JSON, reused within one GPU process')
+    run.add_argument('--mxfp8-gemm-search', action='store_true',
+                     help='build/gemm-probe: isolated CUTLASS grid plus top-2 neighbor search, no fused changes')
+    run.add_argument('--gemm-precision', choices=('bf16', 'mxfp8'), default='bf16',
+                     help='Pure GEMM probe: MXFP8 uses the no-Torch native matrix runner')
     run.add_argument('--gemm-operand-layout', choices=('nt', 'nn', 'tn'), default='nt',
                      help='gemm-probe: forward NT, backward dgrad NN or wgrad TN zero-copy operands')
     run.add_argument('--gemm-candidates', type=int,
@@ -1983,7 +2190,7 @@ def main():
         # checking mutually exclusive actions (e.g. interned int 8). Resolve
         # defaults only after parsing, so --comm-sm 8 still conflicts with list.
         if args.comm_sm is None:
-            args.comm_sm = 0 if args.auto_oproj_comm else 8
+            args.comm_sm = 0 if (args.auto_oproj_comm or args.auto_mxfp8_comm) else 8
         if args.qkv_policy is None:
             args.qkv_policy = 'auto'
         if args.oproj_policy is None:
@@ -1994,6 +2201,8 @@ def main():
     if args.action == 'remote':
         return remote(args.job_path)
     if args.action == 'run':
+        if args.workspace is not None:
+            configure_workspace(args.workspace)
         validate_job(vars(args))
         backward_payload = None
         if args.backward_matrix:

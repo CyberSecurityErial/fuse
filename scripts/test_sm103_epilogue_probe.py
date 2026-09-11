@@ -35,8 +35,14 @@ class EpilogueProbeContracts(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(data)
         pipeline = (ROOT / 'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
-        begin = pipeline.index('template <class Base, class TileShape>\nstruct SignalingEpilogue')
-        body = pipeline[begin:pipeline.index('\n}  // namespace fuse::detail', begin)]
+        # Extract the two tested top-level templates, not neighboring adapters.
+        # Other diagnostic collectives may live between them without becoming
+        # dependencies of this deliberately small host CUTLASS stub.
+        bodies = []
+        for name in ('SignalingEpilogue', 'QkvEpilogueProbe'):
+            begin = pipeline.index(f'template <class Base, class TileShape>\nstruct {name}')
+            bodies.append(pipeline[begin:pipeline.index('\n};', begin) + len('\n};')])
+        body = '\n'.join(bodies)
         ordering = (ROOT / 'csrc/operators/sm103/detail/producer_consumer.cuh').read_text()
         begin = ordering.index('template <int M, int N>\nstruct PublishedTile')
         published_tile = ordering[begin:ordering.index('\n};', begin) + len('\n};')]
@@ -168,7 +174,7 @@ int main(int argc,char** argv) {
         source = source.replace('#include <array>', '#include <array>\n#include <algorithm>\n#include <string>')
         cls.probe = cls.compile(source, 'adapter')
         launch = (ROOT / 'csrc/operators/sm103/detail/launch.cuh').read_text()
-        start = launch.index('template <class Gemm, class Kernel, class Comm, bool Instrumented = false,')
+        start = launch.index('struct ProjectionGemmInput {')
         helper = launch[start:launch.index('\ntemplate <bool Instrumented = false>', start)]
         forward = (ROOT / 'csrc/operators/sm103/api/forward.cuh').read_text()
         entries = forward[forward.index('namespace detail {'):forward.index('}  // namespace detail')]

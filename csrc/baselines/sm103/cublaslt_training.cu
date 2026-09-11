@@ -14,7 +14,8 @@
 #include <string>
 #include <vector>
 
-// Benchmark-only ABI. BF16 outputs; BF16, tensor-scaled E4M3 or NVFP4 inputs.
+// Benchmark-only ABI. BF16 outputs; BF16, tensor-scaled E4M3, MXFP8 or NVFP4 inputs.
+// Precision code 32 means E4M3 with one UE8M0 scale per 32 K values, not FP32.
 // Row-major X[M,K], W[N,K], Y[M,N] map to column-major W^T * X.
 namespace {
 thread_local std::string error;
@@ -95,8 +96,8 @@ float measure(Plan& p, const void* x, const void* w, void* y, cudaStream_t strea
   }
 }
 // cuBLASLt VEC16_UE4M3 scale layout: tiles of 128 rows by 4 scale columns.
-__host__ __device__ int64_t sf_index(int64_t row, int64_t block, int64_t k) {
-  int64_t tiles_k=(k+63)/64;
+__host__ __device__ int64_t sf_index(int64_t row, int64_t block, int64_t k, int group_size=16) {
+  int64_t tiles_k=(k+4*group_size-1)/(4*group_size);
   return ((row/128)*tiles_k+block/4)*512+(row%32)*16+((row%128)/32)*4+block%4;
 }
 __global__ void amax8(const __nv_bfloat16* x, float* maximum, int64_t count) {
@@ -110,6 +111,29 @@ __global__ void encode8(const __nv_bfloat16* x, __nv_fp8_e4m3* y, const float* m
   for(;i<count;i+=int64_t(gridDim.x)*blockDim.x) y[i]=__nv_fp8_e4m3(float(x[i])/scale);
 }
 __global__ void finish_scale8(float* scale) { *scale=fmaxf(*scale/448.0f,1e-12f); }
+// Native cuBLASLt VEC32_UE8M0: the same 128-row x 4-scale tile as NVFP4,
+// but each scale covers 32 K values. Padding stays zero and is never decoded.
+__global__ void quant_mxfp8(const __nv_bfloat16* x, __nv_fp8_e4m3* y,
+                          uint8_t* scales, int64_t rows, int64_t k) {
+  const int lane=threadIdx.x%32;
+  for(int64_t group=(int64_t(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+      group<rows*(k/32);group+=int64_t(gridDim.x)*blockDim.x/32) {
+    const int64_t i=group*32+lane, row=group/(k/32), block=group%(k/32);
+    const float value=float(x[i]);
+    float maximum=fabsf(value);
+    for(int mask=16;mask;mask>>=1) maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,mask));
+    int exponent=maximum>0?ilogbf(maximum)-8:0;
+    if(maximum>0 && ldexpf(maximum,-exponent)>448.0f) ++exponent;
+    exponent=max(-127,min(127,exponent));
+    y[i]=__nv_fp8_e4m3(ldexpf(value,-exponent));
+    if(lane==0) scales[sf_index(row,block,k,32)]=uint8_t(exponent+127);
+  }
+}
+__global__ void decode_mxfp8(const __nv_fp8_e4m3* x,const uint8_t* scales,
+                           __nv_bfloat16* y,int64_t count,int64_t k) {
+  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=int64_t(gridDim.x)*blockDim.x)
+    y[i]=__nv_bfloat16(ldexpf(float(x[i]),int(scales[sf_index(i/k,(i%k)/32,k,32)])-127));
+}
 __device__ unsigned encode4(float v) {
   const float values[8]={0,.5f,1,1.5f,2,3,4,6};
   unsigned code=0; float best=fabsf(v);
@@ -196,10 +220,22 @@ extern "C" int sm103_quantize(int precision,const void* x,void* y,void* scales,
       amax8<<<blocks,256,0,stream>>>((const __nv_bfloat16*)x,(float*)scales,rows*k);
       encode8<<<blocks,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_fp8_e4m3*)y,(float*)scales,rows*k);
       finish_scale8<<<1,1,0,stream>>>((float*)scales);
+    } else if(precision==32 && k%32==0) {
+      ck(cudaMemsetAsync(scales,0,((rows+127)/128)*((k+127)/128)*512,stream));
+      quant_mxfp8<<<blocks,256,0,stream>>>((const __nv_bfloat16*)x,(__nv_fp8_e4m3*)y,(uint8_t*)scales,rows,k);
     } else if(precision==4 && k%16==0) {
       quant4<<<blocks,256,0,stream>>>((const __nv_bfloat16*)x,(unsigned char*)y,(__nv_fp8_e4m3*)scales,rows,k);
-    } else throw std::runtime_error("quantize expects FP8 or FP4 with K multiple of 16");
+    } else throw std::runtime_error("quantize expects FP8, MXFP8 (K multiple of 32), or FP4 (K multiple of 16)");
     ck(cudaGetLastError());return 0;
+  } catch(const std::exception& e) {error=e.what();return -1;}
+}
+extern "C" int sm103_decode_mxfp8(const void* x,const void* scales,void* y,
+                                 int64_t rows,int64_t k,void* stream) {
+  try {
+    if(rows<=0||k<=0||k%32) throw std::runtime_error("invalid MXFP8 decode shape");
+    decode_mxfp8<<<256,256,0,(cudaStream_t)stream>>>((const __nv_fp8_e4m3*)x,
+        (const uint8_t*)scales,(__nv_bfloat16*)y,rows*k,k);
+    ck(cudaGetLastError()); return 0;
   } catch(const std::exception& e) {error=e.what();return -1;}
 }
 extern "C" void* sm103_create_strided(int precision,int64_t m,int64_t n,int64_t k,
@@ -211,8 +247,8 @@ extern "C" void* sm103_create_strided(int precision,int64_t m,int64_t n,int64_t 
       throw std::runtime_error("invalid tuning arguments");
     auto p=std::make_unique<Plan>(); p->beta=beta;
     auto stream=(cudaStream_t)stream_ptr;
-    cudaDataType_t dtype=precision==16?CUDA_R_16BF:precision==8?CUDA_R_8F_E4M3:CUDA_R_4F_E2M1;
-    if(precision!=16&&precision!=8&&precision!=4) throw std::runtime_error("precision must be 16,8,4");
+    cudaDataType_t dtype=precision==16?CUDA_R_16BF:(precision==8||precision==32)?CUDA_R_8F_E4M3:CUDA_R_4F_E2M1;
+    if(precision!=16&&precision!=8&&precision!=4&&precision!=32) throw std::runtime_error("precision must be 16,8,4,32(MXFP8)");
     if ((transpose_x != 0 && transpose_x != 1) || (transpose_w != 0 && transpose_w != 1) ||
         (precision != 16 && (transpose_x || transpose_w)))
       throw std::runtime_error("transpose views require BF16 operands");
@@ -227,7 +263,8 @@ extern "C" void* sm103_create_strided(int precision,int64_t m,int64_t n,int64_t 
     if(math_sms>0) ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET,&math_sms,sizeof(math_sms)));
     if(precision!=16) {
       if(!xscale||!wscale) throw std::runtime_error("missing low-precision scales");
-      auto mode=precision==8?CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F:CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+      auto mode=precision==8?CUBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F:
+          precision==32?CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0:CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
       ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_A_SCALE_MODE,&mode,sizeof(mode)));
       ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_B_SCALE_MODE,&mode,sizeof(mode)));
       ck(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,&wscale,sizeof(wscale)));

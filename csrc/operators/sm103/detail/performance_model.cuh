@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "producer_consumer.cuh"
+#include "model_calibration.cuh"
 
 namespace fuse::detail {
 
@@ -225,6 +226,88 @@ inline OProjModelResult score_oproj_schedule(const OProjModelInput& input) {
   } catch (const std::bad_alloc&) {
     return fail(Status::AllocationFailure);
   }
+}
+
+enum class Mxfp8QkvModelStatus {
+  Success, InvalidInput, UnsupportedGeometry, WorkLimit, InvalidSchedule,
+  NonfiniteScore, AllocationFailure
+};
+
+struct Mxfp8QkvModelInput {
+  int64_t m = 0, n = 0, k = 0;
+  int32_t world = 0, sm_count = 0, comm_ctas = 0, calibrated_compute_ctas = 0;
+  int32_t tile_m = 128, tile_n = 256, tile_k = 128, epilogue_n = 64;
+  int32_t cluster_ctas = 1, resolved_swizzle = 1;
+  bool along_n = false;
+  Mxfp8QkvServices services{};
+  Mxfp8QkvBulkServices bulk{};
+};
+
+struct Mxfp8QkvModelResult {
+  Mxfp8QkvModelStatus status = Mxfp8QkvModelStatus::InvalidInput;
+  int32_t compute_ctas = 0;
+  int64_t scheduled_work_tiles = 0, valid_work_tiles = 0;
+  double score_us = 0, compute_finish_us = 0, copy_finish_us = 0;
+};
+
+inline bool valid_mxfp8_qkv_bulk_services(const Mxfp8QkvServices& s, const Mxfp8QkvBulkServices& p) {
+  if (p.reference_m <= 0 || p.reference_m > INT32_MAX ||
+      !std::isfinite(s.startup_us) || s.startup_us < 0) return false;
+  for (double v : {s.tile_first_us, s.tile_cycle_us, p.route_us, p.quant_route_us})
+    if (!std::isfinite(v) || v <= 0) return false;
+  return true;
+}
+
+// Offline long-sequence service balance for a FIXED GEMM/layout/budget.
+// No GPU work or timing feedback occurs during selection. Let M0 be the
+// independently measured anchor, c communication CTAs, C=148-c compute CTAs:
+//
+//   GEMM tile stream: first ---- cycle ---- cycle ---- ... (ceil(tiles/C))
+//   comm warps:       [ fixed W quantization + output(M0) ] [extra output]
+//                            measured QR(M0)              (M/M0-1)*R(M0)
+//   score = startup + max(GEMM stream, comm-worker service)
+//
+// The first/cycle are DIRECT tile intervals, not aggregate C divided by waves.
+// Whole QR includes publication and mixed traffic once. QR-R is NOT called Q
+// time and is NOT clamped: mixed pacing can make QR shorter than standalone R.
+// This deliberately does not extrapolate individual atomic or TMA latencies
+// into a different concurrent environment. It assumes incremental output at
+// R's observed effective rate and enough overlap for the max approximation;
+// it is neither a fused-time bound nor an exact first-panel/tail simulation.
+// Raster/swizzle/resources select the calibration before this function; the
+// kernel's ConsumerTileOrder remains derived from its ProducerTileOrder. The
+// finite domain is unpadded M0..4*M0 with exact N/K and one CTA per SM.
+inline Mxfp8QkvModelResult score_mxfp8_qkv_bulk(const Mxfp8QkvModelInput& input) {
+  using Status = Mxfp8QkvModelStatus;
+  Mxfp8QkvModelResult result;
+  auto fail = [&](Status status) { result.status = status; return result; };
+  const auto& s = input.services;
+  const auto& p = input.bulk;
+  for (int64_t v : {input.m, input.n, input.k, p.reference_m})
+    if (v <= 0 || v > INT32_MAX) return fail(Status::InvalidInput);
+  if (!valid_mxfp8_qkv_bulk_services(s, p) || input.comm_ctas <= 0 ||
+      input.comm_ctas >= input.sm_count) return fail(Status::InvalidInput);
+  const int sw = input.resolved_swizzle;
+  if (input.sm_count != 148 || (input.world != 4 && input.world != 8) ||
+      input.cluster_ctas != 1 || input.tile_m != 128 || input.tile_n != 256 || input.tile_k != 128 ||
+      (input.epilogue_n != 32 && input.epilogue_n != 64) ||
+      (sw != 1 && sw != 2 && sw != 4 && sw != 8) ||
+      input.m % 128 || input.n % 256 || input.k % 128 || p.reference_m % 128 ||
+      (input.m / 128) % sw || (input.n / 256) % sw || (p.reference_m / 128) % sw ||
+      input.m < p.reference_m || input.m > 4 * p.reference_m) return fail(Status::UnsupportedGeometry);
+  result.valid_work_tiles = result.scheduled_work_tiles = (input.m / 128) * (input.n / 256);
+  result.compute_ctas = static_cast<int32_t>(std::min(result.valid_work_tiles,
+      int64_t{input.sm_count - input.comm_ctas}));
+  if (result.compute_ctas != input.calibrated_compute_ctas) return fail(Status::InvalidInput);
+  const int64_t waves = (result.valid_work_tiles + result.compute_ctas - 1) / result.compute_ctas;
+  result.compute_finish_us = s.startup_us + s.tile_first_us + (waves - 1) * s.tile_cycle_us;
+  // copy_finish means the whole quantization+route role for this model.
+  result.copy_finish_us = s.startup_us + p.quant_route_us +
+      double(input.m - p.reference_m) / p.reference_m * p.route_us;
+  result.score_us = std::max(result.compute_finish_us, result.copy_finish_us);
+  if (!std::isfinite(result.score_us)) return fail(Status::NonfiniteScore);
+  result.status = Status::Success;
+  return result;
 }
 
 }  // namespace fuse::detail

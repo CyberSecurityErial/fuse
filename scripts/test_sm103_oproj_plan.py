@@ -258,7 +258,13 @@ class OProjPlannerTests(unittest.TestCase):
         for run in changed['runs']:
             run['candidates'] = [r for r in run['candidates'] if r['component'] != 'fused']
         self.assertEqual(planner.export_cpp(changed), header)
-        self.assertEqual(header.count('\n  {'), 6)
+        # BF16 owns six fixture anchors, not the independently retained MXFP8
+        # section. Regenerating one precision must not delete the other's table.
+        bf16, mxfp8 = header.split('// BEGIN MXFP8 QKV CALIBRATION', 1)
+        self.assertEqual(bf16.count('\n  {'), 6)
+        production = (planner.Path(__file__).resolve().parents[1] /
+                      'csrc/operators/sm103/detail/model_calibration.cuh').read_text()
+        self.assertEqual(mxfp8, production.split('// BEGIN MXFP8 QKV CALIBRATION', 1)[1])
         self.assertIn('namespace fuse::detail {', header)
         self.assertIn('fixture-k8192', header)
         self.assertIn('fixture-k16384', header)

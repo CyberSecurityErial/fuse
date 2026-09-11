@@ -237,6 +237,7 @@ template <int N, int K = 64, int E = 0> struct A2ALhsGemmTypes : Bf16GemmTypes<N
   using TelemetryGemm = Gemm;
   using TelemetryPureGemm = Gemm;
 };
+template <int N, int K, int E> using Mxfp8GemmFamily = Bf16GemmTypes<N,K,E>;
 template <int N> struct QkvComm { static constexpr int kBlockM = 128, kBlockN = N; };
 using QkvGqaPackCommN64 = QkvComm<64>;
 using QkvGqaPackComm = QkvComm<128>;
@@ -244,6 +245,7 @@ using QkvGqaPackCommSmallInterleaved = QkvComm<128>;
 using QkvGqaPackCommN160 = QkvComm<160>;
 using QkvGqaPackCommN192 = QkvComm<192>;
 using QkvGqaPackCommWide = QkvComm<256>;
+using Mxfp8QkvGqaPackComm = QkvComm<256>;
 namespace detail {
 template <class G, class C> struct MonolithicGemm {};
 template <class K> struct RoleTelemetryKernel {};
@@ -1242,7 +1244,7 @@ class NoResidualHostContracts(unittest.TestCase):
         helpers = gemm[gemm.index("__host__ __device__ constexpr int64_t a_row_stride("):
                        gemm.index("// Backward dgrad reads the stored forward weight")]
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
-        begin = launch.index("template <class Kernel>\ntypename Kernel::Arguments gemm_arguments(")
+        begin = launch.index("template <class Kernel, class Input = Bf16>\ntypename Kernel::Arguments gemm_arguments(")
         # Extract this function only, not unrelated helpers inserted after it.
         arguments = launch[begin:launch.index("\n}\n", begin) + 3]
         source = r"""
@@ -1330,7 +1332,8 @@ int main() {
         subprocess.run([str(self.probe)], check=True, timeout=10)
         launch = (ROOT / "csrc/operators/sm103/detail/launch.cuh").read_text()
         reference = (ROOT / "csrc/operators/sm103/api/reference.cuh").read_text()
-        self.assertEqual(launch.count("auto args = gemm_arguments<Gemm>("), 2)
+        self.assertEqual(launch.count("gemm_arguments<Gemm>("), 2)
+        self.assertIn("auto args = input.template arguments<Gemm>(params, info);", launch)
         self.assertEqual(reference.count("auto args = gemm_arguments<Gemm>("), 1)
 
 
@@ -1355,7 +1358,7 @@ class CtaTimelineHostContracts(unittest.TestCase):
 namespace fuse { constexpr int kMaxWorldSize = 8;
 """ + structs + "}\n"
         pipeline = (ROOT / "csrc/operators/sm103/detail/cutlass_pipeline.cuh").read_text()
-        begin = pipeline.index(" private:\n") + len(" private:\n")
+        begin = pipeline.index(" private:\n", pipeline.index("struct A2ALhsReadyMainloop")) + len(" private:\n")
         recorder = pipeline[begin:pipeline.index("\n  const Params* params_;", begin)]
         recorder_probe = header + r"""
 #define CUTLASS_DEVICE
@@ -1427,10 +1430,10 @@ int main(int argc, char** argv) {
             f"-DFUSE_ENABLE_PROFILING={profiling}", "-Wall", "-Wextra", "-Werror")
             for profiling in (0, 1)}
         harness = (ROOT / "benchmarks/sm103/fused_bf16.cu").read_text()
-        begin = harness.index("    if (options.profile) {", harness.index("create_runtimes("))
-        allocation = harness[begin:harness.index("#endif", begin)]
+        begin = harness.index("    if (options.profile", harness.index("create_runtimes("))
+        allocation = harness[begin:harness.index("\n#endif\n  }\n  finish_all", begin)]
         begin = harness.index("void profile(")
-        profile = harness[begin:harness.index("\n#endif\n\nvoid destroy_runtimes(", begin)]
+        profile = harness[begin:harness.index("\n}\n", begin) + len("\n}\n")]
         timing = harness[harness.index("struct HostLaunchTiming {"):
                          harness.index("\nstruct RankLaunch {")]
         route_header = (ROOT / "include/fuse/profiling/qkv_route.cuh").read_text()
@@ -1446,6 +1449,7 @@ enum class Direction { kQkv, kOproj };
 const char* direction_name(Direction d) { return d == Direction::kQkv ? "GEMM_A2A" : "A2A_GEMM"; }
 struct Options {
   bool profile = true;
+  bool mxfp8_service_probe = false;
   bool qkv_epilogue_probe = false;
   bool oproj_pipeline_probe = false;
   bool oproj_gap_probe = false;

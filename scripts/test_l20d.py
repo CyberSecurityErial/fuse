@@ -21,6 +21,233 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_mxfp8_search_is_explicit_and_budgeted(self):
+        job = self.fused_job(stage='gemm-probe', directions='qkv', launches='graph',
+            gemm_precision='mxfp8', mxfp8_gemm_search=True, gemm_sm_budget=132)
+        l20d.validate_job(job)
+        argv = l20d.gemm_probe_argv(job, Path('/tmp/search-contract'))
+        self.assertTrue(argv[0].endswith('/sm103-mxfp8-search/mxfp8_cutlass_search'))
+        self.assertEqual(argv[-1], '132')
+        for change in ({'gemm_sm_budget':None}, {'mxfp8_gemm_search':False},
+                       {'gemm_precision':'bf16'}, {'launches':'eager'}, {'gemm_sm_budget':149}):
+            with self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+        ordinary = job | {'mxfp8_gemm_search':False, 'gemm_sm_budget':None}
+        self.assertTrue(l20d.gemm_probe_argv(ordinary, Path('/tmp/search-contract'))[0].endswith('/mxfp8_gemm_bench'))
+
+    @contextlib.contextmanager
+    def user_workspace(self):
+        names = ('WORKSPACE', 'REMOTE', 'CONTROL', 'PYTHON', 'CUTLASS', 'MPI_PREFIX')
+        with mock.patch.multiple(l20d, **{name: getattr(l20d, name) for name in names}):
+            l20d.configure_workspace('/home/work/workspace_wct')
+            yield
+
+    def test_user_workspace_relocates_all_runtime_paths(self):
+        with self.user_workspace():
+            self.assertEqual(l20d.workspace_user(), 'work')
+            for value in (l20d.REMOTE, l20d.CONTROL, l20d.PYTHON, l20d.CUTLASS, l20d.MPI_PREFIX):
+                self.assertTrue(str(value).startswith('/home/work/workspace_wct/'))
+            self.assertNotIn('/root/', l20d.source_environment())
+            command = l20d.fused_argv(self.fused_job(stage='fused-build', mpi=True))
+            self.assertNotIn('/root/', ' '.join(command))
+        self.assertEqual(l20d.workspace_user(), 'root')
+        for bad in ('/', '/home/work', '/root', '/tmp/workspace_wct',
+                    '/home/work/../root/workspace_wct', '/home/work/workspace_wct/',
+                    '/home/work/workspace_wct;bad'):
+            with self.assertRaises(ValueError):
+                l20d.workspace_path(bad)
+
+    def test_user_workspace_requires_matching_idle_user_and_host(self):
+        with self.user_workspace(), mock.patch.object(l20d, 'resolve_screen', return_value='123.L20D_screen'):
+            with mock.patch.object(l20d, 'screen_snapshot', return_value='work@l20d-xerkjfcp-0001 ~ $\n'):
+                self.assertEqual(l20d.screen_ready('09'), '123.L20D_screen')
+            for prompt in ('root@l20d-xerkjfcp-0001 ~ #', 'work@wrong ~ $',
+                           'work@l20d-xerkjfcp-0001 ~ $ running', '[Host]>'):
+                with mock.patch.object(l20d, 'screen_snapshot', return_value=prompt), self.assertRaises(RuntimeError):
+                    l20d.screen_ready('09')
+
+    def test_native_environment_does_not_require_te(self):
+        with self.user_workspace(), mock.patch.object(l20d, 'read_command', return_value='tool-version') as run:
+            receipt = l20d.environment_receipt(require_te=False)
+        self.assertFalse(receipt['te_required'])
+        self.assertEqual(receipt['modules'], {})
+        self.assertNotIn('CPATH', receipt['overrides'])
+        self.assertNotIn('import json,transformer_engine', str(run.call_args_list))
+
+    def test_mxfp8_has_isolated_binary_and_explicit_quantization_boundary(self):
+        job = self.fused_job(mxfp8=True, mpi=True, fused_direction='qkv', qkv_policy='auto')
+        l20d.validate_job(job)
+        self.assertEqual(l20d.fused_binary(job).name, 'fused_mxfp8_mpi')
+        self.assertIn('mxfp8', str(l20d.fused_build_dir(job)))
+        self.assertNotIn('--mxfp8-prequantized', l20d.fused_argv(job))
+        self.assertIn('--mxfp8-prequantized', l20d.fused_argv(job | {'mxfp8_prequantized': True}))
+        for mode in ('comm', 'all', 'comm_warp'):
+            configured = job | {'mxfp8_weight_preparation': mode}
+            l20d.validate_job(configured)
+            argv = l20d.fused_argv(configured)
+            self.assertEqual(argv[argv.index('--mxfp8-weight-preparation') + 1], mode)
+            l20d.validate_job(configured | {'mxfp8_prequantized': True})
+            self.assertIn('--mxfp8-prequantized',
+                          l20d.fused_argv(configured | {'mxfp8_prequantized': True}))
+        self.assertGreater(l20d.fused_device_memory(job)['buffer_bytes'],
+                           l20d.fused_device_memory(job | {'mxfp8': False})['buffer_bytes'])
+
+    def test_mxfp8_rejects_bf16_only_modes_before_submission(self):
+        for changes in ({'fused_direction': 'both'}, {'quick': True}, {'backward': True},
+                        {'compute_only': True}, {'qkv_policy': 'm128n128'}, {'hidden': 64}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                l20d.validate_job(self.fused_job(mxfp8=True, fused_direction='qkv', qkv_policy='auto') | changes)
+        with self.assertRaises(ValueError):
+            l20d.validate_job(self.fused_job(mxfp8_prequantized=True))
+        for changes in ({'mxfp8': False}, {'mxfp8_weight_preparation': 'unknown'}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                l20d.validate_job(self.fused_job(mxfp8=True, fused_direction='qkv',
+                    qkv_policy='auto', mxfp8_weight_preparation='comm_warp') | changes)
+
+    def test_mxfp8_calibration_reuses_graph_and_separate_flags(self):
+        job = self.fused_job(mxfp8=True, mpi=True, calibrate=True,
+                             fused_direction='qkv', qkv_policy='auto', fused_launch='graph')
+        l20d.validate_job(job)
+        self.assertIn('--calibrate', l20d.fused_argv(job))
+        measured = l20d.fused_device_memory(job)
+        plain = l20d.fused_device_memory(job | {'calibrate': False})
+        self.assertEqual(measured['buffer_bytes'], plain['buffer_bytes'])
+        self.assertGreater(measured['calibration_flag_bytes'], 0)
+        self.assertEqual(plain['calibration_flag_bytes'], 0)
+        with self.assertRaises(ValueError):
+            l20d.validate_job(job | {'profile': True})
+        for change in ({'mxfp8_prequantized': True}, {'mxfp8_weight_preparation': 'all'},
+                       {'mxfp8_weight_preparation': 'comm_warp'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+
+    def test_mxfp8_profile_uses_existing_single_process_protocol(self):
+        job = self.fused_job(mxfp8=True, profile=True, fused_direction='qkv',
+            directions='qkv', qkv_policy='m128n256', profile_detail='full')
+        argv = l20d.fused_argv(job)
+        self.assertIn('--profile', argv)
+        self.assertIn('--profile-direction', argv)
+        self.assertEqual(l20d.fused_binary(job).name, 'fused_mxfp8')
+        for change in ({'mpi':True}, {'directions':'oproj'}, {'mxfp8_prequantized':True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+        specialized = job | {'mxfp8_weight_preparation': 'comm_warp'}
+        l20d.validate_job(specialized)
+        argv = l20d.fused_argv(specialized)
+        self.assertEqual(argv[argv.index('--mxfp8-weight-preparation') + 1], 'comm_warp')
+        self.assertEqual(l20d.fused_device_memory(job), l20d.fused_device_memory(specialized))
+
+    def test_mxfp8_comm_warp_cli_reaches_validation_without_external_work(self):
+        validate = l20d.validate_job
+        checked = []
+
+        def stop_after_validation(job):
+            validate(job)
+            checked.append(dict(job))
+            raise RuntimeError('CLI validated locally')
+
+        for extra in (['--mpi', '--fused-launch', 'graph'],
+                      ['--profile', '--directions', 'qkv', '--profile-detail', 'full']):
+            with self.subTest(extra=extra), \
+                    mock.patch.object(sys, 'argv', ['l20d.py', 'run', 'fused-smoke',
+                        '--mxfp8', '--fused-direction', 'qkv', '--qkv-policy', 'm128n256',
+                        '--mxfp8-weight-preparation', 'comm_warp', *extra]), \
+                    mock.patch.object(l20d, 'validate_job', side_effect=stop_after_validation), \
+                    mock.patch.object(l20d, 'source_package', side_effect=AssertionError('No packaging')), \
+                    mock.patch.object(l20d, 'command', side_effect=AssertionError('No external command')), \
+                    mock.patch.object(l20d, 'mc_copy', side_effect=AssertionError('No cloud')), \
+                    mock.patch.object(l20d, 'submit', side_effect=AssertionError('No submit')), \
+                    self.assertRaisesRegex(RuntimeError, 'CLI validated locally'):
+                l20d.main()
+        self.assertEqual(len(checked), 2)
+        for job in checked:
+            self.assertEqual(job['mxfp8_weight_preparation'], 'comm_warp')
+            self.assertFalse(job['quick'])
+            self.assertEqual(job.get('warmup', 10), 10)
+            self.assertEqual(job.get('iterations', 50), 50)
+
+    def test_actual_cpp_mxfp8_preparation_parser_accepts_only_supported_modes(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('host C++ compiler unavailable')
+        source = (l20d.REPO / 'benchmarks/sm103/fused_bf16.cu').read_text()
+        marker = '    } else if (argument == "--mxfp8-weight-preparation") {\n'
+        begin = source.index(marker) + len(marker)
+        parser = source[begin:source.index('\n#endif', begin)]
+        unit = self.root / 'mxfp8_preparation_parser.cpp'
+        unit.write_text('''#include <string>
+#include <stdexcept>
+struct Options { std::string mxfp8_weight_preparation = "comm"; };
+void parse(Options& options, int argc, char** argv, int& index) {
+''' + parser + '''
+}
+int main() {
+ for (const char* mode : {"comm", "all", "comm_warp", "unknown", ""}) {
+  Options options; int index = 0;
+  char* argv[] = {const_cast<char*>("--mxfp8-weight-preparation"), const_cast<char*>(mode)};
+  const bool valid = std::string(mode) == "comm" || std::string(mode) == "all" || std::string(mode) == "comm_warp";
+  try { parse(options, 2, argv, index); if (!valid || options.mxfp8_weight_preparation != mode || index != 1) return 1; }
+  catch (const std::runtime_error&) { if (valid) return 2; }
+ }
+ Options options; int index = 0; char* argv[] = {nullptr};
+ try { parse(options, 1, argv, index); return 3; } catch (const std::runtime_error&) {}
+ return 0;
+}
+''')
+        executable = self.root / 'mxfp8_preparation_parser'
+        subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                        str(unit), '-o', str(executable)], check=True, capture_output=True)
+        subprocess.run([str(executable)], check=True, capture_output=True)
+
+    def test_actual_cpp_qkv_route_drain_guard_requires_all_handoff_warps(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('host C++ compiler unavailable')
+        source = (l20d.REPO / 'benchmarks/sm103/fused_bf16.cu').read_text()
+        begin = source.index('        const int route_warps =', source.index('      if (runtime.qkv_route_timeline) {'))
+        route_warps = source[begin:source.index(';', begin) + 1]
+        loop = source.index('        for (int index = 0; index < static_cast<int>(routes.size()); ++index) {', begin)
+        end_marker = '          previous[owner] = r.s2g_read_done;'
+        guard = source[loop:source.index(end_marker, loop) + len(end_marker)]
+        self.assertIn('weight_schedule=warp_then_route_v1', source[begin:loop])
+        precision = source[source.index('    fused_mpi::root_output() << "precision,mxfp8,'):]
+        self.assertIn('weight_schedule=warp_then_route_v1', precision.split('\n#endif', 1)[0])
+        unit = self.root / 'qkv_route_drain_guard.cpp'
+        unit.write_text('''#include <cstdint>
+#include <stdexcept>
+#include <vector>
+struct Record { int cta = 0, warp = 0; uint64_t begin = 0, s2g_read_done = 0; };
+struct Timeline { uint64_t start = 1, role_done = 100; };
+int check(const std::vector<Record>& routes) {
+ struct { int comm_sm = 16; } options;
+ const int tasks = 0;
+''' + route_warps + '''
+ std::vector<Timeline> timeline(options.comm_sm);
+ std::vector<uint64_t> previous(options.comm_sm * route_warps, 0);
+ int seen = 0;
+''' + guard + '''
+  ++seen;
+ }
+ return seen;
+}
+int main() {
+ std::vector<Record> routes(16 * 8);
+ for (int i = 0; i < 128; ++i) routes[i] = {i % 16, i / 16, 2, 3};
+ if (check(routes) != 128) return 1;
+ for (int warp = 0; warp < 8; ++warp) {
+  auto missing = routes; missing[warp * 16] = {};
+  try { check(missing); return 2; } catch (const std::runtime_error&) {}
+ }
+ routes[127].warp = 3;
+ try { check(routes); return 3; } catch (const std::runtime_error&) {}
+ return 0;
+}
+''')
+        executable = self.root / 'qkv_route_drain_guard'
+        subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                        str(unit), '-o', str(executable)], check=True, capture_output=True)
+        subprocess.run([str(executable)], check=True, capture_output=True)
+
     def test_quick_sampling_is_explicit_and_not_profile_or_build(self):
         job = self.fused_job(quick=True)
         l20d.validate_job(job)
@@ -386,6 +613,177 @@ int main() {
                        {'seq_local': 16640 + 128}, {'auto_oproj_comm': 1}, {'stage': 'fused-build'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 l20d.validate_job(job | change)
+
+    def test_auto_mxfp8_comm_is_zero_request_and_pairs_manual_controls(self):
+        job = self.fused_job(mxfp8=True, auto_mxfp8_comm=True, comm_sm=0, mpi=True,
+            fused_direction='qkv', fused_launch='graph', qkv_policy='m128n256',
+            qkv_raster='along_m', max_swizzle_size=8, seq_local=16384, hidden=2048,
+            q_heads=16, kv_heads=8, mxfp8_epilogue_n=32)
+        l20d.validate_job(job)
+        self.assertEqual(l20d.fused_candidates(job)[0], [0])
+        argv = l20d.fused_argv(job)
+        self.assertIn('--auto-mxfp8-comm', argv)
+        self.assertNotIn('--comm-sm', argv)
+        self.assertNotIn('--comm-sm-list', argv)
+        self.assertNotIn('--auto-oproj-comm', argv)
+        paired = job | {'comm_sm_list': '16,32,16', 'calibrate': True}
+        l20d.validate_job(paired)
+        self.assertEqual(l20d.fused_candidates(paired)[0], [16, 32, 0])
+        argv = l20d.fused_argv(paired)
+        self.assertEqual(argv[argv.index('--comm-sm-list') + 1], '16,32')
+        self.assertIn('--auto-mxfp8-comm', argv)
+        self.assertIn('--calibrate', argv)
+        self.assertEqual(l20d.fused_candidates(job | {'comm_sm': 24})[0], [24, 0])
+        self.assertEqual(l20d.fused_device_memory(job)['flag_bytes'],
+                         l20d.fused_device_memory(job | {'auto_mxfp8_comm': False, 'comm_sm': 32})['flag_bytes'])
+        for change in ({'mxfp8': False}, {'auto_mxfp8_comm': 1}, {'auto_oproj_comm': True},
+                       {'stage': 'fused-build'}, {'mpi': False}, {'fused_launch': 'eager'},
+                       {'profile': True}, {'quick': True}, {'fused_direction': 'oproj'},
+                       {'mxfp8_prequantized': True}, {'mxfp8_weight_preparation': 'all'},
+                       {'mxfp8_weight_preparation': 'comm_warp'}, {'qkv_raster': 'heuristic'},
+                       {'comm_sm_list': '0,16'}, {'comm_sm_list': '-1,16'}, {'comm_sm': -1}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+
+    def test_mxfp8_service_probe_is_isolated_profile_artifact(self):
+        job = self.fused_job(mxfp8=True, mxfp8_service_probe=True, profile=True,
+            mpi=False, world=8, directions='qkv', fused_direction='qkv', fused_launch='eager',
+            qkv_policy='m128n256', qkv_raster='along_m', max_swizzle_size=8,
+            seq_local=16384, hidden=2048, q_heads=16, kv_heads=8,
+            mxfp8_epilogue_n=32, comm_sm=16, host_launch='per_gpu_thread')
+        l20d.validate_job(job)
+        argv = l20d.fused_argv(job)
+        self.assertIn('--mxfp8-service-probe', argv)
+        self.assertIn('--profile', argv)
+        self.assertNotIn('--mxfp8-service-output', argv)  # Controller owns the scoped artifact path.
+        self.assertGreater(l20d.fused_device_memory(job)['profile_bytes'],
+            l20d.fused_device_memory(job | {'mxfp8_service_probe': False})['profile_bytes'])
+        padded = job | {'q_heads': 24, 'kv_heads': 24, 'hidden': 4096}
+        l20d.validate_job(padded)
+        l20d.validate_job(job | {'world': 4})
+        with self.assertRaisesRegex(ValueError, 'padded swizzle'):
+            l20d.validate_job(padded | {'mxfp8_service_probe': False})
+        for change in ({'mxfp8': False}, {'mxfp8_service_probe': 1}, {'stage': 'fused-build'},
+                       {'profile': False}, {'mpi': True}, {'world': 2}, {'fused_launch': 'graph'},
+                       {'profile_detail': 'cta'}, {'calibrate': True}, {'auto_mxfp8_comm': True},
+                       {'mxfp8_prequantized': True}, {'mxfp8_weight_preparation': 'all'},
+                       {'mxfp8_weight_preparation': 'comm_warp'}, {'qkv_raster': 'heuristic'},
+                       {'comm_sm_list': '16,32'}, {'comm_sm': 0}, {'quick': True}, {'host_launch': 'sequential'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+        source = (Path(__file__).resolve().parents[1] / 'benchmarks/sm103/fused_bf16.cu').read_text()
+        probe = source.split('void profile_mxfp8_services(', 1)[1].split('void destroy_runtimes(', 1)[0]
+        for stage in ('C_allready', 'C_delay1', 'C_delay2', 'Q', 'R', 'QR', 'QR_phase1'):
+            self.assertIn('"' + stage + '"', probe)
+        self.assertIn('job.instrumented && rank == 0 ? runtime.mxfp8_service', probe)
+        self.assertIn('generation < 2', probe)
+        self.assertIn('i < kWarmup', probe)
+        self.assertIn('i < kSamples', probe)
+        self.assertIn('clear_records()', probe)
+        self.assertIn('service_stage_verified', probe)
+        self.assertIn('performance_accepted=0', probe)
+        self.assertNotIn('candidate_verified', probe)
+        self.assertIn('wait_begin', probe)
+        self.assertIn('release_begin', probe)
+        self.assertIn('resources.delayed_panel < 0', probe)
+        self.assertIn('quant_workspace_validation=1', probe)
+
+    def test_mxfp8_service_preparation_has_independent_positive_epoch(self):
+        source = (l20d.REPO / 'benchmarks/sm103/fused_bf16.cu').read_text()
+        probe = source.split('void profile_mxfp8_services(', 1)[1].split('void destroy_runtimes(', 1)[0]
+        # There is no preceding production F launch in this path. Even the
+        # untimed prepare() validates Comm's positive-epoch contract.
+        stage_loop = probe.index('for (const auto& stage : stages)')
+        seed = probe.index('for (auto& runtime : runtimes) runtime.qkv.epoch = epoch + 1;')
+        prepare = probe.index('prepare_component(runtimes, check_options, Direction::kQkv);')
+        self.assertLess(stage_loop, seed)
+        self.assertLess(seed, prepare)
+        self.assertIn('query_gemm_a2a_mxfp8_service_resources(packed(rank, 1)', probe)
+        run = probe.split('auto run =', 1)[1].split('struct Stage', 1)[0]
+        self.assertLess(run.index('++epoch;'), run.index('packed(rank, epoch)'))
+        self.assertIn('params.projection.epoch = epoch;', probe)
+        validation = source.split('void validate(', 1)[1].split('void validation_self_test(', 1)[0]
+        self.assertIn('packed.projection.epoch = 1;', validation)
+        self.assertIn('packed.projection.ready = runtime.calibration_qkv_ready;', validation)
+        self.assertNotIn('prepare_gemm_a2a_mxfp8(', validation)
+        # Q and QR validation must inspect their own weight workspace, not a
+        # later successful preparation that could hide a quantization omission.
+        self.assertLess(probe.index('validate(runtimes, check_options, Direction::kQkv, context);'),
+                        probe.index('context + ",quant_workspace_validation=1"'))
+
+    def test_mxfp8_auto_query_is_distinct_and_checks_rank_repeat_agreement(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('host C++ compiler unavailable')
+        source = (l20d.REPO / 'benchmarks/sm103/fused_bf16.cu').read_text()
+        candidate = source[source.index('struct Candidate {'):source.index('std::vector<std::string> split_list')]
+        resolver = source[source.index('void resolve_auto_candidates('):source.index('void describe_component(')]
+        unit = self.root / 'mxfp8_auto_query.cpp'
+        unit.write_text('''#define FUSE_BENCH_MXFP8 1
+#include <algorithm>
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <cassert>
+#define CUDA_CHECK(expr) (void)(expr)
+enum class Direction { kQkv, kOproj };
+const char* direction_name(Direction d) { return d == Direction::kQkv ? "GEMM_A2A" : "A2A_GEMM"; }
+struct Options {
+ bool auto_mxfp8_comm=true, auto_oproj_comm=false, profile=false;
+ std::string profile_direction="both";
+ std::vector<int> comm_sm_list{16,32,0};
+ std::vector<std::string> qkv_policy_list{"m128n256"}, oproj_policy_list{"m128n128"};
+ bool run_qkv() const { return true; }
+ bool run_oproj() const { return false; }
+};
+struct RankRuntime {
+ int device=0, sm_count=148, mxfp8_epilogue_n=32;
+ struct { int gemm=1, route=2; } qkv;
+};
+int cudaSetDevice(int) { return 0; }
+void set_tile_policy(Direction, const std::string&) {}
+namespace fused_mpi {
+ std::vector<int> owned_ranks(int n) { std::vector<int> r; for(int i=0;i<n;++i) r.push_back(i); return r; }
+ void agree(const std::string&) {}
+}
+namespace fuse {
+ namespace detail { constexpr char kMxfp8QkvCalibrationVersion[]="synthetic-test-only"; }
+ int mode=0, calls=0;
+ int recommended_gemm_a2a_mxfp8_comm_ctas(int, int, int epilogue) {
+   assert(epilogue==32); int call=calls++;
+   return mode==1 ? 0 : mode==2 ? (call%2 ? 24 : 32) : mode==3 ? (call>=2 ? 24 : 32) : 32;
+ }
+}
+''' + candidate + resolver + '''
+int main() {
+ Options o; auto candidates=make_candidates(o);
+ assert(candidates.size()==3 && !candidates[0].auto_comm && !candidates[1].auto_comm);
+ assert(candidates[2].auto_comm && candidates[2].comm_sm==0);
+ std::vector<RankRuntime> ranks(2);
+ resolve_auto_candidates(ranks,candidates);
+ assert(candidates[2].auto_comm && candidates[2].comm_sm==32 && fuse::calls==4);
+ for (int mode : {1,2,3}) {
+   fuse::mode=mode; fuse::calls=0; candidates=make_candidates(o);
+   bool rejected=false;
+   try { resolve_auto_candidates(ranks,candidates); } catch (const std::runtime_error&) { rejected=true; }
+   assert(rejected);
+ }
+}
+''')
+        executable = self.root / 'mxfp8_auto_query'
+        subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', str(unit), '-o', str(executable)],
+                       check=True, capture_output=True)
+        subprocess.run([str(executable)], check=True, capture_output=True)
+        selected = source[source.index('void select_candidate('):source.index('void resolve_auto_candidates(')]
+        self.assertIn('runtime.qkv.num_comm_ctas = candidate.auto_comm ? 0 : candidate.comm_sm', selected)
+        enqueue = source[source.index('void enqueue_operation('):]
+        fused = enqueue[enqueue.index('} else if (job.direction == Direction::kQkv) {'):]
+        fused = fused[:fused.index('#else')]
+        self.assertIn('fuse::Mxfp8GemmA2AParams params{runtime.qkv', fused)
+        self.assertNotIn('params.projection.num_comm_ctas =', fused)
+        self.assertIn('packed.projection.num_comm_ctas = job.reserved_comm_ctas', enqueue)
 
     def test_mpi_is_explicit_fused_only_and_uses_separate_target(self):
         for stage in l20d.FUSED_STAGES:

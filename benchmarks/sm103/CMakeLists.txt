@@ -22,6 +22,24 @@ endforeach()
 add_library(fuse_sm103_cublaslt SHARED "${FUSE_ROOT}/csrc/baselines/sm103/cublaslt_training.cu")
 target_link_libraries(fuse_sm103_cublaslt PRIVATE CUDA::cublasLt CUDA::cudart CUDA::cuda_driver)
 target_compile_options(fuse_sm103_cublaslt PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
+add_executable(mxfp8_gemm_bench GEMM/mxfp8_bench.cu)
+target_link_libraries(mxfp8_gemm_bench PRIVATE fuse_sm103_cublaslt CUDA::cublas CUDA::cudart)
+target_compile_options(mxfp8_gemm_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
+
+option(FUSE_SM103_BUILD_MXFP8_SEARCH "Build isolated production-collective MXFP8 search" OFF)
+if(FUSE_SM103_BUILD_MXFP8_SEARCH)
+  if(NOT EXISTS "${CUTLASS_ROOT}/include/cutlass/cutlass.h")
+    message(FATAL_ERROR "MXFP8 search requires the existing CUTLASS_ROOT")
+  endif()
+  add_executable(mxfp8_cutlass_search GEMM/mxfp8_bench.cu)
+  target_include_directories(mxfp8_cutlass_search PRIVATE
+    "${FUSE_ROOT}/include" "${CUTLASS_ROOT}/include" "${CUTLASS_ROOT}/tools/util/include")
+  target_compile_definitions(mxfp8_cutlass_search PRIVATE FUSE_MXFP8_SEARCH=1
+    FUSE_ENABLE_PROFILING=0 CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+  target_compile_options(mxfp8_cutlass_search PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+    -O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+  target_link_libraries(mxfp8_cutlass_search PRIVATE fuse_sm103_cublaslt CUDA::cublas CUDA::cudart CUDA::cuda_driver)
+endif()
 
 # Optional, independent pure-GEMM experiment. Existing baseline builds do not
 # require CUTLASS and do not compile either of these template instances.

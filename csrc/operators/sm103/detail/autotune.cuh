@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstring>
+#include <iterator>
 #include <tuple>
 #include "model_calibration.cuh"
 #include "performance_model.cuh"
@@ -124,6 +125,195 @@ inline OProjTuningResult select_oproj_plan_cached(const OProjTuningRequest& requ
   }
   auto result = select_oproj_plan(request);
   if (result.status == OProjTuningStatus::Success) {
+    cache.entries[cache.next] = {request, result, true};
+    cache.next = (cache.next + 1) % cache.entries.size();
+  }
+  return result;
+}
+
+struct Mxfp8QkvTuningRequest {
+  int64_t m = 0, n = 0, k = 0;
+  int32_t world = 0, sm_count = 148, device = 0, capability = 103;
+  int32_t tile_m = 128, tile_n = 256, tile_k = 128, epilogue_n = 64;
+  int32_t stages = 0, cluster_ctas = 1, raster = 0;
+  int32_t max_swizzle_size = 8, swizzle = 1, comm_ctas = 0;
+  int32_t dynamic_smem_bytes = 0, q_heads = 0, kv_heads = 0, head_dim = 128;
+};
+
+enum class Mxfp8QkvTuningStatus { Success, InvalidInput, UnsupportedCalibration, ModelFailure };
+struct Mxfp8QkvTuningResult {
+  Mxfp8QkvTuningStatus status = Mxfp8QkvTuningStatus::UnsupportedCalibration;
+  bool along_n = false;
+  int32_t swizzle = 0, comm_ctas = 0, compute_ctas = 0;
+  Mxfp8QkvModelResult prediction{};
+  bool cache_hit = false;
+};
+
+inline auto mxfp8_qkv_request_key(const Mxfp8QkvTuningRequest& r) {
+  return std::tie(r.m, r.n, r.k, r.world, r.sm_count, r.device, r.capability,
+      r.tile_m, r.tile_n, r.tile_k, r.epilogue_n, r.stages, r.cluster_ctas,
+      r.raster, r.max_swizzle_size, r.swizzle, r.comm_ctas, r.dynamic_smem_bytes,
+      r.q_heads, r.kv_heads, r.head_dim);
+}
+
+// Fixed-GEMM selector: tile, resolved stages/resources, raster and swizzle are
+// INPUTS, never additional search axes. The scored model derives both queues
+// from that same mapping. Changing c changes actual compute workers and the
+// stride of the 8*c shared quantization/route workers, not ready granularity.
+//
+//   exact GEMM/route/domain + exact c -> bracketed K services -> schedule score
+//                                                       -> best measured c
+//
+// Evaluate every available independently measured budget with constant-work
+// host arithmetic. There is no runtime measurement, neighborhood probe or
+// invented SM scaling law. This is finite selection, not global optimality.
+// The overload is useful for host validation and never caches caller-owned data.
+inline Mxfp8QkvTuningResult select_mxfp8_qkv_plan(
+    const Mxfp8QkvTuningRequest& request,
+    const Mxfp8QkvCalibrationPoint* calibration, size_t count) {
+  using Status = Mxfp8QkvTuningStatus;
+  Mxfp8QkvTuningResult best;
+  auto width = [](int v) { return v == 1 || v == 2 || v == 4 || v == 8; };
+  if (request.m <= 0 || request.n <= 0 || request.k <= 0 ||
+      request.m > INT32_MAX || request.n > INT32_MAX || request.k > INT32_MAX ||
+      request.world <= 0 || request.sm_count <= 1 || request.device < 0 ||
+      request.tile_m <= 0 || request.tile_n <= 0 || request.tile_k <= 0 ||
+      request.epilogue_n <= 0 || request.stages <= 0 || request.cluster_ctas <= 0 ||
+      request.raster < 0 || request.raster > 1 || !width(request.max_swizzle_size) ||
+      !width(request.swizzle) || request.swizzle > request.max_swizzle_size ||
+      request.comm_ctas < 0 || request.comm_ctas >= request.sm_count ||
+      request.dynamic_smem_bytes <= 0 || request.q_heads <= 0 || request.kv_heads <= 0 ||
+      request.head_dim <= 0 || (count && !calibration)) {
+    best.status = Status::InvalidInput;
+    return best;
+  }
+  if (request.capability != 103 || request.sm_count != 148 || (request.world != 4 && request.world != 8) ||
+      request.tile_m != 128 || request.tile_n != 256 || request.tile_k != 128 ||
+      (request.epilogue_n != 32 && request.epilogue_n != 64) ||
+      request.m % 128 || request.n % 256 || request.k % 128 ||
+      request.cluster_ctas != 1 || request.head_dim != 128 ||
+      request.q_heads % request.world || request.kv_heads % request.world || request.q_heads % request.kv_heads ||
+      request.n != (int64_t{request.q_heads} + 2 * int64_t{request.kv_heads}) * request.head_dim) return best;
+  auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+  const int64_t mt = ceil_div(request.m, request.tile_m), nt = ceil_div(request.n, request.tile_n);
+  const int64_t padded_m = ceil_div(mt, request.swizzle) * request.swizzle;
+  const int64_t padded_n = ceil_div(nt, request.swizzle) * request.swizzle;
+  const int64_t scheduled = padded_m * padded_n;
+  auto compute_for = [&](int comm) {
+    return static_cast<int32_t>(std::min(scheduled, int64_t{request.sm_count - comm}));
+  };
+  auto matches = [&](const Mxfp8QkvCalibrationPoint& p, int comm) {
+    return p.world == request.world && p.sm_count == request.sm_count && p.capability == request.capability &&
+        p.tile_m == request.tile_m && p.tile_n == request.tile_n && p.tile_k == request.tile_k &&
+        p.epilogue_n == request.epilogue_n && p.stages == request.stages && p.cluster_ctas == request.cluster_ctas &&
+        p.raster == request.raster && p.swizzle == request.swizzle && p.comm_ctas == comm &&
+        p.compute_ctas == compute_for(comm) && p.dynamic_smem_bytes == request.dynamic_smem_bytes &&
+        p.q_heads == request.q_heads && p.kv_heads == request.kv_heads && p.head_dim == request.head_dim &&
+        p.k > 0 && p.k % 128 == 0 && p.m_min > 0 && p.m_max <= INT32_MAX &&
+        p.m_min <= request.m && request.m <= p.m_max &&
+        p.n_min > 0 && p.n_max <= INT32_MAX && p.n_min <= request.n && request.n <= p.n_max;
+  };
+  auto same_domain = [](const Mxfp8QkvCalibrationPoint& a, const Mxfp8QkvCalibrationPoint& b) {
+    return a.m_min == b.m_min && a.m_max == b.m_max && a.n_min == b.n_min && a.n_max == b.n_max &&
+        a.k_interpolation_group == b.k_interpolation_group && a.bulk.reference_m == b.bulk.reference_m;
+  };
+  // Return an exact anchor or the narrowest explicitly authorized K bracket.
+  // All physical fields/budgets match before interpolation; overlapping exact
+  // anchors are ambiguous and fail closed rather than picking favorable data.
+  auto brackets = [&](int comm, const Mxfp8QkvCalibrationPoint*& lower,
+                      const Mxfp8QkvCalibrationPoint*& upper) {
+    lower = upper = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+      const auto& p = calibration[i];
+      if (!matches(p, comm)) continue;
+      if (p.bulk.reference_m != p.m_min || p.n_min != p.n_max ||
+          !valid_mxfp8_qkv_bulk_services(p.services, p.bulk)) return false;
+      if (p.k != request.k) continue;
+      if (lower) { lower = upper = nullptr; return false; }
+      lower = upper = &p;
+    }
+    if (lower) return true;
+    int64_t span = INT64_MAX;
+    bool ambiguous = false;
+    for (size_t i = 0; i < count; ++i) {
+      const auto& a = calibration[i];
+      if (!matches(a, comm) || a.k >= request.k || !a.k_interpolation_group) continue;
+      for (size_t j = 0; j < count; ++j) {
+        const auto& b = calibration[j];
+        if (!matches(b, comm) || b.k <= request.k || !same_domain(a, b)) continue;
+        const int64_t candidate_span = int64_t{b.k} - a.k;
+        if (candidate_span < span) { lower = &a; upper = &b; span = candidate_span; ambiguous = false; }
+        else if (candidate_span == span) ambiguous = true;
+      }
+    }
+    return lower != nullptr && !ambiguous;
+  };
+  try {
+    std::vector<int> evaluated;
+    auto evaluate = [&](int comm) {
+      if (comm <= 0 || comm >= request.sm_count ||
+          std::find(evaluated.begin(), evaluated.end(), comm) != evaluated.end()) return;
+      evaluated.push_back(comm);
+      const Mxfp8QkvCalibrationPoint *lower, *upper;
+      if (!brackets(comm, lower, upper)) return;
+      const double alpha = lower == upper ? 0.0 : double(request.k - lower->k) / (upper->k - lower->k);
+      Mxfp8QkvModelInput input;
+      input.m = request.m; input.n = request.n; input.k = request.k;
+      input.world = request.world; input.sm_count = request.sm_count; input.comm_ctas = comm;
+      input.calibrated_compute_ctas = compute_for(comm);
+      input.tile_m = request.tile_m; input.tile_n = request.tile_n; input.tile_k = request.tile_k;
+      input.epilogue_n = request.epilogue_n; input.cluster_ctas = request.cluster_ctas;
+      input.along_n = request.raster == 1; input.resolved_swizzle = request.swizzle;
+      double Mxfp8QkvServices::* const fields[] = {
+          &Mxfp8QkvServices::startup_us, &Mxfp8QkvServices::tile_first_us,
+          &Mxfp8QkvServices::tile_cycle_us};
+      // Member pointers keep interpolation explicit when service fields evolve.
+      for (auto field : fields) {
+        input.services.*field =
+            lower->services.*field * (1 - alpha) + upper->services.*field * alpha;
+      }
+      input.bulk.reference_m = lower->bulk.reference_m;
+      input.bulk.route_us = lower->bulk.route_us * (1 - alpha) + upper->bulk.route_us * alpha;
+      input.bulk.quant_route_us = lower->bulk.quant_route_us * (1 - alpha) + upper->bulk.quant_route_us * alpha;
+      const auto prediction = score_mxfp8_qkv_bulk(input);
+      if (prediction.status != Mxfp8QkvModelStatus::Success) {
+        if (best.status != Status::Success) { best.status = Status::ModelFailure; best.prediction = prediction; }
+        return;
+      }
+      if (best.status != Status::Success || prediction.score_us < best.prediction.score_us ||
+          (prediction.score_us == best.prediction.score_us && comm < best.comm_ctas)) {
+        best = {Status::Success, input.along_n, request.swizzle, comm, prediction.compute_ctas, prediction, false};
+      }
+    };
+    if (request.comm_ctas) { evaluate(request.comm_ctas); return best; }
+    for (size_t i = 0; i < count; ++i) evaluate(calibration[i].comm_ctas);
+  } catch (const std::bad_alloc&) {
+    best.status = Status::ModelFailure;
+  }
+  return best;
+}
+
+inline Mxfp8QkvTuningResult select_mxfp8_qkv_plan(const Mxfp8QkvTuningRequest& request) {
+  return select_mxfp8_qkv_plan(request, kMxfp8QkvCalibrationPoints.data(), kMxfp8QkvCalibrationPoints.size());
+}
+
+// Only the immutable compiled calibration is cached. Its identity and every
+// physical/override input form the key. No cache exists for caller-owned tables.
+inline Mxfp8QkvTuningResult select_mxfp8_qkv_plan_cached(const Mxfp8QkvTuningRequest& request) {
+  struct Entry { Mxfp8QkvTuningRequest request; Mxfp8QkvTuningResult result; bool valid = false; };
+  struct Cache {
+    std::array<Entry, 16> entries{};
+    size_t next = 0;
+    const char* version = kMxfp8QkvCalibrationVersion;
+  };
+  static thread_local Cache cache;
+  if (std::strcmp(cache.version, kMxfp8QkvCalibrationVersion) != 0) cache = Cache{};
+  for (const auto& entry : cache.entries) {
+    if (!entry.valid || mxfp8_qkv_request_key(entry.request) != mxfp8_qkv_request_key(request)) continue;
+    auto result = entry.result; result.cache_hit = true; return result;
+  }
+  auto result = select_mxfp8_qkv_plan(request);
+  if (result.status == Mxfp8QkvTuningStatus::Success) {
     cache.entries[cache.next] = {request, result, true};
     cache.next = (cache.next + 1) % cache.entries.size();
   }

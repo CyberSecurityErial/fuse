@@ -2,6 +2,7 @@
 #pragma once
 
 #include "fuse/profiling/sm103/host.cuh"
+#include "fuse/profiling/sm103/mxfp8.cuh"
 #include "producer_consumer.cuh"
 
 // Blackwell scheduling, CTA roles, and cooperative launch resources.
@@ -245,6 +246,32 @@ struct MonolithicGemm {
   }
 };
 
+// Optional input-production prologue, selected only by a binding that needs
+// per-call scratch initialization. The ordinary BF16 mixed-role grid is intact.
+// The producer supplies both reset and the optional all-CTA startup control;
+// steady-state input work belongs to its communication operation.
+template <class Base, class InputProducer, bool Instrumented = false>
+struct InputProductionKernel : Base {
+  CUTLASS_DEVICE void operator()(const typename Base::Params& params, char* smem) {
+#if FUSE_ENABLE_PROFILING
+    uint64_t start = 0;
+    if constexpr (Instrumented) {
+      if (threadIdx.x == 0) start = read_global_timer();
+    }
+#endif
+    InputProducer::initialize_grid(params.comm);
+    Base::operator()(params, smem);
+#if FUSE_ENABLE_PROFILING
+    // Role telemetry must include scratch reset and optional startup work,
+    // not make the all-CTA preparation disappear from the kernel envelope.
+    if constexpr (Instrumented) {
+      if (threadIdx.x == 0 && blockIdx.x < params.timeline_capacity)
+        params.timeline[blockIdx.x].start = start;
+    }
+#endif
+  }
+};
+
 // Standalone calibration kernels keep production's physical CTA geometry
 // and shared-memory floor, but do not launch dummy communication/compute CTAs.
 // They deliberately do not change MonolithicGemm's mixed-role contract.
@@ -310,6 +337,146 @@ struct CopyReferenceKernel {
     }
   }
 };
+
+// Independent communication-side input production, with the fused resource
+// floor. The producer follows the existing comm-parameter contract (weights,
+// producer_order, n_band_swizzle); this wrapper adds no arithmetic or protocol.
+template <class CommParams, class InputProducer, class FusedKernel>
+struct InputReferenceKernel {
+  using ProductionKernel = FusedKernel;
+  using Params = CommParams;
+  using ArchTag = typename FusedKernel::ArchTag;
+  using ClusterShape = typename FusedKernel::ClusterShape;
+  static constexpr int MaxThreadsPerBlock = FusedKernel::MaxThreadsPerBlock;
+  static constexpr int MinBlocksPerMultiprocessor = 1;
+  static constexpr size_t SharedStorageSize = FusedKernel::SharedStorageSize;
+  static_assert(MaxThreadsPerBlock == 256 && cute::size(ClusterShape{}) == 1);
+
+  static dim3 get_grid_shape(const Params& p) { return dim3(p.params.num_comm_ctas, 1, 1); }
+  static dim3 get_block_shape() { return FusedKernel::get_block_shape(); }
+
+  CUTLASS_DEVICE void operator()(const Params& p, char*) {
+    // All c CTAs participate in the existing reset/barrier. The ordinary
+    // producer then owns exactly the same queue as each production comm warp:
+    // worker=warp*c+comm, stride=8*c. There is no second arithmetic path,
+    // altered panel publication, routing, or all-CTA preparation prologue.
+    InputProducer::initialize_grid(p);
+    const int comm_ctas = static_cast<int>(gridDim.x);
+    const int worker = static_cast<int>(threadIdx.x / 32) * comm_ctas + blockIdx.x;
+    InputProducer work(p.weights, p.producer_order, p.n_band_swizzle,
+        worker, 8 * comm_ctas);
+    work.drain();
+  }
+};
+
+#if FUSE_ENABLE_PROFILING
+// Fixed-budget OutputGemm service: c control CTAs and the exact G-worker
+// scheduler/resource geometry. Prepared W is untouched; only readiness is
+// seeded, optionally withholding ONE panel with steady-state consumers as a
+// causal probe. First-tile consumers are not recovery-latency observations.
+template <class GemmKernel, class FusedKernel>
+struct InputComputeReferenceKernel : GemmReferenceKernel<GemmKernel, FusedKernel> {
+  using Base = GemmReferenceKernel<GemmKernel, FusedKernel>;
+  struct Params {
+    typename GemmKernel::Params gemm{};
+    uint32_t* weight_ready = nullptr;
+    uint32_t* weight_arrivals = nullptr;
+    int32_t panels = 0, comm_ctas = 0, compute_ctas = 0;
+    uint32_t epoch = 0;
+    Mxfp8ServiceConfig config{};
+    Mxfp8ServiceView service{};
+  };
+  static dim3 get_grid_shape(const Params& p) { return dim3(p.comm_ctas + p.compute_ctas, 1, 1); }
+  CUTLASS_DEVICE void operator()(const Params& p, char* smem) {
+    auto* stamp = p.service.ctas ? p.service.ctas + blockIdx.x : nullptr;
+    uint64_t origin = 0;
+    if (threadIdx.x == 0 && (stamp || (blockIdx.x == 0 && p.config.delayed_panel >= 0))) {
+      origin = read_global_timer();
+      if (stamp) stamp->begin = origin;
+    }
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int panel = index; panel < p.panels; panel += gridDim.x * blockDim.x) {
+      if (panel != p.config.delayed_panel && p.service.panel_release_begin)
+        p.service.panel_release_begin[panel] = read_global_timer();
+      p.weight_arrivals[panel * kReadyFlagStride] = 0;
+      p.weight_ready[panel * kReadyFlagStride] = panel == p.config.delayed_panel ? 0 : p.epoch;
+      // Initial panels become visible through the grid barrier below. The
+      // delayed panel is different: its stamp follows a real GPU release.
+      if (panel != p.config.delayed_panel && p.service.panel_release)
+        p.service.panel_release[panel] = read_global_timer();
+    }
+    cooperative_groups::this_grid().sync();
+    if (threadIdx.x == 0 && stamp) stamp->setup_done = read_global_timer();
+    if (static_cast<int>(blockIdx.x) < p.comm_ctas) {
+      if (blockIdx.x == 0 && threadIdx.x == 0 && p.config.delayed_panel >= 0) {
+        while (read_global_timer() - origin < p.config.delay_ns) __nanosleep(64);
+        if (p.service.panel_release_begin)
+          p.service.panel_release_begin[p.config.delayed_panel] = read_global_timer();
+        store_release_gpu(p.weight_ready + p.config.delayed_panel * kReadyFlagStride, p.epoch);
+        if (p.service.panel_release)
+          p.service.panel_release[p.config.delayed_panel] = read_global_timer();
+      }
+    } else if (PersistentTileSchedulerSm100Monolithic::valid_initial_worker(
+                   p.gemm.scheduler, blockIdx.x)) {
+      GemmKernel{}(p.gemm, smem);
+    }
+    if (threadIdx.x == 0 && stamp) stamp->end = read_global_timer();
+  }
+};
+
+// Independent Q / R / Q+R service. Output is already materialized; seed the
+// SAME full-tile flags so the normal route acquire remains in the hot path.
+// No fake input arithmetic or per-copy readiness granularity is introduced.
+template <class CommOp, class InputProducer, class FusedKernel>
+struct InputCopyReferenceKernel : CopyReferenceKernel<CommOp, FusedKernel> {
+  struct Params {
+    typename CommOp::Params comm{};
+    Mxfp8ServiceView service{};
+    bool route = false;
+    int32_t quant_phase_steps = 0;
+  };
+  static dim3 get_grid_shape(const Params& p) { return dim3(p.comm.params.num_comm_ctas, 1, 1); }
+  CUTLASS_DEVICE void operator()(const Params& p, char* smem) {
+    auto* stamp = p.service.ctas ? p.service.ctas + blockIdx.x : nullptr;
+    if (threadIdx.x == 0 && stamp) stamp->begin = read_global_timer();
+    const int c = p.comm.params.num_comm_ctas;
+    if (p.route) {
+      const int64_t tiles = ((int64_t{p.comm.params.gemm.m} + CommOp::kBlockM - 1) / CommOp::kBlockM) *
+          ((int64_t{p.comm.params.gemm.n} + CommOp::kBlockN - 1) / CommOp::kBlockN);
+      const int index = blockIdx.x * blockDim.x + threadIdx.x;
+      for (int64_t tile = index; tile < tiles; tile += gridDim.x * blockDim.x)
+        p.comm.params.ready[tile * kReadyFlagStride] = p.comm.params.epoch;
+    }
+    // For Q/QR the original input initializer's grid barrier also makes the
+    // diagnostic output seeds visible. R has no input reset, so supplies that
+    // barrier explicitly. Exclude QR's seed work from production startup.
+    InputProducer::initialize_grid(p.comm);
+    if (!p.comm.weights.source) cooperative_groups::this_grid().sync();
+    if (threadIdx.x == 0 && stamp) stamp->setup_done = read_global_timer();
+    const int worker = static_cast<int>(threadIdx.x / 32) * c + blockIdx.x;
+    InputProducer work(p.comm.weights, p.comm.producer_order, p.comm.n_band_swizzle,
+        worker, 8 * c);
+    if (p.route) {
+      // Diagnostic excitation only. Preserve next/pending_chunks in this
+      // worker when handing it to the ordinary route loop. A fresh producer
+      // here would repeat chunks and corrupt the arrival/publication protocol.
+      if (p.quant_phase_steps == 1) work.progress();
+      using Route = typename CommOp::Base;
+      if (p.service.routes)
+        Route{}.template run<true, InputProducer>(
+            p.comm, smem, blockIdx.x, c, true, p.service.routes, work);
+      else
+        Route{}.template run<false, InputProducer>(
+            p.comm, smem, blockIdx.x, c, true, nullptr, work);
+      cooperative_groups::this_grid().sync();
+      CommOp{}.finalize(p.comm);
+    } else {
+      work.drain();
+    }
+    if (threadIdx.x == 0 && stamp) stamp->end = read_global_timer();
+  }
+};
+#endif
 
 struct DeviceInfo {
   int device = -1;

@@ -1,5 +1,81 @@
 # SM103 Ulysses forward baseline bench
 
+## MXFP8 QKV forward baseline (v20 development)
+
+The public operands are **prequantized MXFP8 activations and BF16 master weights**:
+
+```text
+MXFP8 X [M,K] + scales ────────────────────────────────┐
+                                                     ├─ MXFP8 GEMM
+BF16 W [N,K] ── communication-CTA quantization ─ ready ┘
+                    FP32 accumulation → BF16 epilogue → Q/K/V A2A
+                          ↑                                  │
+          quantize subsequent W while waiting/routing outputs ┘
+```
+
+W is freshly quantized on every full call; both sources remain unmodified. Each
+32-element block uses E4M3 values and one UE8M0 power-of-two scale, choosing
+the smallest representable scale that avoids overflow for finite inputs.
+The scale tensors are written directly in the pinned CUTLASS native layout.
+GEMM uses native block-scaled MXFP8 Tensor Cores, not BF16 computation.
+The optional activation adapter runs upstream, outside this operator's boundary.
+The public activation-size query includes native SFA padding. Arbitrary compact
+scale tensors cannot be passed without conversion to the required layout.
+
+The first implementation uses an explicit M128/N256/K128 collective with an
+M128/N64 epilogue, 1-SM cluster, and caller-selected communication CTA budget,
+raster and swizzle. It reuses the existing BF16 output routing and ready
+protocol; it does not reuse BF16 performance curves to select MXFP8 parameters.
+The K dimension must be divisible by 128, head_dim must be 128 for this TMA
+communication-side quantization path, and existing GQA/CP route constraints
+still apply. Special MLA/KDA routing is not added by this precision path.
+
+`fused_mxfp8[_mpi]` reuses the forward harness rather than duplicating its
+validation or sampling loop. The normal Graph boundary is **one persistent
+kernel including weight quantization, GEMM and A2A**. It does not include
+upstream activation quantization. The optional `--mxfp8-prequantized` diagnostic
+prepares W separately and excludes weight preparation; report it separately.
+There is no implicit persistent weight cache. The `precision,` record identifies
+the actual collective and whether quantization is included.
+
+Default `--mxfp8-weight-preparation comm` reuses all communication warps: bounded
+SIMT chunks execute during output-ready waits and after issuing local/peer TMA.
+Every warp drains its remaining assigned weight work before role completion,
+even when it owns no output tasks. A full N256-by-K panel publishes one ready
+flag; all M tiles reuse that panel, and the mainloop caches its acquire across
+prologue/remainder. No per-32-element/K-stage wait is added to GEMM.
+`--mxfp8-weight-preparation all` is an explicit control: all resident CTAs
+quantize first, synchronize, then start their normal roles. It is not overlapped
+quantization/GEMM. Per-call counters are reset inside the cooperative kernel;
+scratch need not be zeroed and Graph replay cannot reuse stale panel readiness.
+First-use N order comes from the resolved raster/swizzle geometry, with optional
+N-band rotation; publication still requires all chunks, not logical task order.
+No model-name or per-shape weight cache is introduced. BF16 bindings retain
+their original no-input-work path and need no new prologue or grid barrier.
+
+The complete output is checked against cuBLAS using independently reconstructed
+quantized operands, then the full A2A route is checked. This validates arithmetic
+and routing on the represented MXFP8 values, **not** model-quality equivalence
+to unquantized BF16. Two reproducible random payloads change both X and W to
+detect stale quantized storage. Formal sampling remains 10 warmups + 50 samples;
+BF16-specific tuning diagnostics are not accepted by this harness. MXFP8 uses
+the existing QKV profiling protocol and supports explicit C/R calibration below.
+
+Through the existing Mac → mc → main screen controller:
+
+```bash
+python3 scripts/l20d.py run fused-build --node 09 --mpi --mxfp8 \
+  --experiment v20-mxfp8-bringup
+python3 scripts/l20d.py run fused-smoke --node 09 --mpi --mxfp8 \
+  --fused-launch graph --fused-direction qkv --world 8 \
+  --global-seq 2048 --hidden 1024 --q-heads 32 --kv-heads 8 --head-dim 128 \
+  --comm-sm 8 --qkv-policy m128n256 --input-generator gpu_philox \
+  --experiment v20-mxfp8-bringup
+```
+
+Validation status: local host contracts pass; CUDA compilation, multi-GPU
+correctness and performance are **pending**, not a released baseline result.
+
 ## OProj ready / MMA / epilogue diagnostic
 
 `l20d.py run fused-smoke --profile --profile-detail full --directions oproj
@@ -383,3 +459,241 @@ Qwen3 CP8/512K的32→48 CTA选择退化10.62%，没有按模型名覆盖该选�
 7点存在采样漂移，7个历史缺测未重试；这些是快测，不是正式稳定性能承诺。
 控制器可用 `--auto-oproj-comm` 请求真实零预算入口，不能同时给显式通信预算，
 也不能与profiling/独立C/R标定混用。首次主机查询和Graph构建不计入Graph吞吐。
+# MXFP8 QKV independent GEMM search
+
+`l20d.py run build --mxfp8-gemm-search` builds an isolated target; run
+`gemm-probe --gemm-precision mxfp8 --mxfp8-gemm-search --gemm-sm-budget 132
+--launches graph --gemm-matrix <matrix.json>` through the normal controller.
+Use the current ordinary-user workspace explicitly on both commands.
+
+The matrix is `{schema: "sm103_gemm_matrix_v1", shapes: [{id,m,n,k}, ...]}`.
+The search reuses the production MXFP8 collective and persistent scheduler,
+with prequantized operands, BF16 output and no quantization/communication or
+ready polling. The 132-CTA cap and one-resident-CTA SMEM allocation model the
+compute budget, not fixed physical SM IDs or communication interference.
+Production remains M128/N256/K128/E64/automatic stages and is not overwritten.
+
+Grid: M128 × N{128,256} × K{128,256} × epilogue-N{32,64} ×
+Along{M,N} × swizzle{1,4}, automatic mainloop stages: 32 candidates.
+Top two stable candidates expand to missing swizzles 2/8 and explicit stages
+2/3, at most two neighborhood rounds, deduplicated across rounds. K256 only
+admits explicit stage2 at N128; N256/K256 stays on Auto (its E64/stage2
+combination exceeds SMEM capacity).
+Each candidate uses converged warmup, Graph10+50, the first stable round
+(half-sample drift ≤5%), and full decoded-operand GEMM validation on two
+random payloads. Results are not accepted until the second payload passes.
+Allocations, operands and reference are reused within each shape; candidates
+and shapes share one process. Resource/memory skips and unstable candidates
+are explicit; failures are not converted to winners. Reports call the result
+candidate-set best, not a global optimum or measured fused speedup.
+# MXFP8 GEMM-driven fused tuning
+
+`scripts/tune_sm103_mxfp8_fused.py` consumes the audited pure-GEMM search
+summary and the existing forward matrix. Its default invocation only prints a
+plan; `--execute` runs the normal L20D controller. Supply `--current`, `--gemm`,
+`--output`, and the current ordinary-user `--workspace` explicitly.
+
+The MXFP8 public parameters expose `epilogue_n=32|64` (default 64 keeps the old
+baseline); `projection.gemm.raster/max_swizzle_size` and
+`projection.num_comm_ctas` remain explicit. The registered M128/N256/K128
+families use auto stages, and do not change complete-panel/tile ready units.
+The same selected family is used for launch, resource queries and profiling.
+
+Like the BF16 GEMM-driven fusion path, the resolved producer tile order drives
+the output-copy dependency inverse. Weight panels follow their first-use N
+order in that same schedule. Raster/swizzle and communication budget are
+joint offline candidates, not independent winners pasted together: start at
+the pure-GEMM winner, scan communication budgets, probe neighboring layouts
+with nearby budgets, then refine the best fused candidate's budget. Each
+candidate uses Graph 10+50, nonzero random operands and full two-payload
+numerical/routing validation. A same-binary E64/M/sw1/comm16 control makes
+the old/new comparison explicit. `summarize_sm103_mxfp8_fused.py` audits raw
+samples, archive receipts and per-rank ownership before accepting a result.
+
+This is bounded offline tuning, not a global-optimality claim or an MXFP8
+runtime performance model. BF16 service-time coefficients are not reused:
+MXFP8 additionally produces quantized weights on communication workers, and
+would require its own measured quantization/compute/copy calibration. No
+model-name lookup or fused winner is embedded in the kernel.
+
+For an explicitly shortened search, `--resume --fast` reuses completed,
+same-binary/same-environment candidate evidence and prioritizes up to two
+layouts already successful for the same N/K family. It probes neighboring
+budgets at every remaining shape and expands regressing cases. This reduces
+candidate count, not matrix coverage, warmup, samples or validation. Such rows
+are marked `family_seeded_joint_pool`; this narrower search is not exhaustive.
+
+## MXFP8 QKV communication autotune
+
+The interface follows BF16: `projection.num_comm_ctas=0` requests automatic
+communication-budget selection; positive values are strict overrides.
+`recommended_gemm_a2a_mxfp8_comm_ctas(problem, route, epilogue_n)` uses the
+same resolver as production and telemetry, returns a positive budget on
+success, and returns zero for unsupported geometry/calibration/device state.
+The query is shape-only. It does not inspect tensor pointers, allocate GPU
+memory, encode descriptors, benchmark candidates, or launch kernels.
+
+**The offline policy passed the declared same-run acceptance matrix on
+2026-09-11.** All 33 physical points have independently confirmed manual
+configurations replayed beside true Auto in the same binary/job. Graph 10+50,
+two random payloads and full numeric/routing validation passed. Auto/manual
+geometric mean is 96.6929%; the minimum is 90.0858% (QwenDense CP4/512K).
+The user's report-only gate is geometric mean >=95% and every point >90%.
+The minimum is close to the boundary, not a guaranteed 90% performance floor.
+The 11 calibration-sequence points average 95.4402%; the 22 held-out sequence
+points average 97.3253%. These are measured retention ratios, not prediction
+accuracy or proof for unmeasured shapes.
+
+Keep the two unique result pairs under `mxfp8-v20/autotune/` in the Mac
+midfile directory: `acceptance-current.json/md` and
+`manual-best-current.json/md`. The latter retains confirmed offline SOTA,
+exact configurations, all 50 samples and provenance without search history.
+Historical measurements remain separate: Dense CP4/512K retains only 88.3915%
+against its older saved throughput, versus 90.0858% against this run's replay.
+Do not claim every point exceeds 90% against the historical snapshot.
+BLOOM CP4/512K's previous OOM left no manual reference; it is now filled by a
+finite 16/24/32-budget search and independent paired confirmation, without
+changing the policy. Qwen3 CP8 remains outside the adapted routing scope;
+Kimi is QKV-only. Qwen72/Llama70 share a physical measurement, not two samples.
+
+The formal binary SHA256 is
+`14ba624ba3bdcde405a8aa53837fc3b2eb83cde326c8d061511f6ad0b966041b`.
+Its calibration identity retains the original `validation_pending_6714eeeb...`
+label so the tested binary is not modified just to rename a provenance marker;
+the acceptance artifact, not that label, records the validation outcome.
+
+The
+registered physical layouts are calibrated independently at communication
+budgets 16/32/64; the maintained calibration artifact records actual coverage,
+unavailable observations and binary identity. S128K is the calibration
+sequence; S256K/S512K are predeclared holdouts, not inputs used to fit a winner.
+Unsupported physical keys return `cudaErrorNotSupported`; the manual path
+remains available. Calibration, Auto performance and bitwise-repeatability are
+separate checks. Do not insert synthetic coefficients, BF16 timings or fused
+winner tables to fill missing domains.
+
+The maintained `acceptance-current.json/md` artifact records the actual formal
+coverage, paired same-run manual budget, historical reference, exact layouts,
+model version and missing rows. A model query succeeding does not certify its
+performance prediction or generalization. Probe diagnostics
+still distinguish Q-only and publishing mixed slots, but individual publication
+latencies do not enter the new decision. They depend on concurrent traffic;
+more context fields do not prove coverage of future concurrent states. Formal
+held-out comparisons remain necessary. No correction fitted to fused winners
+is enabled.
+Online tuning is explicitly out of scope: the first production invocation must
+resolve its budget from the compiled offline strategy without candidate GPU
+launches, timing feedback or runtime calibration.
+
+The coarse offline policy uses directly observed compute tile
+first/cycle services for `C`, and whole local Q+R/R services for `P`. For a
+calibration row count `M0` and a larger row count `M` at the same N/K/layout,
+the rule uses `P(M) = QR(M0) + (M/M0 - 1) * R(M0)` and
+`C(M) = tile_first + (ceil(valid_tiles/(148-c))-1) * tile_cycle`.
+The score is `startup + max(C(M), P(M))`. Weight work is fixed, not multiplied by sequence
+length. `QR-R` is not labeled quantization latency and is not clamped to zero:
+the mixed workload may change traffic pacing. R here is an aggregate effective
+output service, never a per-TMA latency; C uses individual observed tile
+intervals, not whole-C divided by waves. Local Q/R completion excludes cross-rank
+finalization. Extrapolation to 256K/512K remains a hypothesis requiring formal
+validation. It assumes sufficient overlap: neither first-panel stalls nor
+changing fused contention are exactly simulated. Unmodeled stage predictions
+are reported as unknown, not zero. The implementation and its host reference
+must agree before formal GPU acceptance; host tests alone are not acceptance.
+
+The private API mirrors SM103 BF16's `TuningRequest`, `TuningResult`,
+`select_*_plan` and bounded success-only cache. GEMM tile/epilogue, resolved
+stages/raster/swizzle and resource footprint are inputs, not auto outputs.
+Each candidate communication count `c` selects independently measured services
+for compute stride `C=148-c` and communication-warp stride `8*c`. The kernel
+continues to use the original shared scheduling map:
+
+```text
+GEMM scheduler                    shared communication warp
+  tile j, j+C, ...                  wait output -> quantize one chunk
+          ^                         issue G2S -> one chunk -> wait G2S
+    full N256*K ready               issue S2G -> one chunk -> wait slot
+          |                         next output; finally drain own W work
+  last panel contribution <---------+
+          |
+          +-> GEMM -> full output tile ready -> BF16 route -> remote drain
+```
+
+`ProducerTileOrder` supplies the resolved CUTLASS mapping; `ConsumerTileOrder`
+assigns copies to their last logical dependency, while execution still acquires
+all dependencies. No dynamic work queue, new device polling point, changed
+publication granularity or new WASP mode is introduced. Current registered
+geometry is M128/N256/K128 with E32/E64. Other GEMM N tiles require an explicit
+weight-panel dependency adapter before entering this model.
+
+The host scorer evaluates all applicable measured budgets using constant-work
+arithmetic per candidate. It does not simulate publication/DMA events or launch
+GPU candidate trials. Only three direct compute/startup intervals and whole
+R/QR spans enter the compiled decision table; finer diagnostic observations
+remain in calibration JSON. A success-only bounded cache avoids repeated queries.
+
+Missing physical anchors are not guessed. Communication budgets and layouts
+must match measured calibration; K interpolation requires compatible explicit
+brackets and a common interpolation group. Prequantized diagnostics require a
+positive budget: query auto production first and reuse its result, rather than
+score a no-quantization boundary with quantization services. Formal validation
+must use the existing 10+50/random/full-routing protocol and compare against
+held-out hand-tuned cases; synthetic host tests prove model contracts only.
+
+### Calibration is measurement, not fitting
+
+The selection rule is `argmin_c predicted_completion_time(c)`. There is no
+trainable weight, penalty, shape-specific winner, or threshold selected from
+fused performance. Every candidate reconstructs the actual scheduler with
+`compute_ctas=148-c` and `quant/copy_workers=8*c`. Model names and sequence
+labels belong only to the report, never to the selection key or score.
+
+Service values must be durations of identified operations in independent
+experiments. For example, two successive complete output releases by the
+same compute CTA measure its release interval; dividing whole-kernel time by
+waves does not measure that interval. A deliberately delayed weight panel
+measures response after a dependency becomes ready, not an unexplained
+coefficient inferred from fused slowdown. Delay lengths are experimental
+stimuli, not parameters optimized to select a preferred communication budget.
+
+For diagnostic mixed quantization/TMA slots, both branches use the same time
+origin; nested intervals are not added twice. The coarse decision instead uses
+the measured whole QR span once. The original complete-panel ready unit is unchanged.
+
+Keep the primitive evidence and held-out fused validation separate. A new
+M/N reconstructs its work and dependencies instead of choosing a recorded
+winner. Expanding a calibration domain needs independent evidence; unsupported
+resources are not silently extrapolated. A failed prediction is reported and
+investigated through an observable missing dependency or resource interaction,
+never corrected by fitting its error into a scale factor. The acceptance table
+must distinguish fixed-GEMM Auto/manual comparisons from a historical offline
+winner that used a different GEMM layout, and must preserve missing results.
+
+### Independent MXFP8 C/Q/R measurements
+
+Add `--calibrate` to a manual-budget MXFP8 MPI Graph run. The same process and
+buffers measure four distinct boundaries for every candidate and validate
+both random payloads, with pre/post checks around formal 10+50 sampling:
+
+- `fused`: dynamic W quantization + MXFP8 GEMM + BF16 route.
+- `compute_reference`: prepared MXFP8 A/W, no communication/quantization; the
+  production collective retains full-output-tile drain/ready publication.
+- `copy_reference`: already materialized BF16 output, no GEMM/quantization or
+  GEMM-ready waits; includes actual routing and cross-rank completion.
+- `quantize_reference`: original communication-warp producer only, including
+  its reset/barrier and panel publication, with exactly `comm*8` workers.
+  No TMA/GEMM runs inside this timed boundary. Afterwards, C consumes the actual
+  Q output for numerical validation against independently reconstructed
+  operands, without preparing W again. This validation is outside Q timing;
+  it is not a standalone bitwise quantization oracle. Q reset uses `comm`
+  CTAs rather than the full fused grid, so it cannot provide F's startup time.
+
+C uses `148-comm` compute CTAs; R uses `comm` communication CTAs. E32/E64,
+raster/swizzle, threads and actual dynamic SMEM match the requested production
+configuration; separate reference ready/done flags prevent epoch contamination.
+Matching these resources does not assert identical register allocation/SASS.
+Preparation, allocations, graph capture and validation are outside timing.
+Calibration currently requires ordinary `comm` mode and dynamic-weight F.
+These aggregate C/Q/R durations diagnose budget tradeoffs; they cannot uniquely
+identify the model's first-tile/cycle/publication/mixed-window service fields.
+In particular, C divided by waves is not a measured tile-ready latency.

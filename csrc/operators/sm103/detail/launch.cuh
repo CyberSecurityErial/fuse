@@ -121,6 +121,9 @@ using QkvForwardN160Binding = GemmA2AKernelBinding<Bf16GemmTypes<160>, QkvGqaPac
 using QkvForwardN192Binding = GemmA2AKernelBinding<Bf16GemmTypes<192>, QkvGqaPackCommN192>;
 using QkvForwardN256Binding =
     GemmA2AKernelBinding<Bf16GemmTypes<256>, QkvGqaPackCommWide>;
+template <int EpilogueN>
+using Mxfp8QkvBinding = GemmA2AKernelBinding<
+    Mxfp8GemmFamily<256, 128, EpilogueN>, Mxfp8QkvGqaPackComm>;
 using QkvForwardN128K128Binding =
     GemmA2AKernelBinding<Bf16GemmTypes<128, 128>, QkvGqaPackComm>;
 using QkvForwardN256K64E32Binding =
@@ -255,9 +258,9 @@ inline cudaError_t device_info(DeviceInfo* result) {
   return cudaSuccess;
 }
 
-template <class Kernel>
+template <class Kernel, class Input = Bf16>
 typename Kernel::Arguments gemm_arguments(
-    const GemmProblem& problem, const Bf16* lhs, const Bf16* rhs_nt,
+    const GemmProblem& problem, const Input* lhs, const Input* rhs_nt,
     Bf16* output, float alpha, int32_t num_comm_ctas,
     const DeviceInfo& info, GemmRaster fallback) {
   typename Kernel::Arguments args{};
@@ -465,8 +468,18 @@ cudaError_t launch_oproj_forward_policy(
   FUSE_SM103_HOST_RETURN(visit_oproj_forward_policy(policy, launch));
 }
 
+struct ProjectionGemmInput {
+  template <class CommArguments>
+  void configure_communication(CommArguments&) const {}
+  template <class Gemm>
+  auto arguments(const GemmA2AParams& p, const DeviceInfo& info) const {
+    return gemm_arguments<Gemm>(p.gemm, p.lhs, p.rhs_nt, p.local_output,
+        p.alpha, p.num_comm_ctas, info, GemmRaster::kAlongM);
+  }
+};
+
 template <class Gemm, class Kernel, class Comm, bool Instrumented = false,
-          bool EpilogueInstrumented = false>
+          bool EpilogueInstrumented = false, class Input = ProjectionGemmInput>
 cudaError_t launch_gemm_a2a_impl(
     const GemmA2AParams& params, cudaStream_t stream
 #if FUSE_ENABLE_PROFILING
@@ -474,6 +487,7 @@ cudaError_t launch_gemm_a2a_impl(
     detail::QkvEpilogueRecord* epilogue_records = nullptr, int32_t epilogue_record_capacity = 0,
     QkvRouteTimeline* route_timeline = nullptr, int32_t route_capacity = 0
 #endif
+    , Input input = {}
     ) {
   if (!supported_problem(params.gemm) || !std::isfinite(params.alpha) ||
       params.epoch == 0 || params.num_comm_ctas <= 0) {
@@ -504,6 +518,7 @@ cudaError_t launch_gemm_a2a_impl(
   }
 #endif
   // Resolve the communication traversal to the same raster as the producer.
+  input.configure_communication(comm);
   if (comm.params.gemm.raster == GemmRaster::kHeuristic) {
     comm.params.gemm.raster = GemmRaster::kAlongM;
   }
@@ -526,9 +541,7 @@ cudaError_t launch_gemm_a2a_impl(
   }
 #endif
   FUSE_SM103_HOST_MARK(kArguments);
-  auto args = gemm_arguments<Gemm>(
-      params.gemm, params.lhs, params.rhs_nt, params.local_output,
-      params.alpha, params.num_comm_ctas, info, GemmRaster::kAlongM);
+  auto args = input.template arguments<Gemm>(params, info);
 #if FUSE_SM103_QKV_RANK_SWIZZLE
   // Only rotate when the consumer follows the shared tile-order contract.
   // The scalar/vector fallback retains the original producer order.

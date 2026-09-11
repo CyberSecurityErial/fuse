@@ -38,7 +38,7 @@ CONTROL_FILES = ('job.json', 'status.json', 'source-installed.json', 'environmen
 KINDS = {'config', 'device', 'input', 'candidate', 'component_resources', 'correctness', 'route', 'warmup',
          'sample', 'summary', 'candidate_verified', 'validation_self_test', 'validation_oracle',
          'profile_host', 'host_stage', 'input_oracle', 'epilogue_resources', 'epilogue_sample', 'epilogue_cta',
-         'graph_prepare', 'auto_comm'}
+         'graph_prepare', 'auto_comm', 'quant_validation'}
 GRAPH_EPOCH_MODE = 'recapture_update_v1'
 GRAPH_PREPARE_FIELDS = {'kind', 'line', 'label', 'candidate', 'comm_sm', 'tile', 'generation',
     'component', 'rank', 'launch', 'graph_epoch_mode', 'calls', 'first_epoch', 'last_epoch',
@@ -368,7 +368,7 @@ def audit_oproj_probe_record(parts, world, line_number):
                 f'Invalid OProj probe phase order at line {line_number}')
 
 
-def parse_log(text, *, completion='last'):
+def parse_log(text, *, completion='last', components=COMPONENTS):
     rows, diagnostics = [], Counter()
     profile_detail = None  # Old logs predate explicit full/CTA-only selection.
     profile_world = 0
@@ -423,7 +423,9 @@ def parse_log(text, *, completion='last'):
             require(value.lower() not in ('nan', 'inf', '+inf', '-inf', 'infinity', '-infinity'),
                     f'Nonfinite field at line {line_number}')
             row[key] = value
-        require(row.get('component', 'fused') in COMPONENTS, 'Unsupported measurement component')
+        require(row.get('component', 'fused') in components, 'Unsupported measurement component')
+        require(kind != 'quant_validation' or row.get('component') == 'quantize_reference',
+                'Quantization validation requires its explicit reference boundary')
         if kind == 'config':
             profile_detail = row.get('profile_detail')
             profile_world = count(row, 'world', 1)

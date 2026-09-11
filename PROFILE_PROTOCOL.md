@@ -288,6 +288,11 @@ SM103 `producer_ready_v1` 的 task 是生产顺序中的候选槽位，padding �
 另一个依赖 tile 的槽位不发起拷贝，因此 task 编号允许有空洞。
 `profile_qkv_order` 单独记录槽位数和实际拷贝数；逐几何块验收唯一覆盖，
 末尾 drain 从槽位数开始编号，不能用有效记录数推断 drain 的起始编号。
+`profile_qkv_order.route_warps` 记录每 CTA 的实际 route warp 数；旧日志省略时
+按 8 处理。copy 的 owner 为 `task % (comm_ctas * route_warps)`，对应
+`cta=owner % comm_ctas`、物理 `warp=owner / comm_ctas`。drain 编号为
+`slots + warp * comm_ctas + cta`，必须逐 rank 验收全部 copy 和
+`comm_ctas * route_warps` 个 drain，不能通过减少轨道数掩盖缺记录。
 生产参数结构不增加记录指针；开关关闭时不实例化详细诊断路径。诊断专用
 kernel 预热10次，清空记录后采一个连续 epoch，保留前后生产/诊断 event 时间。
 只采一个 epoch，不把这些时间替代正式10+50结果。使用已有
@@ -301,6 +306,78 @@ GPU 编号为 trace 的逻辑 rank，不是 PCI ordinal。local G2S 两端在同
 不是实测 NVLink 线上字节数。S2G 终点仍为源 SMEM read complete，不生成虚构的
 接收端到达时间。旧六份 JSON 可用 `export_sm103_qkv_perfetto.py --annotate-trace
 <path>` 原位补充这些派生信息，不改变时间戳、轨道或 kernel，不需重新采集。
+
+### SM103 MXFP8 QKV 权重量化诊断
+
+沿用上面的 QKV CTA/warp、route 三阶段、finalize 与独立 GPU 时钟原点。
+激活在入口已是 MXFP8；本 trace 包含持久化 kernel 内 BF16 master weight 的
+量化，不包含上游激活量化。`FUSE_ENABLE_PROFILING=OFF` 时无这些记录与打点。
+诊断构建、10 次诊断预热、清空记录后一个连续 epoch、完整数值/路由校验和
+原导出器不变。单进程 per-GPU-thread 发射仅用于诊断，不替代 MPI Graph 正式计时。
+
+| 条带 | 测量边界 |
+|---|---|
+| `W quantize BF16 -> MXFP8` | 原有一个量化 progress chunk 的 32 个 group：读取 BF16、amax 归约、UE8M0 scale、E4M3 转换和写入；不是纯转换指令时间 |
+| `W local bookkeeping (no publication)` | 非发布 chunk 的量化结束到本地记账结束；没有 panel 原子计数或 ready 发布，不画伪 atomic/fence 子条带 |
+| `W arrival counter + warp join` | 仅在本 worker 当前 panel 的最后一个有效 chunk：量化结束到聚合到达计数、可选 ready 发布和 warp 汇合结束；没有额外的 SC device fence |
+| ↳ `W first warp join` | `quant_done→warp_join_done`：原有第一次 `__syncwarp()`，汇合本 warp 的 32 个 lane |
+| ↳ `W arrival counter (address + atomic return)` | `warp_join_done→arrival_done`：lane 0 的 panel 计数寻址和返回旧值的 `fetch_add(arrival_chunks, acq_rel)`；不能单独称为纯原子指令延迟 |
+| ↳ `W ready publication + final warp join` | `arrival_done→end`：最后到达者可选的 ready 发布，以及原有最后一次 warp 汇合；非最后到达者不发布 ready |
+| `W panel ready published (post-store stamp)` | 最后到达的 worker 发布完整 N256×K 权重 panel 后的时间戳；每 panel 一个点，不是每 K32 一个 ready |
+| `GEMM waits W panel + warp join + proxy fence` | 实际发生的新 N panel acquire 至原有 warp 汇合/async proxy fence 结束；缓存命中的复用不伪造事件 |
+
+量化与通信细节紧随所属 CTA/warp 排列，GEMM 权重等待紧随所属计算 CTA。
+记录附带 panel/chunk/M tile、CTA/warp、group 范围及精度。固定槽位唯一写入，
+不添加队列 claim 原子或新的同步，不改变量化生产/消费粒度。导出检查量化
+chunk 全覆盖、每 panel 一次发布、时间戳有序且位于对应 CTA 角色内。
+当前 `warp_panel_acq_rel_v3` 将每 worker 对同 panel 的到达贡献合并一次，
+不改每次 progress 的 1024 值处理量或完整 panel ready 粒度。每 chunk 仍独立记录
+量化时间；`arrival_chunks=0` 时 `warp_join_done/arrival_done/release` 必须全为0；
+正值表示本次实际聚合贡献的有效 chunk 数。导出按 `(rank, CTA, warp, panel)`
+检查正贡献恰在该 worker 最后一个有效 chunk，且等于它的有效 chunk 数；再检查
+各 panel 的贡献总数等于该 panel 的有效 chunk 数。没有任务的 worker 不贡献，
+N 尾部按原128行 padding 计数，不把无效调度槽位算入贡献。
+profile 记录为72字节；新增贡献字段和子阶段时间戳都在该段结束后统一写回，
+没有在原子热路径插入新的 profile 全局写。precision 行与每条记录的协议一致。
+当前 `mxfp8_weight_preparation=comm_warp` 使用单向交接：256-thread 通信 CTA
+的物理 warp 0..3 只做 route；warp 4..7 各自完成所有量化/发布后转做 route，
+不再返回量化，不增加交接 barrier 或动态队列。量化仍有 `comm_ctas*4` 个
+worker；route 保留原 `comm_ctas*8` 静态 ownership，每个 warp 都须有 drain。
+`profile_qkv_order` 明确记录 `route_warps=8,weight_schedule=warp_then_route_v1`。
+CTA 标为 `MXFP8 route + quant role`，route 展示实际 warp 0..7，量化仍按物理
+warp 4..7 展示，不重新编号。全细节导出利用已有时间戳验收：同 rank/CTA/warp
+最后量化 `end` 不晚于首次 route `begin`（无copy时检查drain），因此同warp没有
+量化穿插在任意route条带内；不同warp的量化与通信仍可并行。该检查不推断
+TMA远端到达时间，CTA-only日志不宣称完成此时间线验收。
+
+历史固定4+4日志以 `route_warps=4` 识别，并标记 `fixed_split_legacy_v1`，仅
+展示0..3的route轨道；不将旧数据解释为单向交接。导出交叉检查job模式、各rank
+的route_warps和weight_schedule，拒绝元数据缺失而无法区分的新旧comm_warp，
+以及矛盾/跨rank不一致或量化落在非通信CTA、非物理warp4..7的记录。
+旧 `comm` 的8-warp交替复用及 `all` 格式保持兼容；省略schedule不推断新交接。
+各 warp 的量化时间可以重叠，不能相加当关键路径；ready 是发布后的打点，
+消费者可能在该打点之前已经观察到 flag，不能据此生成负的传播时间。
+
+三个发布子阶段仅在 `arrival_chunks>0` 的 compound 条带内、同一 `tid` 嵌套显示，不增加独立轨道；
+它们连续覆盖父条带。新增边界先保存在寄存器，整个发布段结束后再写入记录，
+不在 warp join/atomic 之间插入新的全局 profile 写入或同步。当前导出要求
+正贡献满足 `quant_done <= warp_join_done <= arrival_done <= end`，不记录 `fence_done`，
+也不伪造零耗时的 fence 条带。`args.publication_protocol=warp_panel_acq_rel_v3`
+标识聚合发布协议；warp 汇合与 `fetch_add(acq_rel)` 的发布语义仍保留。
+`publication_subphase_chunks` 只统计实际发布的 chunk，不再等于全部量化 chunk；
+`aggregate_publications` 是有任务的 worker-panel 组合数。
+
+旧日志没有 `arrival_chunks`、只有 `warp_join_done/arrival_done` 时，继续按
+`warp_join_acq_rel_v2` 每 chunk 显示三个真实子阶段，不将它解释为聚合发布。
+旧日志同时含 `fence_done`、`warp_join_done`、`arrival_done` 时，继续使用
+`W fence + arrival counter + warp join` 父条带和原四个子阶段：先测
+`quant_done→fence_done` 的 `W device fence`，再从 `fence_done` 开始测第一次
+warp 汇合。此时标识为 `sc_fence_acq_rel_v1`，并验证全部五个边界有序。
+旧日志缺少全部三个细分字段时，标识为 `legacy_unsplit`，仅保留原父条带。
+v3 缺贡献/子阶段字段、混合新旧协议、其余部分字段缺失或任何边界乱序均拒绝。
+发布段不含 GEMM 消费者等待，不是 release→acquire 传播时间。计数器可能存在
+同 panel 的竞争，但条带长度本身不能证明竞争或其占比；新增打点也有诊断开销，
+不能替代关闭 profiling 的正式计时。
 
 ### TE Userbuffers QKV 对照（CUDA Event）
 
@@ -351,6 +428,27 @@ GEMM -> A2A 还必须满足：
 - 最终 kernel 时间取所有 CTA 的最大 `end`，不能用 rank 内平均值。
 
 ## 解读边界
+
+SM103 MXFP8 独立服务标定使用 `--mxfp8-service-probe`，sidecar 为
+`services-rank-0.jsonl`（`sm103_mxfp8_services_v1`）。只在 GPU0 记录逐 tile、
+量化 chunk、完整 route slot 与发布区间，其他 rank 仍执行真实通信并完整校验。
+每个服务边界只保留一个原始 capture；tile/warp 内部样本彼此相关，不宣称为
+50 次独立 trace。另存的 control/instrumented 10+50 是包含主机 API 准备等待的
+Eager CUDA-event 诊断，不能当纯 kernel 扰动，也不能拿该比值校正服务系数。
+服务时长仅来自同 rank、同 capture 的 globaltimer 差值。正式 Auto 验收仍须
+profiling 关闭、真实 `comm_ctas=0`、MPI Graph 10+50，与手工配置独立对照。
+
+发布 chunk 在独立 Q、G2S 重叠、S2G 重叠下分别统计。混合场景同时保留
+slot 起点到 quant.end（含发布）与 slot 完成的时长，不能把 Q-only 发布常数
+叠加到已包含发布的混合区间。测到某个上下文的区间不意味着能预测任意并发
+流量中的区间；探针不证明已覆盖与 GEMM 并发的全部资源竞争状态。
+
+整段服务模型使用同一 GPU/capture 的起止差：起点为最早 CTA 的 setup_done，
+Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终远端 drain
+和剩余量化完成，不含跨 rank finalize。不能拿 thread0 的 CTA 退出代表其他
+量化 warp 完成。R/QR 是整段有效服务，不是裸 TMA 延迟或融合执行时间的严格界。
+计算首 tile/周期仍由逐 tile 记录直接统计，不用整段 C 除 waves 代替。
+细分发布记录保留用于诊断，不作为新整段模型的决策系数。
 
 - 不比较不同 rank 的绝对 `%globaltimer` 值；每个 rank 在 JSON 中使用自己的时间原点。
 - `GEMM` 轨道不是纯 Tensor Core 时间，不能直接拿它计算 WGMMA 吞吐。

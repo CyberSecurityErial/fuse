@@ -2,7 +2,13 @@
 # Offline, workspace-local MPICH dev tools. Never changes system packages or PATH.
 set -euo pipefail
 
-TASK_WORKSPACE=/root/workspace_wct
+TASK_WORKSPACE=${FUSE_WORKSPACE:-/root/workspace_wct}
+case "$TASK_WORKSPACE" in
+  /root/workspace_wct|/home/*/workspace_wct) ;;
+  *) echo "Expected a named fuse user workspace" >&2; exit 2 ;;
+esac
+[[ "$(readlink -f "$TASK_WORKSPACE")" == "$TASK_WORKSPACE" ]]
+[[ -O "$TASK_WORKSPACE" ]]
 MPI_PREFIX=${TASK_WORKSPACE}/toolchain/mpich-5.0.1.post1
 MPI_WHEEL_SHA=edb42832e4d04fe3da78056edf74ef01d0405ad375dd990379d8d9bf2507b386
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -11,6 +11,9 @@ struct QkvRouteTimeline {
   uint64_t s2g_begin = 0, s2g_read_done = 0;
   int32_t cta = 0, warp = 0, row = 0, column = 0;
   int32_t rows = 0, columns = 0, peer = 0, segment = 0;
+  // After the original final warp join; includes reusable-stage completion,
+  // not remote-global completion (that remains the trailing drain record).
+  uint64_t copy_end = 0;
 };
 
 cudaError_t launch_gemm_a2a_route_telemetry(

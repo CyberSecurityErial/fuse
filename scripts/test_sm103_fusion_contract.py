@@ -55,17 +55,19 @@ class DriverCallBuildContracts(unittest.TestCase):
         for path in (ROOT / "CMakeLists.txt", *sorted((ROOT / "cmake").glob("*.cmake")),
                      ROOT / "benchmarks/sm103/CMakeLists.txt"):
             if path == ROOT / "benchmarks/sm103/CMakeLists.txt":
-                # The optional Blackwell-only pure-GEMM experiment also needs
-                # this private branch; no preexisting baseline target inherits it.
+                # Blackwell-only BF16/MXFP8 pure-GEMM targets need this private
+                # branch; no cuBLAS baseline target may inherit it.
                 baseline = path.read_text()
                 commands = re.findall(r"target_compile_definitions\s*\(([^)]*)\)", baseline)
                 direct = [command.split() for command in commands
                           if "CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL" in command]
-                self.assertEqual(len(direct), 1)
-                self.assertEqual(direct[0][:3], ["fuse_sm103_cutlass_bf16", "PRIVATE",
-                                               "CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1"])
-                prefix = baseline.split("if(FUSE_SM103_BUILD_CUTLASS_BF16)")[0]
-                self.assertNotIn("CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL", prefix)
+                self.assertEqual({item[0] for item in direct},
+                                 {"fuse_sm103_cutlass_bf16", "mxfp8_cutlass_search"})
+                self.assertEqual(len(direct), 2)
+                for item in direct:
+                    self.assertEqual(item[1], "PRIVATE")
+                    self.assertIn("CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1", item[2:])
+                    self.assertNotIn("PUBLIC", item)
                 continue
             if path != ROOT / "cmake/sm103.cmake":
                 self.assertNotIn("CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL", path.read_text(), str(path))

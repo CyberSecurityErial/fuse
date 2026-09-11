@@ -3,6 +3,7 @@
 
 #include "fuse/profiling/sm103/host.cuh"
 #include "producer_consumer.cuh"
+#include "quantization.cuh"
 
 #include "fuse/arch/common.cuh"
 #include "fuse/operators/primitives/gemm_a2a.h"
@@ -19,6 +20,8 @@
 
 namespace fuse {
 namespace {
+
+struct NoQkvInputWork { static constexpr bool kEnabled = false; };
 
 // Independent communication choices: producer tile N is not the copy width.
 // Keep the first implementation local to SM103; SM90 remains unchanged.
@@ -127,8 +130,8 @@ struct QkvGqaPackCommT {
         sequence_begin + local_sequence;
   }
 
-  static cudaError_t initialize(Arguments& args) {
-    if (!can_implement(args)) {
+  static cudaError_t initialize(Arguments& args, bool check_operands = true) {
+    if (!can_implement(args, check_operands)) {
       return cudaErrorNotSupported;
     }
     const auto& p = args.params;
@@ -230,7 +233,7 @@ struct QkvGqaPackCommT {
     return cudaSuccess;
   }
 
-  static bool can_implement(const Arguments& args) {
+  static bool can_implement(const Arguments& args, bool check_operands = true) {
     // TODO(sm103-segmented-routing): KDA/MLA packed projections need explicit
     // per-segment ownership (head-sharded or replicated latent), not relaxed
     // GQA divisibility checks or synthetic heads. Choose the MLA exchange
@@ -271,7 +274,7 @@ struct QkvGqaPackCommT {
     auto aligned = [](const void* pointer) {
       return pointer != nullptr && reinterpret_cast<uintptr_t>(pointer) % 16 == 0;
     };
-    if (!aligned(p.lhs) || !aligned(p.rhs_nt) || !aligned(p.local_output) ||
+    if ((check_operands && (!aligned(p.lhs) || !aligned(p.rhs_nt))) || !aligned(p.local_output) ||
         p.ready == nullptr || reinterpret_cast<uintptr_t>(p.ready) % 4 != 0) {
       return false;
     }
@@ -310,7 +313,8 @@ struct QkvGqaPackCommT {
     return segment_base + physical_head * route.head_dim + head_offset;
   }
 
-  template <bool TraceTasks = false>
+  template <bool TraceTasks = false, class InputWork = NoQkvInputWork,
+            int QuantWarps = 0>
   CUTLASS_DEVICE void run(
       const Params& args,
       char* smem,
@@ -320,7 +324,10 @@ struct QkvGqaPackCommT {
 #if FUSE_ENABLE_PROFILING
       , QkvRouteTimeline* route_timeline = nullptr
 #endif
+      , InputWork input_work = {}
       ) {
+    static_assert(QuantWarps >= 0 && QuantWarps < kQkvBulkSlots);
+    static_assert(QuantWarps == 0 || InputWork::kEnabled);
     const auto& p = args.params;
     const int32_t m_tiles = ceil_div(p.gemm.m, BlockM);
     const int32_t m_groups = ceil_div(m_tiles, MTilesPerTask);
@@ -347,7 +354,26 @@ struct QkvGqaPackCommT {
           smem + kQkvBulkSlots * kBulkStageBytes);
       const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31;
       const int32_t slot = static_cast<int32_t>(threadIdx.x) >> 5;
+      // Warp specialization stays INSIDE each communication CTA; the outer
+      // communication/compute CTA partition and shared-memory allocation do
+      // not change. QuantWarps is a template constant, not a per-task test.
+      //
+      //   lower warps:  TMA route ----------------------------------->
+      //   upper warps:  W quantize -> publish ALL owned chunks -> route
+      //                       \ panel ready -> GEMM -> output ready /
+      //
+      // Quantization never waits for GEMM, so a route warp waiting for output
+      // cannot block weight production. There is no intermediate CTA barrier
+      // or work-claim queue. Each upper warp switches ONCE after publishing all
+      // of its OWN chunks; it need not wait for other quantization warps. Once
+      // routing, it never quantizes again. All eight original route queues keep
+      // their static owners and stride, including queues whose start is delayed
+      // by quantization. No tasks are stolen, duplicated or reassigned at the
+      // handoff. L2/bandwidth are still shared between the independent warps.
       if (slot < kQkvBulkSlots) {
+        if constexpr (QuantWarps > 0) {
+          if (slot >= kQkvBulkSlots - QuantWarps) input_work.drain();
+        }
         CommElement* stage = stages +
             static_cast<int64_t>(slot) * kBulkStageElements;
         uint64_t* barrier = barriers + slot;
@@ -404,9 +430,20 @@ struct QkvGqaPackCommT {
             // Independent producers can finish out of order: acquire them all.
             for (int32_t producer_m = task.first_m; producer_m <= task.last_m; ++producer_m) {
               for (int32_t producer_n = task.first_n; producer_n <= task.last_n; ++producer_n) {
-                detail::wait_acquire_system(p.ready +
-                    ReadyTile::index(producer_m, producer_n, output_n_tiles) * kReadyFlagStride,
-                    p.epoch, lane);
+                const auto* flag = p.ready +
+                    ReadyTile::index(producer_m, producer_n, output_n_tiles) * kReadyFlagStride;
+                if constexpr (InputWork::kEnabled && QuantWarps == 0) {
+                  // While outputs are unavailable, keep producing weights.
+                  // Blocking here would form a cycle: GEMM waits for weights,
+                  // their producers wait for GEMM outputs. All warp lanes join
+                  // each bounded quantization step; only lane zero polls ready.
+                  while (!__shfl_sync(0xffffffffu,
+                      lane == 0 && detail::load_acquire_system(flag) >= p.epoch, 0)) {
+                    if (!input_work.progress()) __nanosleep(64);
+                  }
+                } else {
+                  detail::wait_acquire_system(flag, p.epoch, lane);
+                }
               }
             }
           }
@@ -429,6 +466,12 @@ struct QkvGqaPackCommT {
                 stage,
                 physical_feature,
                 m_begin);
+          }
+          if constexpr (InputWork::kEnabled && QuantWarps == 0) {
+            __syncwarp();
+            input_work.progress(); // SIMT side work while the local TMA is in flight.
+          }
+          if (lane == 0) {
             cute::wait_barrier(*barrier, phase);
 #if FUSE_ENABLE_PROFILING
             if constexpr (TraceTasks) sample.g2s_done = detail::read_global_timer();
@@ -493,6 +536,12 @@ struct QkvGqaPackCommT {
                 cute::tma_store_arrive();
               }
             }
+          }
+          if constexpr (InputWork::kEnabled && QuantWarps == 0) {
+            __syncwarp();
+            input_work.progress(); // Never overwrite/reuse the communication SMEM slot.
+          }
+          if (lane == 0) {
             cute::tma_store_wait<0>();
 #if FUSE_ENABLE_PROFILING
             if constexpr (TraceTasks) {
@@ -506,7 +555,15 @@ struct QkvGqaPackCommT {
 #endif
           }
           __syncwarp();
+#if FUSE_ENABLE_PROFILING
+          if constexpr (TraceTasks) {
+            if (lane == 0) route_timeline[work].copy_end = detail::read_global_timer();
+          }
+#endif
         }
+        // Warps with no more output tasks still own quantization chunks. Drain
+        // them before any CTA barrier/finalize, including deferred-V routes.
+        if constexpr (InputWork::kEnabled && QuantWarps == 0) input_work.drain();
         if (lane == 0) {
           // Per-task `.read` waits above make each stage reusable.  Before
           // this CTA publishes completion, also wait for every destination
@@ -775,6 +832,73 @@ using QkvGqaPackCommWide = QkvGqaPackCommT<
     static_cast<int32_t>(cute::size<0>(ProjectionTileShape{})),
     static_cast<int32_t>(cute::size<1>(ProjectionTileShape{})),
     QkvCommConfig<1, 256>>;
+// MXFP8-input QKV shares the SAME BF16 output route, TMA slots, publication
+// geometry and production-order mapping. Only communication-side input work
+// is added. Its ownership never changes when a warp switches between roles:
+//
+//   startup:  comm warps quantize W ----ready(N panel)---> GEMM
+//   running:  comm warps [quantize next W | route ready Y] <--- GEMM
+//   tail:     W is complete; all communication warps only route Y
+//
+// Output waits and in-flight TMA windows execute bounded quantization chunks.
+// No compute CTA is reassigned in the default mode. The all-CTA prologue is an
+// explicit control, not claimed to overlap quantization with GEMM.
+// The optional communication-warp mode first dedicates the upper four warps to
+// weight production. Each then joins its own original route queue, without
+// further quantization. All eight route slots are used after this one-way
+// handoff; outer CTA roles, output task ownership and full-panel ready stay fixed.
+struct Mxfp8QkvGqaPackComm : QkvGqaPackCommWide {
+  using Base = QkvGqaPackCommWide;
+  struct Arguments : Base::Arguments { Mxfp8WeightProducer::Arguments weights{}; };
+  using Params = Arguments;
+  static bool can_implement(const Arguments& args) {
+    return args.params.route.head_dim == kQkvBulkColumns &&
+        Base::can_implement(args, false);
+  }
+  static cudaError_t initialize(Arguments& args) {
+    if (!can_implement(args)) return cudaErrorNotSupported;
+    const auto status = Base::initialize(args, false);
+    if (status != cudaSuccess) return status;
+    return args.weights.warp_specialized && !args.use_tma
+        ? cudaErrorNotSupported : cudaSuccess;
+  }
+  static Params to_underlying_arguments(const Arguments& args) { return args; }
+  template <bool TraceTasks = false>
+  CUTLASS_DEVICE void run(const Params& p, char* smem, int comm, int comm_ctas, bool wait
+#if FUSE_ENABLE_PROFILING
+      , QkvRouteTimeline* timeline = nullptr
+#endif
+      ) {
+    auto weights = p.weights;
+    if (weights.all_ctas) weights.source = nullptr; // Already produced by the prologue.
+    const int warp = threadIdx.x / 32;
+    // In specialized mode only physical warps 4..7 consume this producer;
+    // modulo maps those to logical workers 0..3. No warp calls it after starting
+    // its route queue, even when other warps are still producing weights.
+    const int worker_warp = weights.warp_specialized ? warp % 4 : warp;
+    const int quant_warps = weights.warp_specialized ? 4 : kQkvBulkSlots;
+    Mxfp8WeightProducer work(weights, p.producer_order, p.n_band_swizzle,
+        worker_warp * comm_ctas + comm, quant_warps * comm_ctas);
+    // Uniform, once-per-CTA selection; both hot loops are separately compiled.
+    if (weights.warp_specialized) {
+      Base::template run<TraceTasks, Mxfp8WeightProducer, 4>(p, smem, comm, comm_ctas, wait
+#if FUSE_ENABLE_PROFILING
+          , timeline
+#endif
+          , work);
+    } else {
+      Base::template run<TraceTasks, Mxfp8WeightProducer>(p, smem, comm, comm_ctas, wait
+#if FUSE_ENABLE_PROFILING
+          , timeline
+#endif
+          , work);
+    }
+  }
+  CUTLASS_DEVICE void operator()(const Params& p, char* smem, int comm, int comm_ctas) {
+    run(p, smem, comm, comm_ctas, true);
+  }
+};
+
 using QkvGqaPackComm = QkvGqaPackCommSmall;
 
 #if FUSE_ENABLE_PROFILING
