@@ -1,5 +1,14 @@
 # 版本演进手册
 
+## v21.0：SM103 MXFP8 A2A→OProj 手工 SOTA
+
+- 搬运与权重量化分 warp 并行；FP8 cp.async→TMA 混合搬运，scale 成组读取。
+- GEMM 和 A 交货共用有界 M/N 遍历，保持完整 A/W ready；实测选择通信 CTA。
+- 36/36 物理点通过 Graph10+50 和双 payload 校验，最终 GM1.915 PFLOPS/卡，
+  为满 SM 纯 cuBLASLt 的70.5%，相对历史对照+20.97%。仅发布最终优胜配置，
+  不包含搜索过程或 profile；手工 SOTA，不是 Auto 或全局最优承诺。
+  [最终结果与复现](results/sm103/v21.0/README.md)。
+
 ## v20.0：SM103 MXFP8 QKVProj 与离线通信预算
 
 - 已量化 activation，kernel 内动态 BF16 权重量化，MXFP8 GEMM/FP32 累加、

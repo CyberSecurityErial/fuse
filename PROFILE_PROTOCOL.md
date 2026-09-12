@@ -410,6 +410,85 @@ LD_LIBRARY_PATH=/home/chen/workspace/source_code/TransformerEngine:/usr/local/cu
 
 ## 完整性检查
 
+### SM103 MXFP8 A2A → OProj
+
+沿用 BF16 OProj 的 CTA、完整 `(M,peer)` 最终发布 chunk 和逐 `(M,N,peer)`
+acquire 记录，以及 MXFP8 QKV 的量化 chunk、聚合到达和完整 W panel 发布记录。
+`export_sm103_oproj_perfetto.py` 复用同一 MXFP8 量化导出/覆盖校验；每个通信
+CTA 下按物理 warp 排列搬运与量化，发布子阶段在该 warp 的父条带内嵌套。
+不改变 K32 量化组、ready 粒度、队列、acq_rel RMW 或 TMA 完成等待。
+
+当前独立生产队列使用 warp 0..3 搬 A、warp 4..7 连续量化 W。G2S 条带从发起前
+到完成观察，期间包含 SFA 重排；S2G 等待目的 GMEM 完成，二者均不再内联 W
+progress，但仍受并发资源/调度影响，不是裸传输延迟。历史混合生产 trace 的
+G2S/S2G 内含 W progress，不能将新语义套到旧记录。只记录最终发布 chunk，
+不能从它们推算全部搬运次数。W 所有有效 chunk 仍完整记录并审计 panel 贡献。
+BF16 专用 MMA 阶段镜像不用于 block-scaled MXFP8；本入口不声称记录精确 Tensor
+Core 执行时间。可观察每 tile 的 peer acquire 和实际 W panel 等待。
+
+使用独立 profiling 构建、单进程每 GPU 一个 host 线程并发提交，预热诊断 kernel
+10 次后清空记录采一次；输出经完整数值和逐字节 FP8/SFA 路由校验。该入口没有
+host API 内部分段记录，只保留现有 launch/event 诊断。各 rank 独立时间原点。
+手工固定为 Auto 查询的实际预算和同一 GEMM 配置，明确这是该配置的 Eager
+diagnostic trace，不冒充真实 comm_ctas=0 的 MPI Graph 性能验收。
+
+`export_sm103_oproj_perfetto.py --omit-comm-details` 只展示 CTA 角色和逐 tile
+release→acquire，省略通信 warp 的搬运、量化/发布及 W 等待细节；原始记录和
+完整性校验不变，不改变 GPU 打点或同步。JSON 的 `presentation=roles_and_handoffs`
+明确这是显示过滤，不能认为 GPU 打点开销已经移除。
+
+#### MXFP8 GEMM 等数热路径（`--oproj-pipeline-probe`）
+
+复用同一开关与 OProjPipelineBinding；生产构建不实例化observer，未绑定时调用原始collective。
+全部 rank、全部计算 CTA 的每个 `(M,N)` 记录实际 A ready 轮询和逐 tile 的
+load/MMA 阶段累计值；仅 GPU0 的 worker 0、1、`compute_ctas-min(swizzle,compute_ctas)`
+保留全部 K-stage 细节。不能把抽样细节称为全部 CTA 的逐 K-stage 时间线。
+每 rank 额外内存上限192MiB；其他rank无K-stage数组，只记录tile汇总。
+
+| 阶段 | 实际测量边界 |
+|---|---|
+| A ready check / polling | 进入 ready 检查到 acquire 返回；另记原有 warp join / proxy fence |
+| W ready wait | 原有 W panel acquire 到 warp join / proxy fence；与已有量化协议一致 |
+| Load empty-stage acquire / try_acquire | 原有 producer_acquire 与前瞻 producer_try_acquire 分开；后者也可能等待 |
+| Load TMA A/B/SFA/SFB submission | 原有四次 TMA 发起；不是 TMA 到达或裸显存搬运时间 |
+| MMA input-stage wait / next-input try_wait | 原有 consumer_wait 和前瞻 consumer_try_wait；两者都计入该 warp 的等输入时间 |
+| Scale SMEM → TMEM submission | 原有 SFA/SFB UTCCP 发起，另含少量控制指令；不是 scale 搬运完成时间 |
+| MMA reusable TMEM slot | 原有 accumulator producer_acquire 的区间 |
+| MMA issue / stage release | 原有 block-scaled MMA 与 consumer_release 的发起区间；不是 Tensor Core busy |
+| Epilogue | 原有 accumulator wait、TMEM release 和 store 边界，沿用 BF16 observer |
+
+镜像严格对应固定 CUTLASS `57e3cfb` 的
+`sm100_blockscaled_mma_warpspecialized.hpp`。N256 使用 overlapping accumulator：
+第一个 K-stage 先等输入、送 scale，再等 TMEM slot；不能套用 BF16 的先 acquire
+顺序，也不能把 `mma_begin→tmem_acquired` 全记成 TMEM 等待。无新增GPU barrier、
+fence、ready粒度或完成等待；diagnostic记录有额外时钟/寄存器/写回开销。
+
+前瞻等待后移实验使用同一observer，按生产collective的编译期开关放置打点。
+`profile_oproj_pipeline.deferred_lookahead`：bit0为MMA侧，bit1为load侧；旧记录
+缺省0。后移时`try_begin`在`issue_end`之后，`load_try_begin`在`load_end`之后；
+两个end始终只表示当前工作的提交结束，不包含后移的try。汇总仍单列try时间，
+不得在scale/TMA提交时间里再次扣除它。导出器同时验证策略、实际顺序和逐stage汇总。
+
+`gemm_wait_accounting` 按每 CTA 的进入→退出统计比例，同时保留旧图里第一次 A
+acquire→退出的子角色长度。A、W、load 和 MMA 属于重叠执行的 warp，严禁把它们
+相加当 e2e 损失；MMA issuing warp 等输入时，前面已提交的异步 MMA 仍可能执行。
+`try_wait` 不能按名字视为零耗时。单独给出计时/控制未分类部分，不填成纯计算。
+细节都在所属 GEMM CTA 下，`--omit-comm-details` 仍省略通信warp内部，但保留
+GEMM 的 A/W 等待和流水线；presentation 标为 `roles_handoffs_and_gemm_pipeline`。
+沿用 pipeline 视图，不再另铺每个tile的长release→acquire轨道；ready条带的args
+保留 `release_us`、`acquire_minus_release_ns`，条带本身展示真实检查/轮询。
+完整数值/FP8-SFA路由、所有tile及stage计数、抽样worker覆盖、时间有序、汇总非重叠
+和CTA时间闭合都必须验收，不能用大条带release→acquire冒充真正等数时间。
+
+MXFP8完整tile记录还在每个GPU上输出overlap总览，完全由现有时间戳离线导出，
+不增加GPU打点：A输入ready百分比、GEMM完成百分比、首K-stage输入可用百分比。
+采用Perfetto支持的Chrome JSON `C` counter事件；A按有效M行数、GEMM按有效
+输出tile面积加权（K相同），包括尾tile，禁止将抽样CTA补成全局进度。
+完成指epilogue观察到原MMA barrier完成，并非精确硬件结束时刻；首K输入可用
+不代表整tile输入就绪或Tensor Core已发起。另画A全部ready后尚余的GEMM尾段。
+这些是生产/消费进度，不是GPU利用率、NVLink带宽或精确的通算重叠时长。
+格式依据：https://perfetto.dev/docs/getting-started/other-formats#chrome-json-format
+
 每个 rank 都必须满足：
 
 - CTA timeline 容量等于该 GPU 的 SM 数；

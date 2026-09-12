@@ -60,6 +60,15 @@ class QkvPerfettoTests(unittest.TestCase):
                 self.assertAlmostEqual(left['ts']+left['dur'],right['ts'])
             self.assertAlmostEqual(children[-1]['ts']+children[-1]['dur'],parent['ts']+parent['dur'])
 
+    def test_oproj_reuses_quant_protocol_with_oproj_weight_geometry(self):
+        job, records, _ = self.mxfp8_fixture()
+        # Same 384x128 W as the fixture, now described by OProj H x HqD.
+        # KV heads do not contribute to OProj's weight extent.
+        job.update(fused_direction='oproj', hidden=384, q_heads=1, kv_heads=9)
+        result = append_mxfp8_events([], self.log, job, {0:100}, records)
+        self.assertEqual(result['quant_chunks'], 48)
+        self.assertEqual(result['panel_releases'], 2)
+
     def test_mxfp8_publication_subspans_cover_parent_on_same_track(self):
         job, records, _ = self.mxfp8_fixture(dict(fence_done=253,warp_join_done=255,arrival_done=258))
         events = []

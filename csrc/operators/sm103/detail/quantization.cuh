@@ -46,6 +46,35 @@ struct Mxfp8Workspace {
   }
 };
 
+struct Mxfp8A2AWorkspace {
+  Mxfp8Workspace weights{};
+  Fp8E4m3* a = nullptr;
+  cutlass::float_ue8m0_t* sfa = nullptr;
+  uint32_t* ready = nullptr;
+  size_t bytes = 0;
+
+  static Mxfp8A2AWorkspace make(const GemmProblem& p, void* memory = nullptr) {
+    Mxfp8A2AWorkspace w;
+    w.weights = Mxfp8Workspace::make(p, memory);
+    const auto shape = cute::make_shape(p.m, p.n, p.k, 1);
+    const size_t data_bytes = Mxfp8Workspace::align(size_t(p.m) * p.k);
+    const size_t scale_bytes = Mxfp8Workspace::align(cute::size(cute::filter_zeros(
+        Mxfp8ScaleConfig::tile_atom_to_shape_SFA(shape))));
+    // The shape-only query reserves all supported peers. Only the actual
+    // [M tile, world] prefix is used/reset; CP never changes allocation rules.
+    const size_t flags = Mxfp8Workspace::align(size_t(ceil_div(p.m, 128)) *
+        kMaxWorldSize * kReadyFlagStride * sizeof(uint32_t));
+    w.bytes = w.weights.bytes + data_bytes + scale_bytes + flags;
+    if (memory) {
+      auto* base = static_cast<unsigned char*>(memory) + w.weights.bytes;
+      w.a = reinterpret_cast<Fp8E4m3*>(base);
+      w.sfa = reinterpret_cast<cutlass::float_ue8m0_t*>(base + data_bytes);
+      w.ready = reinterpret_cast<uint32_t*>(base + data_bytes + scale_bytes);
+    }
+    return w;
+  }
+};
+
 CUTLASS_HOST_DEVICE int mxfp8_scale_exponent(float amax) {
   // 448 = 1.75 * 2^8. Carry into the exponent exactly when the mantissa
   // exceeds 1.75; unlike log/exp helpers this needs only integer operations.
@@ -326,6 +355,8 @@ struct Mxfp8WeightProducer {
       detail::NBandSwizzle swizzle, int worker, int workers)
       : args(a), order(swizzle), next(worker), stride(workers) {
     // For both AlongM and AlongN the first use of N panels is increasing N
+    // (also within OProj's bounded M-window / N-group traversal). W panels are
+    // produced once, not again when GEMM advances to the next M window.
     // before optional N-band rotation. Use the scheduler's padded N extent;
     // invalid rotated panels are skipped, never assigned a physical flag.
     const bool along_n = schedule.raster_order_ == Schedule::RasterOrder::AlongN;

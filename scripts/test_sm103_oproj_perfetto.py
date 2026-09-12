@@ -1,9 +1,32 @@
 """Synthetic OProj timeline tests; no cluster or GPU operations."""
 import unittest
-from export_sm103_oproj_perfetto import make_trace, tile_consumption, cta_time_accounting
+from export_sm103_oproj_perfetto import make_trace, tile_consumption, cta_time_accounting, overlap_progress
 
 
 class OprojTraceTests(unittest.TestCase):
+    def test_overlap_counters_weight_tails_and_preserve_integer_clocks(self):
+        offset = 1800000000000000000
+        peers = {(0,0):dict(comm_valid=1,release=offset+10),
+                 (0,1):dict(comm_valid=1,release=offset+30)}
+        pipes = {(0,0):dict(first_input=offset+12,acc_wait_end=offset+20),
+                 (0,1):dict(first_input=offset+31,acc_wait_end=offset+50)}
+        events, summary = overlap_progress(0,offset,offset+60,peers,pipes,
+            m=192,n=256,bm=128,bn=256,world=1)
+        self.assertAlmostEqual(summary['gemm_completed_at_a_ready_pct'], 100*128/192)
+        self.assertEqual(summary['gemm_tail_after_a_ready_us'], .020)
+        series = {}
+        for e in events: series.setdefault(e['name'],[]).append(e)
+        self.assertEqual(len(series),3)
+        for points in series.values():
+            values=[e['args']['percent'] for e in points]
+            self.assertEqual(values,sorted(values))
+            self.assertEqual((values[0],values[-1]),(0.,100.))
+        done=series['02 GEMM completed (observed %)']
+        self.assertEqual(done[1]['ts'],.020)
+        with self.assertRaisesRegex(AssertionError,'every GEMM tile'):
+            overlap_progress(0,offset,offset+60,peers,{(0,0):pipes[0,0]},
+                m=192,n=256,bm=128,bn=256,world=1)
+
     def test_cta_accounting_closes_with_overlap_and_other_cta_tail(self):
         ctas = {(0, 0): dict(start=100, end=150),
                 (0, 1): dict(start=110, end=200),
@@ -78,6 +101,34 @@ class OprojTraceTests(unittest.TestCase):
         self.assertIn('local S2G (destination complete)', names)
         self.assertFalse(result['metadata']['performance_accepted'])
         self.assertTrue(all(e.get('dur', 0) >= 0 for e in result['traceEvents']))
+
+    def test_mxfp8_keeps_roles_and_does_not_claim_bare_tma_latency(self):
+        job, lines = self.fixture()
+        job.update(mxfp8=True, fused_direction='oproj')
+        lines = [line for line in lines if 'profile_phase=host_stages' not in line]
+        result = make_trace(lines, job)
+        names = {e['name'] for e in result['traceEvents']}
+        self.assertIn('remote G2S + SFA repack + W progress (completion observed)', names)
+        self.assertIn('local S2G + W progress (destination complete)', names)
+        self.assertFalse(result['metadata']['performance_accepted'])
+        with self.assertRaises(AssertionError):
+            make_trace([line for line in lines if not line.startswith('route,')], job)
+
+    def test_compact_presentation_keeps_exact_roles_and_handoffs(self):
+        job, lines = self.fixture()
+        full = make_trace(lines, job)
+        compact = make_trace(lines, job, omit_comm_details=True)
+        def handoffs(trace):
+            return [e for e in trace['traceEvents'] if e['name'].startswith('release -> acquire')]
+        self.assertEqual(handoffs(full), handoffs(compact))
+        names = {e['name'] for e in compact['traceEvents']}
+        self.assertIn('GEMM role (includes later peer waits)', names)
+        self.assertIn('remote A2A role (includes setup/waits)', names)
+        self.assertNotIn('remote G2S', names)
+        self.assertNotIn('ready atomic (post-publication sample)', names)
+        self.assertEqual(compact['metadata']['presentation'], 'roles_and_handoffs')
+        with self.assertRaises(AssertionError):
+            make_trace([line for line in lines if not line.startswith('profile_peer,')], job, True)
 
     def test_missing_or_duplicate_rejected(self):
         job, lines = self.fixture()
@@ -163,6 +214,74 @@ class OprojTraceTests(unittest.TestCase):
             shifted.append(line)
         summary = make_trace(shifted, job)['metadata']['pipeline_summary']
         self.assertEqual(summary['ready_check_p50_us'], .005)
+
+    def mxfp8_pipeline_fixture(self):
+        job, lines = self.pipeline_fixture()
+        job.update(mxfp8=True, fused_direction='oproj', max_swizzle_size=1, q_heads=1, head_dim=128)
+        lines = [l for l in lines if 'profile_phase=host_stages' not in l]
+        lines = [l.replace('tmem_acquired=112', 'tmem_acquired=135') for l in lines]
+        for i, line in enumerate(lines):
+            if line.startswith('profile_oproj_pipeline,'):
+                lines[i] += (',mxfp8=1,stage_detail=1,first_input=130,first_wait_ns=15,'
+                    'tmem_wait_begin=132,input_wait_ns=15,input_try_ns=1,initial_try_end=110,'
+                    'scale_issue_ns=1,mma_issue_ns=4,load_wait_ns=1,load_try_ns=1,'
+                    'load_issue_ns=2,load_stages=1,mma_stages=1')
+            elif line.startswith('profile_oproj_stage,'):
+                lines[i] += (',scale_end=132,try_begin=130,try_end=131,load_begin=126,'
+                    'load_ready=127,load_try_begin=128,load_try_end=129,load_end=130')
+        lines.append('profile_mxfp8_wait,rank=0,index=0,cta=1,warp=2,m=0,panel=0,begin=126,end=127')
+        return job, lines
+
+    def test_mxfp8_pipeline_keeps_compute_details_when_comm_hidden(self):
+        job, lines = self.mxfp8_pipeline_fixture()
+        trace = make_trace(lines, job, omit_comm_details=True)
+        waits = trace['metadata']['gemm_wait_accounting']['per_cta']
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(waits[0]['a_ready_wait_ns'], 5)
+        self.assertEqual(waits[0]['w_ready_join_fence_ns'], 1)
+        self.assertEqual(waits[0]['input_wait_ns']+waits[0]['input_try_ns'], 16)
+        self.assertEqual(waits[0]['tmem_slot_wait_ns'], 3)  # Not 135-110!
+        names = {e['name']:e for e in trace['traceEvents']}
+        self.assertEqual(names['MMA next-input try_wait']['tid'], 100+32+2)
+        self.assertEqual(names['Load empty-stage acquire']['tid'], 100+32+5)
+        self.assertEqual(names['W ready wait / warp join / proxy fence']['tid'], 100+32+6)
+        self.assertNotIn('weight_panel_waits', trace['metadata']['omitted_details'])
+        self.assertEqual(trace['metadata']['presentation'], 'roles_handoffs_and_gemm_pipeline')
+
+    def test_mxfp8_pipeline_rejects_missing_aggregate_and_bad_scale(self):
+        job, lines = self.mxfp8_pipeline_fixture()
+        for bad in ([l.replace('load_stages=1', 'load_stages=0') for l in lines],
+                    [l.replace('scale_end=132', 'scale_end=129') for l in lines],
+                    [l.replace('input_try_ns=1', 'input_try_ns=1000') for l in lines]):
+            with self.assertRaises(AssertionError):
+                make_trace(bad, job, True)
+
+    def test_mxfp8_deferred_lookahead_keeps_nonoverlapping_accounting(self):
+        for policy in (1, 2, 3):
+            job, lines = self.mxfp8_pipeline_fixture()
+            changed = []
+            for line in lines:
+                if line.startswith('profile_oproj_pipeline,'):
+                    line += f',deferred_lookahead={policy}'
+                    if policy & 1:
+                        line = line.replace('scale_issue_ns=1', 'scale_issue_ns=2')
+                    if policy & 2:
+                        line = line.replace('load_issue_ns=2', 'load_issue_ns=3')
+                if line.startswith('profile_oproj_stage,'):
+                    if policy & 1:
+                        line = line.replace('try_begin=130,try_end=131', 'try_begin=139,try_end=140')
+                    if policy & 2:
+                        line = line.replace('load_try_begin=128,load_try_end=129', 'load_try_begin=130,load_try_end=131')
+                changed.append(line)
+            trace = make_trace(changed, job, True)
+            events = {e['name']: e for e in trace['traceEvents']}
+            scale = events['Scale SMEM -> TMEM submission']
+            self.assertAlmostEqual(scale['dur'], .002 if policy & 1 else .001)
+            load = events['Load TMA A/B/SFA/SFB submission']
+            self.assertAlmostEqual(load['dur'], .003 if policy & 2 else .001)
+            # A policy label must agree with timestamps and scalar sums.
+            with self.assertRaises(AssertionError):
+                make_trace([l.replace(f'deferred_lookahead={policy}', 'deferred_lookahead=0') for l in changed], job, True)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,21 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v21.0 — SM103 MXFP8 A2A→OProj 手工 SOTA
+
+输入已量化的 MXFP8 activation，持久化 kernel 内完成 A2A、BF16 权重量化和
+MXFP8 GEMM，FP32 累加、BF16 输出。激活量化在上游，不计入本边界。
+
+优化要点：搬运与量化分 warp 并行；FP8 使用 cp.async→TMA 混合搬运，scale
+按 4 字节成组读取；GEMM 与通信共用有界 M/N 遍历；按实测选择通信 CTA 数量。
+
+36 个大尺寸长序列物理点（42 展示行），CP4/8×128K/256K/512K，Graph10+50
+全部校验通过。最终优胜配置几何平均 **1.915 PFLOPS/卡**，达到满 SM 纯
+cuBLASLt 的 **70.5%**。相较历史对照 **+20.97%**，不是单独窗口的同场消融。
+
+本版固化当前手工最优：H64/P4，通信 CTA 按点为 20/32/48；不宣称全局最优。
+默认 H/P=0 不变，OProj 新生产路径尚无匹配 Auto 标定，请使用显式正预算。
+[最终结果、各点配置与复现](results/sm103/v21.0/README.md)。
+
 ## v20.0 — SM103 MXFP8 QKVProj 前向与离线通信 Auto
 
 新增已量化 MXFP8 activation + BF16 master weight 的 QKVProj→A2A：持久化

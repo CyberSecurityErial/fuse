@@ -45,6 +45,22 @@ using OprojForwardN128K128Binding = A2ALhsKernelBinding<128, 128>;
 using OprojForwardN256K64E32Binding = A2ALhsKernelBinding<256, 64, 32>;
 using OprojForwardN256K128E32Binding = A2ALhsKernelBinding<256, 128, 32>;
 
+template <int EpilogueN>
+struct Mxfp8OprojBinding {
+  using Types = Mxfp8A2ALhsGemmTypes<EpilogueN>;
+  using Gemm = typename Types::Gemm;
+  using Comm = Mxfp8A2ALhsInputComm;
+  using Kernel = detail::InputProductionKernel<detail::MonolithicGemm<Gemm, Comm>, Comm>;
+#if FUSE_ENABLE_PROFILING
+  using TelemetryGemm = typename Types::TelemetryGemm;
+  using TelemetryComm = Mxfp8A2ALhsInputCommT<true>;
+  using TelemetryKernel = detail::InputProductionKernel<detail::RoleTelemetryKernel<
+      detail::MonolithicGemm<TelemetryGemm, TelemetryComm>>, TelemetryComm, true>;
+#endif
+  static_assert(cute::size<0>(typename Gemm::TileShape{}) == Comm::kReadyBlockM);
+  static_assert(cute::size<2>(typename Gemm::TileShape{}) == Comm::kTileK);
+};
+
 enum class OprojGemmPolicy {
   kM128N128,
   kM128N256,

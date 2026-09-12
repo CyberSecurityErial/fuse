@@ -52,6 +52,118 @@
 
 namespace fuse::detail {
 
+// Bounded OProj experiment: these compile-time switches are recorded by the
+// source/build receipt. They do not change BF16, QKV, or standalone GEMM.
+// Keep them separate to distinguish MMA-side and load-side effects.
+inline constexpr bool kMxfp8OprojDeferMmaLookahead = false;
+inline constexpr bool kMxfp8OprojDeferLoadLookahead = false;
+
+// Adapted from NVIDIA CUTLASS (BSD-3-Clause), pinned at 57e3cfb:
+// sm100_blockscaled_mma_warpspecialized.hpp. try_wait/try_acquire may suspend;
+// issue useful work for the CURRENT stage before peeking at the NEXT stage.
+//
+// Load: acquire(k) -> TMA(k)                 -> try_acquire(k+1)
+// MMA:  wait(k) -> scale copy(k) -> MMA(k) -> release(k) -> try_wait(k+1)
+//
+// This changes neither the real acquire/wait nor the stage/phase being tested.
+// The release is CUTLASS's async UMMA release, not an early SMEM reuse signal.
+// N256 K0 still copies scales before acquiring the overlapping TMEM slot;
+// every later scale copy remains after that stage's full-barrier wait.
+// Peer-segmented load calls retain the original iterator/state and tail peek.
+// No extra fence, barrier, shared storage, or runtime branch is introduced.
+// TODO: only after this isolated experiment, evaluate a bounded M-window
+// traversal across N bands; that is a separate GEMM/L2 scheduling change.
+template <class Base>
+struct Mxfp8OprojMainloop : Base {
+  using Base::Base;
+  static constexpr bool DeferMmaLookahead = kMxfp8OprojDeferMmaLookahead;
+  static constexpr bool DeferLoadLookahead = kMxfp8OprojDeferLoadLookahead;
+
+  template <class Inputs, class Coord, class Iterator>
+  CUTLASS_DEVICE auto load(typename Base::MainloopPipeline pipeline,
+      typename Base::MainloopPipelineState state, const Inputs& inputs,
+      const Coord& coord, Iterator iter, int count) {
+    if constexpr (!DeferLoadLookahead) {
+      return Base::load(pipeline, state, inputs, coord, iter, count);
+    } else {
+      using namespace cute;
+      auto [unused, gA, gB, sA, sB, gSFA, gSFB, sSFA, sSFB,
+            maskA, maskB, maskSFA, maskSFB] = inputs;
+      auto a = gA(_, get<0>(coord) / size(typename Base::TiledMma::AtomThrID{}), _, get<3>(coord));
+      auto b = gB(_, get<1>(coord), _, get<3>(coord));
+      auto sfa = gSFA(_, get<0>(coord) / size(typename Base::TiledMma::AtomThrID{}), _, get<3>(coord));
+      auto sfb = gSFB(_, get<1>(coord), _, get<3>(coord));
+      auto token = pipeline.producer_try_acquire(state);
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (count > 0) {
+        pipeline.producer_acquire(state, token);
+        auto* barrier = pipeline.producer_get_barrier(state);
+        const int slot = state.index();
+        ++state;
+        if (cute::elect_one_sync()) {
+          copy(this->observed_tma_load_a_->with(*barrier, maskA), a(_, *iter), sA(_, slot));
+          copy(this->observed_tma_load_b_->with(*barrier, maskB), b(_, *iter), sB(_, slot));
+          copy(this->observed_tma_load_sfa_->with(*barrier, maskSFA), sfa(_, *iter), sSFA(_, slot));
+          copy(this->observed_tma_load_sfb_->with(*barrier, maskSFB), sfb(_, *iter), sSFB(_, slot));
+        }
+        token = pipeline.producer_try_acquire(state);
+        --count;
+        ++iter;
+      }
+      return cute::make_tuple(state, iter);
+    }
+  }
+
+  template <class Pipelines, class States, class Accumulators, class Inputs, class Coord>
+  CUTLASS_DEVICE auto mma(Pipelines pipelines, States states, Accumulators accumulators_pair,
+      Inputs inputs, Coord coord, int count) {
+    if constexpr (!DeferMmaLookahead) {
+      return Base::mma(pipelines, states, accumulators_pair, inputs, coord, count);
+    } else {
+      using namespace cute;
+      static_assert(!Base::IsCtaN192 && !Base::IsCtaN64,
+          "OProj lookahead adapter requires the ordinary MXFP8 SFB mapping");
+      auto accumulators = get<0>(accumulators_pair);
+      auto [mma, a, b, sfa, sfb, copyA, srcA, dstA, copyB, srcB, dstB] = inputs;
+      auto [pipeline, acc_pipeline] = pipelines;
+      auto [state, acc_state] = states;
+      auto token = pipeline.consumer_try_wait(state, uint32_t(count <= 0));
+      mma.accumulate_ = UMMA::ScaleOut::Zero;
+      // Compile the first overlapping-TMEM step separately, as CUTLASS does.
+      // No first-step branch remains in the steady-state K loop.
+      auto step = [&](auto first) {
+        pipeline.consumer_wait(state, token);
+        const int slot = state.index();
+        auto current = state;
+        ++state;
+        --count;
+        if (cute::elect_one_sync()) {
+          copy(copyA, srcA(_,_,_,_,slot), dstA);
+          copy(copyB, srcB(_,_,_,_,slot), dstB);
+        }
+        if constexpr (Base::IsOverlappingAccum && decltype(first)::value)
+          acc_pipeline.producer_acquire(acc_state);
+        CUTLASS_PRAGMA_UNROLL
+        for (int block = 0; block < size<2>(a); ++block) {
+          cute::gemm(mma.with(mma.accumulate_, sfa(_,_,block), sfb(_,_,block)),
+              a(_,_,block,slot), b(_,_,block,slot), accumulators);
+          mma.accumulate_ = UMMA::ScaleOut::One;
+        }
+        pipeline.consumer_release(current);
+        token = pipeline.consumer_try_wait(state, uint32_t(count <= 0));
+      };
+      if constexpr (Base::IsOverlappingAccum) {
+        if (count > 0) step(cute::true_type{});
+      } else {
+        acc_pipeline.producer_acquire(acc_state);
+      }
+      CUTLASS_PRAGMA_NO_UNROLL
+      while (count > 0) step(cute::false_type{});
+      return state;
+    }
+  }
+};
+
 // Same single-lane contract as SM90. The SM100 caller performs the producer
 // warp rejoin and async-proxy fence after lane zero returns from this helper.
 CUTLASS_DEVICE void wait_acquire_gpu_single_lane(
@@ -214,7 +326,7 @@ template <
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
-    , bool SystemScope = false
+    , bool SystemScope = false, bool ObserveMma = true
     >
 struct A2ALhsReadyMainloop : Base {
 #if FUSE_ENABLE_PROFILING
@@ -426,7 +538,7 @@ struct A2ALhsReadyMainloop : Base {
   template <class Pipelines, class States, class Accumulators, class Inputs, class Coord>
   CUTLASS_DEVICE auto mma(Pipelines pipelines, States states, Accumulators accumulators,
                          Inputs inputs, Coord coord, int k_tiles) {
-    if constexpr (Instrumented) {
+    if constexpr (Instrumented && ObserveMma) {
       const int64_t index = params_->probe.tile_index(coord);
       if (index >= 0) {
         CUTLASS_ASSERT(k_tiles == params_->probe.k_tiles);

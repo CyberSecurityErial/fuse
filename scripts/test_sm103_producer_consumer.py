@@ -27,7 +27,18 @@ class ProducerConsumerTests(unittest.TestCase):
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <algorithm>
+#include <vector>
+#define CUTLASS_HOST
 #define CUTLASS_HOST_DEVICE
+namespace cutlass {
+struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t v) const { return v / divisor; }
+};
+}
 struct Divmod {
   uint64_t divisor = 1;
   void operator()(uint64_t& q, uint64_t& r, uint64_t v) const {
@@ -43,7 +54,8 @@ struct Params {
   Divmod divmod_batch_, divmod_cluster_blk_major_;
 };
 ''' + body + r'''
-void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world, int chunks, int comm_slots) {
+void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world, int chunks, int comm_slots,
+               int h = 0, int g = 0, bool window_test = false) {
   const int pm = (mt + swizzle - 1) / swizzle * swizzle;
   const int pn = (nt + swizzle - 1) / swizzle * swizzle;
   Params params;
@@ -53,10 +65,33 @@ void run_input(int mt, int nt, int swizzle, bool along_n, int compute, int world
   params.divmod_cluster_blk_major_.divisor = along_n ? pn : pm;
   params.raster_order_ = along_n ? Params::RasterOrder::AlongN : Params::RasterOrder::AlongM;
   while ((1 << params.log_swizzle_size_) < swizzle) ++params.log_swizzle_size_;
-  auto order = fuse::detail::A2AInputTileOrder::make(params, mt);
+  const auto rectangles = fuse::detail::OprojTileOrder::make(params, h, g);
+  auto order = fuse::detail::A2AInputTileOrder::make(params, mt, rectangles);
   order.ready_group_m_tiles = comm_slots / chunks > 0 ? comm_slots / chunks : 1;
+  if (window_test) {
+    // Independently recover first use by enumerating all real consumers. The
+    // Python oracle below checks the whole tile sequence, not only its inverse.
+    params.blocks_per_problem_ *= 2;
+    std::vector<uint64_t> first(mt, params.blocks_per_problem_);
+    for (uint64_t q = 0; q < params.blocks_per_problem_; ++q) {
+      const auto t = rectangles.decode(params, q);
+      if (!t.valid || rectangles.linear(params, t.m, t.n, t.batch) != q) std::abort();
+      std::cout << "T " << t.m << ' ' << t.n << ' ' << t.batch << '\n';
+      if (t.batch == 0 && t.m < mt && t.n < nt) first[t.m] = std::min(first[t.m], q);
+    }
+    if (rectangles.decode(params, params.blocks_per_problem_).valid) std::abort();
+    for (int m = 0; m < mt; ++m) {
+      if (order.first_use(m) != first[m]) std::abort();
+    }
+    if (!std::is_sorted(first.begin(), first.end())) std::abort();
+    for (uint64_t q = 0; q <= params.blocks_per_problem_; ++q) {
+      const int expected = std::lower_bound(first.begin(), first.end(), q) - first.begin();
+      if (order.lower_bound(q) != expected) std::abort();
+    }
+  }
   for (uint64_t task = 0; task < uint64_t(mt) * world * chunks; ++task) {
     const auto t = order.decode(task, world, chunks);
+    if (window_test) std::cout << "I ";
     std::cout << t.m << ' ' << t.peer << ' ' << t.chunk << '\n';
   }
 }
@@ -87,6 +122,12 @@ template<int N> void run(int M, int columns, int swizzle, bool along_n, int rank
   }
 }
 int main(int argc, char** argv) {
+  if (argc == 12) {
+    run_input(std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]),
+        std::atoi(argv[5]), std::atoi(argv[6]), std::atoi(argv[7]), std::atoi(argv[8]),
+        std::atoi(argv[9]), std::atoi(argv[10]), std::atoi(argv[11]), true);
+    return 0;
+  }
   if (argc == 10) {
     run_input(std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]),
         std::atoi(argv[5]), std::atoi(argv[6]), std::atoi(argv[7]), std::atoi(argv[8]),
@@ -243,6 +284,77 @@ int main(int argc, char** argv) {
             [str(self.binary), 'input', '4', '64', '4', '1', '140', '4', '4', '64'],
             text=True).splitlines()]
         self.assertEqual(rows, [(m, p, c) for p in range(4) for m in range(4) for c in range(4)])
+
+    def test_oproj_rectangle_order_and_first_use_windows(self):
+        # Cover both padded tails (M/N not multiples of the resolved swizzle)
+        # and clipped rectangles (H/P smaller or larger than actual extents).
+        for mt, nt, h, group_n in ((3, 5, 64, 4), (67, 13, 64, 4),
+                                   (133, 17, 128, 4), (129, 13, 64, 8),
+                                   (67, 5, 2, 2), (133, 17, 0, 0)):
+            for swizzle in (1, 2, 4, 8):
+                for along_n in (False, True):
+                    pm = (mt + swizzle - 1) // swizzle * swizzle
+                    pn = (nt + swizzle - 1) // swizzle * swizzle
+                    height, width = (h, group_n) if h else (pm, pn)
+                    effective_swizzle = min(swizzle, height if along_n else width)
+                    expected_tiles = []
+                    for mb in range(0, pm, height):
+                        for nb in range(0, pn, width):
+                            ms, ns = min(height, pm - mb), min(width, pn - nb)
+                            for band in range(0, ms if along_n else ns, effective_swizzle):
+                                for major in range(ns if along_n else ms):
+                                    for offset in range(effective_swizzle):
+                                        expected_tiles.append((mb + band + offset, nb + major)
+                                            if along_n else (mb + major, nb + band + offset))
+                    for compute in (84, 100, 116, 128):
+                        world, chunks, slots = (4, 3, 12) if compute < 116 else (8, 4, 80)
+                        with self.subTest(mt=mt, nt=nt, h=h, p=group_n, sw=swizzle,
+                                          along_n=along_n, compute=compute):
+                            lines = subprocess.check_output([
+                                str(self.binary), 'window', str(mt), str(nt), str(swizzle),
+                                str(int(along_n)), str(compute), str(world), str(chunks),
+                                str(slots), str(h), str(group_n)], text=True).splitlines()
+                            tiles = [tuple(map(int, line.split()[1:])) for line in lines if line.startswith('T ')]
+                            rows = [tuple(map(int, line.split()[1:])) for line in lines if line.startswith('I ')]
+                            self.assertEqual(tiles, [(m, n, b) for b in range(2) for m, n in expected_tiles])
+                            self.assertEqual(len(set(tiles)), pm * pn * 2)
+                            grid = min(compute, len(expected_tiles))
+                            waves, seen = {}, set()
+                            for i, (m, n) in enumerate(expected_tiles):
+                                if m < mt and n < nt and m not in seen:
+                                    waves.setdefault(i // grid, []).append(m)
+                                    seen.add(m)
+                            expected = []
+                            for ms in waves.values():
+                                cohort = not along_n and pn > effective_swizzle
+                                size = (max(1, slots // chunks) if cohort else
+                                        max(effective_swizzle, (len(ms) + world - 1) // world))
+                                groups = [ms[i:i + size] for i in range(0, len(ms), size)]
+                                if cohort:
+                                    expected.extend((m, peer, c) for members in groups
+                                                    for peer in range(world) for m in members
+                                                    for c in range(chunks))
+                                else:
+                                    for diagonal in range(len(groups) + world - 1):
+                                        for peer in range(world):
+                                            g = diagonal - peer
+                                            if 0 <= g < len(groups):
+                                                expected.extend((m, peer, c) for m in groups[g]
+                                                                for c in range(chunks))
+                            self.assertEqual(rows, expected)
+                            self.assertEqual(len(set(rows)), mt * world * chunks)
+                            for workers in (1, slots, 148):
+                                self.assertEqual(Counter(t for w in range(workers) for t in rows[w::workers]),
+                                                 Counter(expected))
+
+    def test_oproj_qwen_first_two_waves_reuse_four_w_panels(self):
+        for h in (64, 128):
+            lines = subprocess.check_output([str(self.binary), 'window', '128', '16', '8', '1',
+                '128', '8', '4', '80', str(h), '4'], text=True).splitlines()
+            tiles = [tuple(map(int, line.split()[1:])) for line in lines if line.startswith('T ')]
+            for wave in (0, 1):
+                self.assertEqual(set(tiles[wave * 128:(wave + 1) * 128]),
+                    {(m, n, 0) for m in range(wave * 32, (wave + 1) * 32) for n in range(4)})
 
     def check_orders(self, ranks):
         for tile_n in (64,128,160,192,256):

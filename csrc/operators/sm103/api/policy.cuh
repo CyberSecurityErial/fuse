@@ -100,9 +100,60 @@ inline cudaError_t resolve_oproj_communication(
 // Match the BF16 resolver contract: a positive budget is a strict override;
 // zero selects a HOST plan before any descriptor construction or GPU launch.
 // GEMM owns the layout. The selected budget changes both j + wave*C compute
-// ownership and w + step*(8*c) quantization/copy ownership, so the scorer must
+// ownership and each producer cohort's strided ownership, so the scorer must
 // rebuild those chains together. No tile policy, ready granularity or device
 // work queue is changed here.
+inline cudaError_t resolve_mxfp8_oproj_communication(
+    const Mxfp8A2AGemmParams& params, Mxfp8A2AGemmParams* resolved) {
+  if (!resolved || params.projection.num_comm_ctas < 0) return cudaErrorInvalidValue;
+  *resolved = params;
+  if (params.projection.num_comm_ctas > 0) return cudaSuccess;
+  // Bounded traversal changes A first-use windows; old Auto calibration does
+  // not describe that service. Explicit budgets do not consult this model.
+  if (params.m_window_tiles != 0 || params.n_group_tiles != 0) return cudaErrorNotSupported;
+  // Explicit budgets remain available for bring-up/recalibration. Auto must
+  // not score a new producer schedule with services measured on the old one.
+  if (detail::kMxfp8OprojCalibrationProducerRevision !=
+      Mxfp8A2ALhsInputComm::kWeightProducerRevision) return cudaErrorNotSupported;
+  const auto& p = params.projection.gemm;
+  const auto& r = params.projection.route;
+  if (!Mxfp8A2ALhsInputComm::supported_geometry(p,r) ||
+      params.projection.lhs_policy != A2ALhsGemmPolicy::kAuto ||
+      (params.epilogue_n != 32 && params.epilogue_n != 64) ||
+      (r.world_size != 4 && r.world_size != 8) || !r.causal_load_balanced || r.cyclic_peer_order ||
+      a_row_stride(p) != p.k || b_row_stride(p) != p.k || d_row_stride(p) != p.n ||
+      ((int64_t{p.m}+127)/128)*((int64_t{p.n}+255)/256) > 1000000) return cudaErrorNotSupported;
+  DeviceInfo info{};
+  auto status = device_info(&info);
+  if (status != cudaSuccess) return status;
+  if (info.sm_count != 148) return cudaErrorNotSupported;
+  auto select = [&](auto binding_tag) {
+    using Binding = typename decltype(binding_tag)::type;
+    using Gemm = typename Binding::Gemm;
+    size_t dynamic_smem = 0;
+    auto status = detail::launch_shared_memory<typename Binding::Kernel>(info,&dynamic_smem);
+    if (status != cudaSuccess) return status;
+    // Geometry only: no descriptor encoding, tensor access or trial launch.
+    const auto args = gemm_arguments<Gemm,Fp8E4m3>(
+        p,nullptr,nullptr,nullptr,1.0f,0,info,GemmRaster::kAlongN);
+    const auto order = a2a_input_order<Gemm>(args);
+    detail::Mxfp8OprojTuningRequest request;
+    request.m=p.m; request.n=p.n; request.k=p.k; request.world=r.world_size;
+    request.sm_count=info.sm_count; request.epilogue_n=params.epilogue_n;
+    request.raster=order.along_n ? 1 : 0;
+    request.max_swizzle_size=p.max_swizzle_size; request.swizzle=1<<order.log_swizzle;
+    request.dynamic_smem_bytes=static_cast<int32_t>(dynamic_smem);
+    const auto plan = detail::select_mxfp8_oproj_plan(request);
+    if (plan.status != detail::Mxfp8OprojTuningStatus::Success)
+      return plan.status == detail::Mxfp8OprojTuningStatus::InvalidInput
+          ? cudaErrorInvalidValue : cudaErrorNotSupported;
+    resolved->projection.num_comm_ctas=plan.comm_ctas;
+    return cudaSuccess;
+  };
+  return params.epilogue_n == 32 ? select(TypeTag<Mxfp8OprojBinding<32>>{})
+                               : select(TypeTag<Mxfp8OprojBinding<64>>{});
+}
+
 inline cudaError_t resolve_mxfp8_qkv_communication(
     const Mxfp8GemmA2AParams& params, Mxfp8GemmA2AParams* resolved) {
   if (!resolved || params.projection.num_comm_ctas < 0) return cudaErrorInvalidValue;
@@ -192,6 +243,14 @@ inline cudaError_t resolve_mxfp8_qkv_communication(
 }
 
 }  // namespace
+
+int32_t recommended_a2a_gemm_mxfp8_comm_ctas(
+    const GemmProblem& problem, const UlyssesRoute& route, int32_t epilogue_n) {
+  Mxfp8A2AGemmParams params{}, resolved{};
+  params.projection.gemm=problem; params.projection.route=route; params.epilogue_n=epilogue_n;
+  return resolve_mxfp8_oproj_communication(params,&resolved) == cudaSuccess
+      ? resolved.projection.num_comm_ctas : 0;
+}
 
 int32_t recommended_gemm_a2a_mxfp8_comm_ctas(
     const GemmProblem& problem, const UlyssesRoute& route, int32_t epilogue_n) {

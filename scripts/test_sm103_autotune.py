@@ -29,6 +29,9 @@ def compiled_services():
     uses exactly the two service values and actual compute budget from C++.
     """
     header = (ROOT / 'csrc/operators/sm103/detail/model_calibration.cuh').read_text()
+    # The shared header also contains MXFP8 tables with a different record
+    # schema. This parity test consumes only the BF16 OProj calibration array.
+    header = header.split('kOprojCalibrationPoints[] = {', 1)[1].split('};', 1)[0]
     anchors = {}
     for line in re.findall(r'^  \{([^}]+)\},$', header, re.MULTILINE):
         cells = line.split(', ')
@@ -54,7 +57,20 @@ class OProjAutotuneTests(unittest.TestCase):
         cls.addClassCleanup(temporary.cleanup)
         directory = Path(temporary.name)
         (directory / 'cutlass').mkdir()
-        (directory / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/cutlass.h').write_text(
+            '#pragma once\n#define CUTLASS_HOST\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/fast_math.h').write_text(r'''
+#pragma once
+#include <cstdint>
+namespace cutlass {
+struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t v) const { return v / divisor; }
+};
+}
+''')
         cls.binary = directory / 'selector'
         source = r'''
 #include "csrc/operators/sm103/detail/autotune.cuh"

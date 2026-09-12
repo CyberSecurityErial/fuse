@@ -55,10 +55,11 @@ constexpr int kWarmup = 10;
 constexpr int kSamples = 50;
 constexpr uint64_t kCpuOracleElements = 4 * 1024 * 1024;
 
-enum class MeasurementComponent { kFused, kComputeReference, kCopyReference, kQuantizeReference };
+enum class MeasurementComponent { kFused, kComputeReference, kCopyReference, kQuantizeReference, kProducerReference };
 
 bool component_has_route(MeasurementComponent component) {
-  return component == MeasurementComponent::kFused || component == MeasurementComponent::kCopyReference;
+  return component == MeasurementComponent::kFused || component == MeasurementComponent::kCopyReference ||
+      component == MeasurementComponent::kProducerReference;
 }
 
 const char* component_name(MeasurementComponent component) {
@@ -67,6 +68,7 @@ const char* component_name(MeasurementComponent component) {
     case MeasurementComponent::kComputeReference: return "compute_reference";
     case MeasurementComponent::kCopyReference: return "copy_reference";
     case MeasurementComponent::kQuantizeReference: return "quantize_reference";
+    case MeasurementComponent::kProducerReference: return "producer_reference";
   }
   throw std::runtime_error("invalid measurement component");
 }
@@ -76,6 +78,8 @@ struct Options {
   bool mxfp8_prequantized = false;
   std::string mxfp8_weight_preparation = "comm";
   int mxfp8_epilogue_n = 64;
+  int oproj_m_window_tiles = 0;
+  int oproj_n_group_tiles = 0;
 #endif
   int world = 4;
   int comm_sm = 8;
@@ -209,7 +213,8 @@ std::vector<Candidate> make_candidates(const Options& options) {
   }
   for (const auto& policy : options.oproj_policy_list) {
     for (int comm_sm : options.comm_sm_list) {
-      candidates.push_back({Direction::kOproj, comm_sm, policy, options.auto_oproj_comm});
+      candidates.push_back({Direction::kOproj, comm_sm, policy,
+          options.auto_oproj_comm || (options.auto_mxfp8_comm && comm_sm == 0)});
     }
   }
   candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
@@ -430,6 +435,12 @@ Options parse_options(int argc, char** argv) {
     } else if (argument == "--causal") {
       options.causal = true;
 #if FUSE_BENCH_MXFP8
+    } else if (argument == "--oproj-m-window-tiles" || argument == "--oproj-n-group-tiles") {
+      const uint64_t value = number();
+      if (value > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("window dimensions must fit int32");
+      (argument == "--oproj-m-window-tiles" ? options.oproj_m_window_tiles : options.oproj_n_group_tiles) =
+          static_cast<int>(value);
     } else if (argument == "--mxfp8-epilogue-n") {
       options.mxfp8_epilogue_n = positive_int();
       if (options.mxfp8_epilogue_n != 32 && options.mxfp8_epilogue_n != 64)
@@ -495,6 +506,7 @@ Options parse_options(int argc, char** argv) {
                    "[--host-launch sequential|per_gpu_thread] [--launch eager|graph] "
                    "[--cpu-oracle] [--validation-self-test] [--calibrate]\n"
 #if FUSE_BENCH_MXFP8
+                   "--oproj-m-window-tiles H --oproj-n-group-tiles P: explicit MXFP8 OProj tile windows; 0/0 disables.\n"
                    "--mxfp8-weight-preparation comm|all|comm_warp: comm_warp uses warp_then_route_v1; "
                    "warps 0..3 route immediately, warps 4..7 quantize their weights then join routing.\n"
 #endif
@@ -684,6 +696,14 @@ Options parse_options(int argc, char** argv) {
   if (options.profile) throw std::runtime_error("rebuild with FUSE_ENABLE_PROFILING=ON for --profile");
 #endif
 #if FUSE_BENCH_MXFP8
+  if (options.oproj_m_window_tiles || options.oproj_n_group_tiles) {
+    const int h = options.oproj_m_window_tiles, p = options.oproj_n_group_tiles;
+    if (h <= 0 || p <= 0 || (h & (h - 1)) || (p & (p - 1)) ||
+        int64_t{h} * p > std::numeric_limits<int32_t>::max() ||
+        options.fused_direction != "oproj" || options.auto_mxfp8_comm ||
+        !(has_comm_sm || has_comm_sm_list))
+      throw std::runtime_error("OProj windows require two positive power-of-two tile dimensions and explicit communication CTAs");
+  }
   if (options.mxfp8_service_probe && (!options.profile || fused_mpi::enabled ||
       (options.world != 4 && options.world != 8) ||
       options.profile_detail != "full" || options.launch != "eager" || options.auto_mxfp8_comm ||
@@ -694,20 +714,27 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("MXFP8 services require CP4/8 single-process full profile, explicit ordinary comm/layout, and output path");
   if (!options.mxfp8_service_probe && !options.mxfp8_service_output.empty())
     throw std::runtime_error("--mxfp8-service-output requires --mxfp8-service-probe");
+  const auto& mxfp8_raster = options.run_oproj() ? options.oproj_raster : options.qkv_raster;
   if (options.auto_mxfp8_comm && (!fused_mpi::enabled || options.launch != "graph" || options.profile ||
       options.mxfp8_prequantized || options.mxfp8_weight_preparation != "comm" ||
-      (options.qkv_raster != "along_m" && options.qkv_raster != "along_n")))
+      (mxfp8_raster != "along_m" && mxfp8_raster != "along_n")))
     throw std::runtime_error("MXFP8 automatic CTAs require MPI Graph, dynamic-weight ordinary comm, and explicit raster");
-  if (options.fused_direction != "qkv" ||
+  if ((options.fused_direction != "qkv" && options.fused_direction != "oproj") ||
       options.cpu_oracle || options.compute_only || options.validation_self_test ||
       !options.counter_component.empty() || options.quick)
-    throw std::runtime_error("MXFP8 baseline requires QKV-only, full 10+50, without BF16-specific diagnostics");
-  if (options.profile && (options.profile_direction != "qkv" || options.mxfp8_prequantized))
-    throw std::runtime_error("MXFP8 profile requires dynamic-weight QKV");
+    throw std::runtime_error("MXFP8 baseline requires one forward direction, full 10+50, without BF16-specific diagnostics");
+  if (options.run_oproj() && (
+      options.mxfp8_prequantized || options.mxfp8_weight_preparation != "comm" ||
+      options.oproj_policy_list != std::vector<std::string>{"m128n256"}))
+    throw std::runtime_error("MXFP8 OProj baseline requires explicit comm, m128n256 and no QKV diagnostics");
+  if (options.profile && (options.profile_direction != options.fused_direction ||
+      options.mxfp8_prequantized || options.oproj_gap_probe))
+    throw std::runtime_error("MXFP8 profile requires matching direction and dynamic weight; BF16 gap probe is not applicable");
   if (options.calibrate && (options.mxfp8_prequantized || options.mxfp8_weight_preparation != "comm"))
     throw std::runtime_error("MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps");
   if (options.qkv_policy_list.empty()) options.qkv_policy_list = {"m128n256"};
-  if (options.qkv_policy_list != std::vector<std::string>{"m128n256"} || options.hidden % 128 || options.head_dim != 128)
+  if (options.qkv_policy_list != std::vector<std::string>{"m128n256"} || options.hidden % 128 ||
+      (options.run_qkv() && options.head_dim != 128))
     throw std::runtime_error("MXFP8 baseline requires M128/N256/K128, hidden divisible by 128, and head_dim=128");
 #endif
   return options;
@@ -730,6 +757,7 @@ struct RankRuntime {
   void* mxfp8_workspace = nullptr;
   size_t mxfp8_workspace_bytes = 0;
   fuse::Mxfp8Activation mxfp8_activation{};
+  fuse::Mxfp8A2AGemmParams mxfp8_oproj{};
   fuse::Mxfp8WeightPreparation mxfp8_weight_preparation = fuse::Mxfp8WeightPreparation::kCommunicationCtas;
   int mxfp8_epilogue_n = 64;
   Bf16* mxfp8_reference_a = nullptr;
@@ -981,7 +1009,8 @@ void report_graph_preparation(const std::vector<RankRuntime>& runtimes, const Op
 void exchange_peer_buffers(std::vector<RankRuntime>& runtimes, const Options& options) {
 #if FUSE_BENCH_MPI
   enum Buffer { kQkvSource, kQkvDestination, kRouteDone, kOprojInput,
-                kInputReady, kCalibrationDone, kQkvWeight, kOprojWeight, kCount };
+                kInputReady, kCalibrationDone, kQkvWeight, kOprojWeight,
+                kMxfp8Input, kMxfp8Scales, kCount };
   struct Handle { cudaIpcMemHandle_t memory{}; int present = 0; };
   using Handles = std::array<Handle, kCount>;
   std::vector<Handles> handles(options.world);
@@ -990,7 +1019,14 @@ void exchange_peer_buffers(std::vector<RankRuntime>& runtimes, const Options& op
   const void* pointers[kCount] = {
       owner.qkv.local_output, owner.peer_output, owner.route_done, owner.peer_input,
       owner.input_ready, owner.calibration_route_done,
-      share_weights ? owner.qkv.rhs_nt : nullptr, share_weights ? owner.oproj.rhs_nt : nullptr};
+      share_weights ? owner.qkv.rhs_nt : nullptr, share_weights ? owner.oproj.rhs_nt : nullptr,
+#if FUSE_BENCH_MXFP8
+      options.run_oproj() ? owner.mxfp8_activation.data : nullptr,
+      options.run_oproj() ? owner.mxfp8_activation.scales : nullptr
+#else
+      nullptr, nullptr
+#endif
+  };
   for (int field = 0; field < kCount; ++field) {
     auto& handle = handles[fused_mpi::process_rank][field];
     if (!pointers[field]) continue;
@@ -1016,6 +1052,13 @@ void exchange_peer_buffers(std::vector<RankRuntime>& runtimes, const Options& op
     view.calibration_route_done = static_cast<uint32_t*>(mapped[kCalibrationDone]);
     view.qkv.rhs_nt = static_cast<Bf16*>(mapped[kQkvWeight]);
     view.oproj.rhs_nt = static_cast<Bf16*>(mapped[kOprojWeight]);
+#if FUSE_BENCH_MXFP8
+    if (options.run_oproj()) {
+      view.mxfp8_activation = owner.mxfp8_activation; // Same per-peer allocation shape.
+      view.mxfp8_activation.data = static_cast<fuse::Fp8E4m3*>(mapped[kMxfp8Input]);
+      view.mxfp8_activation.scales = static_cast<uint8_t*>(mapped[kMxfp8Scales]);
+    }
+#endif
   }
   fused_mpi::barrier();
 #else
@@ -1150,6 +1193,23 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.oproj.ready = allocate<uint32_t>(runtime, static_cast<size_t>(oproj_flags));
       runtime.oproj_reference = allocate<Bf16>(runtime, checked_product(m, options.hidden));
       runtime.reference_lhs = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+#if FUSE_BENCH_MXFP8
+      runtime.mxfp8_epilogue_n = options.mxfp8_epilogue_n;
+      auto& activation = runtime.mxfp8_activation;
+      CUDA_CHECK(fuse::a2a_gemm_mxfp8_activation_size(runtime.oproj.gemm, runtime.oproj.route,
+          &activation.data_bytes, &activation.scale_bytes));
+      activation.data = reinterpret_cast<fuse::Fp8E4m3*>(allocate<uint8_t>(runtime, activation.data_bytes));
+      activation.scales = allocate<uint8_t>(runtime, activation.scale_bytes);
+      CUDA_CHECK(fuse::a2a_gemm_mxfp8_workspace_size(runtime.oproj.gemm, &runtime.mxfp8_workspace_bytes));
+      runtime.mxfp8_workspace = allocate<uint8_t>(runtime, runtime.mxfp8_workspace_bytes);
+      runtime.mxfp8_reference_a = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
+      runtime.mxfp8_reference_b = allocate<Bf16>(runtime, oproj_weight_count);
+      runtime.mxfp8_oproj.workspace = runtime.mxfp8_workspace;
+      runtime.mxfp8_oproj.workspace_bytes = runtime.mxfp8_workspace_bytes;
+      runtime.mxfp8_oproj.epilogue_n = options.mxfp8_epilogue_n;
+      runtime.mxfp8_oproj.m_window_tiles = options.oproj_m_window_tiles;
+      runtime.mxfp8_oproj.n_group_tiles = options.oproj_n_group_tiles;
+#endif
     }
     runtime.validation = allocate<fused_validation::Scratch>(runtime, 1);
     if (options.calibrate || options.oproj_gap_probe || options.mxfp8_service_probe) {
@@ -1165,8 +1225,10 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
     if (options.profile && (!options.mxfp8_service_probe || rank == 0)) {
       runtime.timeline = allocate<fuse::A2AGemmCtaTimeline>(runtime, runtime.sm_count);
 #if FUSE_BENCH_MXFP8
-      runtime.mxfp8_probe.quant_capacity = ceil_div(options.projection_width(), 256) * (256 * (options.hidden / 32) / 32);
-      runtime.mxfp8_probe.wait_capacity = ceil_div(options.seq_local, 128) * ceil_div(options.projection_width(), 256);
+      const int quant_n = options.run_oproj() ? options.hidden : options.projection_width();
+      const int quant_k = options.run_oproj() ? options.q_width() : options.hidden;
+      runtime.mxfp8_probe.quant_capacity = ceil_div(quant_n, 256) * (256 * (quant_k / 32) / 32);
+      runtime.mxfp8_probe.wait_capacity = ceil_div(options.seq_local, 128) * ceil_div(quant_n, 256);
       runtime.mxfp8_probe.quant = allocate<fuse::Mxfp8QuantRecord>(runtime, runtime.mxfp8_probe.quant_capacity);
       runtime.mxfp8_probe.waits = allocate<fuse::Mxfp8WaitRecord>(runtime, runtime.mxfp8_probe.wait_capacity);
 #endif
@@ -1193,7 +1255,12 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
           service.route_capacity = runtime.qkv_route_capacity;
         }
 #endif
-        const auto oproj_traits = fuse::cutlass_kernel_traits();
+        const auto oproj_traits =
+#if FUSE_BENCH_MXFP8
+            fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+#else
+            fuse::cutlass_kernel_traits();
+#endif
         if (oproj_traits.block_m <= 0 || oproj_traits.block_n <= 0) {
           throw std::runtime_error("invalid OProj tile query");
         }
@@ -1201,20 +1268,21 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
         const int n_tiles = ceil_div(options.hidden, oproj_traits.block_n);
         runtime.peer_capacity = std::max(m_tiles * n_tiles, m_tiles * options.world);
         runtime.peer_timeline = allocate<fuse::A2AGemmPeerTimeline>(runtime, runtime.peer_capacity);
-        if ((options.oproj_pipeline_probe || options.oproj_gap_probe) && rank == 0) {
+        if ((options.oproj_pipeline_probe || options.oproj_gap_probe) && (rank == 0 || FUSE_BENCH_MXFP8)) {
           auto& probe = runtime.oproj_pipeline;
           probe.m_tiles = m_tiles;
           probe.n_tiles = n_tiles;
           probe.k_tiles = options.q_width() / oproj_traits.block_k;
           probe.comm_ctas = options.oproj_gap_probe ? 0 : options.comm_sm;
-          probe.all_workers = options.oproj_gap_probe;
+          probe.all_workers = options.oproj_gap_probe || FUSE_BENCH_MXFP8;
+          probe.sampled_stages = FUSE_BENCH_MXFP8;
           probe.compute_ctas = std::min(m_tiles * n_tiles, runtime.sm_count - options.comm_sm);
           probe.swizzle = options.max_swizzle_size;
           const size_t tiles = checked_product(m_tiles, n_tiles);
-          const size_t stages = options.oproj_gap_probe ? 0 : checked_product(tiles, probe.k_tiles);
+          const size_t stages = options.oproj_gap_probe || rank != 0 ? 0 : checked_product(tiles, probe.k_tiles);
           const size_t bytes = tiles * sizeof(fuse::detail::OprojPipelineRecord) +
               stages * sizeof(fuse::detail::OprojMmaStageRecord);
-          if (bytes > (64 << 20)) throw std::runtime_error("OProj pipeline probe exceeds 64 MiB diagnostic limit");
+          if (bytes > (192 << 20)) throw std::runtime_error("OProj pipeline probe exceeds 192 MiB diagnostic limit");
           probe.tiles = allocate<fuse::detail::OprojPipelineRecord>(runtime, tiles);
           if (stages) probe.stages = allocate<fuse::detail::OprojMmaStageRecord>(runtime, stages);
         }
@@ -1231,6 +1299,9 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.qkv.peer_route_done_epoch[peer] = runtimes[peer].route_done;
       runtime.oproj.peer_input[peer] = runtimes[peer].peer_input;
       runtime.oproj.peer_input_ready[peer] = runtimes[peer].input_ready;
+#if FUSE_BENCH_MXFP8
+      if (options.run_oproj()) runtime.mxfp8_oproj.activation[peer] = runtimes[peer].mxfp8_activation;
+#endif
     }
   }
   finish_all(runtimes);
@@ -1280,13 +1351,15 @@ void set_inputs(std::vector<RankRuntime>& runtimes, const Options& options, uint
 #if FUSE_BENCH_MXFP8
     // Change the BF16 master weight too, with the same seed on all ranks.
     // The second payload therefore detects accidental activation OR weight reuse.
-    const auto weight_count = checked_product(options.hidden, options.projection_width());
+    const auto weight_count = checked_product(options.hidden,
+        options.run_qkv() ? options.projection_width() : options.q_width());
+    auto* master_weight = options.run_qkv() ? const_cast<Bf16*>(runtime.qkv.rhs_nt) : runtime.oproj.rhs_nt;
     const auto weight_seed = options.seed + generation * 100003u + 11u;
     if (options.input_generator == "gpu_philox") {
-      make_gpu_values(runtime, const_cast<Bf16*>(runtime.qkv.rhs_nt), weight_count,
+      make_gpu_values(runtime, master_weight, weight_count,
           weight_seed, "MXFP8-weight," + label, 0.02f);
     } else {
-      upload(const_cast<Bf16*>(runtime.qkv.rhs_nt),
+      upload(master_weight,
           make_values(weight_count, weight_seed, "MXFP8-weight," + label, 0.02f), runtime.stream);
     }
 #endif
@@ -1340,8 +1413,14 @@ void set_inputs(std::vector<RankRuntime>& runtimes, const Options& options, uint
   for (const int rank : fused_mpi::owned_ranks(options.world)) {
     auto& r = runtimes[rank];
     CUDA_CHECK(cudaSetDevice(r.device));
-    CUDA_CHECK(fuse::quantize_gemm_a2a_mxfp8_activation(
-        r.qkv.gemm, r.qkv.lhs, r.mxfp8_activation, r.stream));
+    auto activation_shape = options.run_qkv() ? r.qkv.gemm : r.oproj.gemm;
+    if (options.run_oproj()) {
+      activation_shape.m = options.seq_local * options.world;
+      activation_shape.k = options.q_width() / options.world;
+    }
+    // Shared upstream adapter; OProj's input is a global-row / local-K shard.
+    CUDA_CHECK(fuse::quantize_gemm_a2a_mxfp8_activation(activation_shape,
+        options.run_qkv() ? r.qkv.lhs : r.peer_input, r.mxfp8_activation, r.stream));
     if (options.mxfp8_prequantized) {
       fuse::Mxfp8GemmA2AParams p{r.qkv, r.mxfp8_workspace, r.mxfp8_workspace_bytes,
                                 r.mxfp8_activation, r.mxfp8_weight_preparation, r.mxfp8_epilogue_n};
@@ -1388,7 +1467,8 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
     const auto& problem = qkv ? runtime.qkv.gemm : runtime.oproj.gemm;
     const auto traits =
 #if FUSE_BENCH_MXFP8
-        fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+        qkv ? fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
+            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
 #else
         qkv
         ? fuse::qkv_cutlass_kernel_traits(runtime.qkv.gemm, runtime.qkv.route,
@@ -1410,6 +1490,10 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
               << ",padded_m_tiles=" << schedule.padded_m_tiles << ",padded_n_tiles=" << schedule.padded_n_tiles
               << ",scheduled_compute_ctas=" << std::min(schedule.tiles(), int64_t{runtime.sm_count - candidate.comm_sm});
     if (!qkv) std::cout << ",oproj_comm_layout=" << std::getenv("FUSE_SM103_OPROJ_COMM_LAYOUT");
+#if FUSE_BENCH_MXFP8
+    if (!qkv) std::cout << ",oproj_m_window_tiles=" << runtime.mxfp8_oproj.m_window_tiles
+                       << ",oproj_n_group_tiles=" << runtime.mxfp8_oproj.n_group_tiles;
+#endif
     std::cout << '\n';
   }
   std::cout << std::flush;
@@ -1430,9 +1514,9 @@ void resolve_auto_candidates(std::vector<RankRuntime>& runtimes, std::vector<Can
       CUDA_CHECK(cudaSetDevice(runtime.device));
       const auto begin = std::chrono::steady_clock::now();
 #if FUSE_BENCH_MXFP8
-      if (candidate.direction != Direction::kQkv) throw std::runtime_error("MXFP8 auto requires QKV");
-      const auto query = [&]() { return fuse::recommended_gemm_a2a_mxfp8_comm_ctas(
-          runtime.qkv.gemm, runtime.qkv.route, runtime.mxfp8_epilogue_n); };
+      const auto query = [&]() { return candidate.direction == Direction::kQkv
+          ? fuse::recommended_gemm_a2a_mxfp8_comm_ctas(runtime.qkv.gemm,runtime.qkv.route,runtime.mxfp8_epilogue_n)
+          : fuse::recommended_a2a_gemm_mxfp8_comm_ctas(runtime.oproj.gemm,runtime.oproj.route,runtime.mxfp8_epilogue_n); };
       const int comm = query();
 #else
       const int comm = fuse::recommended_a2a_lhs_gemm_comm_ctas(runtime.oproj.gemm, runtime.oproj.route);
@@ -1451,7 +1535,8 @@ void resolve_auto_candidates(std::vector<RankRuntime>& runtimes, std::vector<Can
       candidate.comm_sm = comm;
       std::cout << "auto_comm," << direction_name(candidate.direction) << candidate_context(index, candidate) << ",rank=" << rank
 #if FUSE_BENCH_MXFP8
-                << ",model_version=" << fuse::detail::kMxfp8QkvCalibrationVersion
+                << ",model_version=" << (candidate.direction == Direction::kQkv
+                    ? fuse::detail::kMxfp8QkvCalibrationVersion : fuse::detail::kMxfp8OprojCalibrationVersion)
                 << ",requested_comm=0,resolved_comm=" << comm
 #endif
                 << ",launch_comm=0,query_us=" << std::chrono::duration<double, std::micro>(first - begin).count()
@@ -1471,7 +1556,8 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
     const auto& problem = qkv ? runtime.qkv.gemm : runtime.oproj.gemm;
     const auto traits =
 #if FUSE_BENCH_MXFP8
-        fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+        qkv ? fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
+            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
 #else
         qkv
         ? fuse::qkv_cutlass_kernel_traits(problem, runtime.qkv.route, options.comm_sm, runtime.sm_count)
@@ -1489,7 +1575,8 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
               << ",padded_m_tiles=" << schedule.padded_m_tiles << ",padded_n_tiles=" << schedule.padded_n_tiles
               << ",compute_budget=" << budget
               << ",scheduled_compute_ctas=" << ((options.component == MeasurementComponent::kCopyReference ||
-                                                  options.component == MeasurementComponent::kQuantizeReference)
+                                                  options.component == MeasurementComponent::kQuantizeReference ||
+                                                  options.component == MeasurementComponent::kProducerReference)
                                                    ? int64_t{0} : std::min(schedule.tiles(), int64_t{budget}))
               << ",scheduled_comm_ctas=" << (options.component == MeasurementComponent::kComputeReference
                                                 ? 0 : options.comm_sm)
@@ -1499,9 +1586,12 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
 #if FUSE_BENCH_MXFP8
     std::cout << ",reference_precision=mxfp8,reference_weight_preparation="
               << (options.component == MeasurementComponent::kFused ? "not_applicable" :
-                  (options.component == MeasurementComponent::kQuantizeReference ? "inside_timing" : "outside_timing"))
+                  ((options.component == MeasurementComponent::kQuantizeReference ||
+                    options.component == MeasurementComponent::kProducerReference) ? "inside_timing" : "outside_timing"))
               << ",epilogue_n=" << runtime.mxfp8_epilogue_n
               << ",reference_resource_contract=production_threads_and_dynamic_smem";
+    if (!qkv) std::cout << ",oproj_m_window_tiles=" << runtime.mxfp8_oproj.m_window_tiles
+                       << ",oproj_n_group_tiles=" << runtime.mxfp8_oproj.n_group_tiles;
 #endif
     if (!qkv) std::cout << ",oproj_comm_layout=" << options.oproj_comm_layout;
     std::cout << '\n';
@@ -1557,9 +1647,26 @@ void prepare_component(std::vector<RankRuntime>& runtimes, const Options& option
     } else {
       destination = compute ? runtime.oproj.output : runtime.oproj.input_staging;
       width = compute ? options.hidden : options.q_width();
+#if FUSE_BENCH_MXFP8
+      auto packed = runtime.mxfp8_oproj;
+      packed.projection = runtime.oproj;
+      packed.projection.num_comm_ctas = options.comm_sm;
+      packed.projection.epoch = 1;
+      if (compute) {
+        // Materialize actual FP8/SFA/W outside C timing. C itself never repairs
+        // the inputs or launches a communication/quantization operation.
+        CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_producer_reference(packed, runtime.stream));
+      } else {
+        // R/P must overwrite poisoned data themselves. P validation runs pure
+        // C afterward without preparation, so missing W work remains visible.
+        CUDA_CHECK(cudaMemsetAsync(runtime.mxfp8_workspace, 0xff,
+            runtime.mxfp8_workspace_bytes, runtime.stream));
+      }
+#else
       if (compute) CUDA_CHECK(cudaMemcpyAsync(runtime.oproj.input_staging, runtime.reference_lhs,
           checked_bytes<Bf16>(checked_product(options.seq_local, options.q_width())),
           cudaMemcpyDeviceToDevice, runtime.stream));
+#endif
     }
     CUDA_CHECK(cudaMemsetAsync(destination, 0xff,
         checked_bytes<Bf16>(checked_product(options.seq_local, width)), runtime.stream));
@@ -1625,6 +1732,17 @@ void enqueue_operation(const RankLaunch& job, int rank) {
       auto params = runtime.oproj;
       params.epoch = job.epoch;
       params.ready = runtime.calibration_oproj_ready;
+#if FUSE_BENCH_MXFP8
+      auto packed = runtime.mxfp8_oproj;
+      packed.projection = params;
+      packed.projection.num_comm_ctas = job.reserved_comm_ctas;
+      if (job.component == MeasurementComponent::kComputeReference)
+        CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_compute_reference(packed, runtime.stream));
+      else if (job.component == MeasurementComponent::kCopyReference)
+        CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_copy_reference(packed, runtime.stream));
+      else
+        CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_producer_reference(packed, runtime.stream));
+#else
       if (job.component == MeasurementComponent::kComputeReference) {
 #if FUSE_ENABLE_PROFILING
         fuse::detail::OprojPipelineBinding binding(
@@ -1632,6 +1750,7 @@ void enqueue_operation(const RankLaunch& job, int rank) {
 #endif
         CUDA_CHECK(fuse::launch_a2a_gemm_cutlass_reference(params, runtime.stream, job.reserved_comm_ctas));
       } else CUDA_CHECK(fuse::launch_a2a_gemm_copy_reference(params, runtime.stream));
+#endif
     }
   } else if (job.direction == Direction::kQkv) {
     runtime.qkv.epoch = job.epoch;
@@ -1665,6 +1784,24 @@ void enqueue_operation(const RankLaunch& job, int rank) {
 #endif
   } else {
     runtime.oproj.epoch = job.epoch;
+#if FUSE_BENCH_MXFP8
+    runtime.mxfp8_oproj.projection = runtime.oproj;
+    // Prove the production path does not read the old BF16 A/staging/ready.
+    for (auto& input : runtime.mxfp8_oproj.projection.peer_input) input = nullptr;
+    runtime.mxfp8_oproj.projection.input_staging = nullptr;
+    runtime.mxfp8_oproj.projection.ready = nullptr;
+#if FUSE_ENABLE_PROFILING
+    if (job.profile) {
+      fuse::detail::OprojPipelineBinding binding(
+          runtime.oproj_pipeline.tiles ? &runtime.oproj_pipeline : nullptr);
+      CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_role_telemetry(
+        runtime.mxfp8_oproj, runtime.timeline, runtime.sm_count,
+        runtime.peer_timeline, runtime.peer_capacity, runtime.mxfp8_probe, runtime.stream));
+    }
+    else
+#endif
+    CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_cutlass(runtime.mxfp8_oproj, runtime.stream));
+#else
 #if FUSE_ENABLE_PROFILING
     if (job.profile) {
       fuse::detail::OprojPipelineBinding binding(
@@ -1676,6 +1813,7 @@ void enqueue_operation(const RankLaunch& job, int rank) {
     else
 #endif
     CUDA_CHECK(fuse::launch_a2a_gemm_cutlass(runtime.oproj, runtime.stream));
+#endif
   }
 }
 
@@ -1883,8 +2021,19 @@ void prepare_references(std::vector<RankRuntime>& runtimes, const Options& optio
                   << ",elements=" << expected.size() << ",full_cpu_bitwise_match=1\n";
       }
     } else upload(runtime.reference_lhs, expected, runtime.stream);
+#if FUSE_BENCH_MXFP8
+    fused_mxfp8::reference_operand<<<256, 256, 0, runtime.stream>>>(runtime.reference_lhs,
+        runtime.mxfp8_reference_a, int64_t{options.seq_local} * options.q_width());
+    CUDA_CHECK(cudaGetLastError());
+    fused_mxfp8::reference_operand<<<256, 256, 0, runtime.stream>>>(runtime.oproj.rhs_nt,
+        runtime.mxfp8_reference_b, int64_t{options.hidden} * options.q_width());
+    CUDA_CHECK(cudaGetLastError());
     cublas_nt(runtime, options.seq_local, options.hidden, options.q_width(),
-              runtime.reference_lhs, runtime.oproj.rhs_nt, runtime.oproj_reference);
+        runtime.mxfp8_reference_a, runtime.mxfp8_reference_b, runtime.oproj_reference);
+#else
+    cublas_nt(runtime, options.seq_local, options.hidden, options.q_width(),
+        runtime.reference_lhs, runtime.oproj.rhs_nt, runtime.oproj_reference);
+#endif
   }
   finish_all(runtimes);
   // Only this generation's independent OProj oracle is needed on the host.
@@ -1936,9 +2085,20 @@ std::vector<ValidationResult> gpu_validation(
           oracle, checked_product(options.seq_local, options.projection_width()),
           runtime.validation, 1, runtime.stream));
     } else {
+#if FUSE_BENCH_MXFP8
+      fuse::Mxfp8Activation received{};
+      CUDA_CHECK(fuse::a2a_gemm_mxfp8_staging_view(runtime.mxfp8_oproj, &received));
+      fused_mxfp8::check_oproj_route<<<256, 256, 0, runtime.stream>>>(runtime.mxfp8_oproj,
+          received, reinterpret_cast<uint16_t*>(runtime.oproj.input_staging));
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(runtime.oproj.input_staging),
+          fused_mxfp8::ZeroOracle{}, checked_product(options.seq_local, options.q_width()),
+          runtime.validation, 1, runtime.stream));
+#else
       CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(runtime.oproj.input_staging),
           fused_validation::DenseOracle{reinterpret_cast<const uint16_t*>(runtime.reference_lhs)},
           checked_product(options.seq_local, options.q_width()), runtime.validation, 1, runtime.stream));
+#endif
     }
   }
   finish_all(runtimes);
@@ -2063,6 +2223,22 @@ void compare_validation_oracles(const std::vector<ValidationResult>& gpu,
 void validate(std::vector<RankRuntime>& runtimes, const Options& options, Direction direction,
                 const std::string& context = "") {
 #if FUSE_BENCH_MXFP8
+  if (options.component == MeasurementComponent::kProducerReference) {
+    for (const int rank : fused_mpi::owned_ranks(options.world)) {
+      auto& runtime = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(runtime.device));
+      auto packed = runtime.mxfp8_oproj;
+      packed.projection = runtime.oproj;
+      packed.projection.num_comm_ctas = options.comm_sm;
+      packed.projection.epoch = 1;
+      CUDA_CHECK(cudaMemsetAsync(runtime.oproj.output, 0xff,
+          checked_bytes<Bf16>(checked_product(options.seq_local, options.hidden)), runtime.stream));
+      CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_compute_reference(packed, runtime.stream));
+    }
+    finish_all(runtimes);
+    fused_mpi::root_output() << "producer_validation," << direction_name(direction) << context
+        << ",method=represented_operands_gemm,prepare_repeated=0,compute_outside_timing=1\n";
+  }
   if (options.component == MeasurementComponent::kQuantizeReference) {
     // Read Q's actual packed A/W through the same compute collective, outside
     // the measured Q Graph. No weight preparation here: the independent BF16
@@ -2741,14 +2917,14 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
         const auto& probe = runtime.oproj_pipeline;
         const size_t count = static_cast<size_t>(probe.m_tiles) * probe.n_tiles;
         CUDA_CHECK(cudaMemsetAsync(probe.tiles, 0, count * sizeof(*probe.tiles), runtime.stream));
-        CUDA_CHECK(cudaMemsetAsync(probe.stages, 0, count * probe.k_tiles * sizeof(*probe.stages), runtime.stream));
+        if (probe.stages) CUDA_CHECK(cudaMemsetAsync(probe.stages, 0, count * probe.k_tiles * sizeof(*probe.stages), runtime.stream));
       }
     }
     finish_all(runtimes); // Never reset cumulative ready flags.
   };
   for (const int rank : fused_mpi::owned_ranks(options.world)) {
     CUDA_CHECK(cudaSetDevice(runtimes[rank].device));
-    if (direction == Direction::kOproj) {
+    if (direction == Direction::kOproj && !FUSE_BENCH_MXFP8) {
       fuse::A2AGemmRoleResources resources{};
       CUDA_CHECK(fuse::query_a2a_gemm_role_resources(&resources));
       std::cout << "profile_resources,rank=" << rank << ",threads=" << resources.threads_per_cta
@@ -2811,7 +2987,10 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
     const auto& runtime = runtimes[rank];
     const auto timeline = download(runtime.timeline, runtime.sm_count);
 #if FUSE_BENCH_MXFP8
-    const auto traits = fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+    const auto traits = direction == Direction::kOproj
+        ? fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
+        : fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+    const int weight_panels = ceil_div(direction == Direction::kOproj ? options.hidden : options.projection_width(), 256);
     const auto quant = download(runtime.mxfp8_probe.quant, runtime.mxfp8_probe.quant_capacity);
     for (int i = 0; i < static_cast<int>(quant.size()); ++i) {
       const auto& r = quant[i];
@@ -2829,8 +3008,8 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       const auto& r = waits[i];
       if (!r.begin) continue; // Repeated N panel uses reuse the mainloop's acquired panel.
       std::cout << "profile_mxfp8_wait,rank=" << rank << ",index=" << i
-                << ",cta=" << r.cta << ",warp=" << r.warp << ",m=" << i / ceil_div(options.projection_width(), 256)
-                << ",panel=" << i % ceil_div(options.projection_width(), 256)
+                << ",cta=" << r.cta << ",warp=" << r.warp << ",m=" << i / weight_panels
+                << ",panel=" << i % weight_panels
                 << ",begin=" << r.begin << ",end=" << r.end << '\n';
     }
 #else
@@ -2950,7 +3129,8 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       const auto& probe = runtime.oproj_pipeline;
       const int count = probe.m_tiles * probe.n_tiles;
       const auto records = download(probe.tiles, count);
-      const auto stages = download(probe.stages, static_cast<size_t>(count) * probe.k_tiles);
+      const auto stages = probe.stages ? download(probe.stages, static_cast<size_t>(count) * probe.k_tiles)
+          : std::vector<fuse::detail::OprojMmaStageRecord>{};
       for (int tile = 0; tile < count; ++tile) {
         const auto& r = records[tile];
         if (!r.mma_begin) continue;
@@ -2964,6 +3144,23 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                   << ",acc_wait_begin=" << r.acc_wait_begin << ",acc_wait_end=" << r.acc_wait_end
                   << ",tmem_release_begin=" << r.tmem_release_begin << ",tmem_release_end=" << r.tmem_release_end
                   << ",epi_return=" << r.epi_return << ",k_tiles=" << probe.k_tiles;
+#if FUSE_BENCH_MXFP8
+        if (r.load_stages != probe.k_tiles || r.mma_stages != probe.k_tiles ||
+            !r.first_input || r.tmem_wait_begin > r.tmem_acquired)
+          throw std::runtime_error("incomplete MXFP8 load/MMA stage accounting");
+        const int worker = r.cta - probe.comm_ctas;
+        const bool detailed = probe.stages && (worker == 0 || worker == 1 ||
+            worker == probe.compute_ctas - std::min(probe.swizzle, probe.compute_ctas));
+        std::cout << ",mxfp8=1,stage_detail=" << detailed
+                  << ",first_input=" << r.first_input << ",first_wait_ns=" << r.first_wait_ns
+                  << ",tmem_wait_begin=" << r.tmem_wait_begin << ",input_wait_ns=" << r.input_wait_ns
+                  << ",scale_issue_ns=" << r.scale_issue_ns << ",mma_issue_ns=" << r.mma_issue_ns
+                  << ",load_wait_ns=" << r.load_wait_ns << ",load_issue_ns=" << r.load_issue_ns
+                  << ",input_try_ns=" << r.input_try_ns << ",load_try_ns=" << r.load_try_ns
+                  << ",initial_try_end=" << r.initial_try_end
+                  << ",deferred_lookahead=" << r.deferred_lookahead
+                  << ",load_stages=" << r.load_stages << ",mma_stages=" << r.mma_stages;
+#endif
         for (int peer = 0; peer < options.world; ++peer) {
           const auto& ready = r.ready[peer];
           if (!ready.begin || ready.begin > ready.end || ready.end > ready.joined)
@@ -2972,13 +3169,26 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                     << ",ready_joined" << peer << '=' << ready.joined << ",cache_hit" << peer << '=' << ready.cache_hit;
         }
         std::cout << '\n';
+#if FUSE_BENCH_MXFP8
+        if (!detailed) continue;
+#endif
         for (int k = 0; k < probe.k_tiles; ++k) {
           const auto& s = stages[static_cast<size_t>(tile) * probe.k_tiles + k];
           if (!s.wait_begin || s.wait_begin > s.wait_end || s.wait_end > s.issue_end)
             throw std::runtime_error("invalid OProj MMA stage interval");
           std::cout << "profile_oproj_stage,rank=" << rank << ",index=" << tile << ",k=" << k
                     << ",wait_begin=" << s.wait_begin << ",wait_end=" << s.wait_end
-                    << ",issue_end=" << s.issue_end << '\n';
+                    << ",issue_end=" << s.issue_end;
+#if FUSE_BENCH_MXFP8
+          if (!(s.wait_end <= s.scale_end && s.scale_end <= s.issue_end &&
+                s.load_begin > 0 && s.load_begin <= s.load_ready && s.load_ready <= s.load_end))
+            throw std::runtime_error("invalid MXFP8 load/scale stage interval");
+          std::cout << ",scale_end=" << s.scale_end << ",load_begin=" << s.load_begin
+                    << ",load_ready=" << s.load_ready << ",load_end=" << s.load_end
+                    << ",try_begin=" << s.try_begin << ",try_end=" << s.try_end
+                    << ",load_try_begin=" << s.load_try_begin << ",load_try_end=" << s.load_try_end;
+#endif
+          std::cout << '\n';
         }
       }
     }
@@ -3037,6 +3247,11 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
   // Validate the instrumented epoch before production diagnostics overwrite
   // its outputs; timestamp coverage alone does not establish correctness.
   validate(runtimes, options, direction, ",profile_phase=instrumented");
+#if FUSE_BENCH_MXFP8
+  // OProj currently has device-role telemetry, not the optional host API
+  // stage hooks. Do not emit empty host-stage records or fake their coverage.
+  if (direction == Direction::kOproj) return;
+#endif
   profile_host_stages(runtimes, options, direction, epoch);
   validate(runtimes, options, direction, ",profile_phase=host_stages");
 }
@@ -3348,6 +3563,7 @@ int main(int argc, char** argv) {
     fused_mpi::agree(options.mxfp8_prequantized ? "mxfp8_prequantized" : "mxfp8_dynamic");
     fused_mpi::agree(options.mxfp8_weight_preparation);
     fused_mpi::agree(std::to_string(options.mxfp8_epilogue_n));
+    fused_mpi::agree(std::to_string(options.oproj_m_window_tiles) + " " + std::to_string(options.oproj_n_group_tiles));
     fused_mpi::agree(fuse::detail::kMxfp8QkvCalibrationVersion);
     fused_mpi::root_output() << "precision,mxfp8,input=mxfp8,weight=bf16,output=bf16,accumulator=fp32"
         << ",scale=ue8m0,group_k=32,tile=128x256x128,includes_activation_quantization=0"
@@ -3368,6 +3584,8 @@ int main(int argc, char** argv) {
               << ",auto_oproj_comm=" << options.auto_oproj_comm
 #if FUSE_BENCH_MXFP8
               << ",auto_mxfp8_comm=" << options.auto_mxfp8_comm
+              << ",oproj_m_window_tiles=" << options.oproj_m_window_tiles
+              << ",oproj_n_group_tiles=" << options.oproj_n_group_tiles
 #endif
               << ",global_seq=" << options.global_seq() << ",seq_local=" << options.seq_local
               << ",q_heads=" << options.q_heads << ",kv_heads=" << options.kv_heads
@@ -3497,7 +3715,8 @@ int main(int argc, char** argv) {
           for (const auto component : {MeasurementComponent::kComputeReference,
                                        MeasurementComponent::kCopyReference
 #if FUSE_BENCH_MXFP8
-                                       , MeasurementComponent::kQuantizeReference
+                                       , (candidate.direction == Direction::kQkv ? MeasurementComponent::kQuantizeReference
+                                                                                : MeasurementComponent::kProducerReference)
 #endif
                                        }) {
             if (options.compute_only && component != MeasurementComponent::kComputeReference) continue;
@@ -3552,10 +3771,12 @@ int main(int argc, char** argv) {
     fused_mpi::finalize();
     ::alarm(0);
     for (size_t index = 0; index < candidates.size(); ++index) {
+      const auto& candidate = candidates[index];
       for (const auto component : {MeasurementComponent::kFused, MeasurementComponent::kComputeReference,
                                    MeasurementComponent::kCopyReference
 #if FUSE_BENCH_MXFP8
-                                   , MeasurementComponent::kQuantizeReference
+                                   , (candidate.direction == Direction::kQkv ? MeasurementComponent::kQuantizeReference
+                                                                            : MeasurementComponent::kProducerReference)
 #endif
                                    }) {
         if (!options.calibrate && component != MeasurementComponent::kFused) continue;

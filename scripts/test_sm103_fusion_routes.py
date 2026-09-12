@@ -238,6 +238,9 @@ template <int N, int K = 64, int E = 0> struct A2ALhsGemmTypes : Bf16GemmTypes<N
   using TelemetryPureGemm = Gemm;
 };
 template <int N, int K, int E> using Mxfp8GemmFamily = Bf16GemmTypes<N,K,E>;
+template <int E> using Mxfp8A2ALhsGemmTypes = A2ALhsGemmTypes<256,128,E>;
+struct Mxfp8A2ALhsInputComm { static constexpr int kReadyBlockM = 128, kTileK = 128; };
+template <bool Profile> using Mxfp8A2ALhsInputCommT = Mxfp8A2ALhsInputComm;
 template <int N> struct QkvComm { static constexpr int kBlockM = 128, kBlockN = N; };
 using QkvGqaPackCommN64 = QkvComm<64>;
 using QkvGqaPackComm = QkvComm<128>;
@@ -248,6 +251,7 @@ using QkvGqaPackCommWide = QkvComm<256>;
 using Mxfp8QkvGqaPackComm = QkvComm<256>;
 namespace detail {
 template <class G, class C> struct MonolithicGemm {};
+template <class K, class P, bool Profile = false> struct InputProductionKernel {};
 template <class K> struct RoleTelemetryKernel {};
 }
 template <class G, class C> struct GemmA2ARoleTelemetryKernel {};
@@ -1578,7 +1582,7 @@ int main(int argc, char** argv) {
 }
 """
         cls.profile_probe = compile_host_probe(cls, profile_probe, "cta-profile-flow",
-            "-DFUSE_ENABLE_PROFILING=1", "-Wall", "-Wextra", "-Werror")
+            "-DFUSE_ENABLE_PROFILING=1", "-DFUSE_BENCH_MXFP8=0", "-Wall", "-Wextra", "-Werror")
 
     def test_first_cta_stamp_is_latched_but_full_peer_observations_remain(self):
         for profiling, detail in product((0, 1), ("full", "cta")):

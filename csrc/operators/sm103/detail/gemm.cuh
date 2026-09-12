@@ -232,6 +232,28 @@ struct Mxfp8GemmFamily {
 // geometry or publishing their winners into the fused path implicitly.
 using Mxfp8GemmTypes = Mxfp8GemmFamily<>;
 
+// The same block-scaled collective serves either fusion direction. OProj
+// waits for complete A peer shards and W panels, then uses the ordinary BF16
+// output epilogue: there is no output-router ready publication to perform.
+template <int EpilogueN = 32>
+struct Mxfp8A2ALhsGemmTypes : Mxfp8GemmFamily<256, 128, EpilogueN> {
+  using Types = Mxfp8GemmFamily<256, 128, EpilogueN>;
+  using Collective = detail::Mxfp8OprojMainloop<typename Types::Mainloop>;
+  using Mainloop = detail::A2ALhsReadyMainloop<
+      detail::WeightReadyMainloop<Collective>, typename Types::TileShape>;
+  using Gemm = cutlass::gemm::kernel::GemmUniversal<ProblemShape, Mainloop,
+      typename Types::Epilogue, detail::MonolithicPersistentScheduler>;
+#if FUSE_ENABLE_PROFILING
+  // Reuse the ready/CTA protocol, not the BF16-only MMA diagnostic mirror:
+  // block-scaled MMA has additional scale operands and a different contract.
+  using TelemetryMainloop = detail::A2ALhsReadyMainloop<
+      detail::WeightReadyMainloop<detail::OprojMxfp8MainloopObserver<Collective>>, typename Types::TileShape,
+      true, false, false>;
+  using TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<ProblemShape,
+      TelemetryMainloop, detail::OprojEpilogueObserver<typename Types::Epilogue>, detail::MonolithicPersistentScheduler>;
+#endif
+};
+
 #if FUSE_ENABLE_PROFILING
 // One explicitly bounded probe, not a new production policy or a second
 // all-policy diagnostic grid. Its collective geometry matches N256/K64/e32.

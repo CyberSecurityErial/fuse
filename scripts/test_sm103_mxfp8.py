@@ -84,6 +84,19 @@ class Mxfp8QuantizationContracts(unittest.TestCase):
             self.assertEqual(merged['rows'][1]['source_run_id'],'unit-tail')
             with self.assertRaises(ValueError):
                 report.merge(first,tail | {'compute_ctas':148})
+            # A new explicit budget must propagate through every result; an old
+            # 132-CTA record cannot be accepted just by relabeling the job.
+            job['gemm_sm_budget']=128
+            (control/'job.json').write_text(json.dumps(job))
+            save()
+            with self.assertRaisesRegex(ValueError,'budget mismatch'):
+                report.audit(root)
+            result['compute_ctas']=128
+            lines[-1]='RESULT '+json.dumps(result)
+            save()
+            updated=report.audit(root)
+            self.assertEqual(updated['compute_ctas'],128)
+            self.assertIn('128 个计算 CTA',report.render(updated))
             lines=[line for line in lines if 'generation=1' not in line]
             save()
             with self.assertRaisesRegex(ValueError,'dual-payload'):
@@ -477,7 +490,7 @@ int main() {
   float source=1;
   for(int n : {0,1,127,128,129,256,384,385,768,1536,2304})
   for(int k : {128,256,384,640,1024,1536,2048,3072,8192})
-  for(int workers : {1,3,64,128,1184}) for(int along : {0,1}) for(int rotate : {0,1}) {
+  for(int workers : {1,3,64,128,192,384,1184}) for(int along : {0,1}) for(int rotate : {0,1}) {
     int panels=ceil_div(n,256), extent=ceil_div(panels,4)*4;
     std::vector<uint32_t> arrivals(panels*kReadyFlagStride), ready(arrivals.size());
     Mxfp8WeightProducer::Arguments a{};

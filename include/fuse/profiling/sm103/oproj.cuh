@@ -4,8 +4,9 @@
 // SM103-specific diagnostics; shared profiling records remain one directory up.
 
 // Opt-in OProj pipeline diagnostics. No production ready granularity, MMA
-// schedule, or synchronization changes. The harness samples GPU0 and three
-// persistent workers only; records belong to logical (M,N,K), not clock bins.
+// schedule, or synchronization changes. BF16 samples GPU0/three workers;
+// MXFP8 adds all-rank/all-worker tile sums, with K-stage detail on the same
+// three GPU0 workers. Records belong to logical (M,N,K), not clock bins.
 #if FUSE_ENABLE_PROFILING
 #include "fuse/profiling/timeline.cuh"
 #include <cute/tensor.hpp>
@@ -22,6 +23,9 @@ struct OprojReadyRecord {
 
 struct OprojMmaStageRecord {
   uint64_t wait_begin = 0, wait_end = 0, issue_end = 0;
+  uint64_t scale_end = 0;
+  uint64_t load_begin = 0, load_ready = 0, load_end = 0;
+  uint64_t try_begin = 0, try_end = 0, load_try_begin = 0, load_try_end = 0;
 };
 
 struct OprojPipelineRecord {
@@ -31,6 +35,14 @@ struct OprojPipelineRecord {
   uint64_t epi_begin = 0, acc_wait_begin = 0, acc_wait_end = 0;
   uint64_t tmem_release_begin = 0, tmem_release_end = 0, epi_return = 0;
   int32_t cta = -1;
+  // MXFP8: whole-tile sums for every worker; detailed K-stage records are
+  // sampled separately. Different warp sums overlap and must NOT be added.
+  uint64_t tmem_wait_begin = 0, first_wait_ns = 0, input_wait_ns = 0;
+  uint64_t scale_issue_ns = 0, mma_issue_ns = 0;
+  uint64_t load_wait_ns = 0, load_issue_ns = 0;
+  int32_t load_stages = 0, mma_stages = 0;
+  uint64_t input_try_ns = 0, load_try_ns = 0, initial_try_end = 0;
+  uint32_t deferred_lookahead = 0;  // bit 0: MMA, bit 1: load
 };
 
 struct OprojPipelineView {
@@ -39,6 +51,7 @@ struct OprojPipelineView {
   int32_t m_tiles = 0, n_tiles = 0, k_tiles = 0;
   int32_t comm_ctas = 0, compute_ctas = 0, swizzle = 1;
   bool all_workers = false;
+  bool sampled_stages = false;
 
 #if defined(__CUDACC__)
   template <class Coord>
@@ -51,6 +64,16 @@ struct OprojPipelineView {
     const int n = static_cast<int>(cute::get<1>(coord));
     if (m < 0 || m >= m_tiles || n < 0 || n >= n_tiles || cute::get<3>(coord) != 0) return -1;
     return static_cast<int64_t>(m) * n_tiles + n;
+  }
+
+  template <class Coord>
+  CUTLASS_DEVICE OprojMmaStageRecord* stage_records(const Coord& coord) const {
+    const int64_t index = tile_index(coord);
+    if (index < 0 || !stages) return nullptr;
+    const int worker = static_cast<int>(blockIdx.x) - comm_ctas;
+    const int tail = compute_ctas - (swizzle < compute_ctas ? swizzle : compute_ctas);
+    if (sampled_stages && worker != 0 && worker != 1 && worker != tail) return nullptr;
+    return stages + index * k_tiles;
   }
 #endif
 };
@@ -76,6 +99,204 @@ CUTLASS_DEVICE uint64_t oproj_timestamp() {
   asm volatile("" ::: "memory");
   return now;
 }
+
+// Adapted from NVIDIA CUTLASS (BSD-3-Clause), pinned at 57e3cfb:
+// sm100_blockscaled_mma_warpspecialized.hpp load/mma
+// diagnostic mirrors. The concrete MainloopPipeline argument is passed by
+// value upstream, so inheritance of just that pipeline would be sliced.
+// Follow the production adapter's compile-time lookahead placement; retain
+// real wait/acquire, elected TMA/UTCCP, iterator and release ordering.
+// In particular N256 uses overlapping accumulators: K0 input wait + scale
+// copies precede the TMEM slot acquire, unlike BF16's acquire-first path.
+//
+// A/W ready -> load warp: empty-stage wait -> TMA A/B/SFA/SFB submission
+//                                            |
+//             MMA warp: full-stage wait -> scale SMEM->TMEM -> MMA submission
+//                                            K0 also waits for reusable TMEM
+//
+// No extra barrier/fence/completion wait. These are issuing-warp spans, not
+// Tensor Core busy/idle time: input waits may overlap previously issued MMA.
+// Only profiling builds instantiate this adapter. Null probes call stock code.
+// TODO: replace mirrors with upstream observer hooks when available.
+template <class Base>
+struct OprojMxfp8MainloopObserver : Base {
+  struct Arguments : Base::Arguments { OprojPipelineView pipeline_probe{}; };
+  struct Params : Base::Params { OprojPipelineView pipeline_probe{}; };
+  template <class Problem>
+  static Params to_underlying_arguments(const Problem& problem, const Arguments& args,
+      void* workspace, const cutlass::KernelHardwareInfo& hardware = {}) {
+    Params p{};
+    static_cast<typename Base::Params&>(p) = Base::to_underlying_arguments(
+        problem, static_cast<const typename Base::Arguments&>(args), workspace, hardware);
+    p.pipeline_probe = args.pipeline_probe;
+    return p;
+  }
+  template <class Cluster>
+  CUTLASS_DEVICE OprojMxfp8MainloopObserver(const Params& p, Cluster cluster, uint32_t rank)
+      : Base(static_cast<const typename Base::Params&>(p), cluster, rank), probe_(p.pipeline_probe) {}
+
+  template <class Inputs, class Coord, class Iterator>
+  CUTLASS_DEVICE auto load(typename Base::MainloopPipeline pipeline,
+      typename Base::MainloopPipelineState state, const Inputs& inputs,
+      const Coord& coord, Iterator iter, int count) {
+    using namespace cute;
+    const int64_t index = probe_.tile_index(coord);
+    if (index < 0) return Base::load(pipeline, state, inputs, coord, iter, count);
+    auto [unused, gA, gB, sA, sB, gSFA, gSFB, sSFA, sSFB, maskA, maskB, maskSFA, maskSFB] = inputs;
+    auto a = gA(_, get<0>(coord) / size(typename Base::TiledMma::AtomThrID{}), _, get<3>(coord));
+    auto b = gB(_, get<1>(coord), _, get<3>(coord));
+    auto sfa = gSFA(_, get<0>(coord) / size(typename Base::TiledMma::AtomThrID{}), _, get<3>(coord));
+    auto sfb = gSFB(_, get<1>(coord), _, get<3>(coord));
+    auto* detail = probe_.stage_records(coord);
+    const bool writer = threadIdx.x % 32 == 0;
+    const uint64_t initial_begin = writer ? oproj_timestamp() : 0;
+    auto token = pipeline.producer_try_acquire(state);
+    uint64_t try_ns = writer ? oproj_timestamp() - initial_begin : 0;
+    uint64_t wait_ns = 0, issue_ns = 0;
+    const int stages = count;
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (count > 0) {
+      const uint64_t begin = writer ? oproj_timestamp() : 0;
+      pipeline.producer_acquire(state, token);
+      const uint64_t ready = writer ? oproj_timestamp() : 0;
+      auto* barrier = pipeline.producer_get_barrier(state);
+      const int slot = state.index();
+      ++state;
+      uint64_t try_begin = 0, try_end = 0;
+      auto peek = [&]() {
+        if (writer) try_begin = oproj_timestamp();
+        token = pipeline.producer_try_acquire(state);
+        if (writer) try_end = oproj_timestamp();
+      };
+      if constexpr (!Base::DeferLoadLookahead) peek();
+      if (cute::elect_one_sync()) {
+        copy(this->observed_tma_load_a_->with(*barrier, maskA), a(_, *iter), sA(_, slot));
+        copy(this->observed_tma_load_b_->with(*barrier, maskB), b(_, *iter), sB(_, slot));
+        copy(this->observed_tma_load_sfa_->with(*barrier, maskSFA), sfa(_, *iter), sSFA(_, slot));
+        copy(this->observed_tma_load_sfb_->with(*barrier, maskSFB), sfb(_, *iter), sSFB(_, slot));
+      }
+      const uint64_t end = writer ? oproj_timestamp() : 0;
+      if constexpr (Base::DeferLoadLookahead) peek();
+      if (writer) {
+        wait_ns += ready - begin;
+        try_ns += try_end - try_begin;
+        issue_ns += end - ready - (Base::DeferLoadLookahead ? 0 : try_end - try_begin);
+        if (detail) {
+          auto& r = detail[static_cast<int>(*iter)];
+          r.load_begin = begin; r.load_ready = ready; r.load_end = end;
+          r.load_try_begin = try_begin; r.load_try_end = try_end;
+        }
+      }
+      --count;
+      ++iter;
+    }
+    if (writer) {
+      auto& r = probe_.tiles[index];
+      r.load_wait_ns += wait_ns; r.load_issue_ns += issue_ns;
+      r.load_try_ns += try_ns;
+      r.load_stages += stages;
+    }
+    return cute::make_tuple(state, iter);
+  }
+
+  template <class Pipelines, class States, class Accumulators, class Inputs, class Coord>
+  CUTLASS_DEVICE auto mma(Pipelines pipelines, States states, Accumulators accumulators_pair,
+      Inputs inputs, Coord coord, int count) {
+    using namespace cute;
+    static_assert(!Base::IsCtaN192 && !Base::IsCtaN64,
+        "Diagnostic mirror requires the ordinary MXFP8 SFB mapping");
+    const int64_t index = probe_.tile_index(coord);
+    if (index < 0) return Base::mma(pipelines, states, accumulators_pair, inputs, coord, count);
+    auto accumulators = get<0>(accumulators_pair);
+    auto [mma, a, b, sfa, sfb, copyA, srcA, dstA, copyB, srcB, dstB] = inputs;
+    auto [pipeline, acc_pipeline] = pipelines;
+    auto [state, acc_state] = states;
+    auto* record = probe_.tiles + index;
+    auto* detail = probe_.stage_records(coord);
+    const bool writer = threadIdx.x % 32 == 0;
+    const uint64_t begin = writer ? oproj_timestamp() : 0;
+    auto token = pipeline.consumer_try_wait(state, uint32_t(count <= 0));
+    const uint64_t initial_try_end = writer ? oproj_timestamp() : 0;
+    uint64_t try_ns = initial_try_end - begin;
+    mma.accumulate_ = UMMA::ScaleOut::Zero;
+    uint64_t first_input = 0, first_wait = 0, wait_ns = 0, scale_ns = 0, issue_ns = 0;
+    uint64_t slot_begin = 0, slot_end = 0;
+    int k = 0;
+    auto acquire_slot = [&]() {
+      if (writer) slot_begin = oproj_timestamp();
+      acc_pipeline.producer_acquire(acc_state);
+      if (writer) slot_end = oproj_timestamp();
+    };
+    auto step = [&](bool first) {
+      const uint64_t wait_begin = writer ? oproj_timestamp() : 0;
+      pipeline.consumer_wait(state, token);
+      const uint64_t wait_end = writer ? oproj_timestamp() : 0;
+      const int slot = state.index();
+      auto current = state;
+      ++state;
+      --count;
+      uint64_t try_begin = 0, try_end = 0;
+      auto peek = [&]() {
+        if (writer) try_begin = oproj_timestamp();
+        token = pipeline.consumer_try_wait(state, uint32_t(count <= 0));
+        if (writer) try_end = oproj_timestamp();
+      };
+      if constexpr (!Base::DeferMmaLookahead) peek();
+      if (cute::elect_one_sync()) {
+        copy(copyA, srcA(_,_,_,_,slot), dstA);
+        copy(copyB, srcB(_,_,_,_,slot), dstB);
+      }
+      const uint64_t scale_end = writer ? oproj_timestamp() : 0;
+      if constexpr (Base::IsOverlappingAccum) {
+        if (first) acquire_slot();
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int block = 0; block < size<2>(a); ++block) {
+        cute::gemm(mma.with(mma.accumulate_, sfa(_,_,block), sfb(_,_,block)),
+            a(_,_,block,slot), b(_,_,block,slot), accumulators);
+        mma.accumulate_ = UMMA::ScaleOut::One;
+      }
+      pipeline.consumer_release(current);
+      const uint64_t end = writer ? oproj_timestamp() : 0;
+      if constexpr (Base::DeferMmaLookahead) peek();
+      if (writer) {
+        if (first) { first_input = wait_end; first_wait = wait_end - wait_begin; }
+        wait_ns += wait_end - wait_begin;
+        try_ns += try_end - try_begin;
+        scale_ns += scale_end - wait_end - (Base::DeferMmaLookahead ? 0 : try_end - try_begin);
+        issue_ns += end - ((Base::IsOverlappingAccum && first) ? slot_end : scale_end);
+        if (detail) {
+          auto& r = detail[k];
+          r.wait_begin = wait_begin; r.wait_end = wait_end;
+          r.scale_end = scale_end; r.issue_end = end;
+          r.try_begin = try_begin; r.try_end = try_end;
+        }
+      }
+      ++k;
+    };
+    if constexpr (Base::IsOverlappingAccum) {
+      if (count > 0) step(true);
+    } else {
+      acquire_slot();
+    }
+    CUTLASS_PRAGMA_NO_UNROLL
+    while (count > 0) step(k == 0);
+    if (writer) {
+      const uint64_t end = oproj_timestamp();
+      record->mma_begin = begin; record->tmem_wait_begin = slot_begin;
+      record->tmem_acquired = slot_end; record->mma_return = end;
+      record->first_input = first_input; record->first_wait_ns = first_wait;
+      record->input_wait_ns = wait_ns; record->scale_issue_ns = scale_ns;
+      record->mma_issue_ns = issue_ns; record->mma_stages = k;
+      record->input_try_ns = try_ns; record->initial_try_end = initial_try_end;
+      record->deferred_lookahead = int(Base::DeferMmaLookahead) | (int(Base::DeferLoadLookahead) << 1);
+      record->cta = static_cast<int>(blockIdx.x);
+    }
+    return state;
+  }
+ private:
+  OprojPipelineView probe_;
+};
 
 // The stock BF16 SM100 mma() takes a concrete MainloopPipeline, so a derived
 // pipeline would be sliced and cannot observe consumer_wait(). This small

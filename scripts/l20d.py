@@ -45,7 +45,7 @@ QKV_POLICIES = ('auto', 'm128n64', 'm128n128', 'm128n160', 'm128n192', 'm128n256
 OPROJ_POLICIES = ('auto', 'm128n128', 'm128n256') + BLACKWELL_TILE_VARIANTS
 FUSED_STAGES = ('fused-build', 'fused-smoke')
 DONE = {'succeeded', 'failed'}
-STAGES = ('doctor', 'build', 'te-build', 'ub-check', 'batch-check', 'matrix-check', 'cache-check', 'smoke', 'sweep', 'refine', 'formal', 'summary', 'overhead', 'baseline-replay', 'gemm-probe', 'gemm-cutlass-build', *FUSED_STAGES)
+STAGES = ('doctor', 'build', 'te-build', 'ub-check', 'batch-check', 'matrix-check', 'cache-check', 'smoke', 'sweep', 'refine', 'formal', 'summary', 'overhead', 'baseline-replay', 'gemm-probe', 'gemm-cutlass-build', 'transport-probe', *FUSED_STAGES)
 BASELINE_CASE_FIELDS = ('direction', 'model', 'seq', 'cp', 'hidden', 'q_heads', 'kv_heads',
                         'head_dim', 'm', 'n', 'k')
 CUTLASS_COUNTER_RANGE = 'fuse_cutlass_1sm_counters'
@@ -291,9 +291,16 @@ def fused_device_memory(job):
                         oproj * (3 * m * q + 2 * m * h + h * q))
     if job.get('mxfp8'):
         # Packed FP8 A/W + independent BF16 decoded-oracle A/W + native scales.
-        buffer_bytes += 3 * (m * h + p * h)
-        buffer_bytes += ((m + 127) // 128 + (p + 127) // 128) * ((h + 127) // 128) * 512 + 1024
-        buffer_bytes += 2 * ((p + 255) // 256) * 32 * 4 + 512  # Per-call panel counters/ready.
+        if oproj:
+            buffer_bytes += 4 * m * q + 3 * h * q
+            buffer_bytes += (((m * shape['world'] + 127) // 128) *
+                             ((q // shape['world'] + 127) // 128) +
+                             ((m + 127) // 128 + (h + 127) // 128) * ((q + 127) // 128)) * 512 + 2048
+            buffer_bytes += (2 * ((h + 255) // 256) + ((m + 127) // 128) * 8) * 32 * 4
+        else:
+            buffer_bytes += 3 * (m * h + p * h)
+            buffer_bytes += ((m + 127) // 128 + (p + 127) // 128) * ((h + 127) // 128) * 512 + 1024
+            buffer_bytes += 2 * ((p + 255) // 256) * 32 * 4 + 512  # Per-call panel counters/ready.
     m_tiles = (m + 127) // 128
     flag_bytes = 4 * 32 * (qkv * (m_tiles * ((p + 63) // 64) + shape['world']) +
                           oproj * (m_tiles * shape['world'] + 1))
@@ -308,11 +315,12 @@ def fused_device_memory(job):
         if job.get('mxfp8'):
             # Mxfp8QuantRecord includes publication timestamps and the aggregated
             # chunk contribution (72 bytes); Mxfp8WaitRecord remains 24 bytes.
-            profile_bytes += ((p + 255) // 256) * (h // 4) * 72 + m_tiles * ((p + 255) // 256) * 24
+            quant_n, quant_k = (h, q) if not qkv else (p, h)
+            profile_bytes += ((quant_n + 255) // 256) * (quant_k // 4) * 72 + m_tiles * ((quant_n + 255) // 256) * 24
             if job.get('mxfp8_service_probe'):
                 profile_bytes += m_tiles * ((p + 255) // 256) * 48 + 148 * 24 + ((p + 255) // 256) * 16
         if job.get('oproj_pipeline_probe') or job.get('oproj_gap_probe'):
-            profile_bytes += 64 << 20  # GPU0-only bounded private probe; conservative per-rank allowance.
+            profile_bytes += 192 << 20  # Bounded pipeline probe, conservative per-rank allowance.
     allocated_bytes = buffer_bytes + flag_bytes + calibration_flag_bytes + profile_bytes
     headroom_bytes = max(512 << 20, (allocated_bytes + 9) // 10)
     return dict(geometry=shape, buffer_bytes=buffer_bytes, flag_bytes=flag_bytes,
@@ -357,6 +365,15 @@ def validate_job(job, hostname=None):
     if job.get('mxfp8_epilogue_n') is not None and (
             not job.get('mxfp8') or job['mxfp8_epilogue_n'] not in (32, 64)):
         raise ValueError('--mxfp8-epilogue-n requires MXFP8 and 32 or 64')
+    window = tuple(job.get(key, 0) for key in ('oproj_m_window_tiles', 'oproj_n_group_tiles'))
+    if any(type(value) is not int or value < 0 or value > 2**31 - 1 for value in window):
+        raise ValueError('OProj window dimensions must be nonnegative int32 values')
+    if any(window) and (any(value == 0 or value & (value - 1) for value in window) or
+            window[0] * window[1] > 2**31 - 1 or not job.get('mxfp8') or
+            job['stage'] != 'fused-smoke' or job.get('fused_direction') != 'oproj' or
+            job.get('auto_mxfp8_comm') or job.get('auto_oproj_comm') or
+            (job.get('comm_sm') is None and job.get('comm_sm_list') is None)):
+        raise ValueError('OProj windows require two positive power-of-two tile dimensions and explicit MXFP8 OProj communication CTAs')
     if type(job.get('auto_mxfp8_comm', False)) is not bool:
         raise ValueError('Automatic MXFP8 CTA selection must be a boolean')
     if type(job.get('mxfp8_service_probe', False)) is not bool:
@@ -374,26 +391,37 @@ def validate_job(job, hostname=None):
             not job.get('mxfp8') or job['stage'] != 'fused-smoke' or not job.get('mpi') or
             job.get('fused_launch') != 'graph' or job.get('profile') or job.get('auto_oproj_comm') or
             job.get('mxfp8_prequantized') or job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') or
-            job.get('qkv_raster') not in ('along_m', 'along_n')):
+            job.get('oproj_raster' if job.get('fused_direction') == 'oproj' else 'qkv_raster') not in ('along_m', 'along_n')):
         raise ValueError('Automatic MXFP8 CTAs require MPI Graph dynamic-weight ordinary comm and explicit raster')
     if job.get('mxfp8'):
         if job['stage'] not in FUSED_STAGES or any(job.get(k) for k in (
                 'backward', 'quick', 'compute_only', 'cpu_oracle',
                 'validation_self_test', 'fused_counters', 'auto_oproj_comm', 'qkv_rank_swizzle')):
             raise ValueError('MXFP8 baseline requires isolated forward build/smoke without BF16 tuning/diagnostics')
-        if job['stage'] == 'fused-smoke' and job.get('fused_direction') != 'qkv':
-            raise ValueError('MXFP8 requires QKV-only')
+        if job['stage'] == 'fused-smoke' and job.get('fused_direction') not in ('qkv', 'oproj'):
+            raise ValueError('MXFP8 requires one forward direction')
+        if job['stage'] == 'fused-smoke' and job.get('fused_direction') == 'oproj':
+            if (job.get('mxfp8_prequantized') or
+                    job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') or
+                    job.get('oproj_policy_list') != 'm128n256' or
+                    job.get('oproj_comm_layout', 'rows') != 'rows'):
+                raise ValueError('MXFP8 OProj requires explicit comm, m128n256/rows and no QKV diagnostics')
+            shape = fused_geometry(job)
+            if (shape['q_width'] // shape['world'] % 128 or shape['seq_local'] % 128 or
+                    (job.get('causal') and shape['seq_local'] % 256)):
+                raise ValueError('MXFP8 OProj requires K128 peer shards and complete M128 sequence chunks')
         if job.get('calibrate') and (job.get('mxfp8_prequantized') or
                 job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm')):
             raise ValueError('MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps')
         if job.get('profile') and (job.get('mpi') or job.get('mxfp8_prequantized') or
-                (job['stage'] == 'fused-smoke' and job.get('directions') != 'qkv')):
-            raise ValueError('MXFP8 profiling requires single-process dynamic-weight QKV')
+                job.get('oproj_gap_probe') or
+                (job['stage'] == 'fused-smoke' and job.get('directions') != job.get('fused_direction'))):
+            raise ValueError('MXFP8 profiling requires single-process dynamic weight, matching direction, no BF16 gap probe')
         if job.get('qkv_policy', 'auto') not in ('auto', 'm128n256') or job.get('qkv_policy_list') not in (None, 'm128n256'):
             raise ValueError('MXFP8 baseline uses the fixed M128/N256/K128 collective')
         if job.get('hidden', 1024) % 128:
             raise ValueError('MXFP8 baseline hidden dimension must be divisible by 128')
-        if job.get('head_dim', 128) != 128:
+        if job.get('fused_direction') != 'oproj' and job.get('head_dim', 128) != 128:
             raise ValueError('MXFP8 communication-side quantization requires the head_dim=128 TMA route')
         if job.get('mxfp8_weight_preparation') not in (None, 'comm', 'all', 'comm_warp'):
             raise ValueError('MXFP8 weight preparation requires comm, all, or comm_warp')
@@ -880,6 +908,30 @@ def source_package(directory):
     return archive, source_id, manifest
 
 
+def frozen_source_package(directory, run_id):
+    """Reuse exact local source bytes while Mac development moves on.
+
+    Only the source snapshot is inherited. Runtime options, receipts, controller
+    and device checks remain those of the new job; this is not result reuse.
+    """
+    parent = LOCAL / identifier(run_id)
+    job = json.loads((parent / 'job.json').read_text())
+    archive = directory / 'source.tar.gz'
+    shutil.copyfile(parent / 'source.tar.gz', archive)
+    if sha(archive) != job['archive_sha256']:
+        raise ValueError('Frozen source archive digest mismatch')
+    with tarfile.open(archive) as tar:
+        members = tar.getmembers()
+        if any(not (item.isfile() or item.issym()) for item in members):
+            raise ValueError('Unexpected frozen source member type')
+        files = {item.name: ('link:' + item.linkname if item.issym() else
+                 hashlib.sha256(tar.extractfile(item).read()).hexdigest()) for item in members}
+    source_id = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+    if len(files) != len(members) or files != job['files'] or source_id != job['source_id']:
+        raise ValueError('Frozen source manifest mismatch')
+    return archive, source_id, files, job.get('git_head')
+
+
 def submit(job):
     if job.get('workspace') is not None:
         configure_workspace(job['workspace'])
@@ -973,7 +1025,11 @@ def wait_for_run(run_id, minimum_attempt=1):
             raise RuntimeError('Remote heartbeat is stale for 180 seconds. '
                                'No task was resubmitted or terminated. '
                                f'Last local receipt: {folder / "latest.json"}')
-        if state.get('attempt', 0) < minimum_attempt:
+        # A transient read has no attempt field. Its timeout is measured from
+        # the last changed receipt above, not from the start of a long job.
+        if state['state'] == 'awaiting-status':
+            pass
+        elif state.get('attempt', 0) < minimum_attempt:
             if time.monotonic() - started > 180:
                 raise RuntimeError('No new remote receipt after 180 seconds. '
                                    'No screen read, resubmission, or termination was attempted.')
@@ -1224,7 +1280,7 @@ def fused_argv(job):
         argv += ['--counter-component', job['fused_counters'],
                  '--counter-direction', job.get('directions', 'qkv')]
     for key, default in (('max_swizzle_size', 1), ('qkv_raster', 'heuristic'), ('oproj_raster', 'heuristic'),
-                         ('oproj_comm_layout', 'rows')):
+                         ('oproj_comm_layout', 'rows'), ('oproj_m_window_tiles', 0), ('oproj_n_group_tiles', 0)):
         if job.get(key, default) != default:
             argv += ['--' + key.replace('_', '-'), str(job[key])]
     if job.get('input_generator', 'cpu_mt19937') != 'cpu_mt19937':
@@ -1736,7 +1792,7 @@ def remote(job_path):
                 if actual != value:
                     raise RuntimeError(f'Source changed since this run: {name}; submit a new run')
         receipt = environment_receipt(require_te=job['stage'] not in
-            (*FUSED_STAGES, 'build', 'gemm-probe', 'gemm-cutlass-build'))
+            (*FUSED_STAGES, 'build', 'gemm-probe', 'gemm-cutlass-build', 'transport-probe'))
         if job.get('mpi'):
             receipt['mpi_toolchain'] = mpi_toolchain_receipt()
         env_id = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
@@ -1769,6 +1825,26 @@ def remote(job_path):
                 argv = ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_argv)]
         elif stage == 'gemm-cutlass-build':
             argv = cutlass_probe_build_argv()
+        elif stage == 'transport-probe':
+            devices = fused_devices(job)[:2]
+            env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, devices,
+                dict(minimum_free_bytes=2 << 30, note='Two-GPU transport microbenchmark, no GEMM'))
+            build = REMOTE / 'build/sm103-transport'
+            build.mkdir(parents=True, exist_ok=True)
+            binary = build / 'transport_probe'
+            compile_argv = ['/usr/local/cuda/bin/nvcc', '-O3', '-std=c++17', '-arch=sm_103a',
+                '-I' + CUTLASS + '/include', str(REMOTE / 'benchmarks/sm103/transport_probe.cu'),
+                '-o', str(binary)]
+            write_json(folder / 'transport-contract.json', dict(
+                hardware_user_description='B300 (reported name may be L20D)', physical_devices=devices,
+                source_id=job['source_id'], direction='visible GPU1 -> visible GPU0 pull',
+                warmup=10, samples=50, repetitions_per_sample=32, slots=32,
+                endpoints=['remote GMEM -> local SMEM', 'remote GMEM -> local GMEM'],
+                concurrency=[[1,1],[20,4]], cache='warm cyclic working set; no forced flush',
+                latency='per-warp globaltimer, includes issue/wait/join; not intrinsic hardware latency',
+                bandwidth='G2G aggregate includes loop/timer/kernel overhead; G2S per-worker service rate only'))
+            argv = ['bash', '-c', shlex.join(compile_argv) + ' && exec ' +
+                    shlex.join([str(binary), str(folder / 'transport.csv')])]
         elif stage in FUSED_STAGES:
             argv = fused_argv(job)
             if stage == 'fused-smoke':
@@ -1939,9 +2015,10 @@ def remote(job_path):
         with log_path.open('w') as log, contextlib.ExitStack() as monitors:
             if stage == 'fused-smoke':
                 monitors.enter_context(fused_telemetry(job, folder))
-            elif stage == 'gemm-probe':
+            elif stage in ('gemm-probe', 'transport-probe'):
                 monitors.enter_context(baseline_executor(REMOTE).telemetry(
-                    fused_devices(job)[0], folder / 'gpu-telemetry.csv'))
+                    ','.join(fused_devices(job)[:2]) if stage == 'transport-probe' else fused_devices(job)[0],
+                    folder / 'gpu-telemetry.csv'))
             proc = subprocess.Popen(argv, cwd=REMOTE, env=env, stdout=log, stderr=subprocess.STDOUT,
                                     start_new_session=True)
             progress_stop = threading.Event()
@@ -2050,6 +2127,7 @@ def main():
     run.add_argument('stage', choices=STAGES)
     run.add_argument('--node', choices=tuple(NODES), default='09')
     run.add_argument('--workspace', type=str, help='Remote user workspace; saved in the job for safe resume')
+    run.add_argument('--source-run', help='Reuse the verified local source snapshot of this run, not current Mac edits')
     run.add_argument('--profile', action='store_true', help='fused stages: separate instrumented build/run')
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
     run.add_argument('--backward', action='store_true', help='reuse BF16 reverse-route harness, separate build directory')
@@ -2089,7 +2167,7 @@ def main():
     communication.add_argument('--auto-oproj-comm', action='store_true',
                                help='OProj Graph: exercise runtime automatic CTA selection with explicit GEMM layout')
     run.add_argument('--auto-mxfp8-comm', action='store_true',
-                     help='MXFP8 Graph QKV: runtime auto CTA candidate, optionally paired with --comm-sm/list')
+                     help='MXFP8 Graph QKV/OProj: runtime auto CTA candidate, optionally paired with --comm-sm/list')
     run.add_argument('--mxfp8-service-probe', action='store_true',
                      help='MXFP8 single-process CP4/8 profile: independent C/Q/R/QR services; GPU0-only detail artifact')
     tiles = run.add_mutually_exclusive_group()
@@ -2101,6 +2179,10 @@ def main():
     oproj_tiles.add_argument('--oproj-policy-list', help='fused smoke: independent OProj tile candidates')
     run.add_argument('--oproj-comm-layout', choices=('rows', 'columns'), default='rows',
                      help='fused smoke: one OProj communication layout per run, independent of GEMM tile policy')
+    run.add_argument('--oproj-m-window-tiles', type=int, default=0,
+                     help='MXFP8 OProj: bounded M tile window; requires --oproj-n-group-tiles and explicit comm CTAs')
+    run.add_argument('--oproj-n-group-tiles', type=int, default=0,
+                     help='MXFP8 OProj: N tile group inside each M window; both window dimensions default to disabled')
     run.add_argument('--causal', action='store_true', help='fused smoke: OProj two-chunk gather')
     run.add_argument('--cpu-oracle', action='store_true', help='fused smoke: small-shape CPU/GPU full-validation cross-check')
     run.add_argument('--validation-self-test', action='store_true', help='fused smoke: small-shape corruption/NaN detection and restoration checks')
@@ -2233,11 +2315,15 @@ def main():
         folder = LOCAL / run_id
         folder.mkdir(parents=True)
         started = time.perf_counter()
-        archive, source_id, files = source_package(folder)
+        if args.source_run:
+            archive, source_id, files, git_head = frozen_source_package(folder, args.source_run)
+        else:
+            archive, source_id, files = source_package(folder)
+            git_head = read_command(['git', '-C', REPO, 'rev-parse', 'HEAD'])
         timings = {'pack_s': time.perf_counter() - started}
         job = vars(args) | dict(run_id=run_id, experiment=args.experiment or run_id,
                                source_id=source_id, archive_sha256=sha(archive), files=files,
-                               git_head=read_command(['git', '-C', REPO, 'rev-parse', 'HEAD']))
+                               git_head=git_head)
         if replay_payload is not None:
             job.pop('winners', None)  # Mac path is not a remote input; embed verified portable data.
             job['baseline_replay'] = replay_payload

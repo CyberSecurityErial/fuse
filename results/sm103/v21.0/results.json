@@ -1,0 +1,1875 @@
+{
+  "version": "v21.0",
+  "scope": "SM103 MXFP8 A2A to OProj forward; final explicit manual SOTA only",
+  "physical_points": 36,
+  "model_rows": 42,
+  "protocol": "Graph 10+50; max-rank latency; two reproducible random payloads; complete numerical and FP8/SFA byte-routing validation",
+  "boundary": "prequantized MXFP8 activation; fused A2A + BF16 W quantization + MXFP8 GEMM, FP32 accumulation, BF16 output",
+  "source_id": "2fc9eceb1c46971b383c4072f971ea46d8bcf0800fe5eb1ed6a54fae05f52950",
+  "build_run": "20260912-212435-64dbf5",
+  "binary_sha256": "79f875eb684b48df1ddb791712fb69c25c6f421742ee1c71badae0e612f199b7",
+  "environment_fingerprint": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+  "pure_reference": {
+    "run_id": "20260912-010803-01a286",
+    "scope": "full-device unrestricted 148 SM pure cuBLASLt; math_sms=0; no quantization or communication"
+  },
+  "summary": {
+    "fused_gmean": 1.9146931542881838,
+    "compute_gmean": 2.1743869636238435,
+    "cublaslt_gmean": 2.7166571632312078,
+    "fused_over_compute_gmean": 0.8805668845149565,
+    "fused_over_cublaslt_gmean": 0.7047974916388923,
+    "fused_min": 1.6136636151561001,
+    "fused_max": 2.0055334305555856,
+    "best_comm_counts": {
+      "48": 20,
+      "32": 10,
+      "20": 6
+    }
+  },
+  "selection": "Fastest measured fused candidate at H64/P4 and comm20/32/48; finite offline best, not global optimum or Auto",
+  "rows": [
+    {
+      "id": "h4096q64d128cp8s131072",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "raster": "along_n",
+        "max_swizzle_size": 8
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 0.6813759803771973,
+        "p95_ms": 0.6927664041519165,
+        "pflops_per_rank": 1.6136636151561001
+      },
+      "compute": {
+        "p50_ms": 0.5014080107212067,
+        "p95_ms": 0.5077632129192352,
+        "pflops_per_rank": 2.192848148146862
+      },
+      "pure_cublaslt": {
+        "p50_ms": 0.421008006,
+        "p95_ms": 0.425215989,
+        "pflops": 2.61161691
+      },
+      "evidence": {
+        "run_id": "20260912-213532-f32eec",
+        "candidate_id": 2,
+        "artifact_sha256": "74f48dd1f1e54fff3ba933b03ebcd035e7ac39b5bf7694f6412ea0875610c1c4",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.7358756768086195,
+      "fused_over_cublaslt": 0.6178791418363501,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 131072 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s131072",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 2,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 1.1780319809913635,
+        "p95_ms": 1.1869615733623504,
+        "pflops_per_rank": 1.866692323328463
+      },
+      "compute": {
+        "p50_ms": 0.9833280146121979,
+        "p95_ms": 1.0006112277507782,
+        "pflops_per_rank": 2.2363069320457067
+      },
+      "pure_cublaslt": {
+        "p50_ms": 0.782559991,
+        "p95_ms": 0.790624022,
+        "pflops": 2.81003793
+      },
+      "evidence": {
+        "run_id": "20260912-213556-724171",
+        "candidate_id": 2,
+        "artifact_sha256": "424365b1f014ebe3b8ba551e6d4de490c63d25cfbb3ab660f78285d0e0f42329",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8347209842169869,
+      "fused_over_cublaslt": 0.6642943511187633,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 2 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 4 --global-seq 131072 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s131072",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 1.2254079580307007,
+        "p95_ms": 1.2299424290657044,
+        "pflops_per_rank": 1.7945234002608843
+      },
+      "compute": {
+        "p50_ms": 0.9943999946117401,
+        "p95_ms": 1.0036400139331818,
+        "pflops_per_rank": 2.211407147493601
+      },
+      "pure_cublaslt": {
+        "p50_ms": 0.788512021,
+        "p95_ms": 0.794399977,
+        "pflops": 2.78882654
+      },
+      "evidence": {
+        "run_id": "20260912-213614-8edec3",
+        "candidate_id": 2,
+        "artifact_sha256": "0e54c9efca802d80eb84b0f5009ab84bde58f3efdedeb241fd57dd6a5d6beb95",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8114848513060063,
+      "fused_over_cublaslt": 0.6434689911767995,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 131072 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s131072",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 1.594319999217987,
+        "p95_ms": 1.6290016233921052,
+        "pflops_per_rank": 1.8103128759143008
+      },
+      "compute": {
+        "p50_ms": 1.3774399757385254,
+        "p95_ms": 1.3918656349182128,
+        "pflops_per_rank": 2.0953493972501644
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.04947197,
+        "p95_ms": 1.05955195,
+        "pflops": 2.75016208
+      },
+      "evidence": {
+        "run_id": "20260912-213643-a007c9",
+        "candidate_id": 3,
+        "artifact_sha256": "d202c1a786b6e16c0a2dc9868af7deac9dc5c78ba2d8e6d0b0e5c7a82a31b6ff",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.863967068351497,
+      "fused_over_cublaslt": 0.65825679478291,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 131072 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s131072",
+      "models": [
+        "representative_large"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.109663963317871,
+        "p95_ms": 2.136777567863464,
+        "pflops_per_rank": 1.8241249621403157
+      },
+      "compute": {
+        "p50_ms": 1.839456021785736,
+        "p95_ms": 1.8540048122406005,
+        "pflops_per_rank": 2.0920808389211154
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.44049597,
+        "p95_ms": 1.44579196,
+        "pflops": 2.67150397
+      },
+      "evidence": {
+        "run_id": "20260912-213712-7aeab7",
+        "candidate_id": 3,
+        "artifact_sha256": "909c20522520270161dfd8c82e43f53228b83a4a5be44c4967ee49ddd83fe6ce",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8719189661337444,
+      "fused_over_cublaslt": 0.6828082543108913,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 131072 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s131072",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.2477279901504517,
+        "p95_ms": 2.273363184928894,
+        "pflops_per_rank": 1.9566631417930676
+      },
+      "compute": {
+        "p50_ms": 2.0943679809570312,
+        "p95_ms": 2.1407919049263002,
+        "pflops_per_rank": 2.0999397198071623
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.58382404,
+        "p95_ms": 1.59379196,
+        "pflops": 2.77685299
+      },
+      "evidence": {
+        "run_id": "20260912-213741-b23aaf",
+        "candidate_id": 3,
+        "artifact_sha256": "9840720e987bbf3e63f1d188f07e8b543a766874614f940328d22ec72db8e184",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9317710995879197,
+      "fused_over_cublaslt": 0.7046333201071143,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 131072 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s131072",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.9019999504089355,
+        "p95_ms": 3.00316641330719,
+        "pflops_per_rank": 1.989123412979582
+      },
+      "compute": {
+        "p50_ms": 2.737679958343506,
+        "p95_ms": 2.7681360483169555,
+        "pflops_per_rank": 2.1085138269108494
+      },
+      "pure_cublaslt": {
+        "p50_ms": 2.10143995,
+        "p95_ms": 2.11814404,
+        "pflops": 2.74689555
+      },
+      "evidence": {
+        "run_id": "20260912-213759-127af6",
+        "candidate_id": 3,
+        "artifact_sha256": "94d00cadb2ac1afd4f02ce9543f093378778ebae5ff3e4a2e3a196d4d2073a58",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9433769831587093,
+      "fused_over_cublaslt": 0.7241350742220912,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 131072 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s131072",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 3.5862560272216797,
+        "p95_ms": 3.626472020149231,
+        "pflops_per_rank": 1.8778661280760016
+      },
+      "compute": {
+        "p50_ms": 3.1810719966888428,
+        "p95_ms": 3.20307834148407,
+        "pflops_per_rank": 2.117056365633317
+      },
+      "pure_cublaslt": {
+        "p50_ms": 2.502496,
+        "p95_ms": 2.5281601,
+        "pflops": 2.69111667
+      },
+      "evidence": {
+        "run_id": "20260912-213818-fde80d",
+        "candidate_id": 3,
+        "artifact_sha256": "9adcf7ffc41460b14581a36cdf5b9ef8bd1b94c4beb2c592b728a781e4d51315",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8870175393342626,
+      "fused_over_cublaslt": 0.6978018266580771,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 131072 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s131072",
+      "models": [
+        "representative_large"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 3.945312023162842,
+        "p95_ms": 4.011796855926514,
+        "pflops_per_rank": 1.9508169060509122
+      },
+      "compute": {
+        "p50_ms": 3.645535945892334,
+        "p95_ms": 3.661091125011444,
+        "pflops_per_rank": 2.1112345368872982
+      },
+      "pure_cublaslt": {
+        "p50_ms": 2.88031995,
+        "p95_ms": 2.89347196,
+        "pflops": 2.67212724
+      },
+      "evidence": {
+        "run_id": "20260912-213847-eda68b",
+        "candidate_id": 3,
+        "artifact_sha256": "8e8f4d6e61f11741fd26964f915565fe0e4abc09774a6cab8c19aa15469a858c",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9240171435084147,
+      "fused_over_cublaslt": 0.7300613821259919,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 131072 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s131072",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 8,
+      "global_seq": 131072,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 16384,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 4.621232032775879,
+        "p95_ms": 4.756091237068176,
+        "pflops_per_rank": 1.9034086494298725
+      },
+      "compute": {
+        "p50_ms": 4.130592107772827,
+        "p95_ms": 4.183819127082825,
+        "pflops_per_rank": 2.1294993048710307
+      },
+      "pure_cublaslt": {
+        "p50_ms": 3.230304,
+        "p95_ms": 3.24892807,
+        "pflops": 2.72299233
+      },
+      "evidence": {
+        "run_id": "20260912-213911-62732b",
+        "candidate_id": 3,
+        "artifact_sha256": "5b43181e6ebf21434c230a426a57298a7b2b3d43044333c696febbf1bb42c49a",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.89382919500185,
+      "fused_over_cublaslt": 0.6990135919442243,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 131072 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp4s131072",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 6.922960042953491,
+        "p95_ms": 7.009436821937561,
+        "pflops_per_rank": 1.945557587605231
+      },
+      "compute": {
+        "p50_ms": 6.413887977600098,
+        "p95_ms": 6.476092839241028,
+        "pflops_per_rank": 2.0999770322299485
+      },
+      "pure_cublaslt": {
+        "p50_ms": 4.94033599,
+        "p95_ms": 5.02172804,
+        "pflops": 2.72633632
+      },
+      "evidence": {
+        "run_id": "20260912-213939-fd0b1a",
+        "candidate_id": 3,
+        "artifact_sha256": "c4c193907a95f6ffe031572760898269d08ae54b43e1eae57d9a82b07aacf85e",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9264661268886637,
+      "fused_over_cublaslt": 0.7136161350794867,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 131072 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s131072",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 4,
+      "global_seq": 131072,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 8.93455982208252,
+        "p95_ms": 9.094907331466676,
+        "pflops_per_rank": 1.9690042256962033
+      },
+      "compute": {
+        "p50_ms": 8.350175857543945,
+        "p95_ms": 8.445214414596558,
+        "pflops_per_rank": 2.106804257125002
+      },
+      "pure_cublaslt": {
+        "p50_ms": 6.52340794,
+        "p95_ms": 6.55603218,
+        "pflops": 2.69677847
+      },
+      "evidence": {
+        "run_id": "20260912-214003-cec5c4",
+        "candidate_id": 3,
+        "artifact_sha256": "ed11daa0ea6a9ba92beb99ea6779cc639e155e38a73c148e70f9652b15575fdb",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9345928645422218,
+      "fused_over_cublaslt": 0.7301319880739789,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 131072 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp8s262144",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "raster": "along_n",
+        "max_swizzle_size": 2
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 1.1744160056114197,
+        "p95_ms": 1.2081439673900605,
+        "pflops_per_rank": 1.8724397871324594
+      },
+      "compute": {
+        "p50_ms": 0.9705759882926941,
+        "p95_ms": 0.9791487962007522,
+        "pflops_per_rank": 2.2656889126427124
+      },
+      "pure_cublaslt": {
+        "p50_ms": 0.782559991,
+        "p95_ms": 0.790624022,
+        "pflops": 2.81003793
+      },
+      "evidence": {
+        "run_id": "20260912-214027-b32178",
+        "candidate_id": 1,
+        "artifact_sha256": "792b2624e1a9e42d60db3a6fd4272fe86e990012120b7e518cf5f03cfe456067",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8264328684684408,
+      "fused_over_cublaslt": 0.6663396842947452,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 2 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 262144 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s262144",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.2864800691604614,
+        "p95_ms": 2.315342330932617,
+        "pflops_per_rank": 1.9235009175998867
+      },
+      "compute": {
+        "p50_ms": 2.0713119506835938,
+        "p95_ms": 2.129360020160675,
+        "pflops_per_rank": 2.123314409330046
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.61440003,
+        "p95_ms": 1.62102401,
+        "pflops": 2.72426067
+      },
+      "evidence": {
+        "run_id": "20260912-214056-ded403",
+        "candidate_id": 3,
+        "artifact_sha256": "b08f5140938bab4b198e6339667d5a9dbf82d42bf8ccba40791e6de452a76fb3",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9058954760292872,
+      "fused_over_cublaslt": 0.7060634611003971,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 262144 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s262144",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.3272160291671753,
+        "p95_ms": 2.3377840638160707,
+        "pflops_per_rank": 1.8898316512016713
+      },
+      "compute": {
+        "p50_ms": 1.9820159673690796,
+        "p95_ms": 2.003753638267517,
+        "pflops_per_rank": 2.2189763268869878
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.58382404,
+        "p95_ms": 1.59379196,
+        "pflops": 2.77685299
+      },
+      "evidence": {
+        "run_id": "20260912-214114-b3952e",
+        "candidate_id": 2,
+        "artifact_sha256": "da9259b989624518b0f27fded2cfb08f27651f64c91f9fff5b792b5418227c70",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.85166823471836,
+      "fused_over_cublaslt": 0.6805659709056731,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 262144 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s262144",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 3.073280096054077,
+        "p95_ms": 3.0935375452041627,
+        "pflops_per_rank": 1.8782655226367069
+      },
+      "compute": {
+        "p50_ms": 2.7777600288391113,
+        "p95_ms": 2.794859194755554,
+        "pflops_per_rank": 2.0780902546993705
+      },
+      "pure_cublaslt": {
+        "p50_ms": 2.10143995,
+        "p95_ms": 2.11814404,
+        "pflops": 2.74689555
+      },
+      "evidence": {
+        "run_id": "20260912-214144-c7f120",
+        "candidate_id": 3,
+        "artifact_sha256": "b4cfb707027da38edc6b7cd586c69aee137b594d170a1f4f88953e9881225bf0",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9038421302391548,
+      "fused_over_cublaslt": 0.6837775548606888,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 262144 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s262144",
+      "models": [
+        "representative_large"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 4.089168071746826,
+        "p95_ms": 4.1853279113769535,
+        "pflops_per_rank": 1.882187589111285
+      },
+      "compute": {
+        "p50_ms": 3.683151960372925,
+        "p95_ms": 3.6994719743728637,
+        "pflops_per_rank": 2.0896725080147682
+      },
+      "pure_cublaslt": {
+        "p50_ms": 2.88031995,
+        "p95_ms": 2.89347196,
+        "pflops": 2.67212724
+      },
+      "evidence": {
+        "run_id": "20260912-214213-79f538",
+        "candidate_id": 3,
+        "artifact_sha256": "d86e48383f2d794bdccbc40acf428104308d1886e930baab7b08eae503771be5",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9007093608650677,
+      "fused_over_cublaslt": 0.7043779805602689,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 262144 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s262144",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 4.401968002319336,
+        "p95_ms": 4.5890672445297245,
+        "pflops_per_rank": 1.9982183008993843
+      },
+      "compute": {
+        "p50_ms": 3.941215991973877,
+        "p95_ms": 4.047768187522888,
+        "pflops_per_rank": 2.2318221178745032
+      },
+      "pure_cublaslt": {
+        "p50_ms": 3.22399998,
+        "p95_ms": 3.24060798,
+        "pflops": 2.72831671
+      },
+      "evidence": {
+        "run_id": "20260912-214242-7cf7ae",
+        "candidate_id": 2,
+        "artifact_sha256": "fc1ff9c1134ade2addaf2c2cc33d05fb994d1582a48ec8b3d34cfcc8164b8954",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8953304499027038,
+      "fused_over_cublaslt": 0.7323996857019522,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 4 --global-seq 262144 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s262144",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 5.975376129150391,
+        "p95_ms": 6.342979311943054,
+        "pflops_per_rank": 1.932074540935971
+      },
+      "compute": {
+        "p50_ms": 5.620815992355347,
+        "p95_ms": 5.730187225341797,
+        "pflops_per_rank": 2.0539494812407546
+      },
+      "pure_cublaslt": {
+        "p50_ms": 4.22238398,
+        "p95_ms": 4.24291182,
+        "pflops": 2.73420706
+      },
+      "evidence": {
+        "run_id": "20260912-214306-ff3a2c",
+        "candidate_id": 3,
+        "artifact_sha256": "cc5364b8cea7bc80a25cb8a38650dada91e48594e8e73d1b42100cd8eb076e9d",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9406631266163561,
+      "fused_over_cublaslt": 0.7066306605674447,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 262144 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s262144",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 7.1069440841674805,
+        "p95_ms": 7.394110298156738,
+        "pflops_per_rank": 1.8951911371107661
+      },
+      "compute": {
+        "p50_ms": 6.024127960205078,
+        "p95_ms": 6.041307210922241,
+        "pflops_per_rank": 2.2358451761369085
+      },
+      "pure_cublaslt": {
+        "p50_ms": 4.94033599,
+        "p95_ms": 5.02172804,
+        "pflops": 2.72633632
+      },
+      "evidence": {
+        "run_id": "20260912-214330-7fa798",
+        "candidate_id": 2,
+        "artifact_sha256": "8e29e236801032002cbc56b01960a04c7f7b6f82496f7f88cd50ffb63b6a4407",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.847639701236056,
+      "fused_over_cublaslt": 0.6951420935149946,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 262144 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s262144",
+      "models": [
+        "representative_large"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 7.89303994178772,
+        "p95_ms": 8.00299687385559,
+        "pflops_per_rank": 1.9502198015455061
+      },
+      "compute": {
+        "p50_ms": 7.546272039413452,
+        "p95_ms": 7.7143326044082645,
+        "pflops_per_rank": 2.0398367178478316
+      },
+      "pure_cublaslt": {
+        "p50_ms": 5.75607991,
+        "p95_ms": 5.78892803,
+        "pflops": 2.67424411
+      },
+      "evidence": {
+        "run_id": "20260912-214359-96aaf4",
+        "candidate_id": 3,
+        "artifact_sha256": "54a6d6e372eca17246ba7f49ec6aa3bdf389d162e3585e7a51ad6e30eb66adba",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9560666226280712,
+      "fused_over_cublaslt": 0.7292602026318031,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 262144 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s262144",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 8,
+      "global_seq": 262144,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 32768,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 9.19819164276123,
+        "p95_ms": 9.401393795013428,
+        "pflops_per_rank": 1.9125700711248668
+      },
+      "compute": {
+        "p50_ms": 8.3679518699646,
+        "p95_ms": 8.436608362197877,
+        "pflops_per_rank": 2.10232877982488
+      },
+      "pure_cublaslt": {
+        "p50_ms": 6.52340794,
+        "p95_ms": 6.55603218,
+        "pflops": 2.69677847
+      },
+      "evidence": {
+        "run_id": "20260912-214422-b58117",
+        "candidate_id": 3,
+        "artifact_sha256": "19185b3cdc29bfdfb33f52beb44b86683ed96033f526a09ae89a3017bdb074b3",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9097388046431919,
+      "fused_over_cublaslt": 0.7092054806878025,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 262144 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp4s262144",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 13.601200103759766,
+        "p95_ms": 13.85044002532959,
+        "pflops_per_rank": 1.9805630881840748
+      },
+      "compute": {
+        "p50_ms": 12.770751953125,
+        "p95_ms": 12.797035264968873,
+        "pflops_per_rank": 2.1093538563263903
+      },
+      "pure_cublaslt": {
+        "p50_ms": 9.946064,
+        "p95_ms": 10.0636797,
+        "pflops": 2.70841158
+      },
+      "evidence": {
+        "run_id": "20260912-214457-6a1502",
+        "candidate_id": 3,
+        "artifact_sha256": "22f43c764abdb925e86268b56a68497a2d9b72679fc2a7192a0a51233732ef68",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.938943023828816,
+      "fused_over_cublaslt": 0.7312637055643053,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 262144 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s262144",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 4,
+      "global_seq": 262144,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 17.691375732421875,
+        "p95_ms": 18.103062248229982,
+        "pflops_per_rank": 1.9887866619864847
+      },
+      "compute": {
+        "p50_ms": 16.722031593322754,
+        "p95_ms": 16.741641235351562,
+        "pflops_per_rank": 2.1040728151046797
+      },
+      "pure_cublaslt": {
+        "p50_ms": 13.0470881,
+        "p95_ms": 13.1570559,
+        "pflops": 2.69672219
+      },
+      "evidence": {
+        "run_id": "20260912-214526-d25ec8",
+        "candidate_id": 3,
+        "artifact_sha256": "d8509fce22828d2d258083f93f0f2154e77b63dba320794f260dc97db4c1d879",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9452080972243067,
+      "fused_over_cublaslt": 0.7374829596319985,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 4 --global-seq 262144 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp8s524288",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "raster": "along_n",
+        "max_swizzle_size": 8
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 2.3424960374832153,
+        "p95_ms": 2.3768848419189452,
+        "pflops_per_rank": 1.8775043546409897
+      },
+      "compute": {
+        "p50_ms": 1.9839040040969849,
+        "p95_ms": 1.9940431654453277,
+        "pflops_per_rank": 2.2168645771274917
+      },
+      "pure_cublaslt": {
+        "p50_ms": 1.61440003,
+        "p95_ms": 1.62102401,
+        "pflops": 2.72426067
+      },
+      "evidence": {
+        "run_id": "20260912-214600-36bd87",
+        "candidate_id": 1,
+        "artifact_sha256": "7d330b5ab447fb8ed9ce6a8fb530e6a232703a24f0ee4779d3b6fe059cb90271",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8469188303210524,
+      "fused_over_cublaslt": 0.6891794075788605,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 524288 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s524288",
+      "models": [
+        "qwen3_235b"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 4096,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 4096,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 4.533615827560425,
+        "p95_ms": 4.700927948951721,
+        "pflops_per_rank": 1.940193734267345
+      },
+      "compute": {
+        "p50_ms": 3.9749120473861694,
+        "p95_ms": 4.054135990142822,
+        "pflops_per_rank": 2.2129025541564253
+      },
+      "pure_cublaslt": {
+        "p50_ms": 3.26467204,
+        "p95_ms": 3.292032,
+        "pflops": 2.69432669
+      },
+      "evidence": {
+        "run_id": "20260912-214630-9e7b36",
+        "candidate_id": 2,
+        "artifact_sha256": "940408ccda6959164b867dbebae0fc65bb2914a9059cc291d9c972aa8ca45b76",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8767641985062289,
+      "fused_over_cublaslt": 0.7201033718250941,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 4 --global-seq 524288 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s524288",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 4.623952150344849,
+        "p95_ms": 4.8519855260849,
+        "pflops_per_rank": 1.9022889373005296
+      },
+      "compute": {
+        "p50_ms": 3.693503975868225,
+        "p95_ms": 3.846934413909912,
+        "pflops_per_rank": 2.381503601912414
+      },
+      "pure_cublaslt": {
+        "p50_ms": 3.22399998,
+        "p95_ms": 3.24060798,
+        "pflops": 2.72831671
+      },
+      "evidence": {
+        "run_id": "20260912-214654-b3040b",
+        "candidate_id": 1,
+        "artifact_sha256": "23ec3da485880b251cbcd1e17d52de04591abd3b3e425f2f889fa383512ec2c3",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.7987764266965367,
+      "fused_over_cublaslt": 0.6972390449862874,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 8 --global-seq 524288 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s524288",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 6.124287843704224,
+        "p95_ms": 7.54740147590637,
+        "pflops_per_rank": 1.8850962571127587
+      },
+      "compute": {
+        "p50_ms": 5.672352075576782,
+        "p95_ms": 5.7521679401397705,
+        "pflops_per_rank": 2.035288349141142
+      },
+      "pure_cublaslt": {
+        "p50_ms": 4.22238398,
+        "p95_ms": 4.24291182,
+        "pflops": 2.73420706
+      },
+      "evidence": {
+        "run_id": "20260912-214723-856b17",
+        "candidate_id": 3,
+        "artifact_sha256": "24c19dcde9675dc7e6dcffe594f9662c362e8b90716056eccde99b4fed27628b",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9262059884085898,
+      "fused_over_cublaslt": 0.6894489757892581,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 524288 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s524288",
+      "models": [
+        "representative_large"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 48,
+      "compute_ctas": 100,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 8.215152263641357,
+        "p95_ms": 8.353328227996826,
+        "pflops_per_rank": 1.87375258484144
+      },
+      "compute": {
+        "p50_ms": 7.5237438678741455,
+        "p95_ms": 7.638961720466614,
+        "pflops_per_rank": 2.0459445535608562
+      },
+      "pure_cublaslt": {
+        "p50_ms": 5.75607991,
+        "p95_ms": 5.78892803,
+        "pflops": 2.67424411
+      },
+      "evidence": {
+        "run_id": "20260912-214752-79315f",
+        "candidate_id": 3,
+        "artifact_sha256": "508ba09b9899530fb15eeffe91ea3b233f09166508a8ec39971a6152743ce5c3",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.9158374216839232,
+      "fused_over_cublaslt": 0.7006662472714356,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 48 --causal --world 8 --global-seq 524288 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s524288",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 8192,
+      "q_heads": 64,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 8192,
+      "k": 8192,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 8.77182388305664,
+        "p95_ms": 8.975726175308228,
+        "pflops_per_rank": 2.0055334305555856
+      },
+      "compute": {
+        "p50_ms": 7.508847951889038,
+        "p95_ms": 7.729886364936829,
+        "pflops_per_rank": 2.3428608698875366
+      },
+      "pure_cublaslt": {
+        "p50_ms": 6.48028803,
+        "p95_ms": 6.51251221,
+        "pflops": 2.71472286
+      },
+      "evidence": {
+        "run_id": "20260912-214826-cdbca4",
+        "candidate_id": 1,
+        "artifact_sha256": "8add81d452f03c51a9d06967b905fb0d27e2ebd3db261bdf85dd0482b7790ab2",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8560190049406803,
+      "fused_over_cublaslt": 0.7387617572703482,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 4 --global-seq 524288 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s524288",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 7168,
+      "q_heads": 96,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 7168,
+      "k": 12288,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 11.63158369064331,
+        "p95_ms": 11.840969514846801,
+        "pflops_per_rank": 1.9850903193749854
+      },
+      "compute": {
+        "p50_ms": 9.717023849487305,
+        "p95_ms": 9.991334629058837,
+        "pflops_per_rank": 2.3762156541906885
+      },
+      "pure_cublaslt": {
+        "p50_ms": 8.51219177,
+        "p95_ms": 8.55721569,
+        "pflops": 2.71254981
+      },
+      "evidence": {
+        "run_id": "20260912-214850-fff6bb",
+        "candidate_id": 1,
+        "artifact_sha256": "b7d9f49478e61ff379edcbd1152b6d0a873590735c38fca509839da601fdcb7c",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8353998997835422,
+      "fused_over_cublaslt": 0.7318170940333757,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 4 --global-seq 524288 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s524288",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 13.710879802703857,
+        "p95_ms": 14.279246377944947,
+        "pflops_per_rank": 1.9647196436803187
+      },
+      "compute": {
+        "p50_ms": 11.930927753448486,
+        "p95_ms": 11.972534656524658,
+        "pflops_per_rank": 2.257832369551135
+      },
+      "pure_cublaslt": {
+        "p50_ms": 9.946064,
+        "p95_ms": 10.0636797,
+        "pflops": 2.70841158
+      },
+      "evidence": {
+        "run_id": "20260912-214920-66ceb9",
+        "candidate_id": 2,
+        "artifact_sha256": "8045d676f77f63a344cb538a1214e23342e99f2cc3f1eb1208973c9e26dcfee9",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8701795891388128,
+      "fused_over_cublaslt": 0.7254139873675768,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 524288 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s524288",
+      "models": [
+        "representative_large"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 7168,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 7168,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 4,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 15.524864196777344,
+        "p95_ms": 15.848834896087647,
+        "pflops_per_rank": 1.9830334866387196
+      },
+      "compute": {
+        "p50_ms": 13.118735790252686,
+        "p95_ms": 13.361561918258667,
+        "pflops_per_rank": 2.3467448441642116
+      },
+      "pure_cublaslt": {
+        "p50_ms": 11.524816,
+        "p95_ms": 11.5967684,
+        "pflops": 2.67130733
+      },
+      "evidence": {
+        "run_id": "20260912-214959-f1947e",
+        "candidate_id": 1,
+        "artifact_sha256": "20cdcc0b7d9a10fe780ddf341731ca90bfaa7e277a7766a2d80747173425b144",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8450145279194053,
+      "fused_over_cublaslt": 0.7423456913281182,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 4 --global-seq 524288 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s524288",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 8,
+      "global_seq": 524288,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 65536,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 32,
+      "compute_ctas": 116,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 17.90676784515381,
+        "p95_ms": 17.98585710525513,
+        "pflops_per_rank": 1.9648644799041224
+      },
+      "compute": {
+        "p50_ms": 15.577600002288818,
+        "p95_ms": 15.666153621673583,
+        "pflops_per_rank": 2.258651659027216
+      },
+      "pure_cublaslt": {
+        "p50_ms": 13.0470881,
+        "p95_ms": 13.1570559,
+        "pflops": 2.69672219
+      },
+      "evidence": {
+        "run_id": "20260912-215033-12fa1b",
+        "candidate_id": 2,
+        "artifact_sha256": "9b4b9922385e742b7d83f57d52d1df205f24c9d52755cc983aa069a1d18434fd",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8699280706040233,
+      "fused_over_cublaslt": 0.7286121229655185,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 32 --causal --world 8 --global-seq 524288 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp4s524288",
+      "models": [
+        "bloom_176b"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 14336,
+      "q_heads": 112,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 14336,
+      "k": 14336,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 26.92852783203125,
+        "p95_ms": 27.594036769866943,
+        "pflops_per_rank": 2.000706094929515
+      },
+      "compute": {
+        "p50_ms": 23.16983985900879,
+        "p95_ms": 23.32355365753174,
+        "pflops_per_rank": 2.3252672478043115
+      },
+      "pure_cublaslt": {
+        "p50_ms": 19.9523039,
+        "p95_ms": 20.0558071,
+        "pflops": 2.70024304
+      },
+      "evidence": {
+        "run_id": "20260912-215113-2842f0",
+        "candidate_id": 1,
+        "artifact_sha256": "7118c0f5e12c5343957f63c3889669783e0ccb356d226d344cd38a9203034bb1",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.8604198492963461,
+      "fused_over_cublaslt": 0.7409355622038803,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 4 --global-seq 524288 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s524288",
+      "models": [
+        "llama31_405b"
+      ],
+      "world": 4,
+      "global_seq": 524288,
+      "hidden": 16384,
+      "q_heads": 128,
+      "head_dim": 128,
+      "m": 131072,
+      "n": 16384,
+      "k": 16384,
+      "gemm": {
+        "tile_m": 128,
+        "tile_n": 256,
+        "tile_k": 128,
+        "epilogue_n": 32,
+        "stages": 0,
+        "max_swizzle_size": 8,
+        "raster": "along_n"
+      },
+      "comm_ctas": 20,
+      "compute_ctas": 128,
+      "m_window_tiles": 64,
+      "n_group_tiles": 4,
+      "fused": {
+        "p50_ms": 35.23545455932617,
+        "p95_ms": 35.70024700164795,
+        "pflops_per_rank": 1.9971005073649233
+      },
+      "compute": {
+        "p50_ms": 30.504048347473145,
+        "p95_ms": 30.79983377456665,
+        "pflops_per_rank": 2.3068657437232627
+      },
+      "pure_cublaslt": {
+        "p50_ms": 26.1493921,
+        "p95_ms": 26.3037434,
+        "pflops": 2.69102792
+      },
+      "evidence": {
+        "run_id": "20260912-215153-f1a765",
+        "candidate_id": 1,
+        "artifact_sha256": "46119022d911ead503e4c2507c3330a3cc9ff0324c6afb4ca68619dd472d285d",
+        "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+      },
+      "fused_over_compute": 0.865720301581842,
+      "fused_over_cublaslt": 0.7421329568980924,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --directions oproj --fused-direction oproj --fused-launch graph --input-generator gpu_philox --mxfp8-weight-preparation comm --mxfp8-epilogue-n 32 --oproj-policy-list m128n256 --qkv-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --oproj-comm-layout rows --oproj-m-window-tiles 64 --oproj-n-group-tiles 4 --comm-sm-list 20 --causal --world 4 --global-seq 524288 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --experiment v21-release-replay --timeout 600 --calibrate"
+    }
+  ]
+}

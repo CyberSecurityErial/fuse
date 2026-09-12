@@ -13,6 +13,53 @@
 
 namespace fuse::detail {
 
+struct Mxfp8OprojServices {
+  int64_t reference_m = 0;
+  int32_t sm_count = 0, comm_ctas = 0, compute_ctas = 0;
+  double compute_us = 0, copy_us = 0, producer_us = 0;
+};
+
+struct Mxfp8OprojModelResult {
+  bool valid = false;
+  double compute_finish_us = 0, producer_finish_us = 0, score_us = 0;
+};
+
+// Long-sequence balance, evaluated for EACH independently measured SM split.
+// The caller matches N/K, CP, collective, raster/swizzle and resource footprint
+// before passing a service sample. No throughput is assumed linear in SMs.
+//
+//   C(M0,c): prepared A/W -> GEMM, exactly (SM-c) compute workers
+//   R(M0,c): A + SFA pull/repack, c producer CTAs, no W quantization
+//   P(M0,c): same A path + actual W quantization/publication, no GEMM
+//
+//   r = M/M0;  C = r*C(M0,c);  P = P(M0,c) + (r-1)*R(M0,c)
+//   score = max(C,P)
+//
+// W size is fixed as M grows. P already measures its mixed service once;
+// P-R is NOT interpreted as an isolated quantization time or clamped to zero.
+// C uses an amortized long-sequence stream, not a first-tile latency. Startup,
+// wave rounding and concurrent GEMM/producer interference are not predicted
+// separately: this is an offline ranking approximation, not an E2E bound.
+// Validate its M0..4*M0 extrapolation on held-out lengths before enabling Auto.
+// Queue first-use windows still come from the actual selected SM budget and
+// GEMM mapping. This scorer changes neither ready granularity nor queue order.
+inline Mxfp8OprojModelResult score_mxfp8_oproj_bulk(
+    int64_t m, const Mxfp8OprojServices& s) {
+  Mxfp8OprojModelResult result;
+  if (s.reference_m <= 0 || s.reference_m > INT32_MAX || m < s.reference_m ||
+      m > 4 * s.reference_m || m % 128 || s.reference_m % 128 ||
+      s.comm_ctas <= 0 || s.comm_ctas >= s.sm_count ||
+      s.compute_ctas != s.sm_count - s.comm_ctas) return result;
+  for (double v : {s.compute_us, s.copy_us, s.producer_us})
+    if (!std::isfinite(v) || v <= 0) return result;
+  const double ratio = static_cast<double>(m) / s.reference_m;
+  result.compute_finish_us = ratio * s.compute_us;
+  result.producer_finish_us = s.producer_us + (ratio - 1) * s.copy_us;
+  result.score_us = std::max(result.compute_finish_us, result.producer_finish_us);
+  result.valid = std::isfinite(result.score_us) && result.score_us > 0;
+  return result;
+}
+
 enum class OProjModelRaster { AlongM, AlongN };
 enum class OProjModelStatus {
   Success, InvalidInput, UnsupportedGeometry, WorkLimit, InvalidSchedule,

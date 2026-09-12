@@ -153,6 +153,8 @@ def append_mxfp8_events(events, log_path, job, origins, records, route_warps=8,
     world, comm = int(job['world']), int(job['comm_sm'])
     n = (int(job['q_heads']) + 2 * int(job['kv_heads'])) * int(job['head_dim'])
     k, m = int(job['hidden']), int(job['global_seq']) // world
+    if job.get('fused_direction') == 'oproj':
+        n, k = int(job['hidden']), int(job['q_heads']) * int(job['head_dim'])
     panels, steps = (n + 255) // 256, 256 * (k // 32) // 32
     seen, releases, waits, tracks = set(), {}, set(), set()
     publication_subphase_chunks = 0

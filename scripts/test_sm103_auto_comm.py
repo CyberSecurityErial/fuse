@@ -35,7 +35,20 @@ class AutoCommunicationTests(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         directory = Path(cls.temp.name)
         (directory / 'cutlass').mkdir()
-        (directory / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/cutlass.h').write_text(
+            '#pragma once\n#define CUTLASS_HOST\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/fast_math.h').write_text(r'''
+#pragma once
+#include <cstdint>
+namespace cutlass {
+struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t v) const { return v / divisor; }
+};
+}
+''')
         policy = (API / 'policy.cuh').read_text()
         forward = (API / 'forward.cuh').read_text()
         reference = (API / 'reference.cuh').read_text()

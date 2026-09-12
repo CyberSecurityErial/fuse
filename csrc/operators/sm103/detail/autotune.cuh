@@ -10,6 +10,72 @@
 
 namespace fuse::detail {
 
+struct Mxfp8OprojTuningRequest {
+  int64_t m = 0, n = 0, k = 0;
+  int32_t world = 0, sm_count = 148, capability = 103;
+  int32_t tile_m = 128, tile_n = 256, tile_k = 128, epilogue_n = 32, stage_policy = 0;
+  int32_t raster = 1, max_swizzle_size = 1, swizzle = 1, dynamic_smem_bytes = 0;
+  int32_t comm_ctas = 0;
+};
+enum class Mxfp8OprojTuningStatus { Success, InvalidInput, UnsupportedCalibration, ModelFailure };
+struct Mxfp8OprojTuningResult {
+  Mxfp8OprojTuningStatus status = Mxfp8OprojTuningStatus::UnsupportedCalibration;
+  bool along_n = false;
+  bool feed_feasible = false;
+  int32_t swizzle = 0, comm_ctas = 0, compute_ctas = 0;
+  Mxfp8OprojModelResult prediction{};
+};
+
+// GEMM is an immutable input, not a second search axis. Match independently
+// measured physical services at each actual SM split; choose by C/P balance.
+// Minimize max(C,P): accepting a small producer deficit can be cheaper than
+// taking more SMs away from GEMM. P<=C is diagnostic, not a hard constraint.
+// Standalone services approximate the balance, not concurrent contention.
+// The launcher then lowers the same GEMM map with the chosen c, rebuilding A
+// first-use windows/cohorts and W production stride together. There is no
+// model-name dispatch, online GPU trial, fitted coefficient or winner lookup.
+inline Mxfp8OprojTuningResult select_mxfp8_oproj_plan(
+    const Mxfp8OprojTuningRequest& r, const Mxfp8OprojCalibrationPoint* points, size_t count) {
+  using Status = Mxfp8OprojTuningStatus;
+  Mxfp8OprojTuningResult best;
+  auto width = [](int v) { return v == 1 || v == 2 || v == 4 || v == 8; };
+  if (r.m <= 0 || r.m > INT32_MAX || r.n <= 0 || r.n > INT32_MAX ||
+      r.k <= 0 || r.k > INT32_MAX || r.capability != 103 || r.sm_count != 148 ||
+      (r.world != 4 && r.world != 8) || r.comm_ctas < 0 || r.comm_ctas >= r.sm_count ||
+      r.tile_m != 128 || r.tile_n != 256 || r.tile_k != 128 || r.stage_policy != 0 ||
+      (r.epilogue_n != 32 && r.epilogue_n != 64) || r.dynamic_smem_bytes <= 0 ||
+      (r.raster != 0 && r.raster != 1) || !width(r.swizzle) || !width(r.max_swizzle_size) ||
+      r.swizzle > r.max_swizzle_size || (!points && count)) {
+    best.status = Status::InvalidInput; return best;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    const auto& p = points[i];
+    if (p.n != r.n || p.k != r.k || p.world != r.world || p.sm_count != r.sm_count ||
+        p.tile_m != r.tile_m || p.tile_n != r.tile_n || p.tile_k != r.tile_k ||
+        p.epilogue_n != r.epilogue_n || p.stage_policy != r.stage_policy ||
+        p.raster != r.raster || p.swizzle != r.swizzle ||
+        p.dynamic_smem_bytes != r.dynamic_smem_bytes || (r.comm_ctas && p.comm_ctas != r.comm_ctas)) continue;
+    const Mxfp8OprojServices services{p.reference_m,p.sm_count,p.comm_ctas,p.compute_ctas,
+        p.compute_us,p.copy_us,p.producer_us};
+    const auto prediction = score_mxfp8_oproj_bulk(r.m, services);
+    if (!prediction.valid) continue;
+    const bool feed_feasible = prediction.producer_finish_us <= prediction.compute_finish_us;
+    if (best.status != Status::Success || prediction.score_us < best.prediction.score_us ||
+        (prediction.score_us == best.prediction.score_us && p.comm_ctas < best.comm_ctas)) {
+      best.status = Status::Success;
+      best.along_n = r.raster == 1; best.swizzle = r.swizzle;
+      best.comm_ctas = p.comm_ctas; best.compute_ctas = p.compute_ctas;
+      best.feed_feasible = feed_feasible;
+      best.prediction = prediction;
+    }
+  }
+  return best;
+}
+
+inline Mxfp8OprojTuningResult select_mxfp8_oproj_plan(const Mxfp8OprojTuningRequest& r) {
+  return select_mxfp8_oproj_plan(r,kMxfp8OprojCalibrationPoints.data(),kMxfp8OprojCalibrationPoints.size());
+}
+
 struct OProjTuningRequest {
   int64_t m = 0, n = 0, k = 0;
   int32_t world = 0, sm_count = 148, device = 0;

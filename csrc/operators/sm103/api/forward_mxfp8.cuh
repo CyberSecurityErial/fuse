@@ -529,4 +529,240 @@ cudaError_t launch_gemm_a2a_mxfp8_role_telemetry(
 }
 #endif
 
+namespace {
+
+enum class Mxfp8OprojOperation { kFused, kCompute, kCopy, kProducer };
+
+template <int EpilogueN, Mxfp8OprojOperation Operation = Mxfp8OprojOperation::kFused,
+          bool Profile = false>
+cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
+#if FUSE_ENABLE_PROFILING
+    , A2AGemmCtaTimeline* timeline = nullptr, int32_t capacity = 0,
+    A2AGemmPeerTimeline* peers = nullptr, int32_t peer_capacity = 0,
+    Mxfp8ProfileView weight = {}
+#endif
+    ) {
+  using Binding = Mxfp8OprojBinding<EpilogueN>;
+#if FUSE_ENABLE_PROFILING
+  using Gemm = std::conditional_t<Profile, typename Binding::TelemetryGemm, typename Binding::Gemm>;
+  using Comm = std::conditional_t<Profile, typename Binding::TelemetryComm, typename Binding::Comm>;
+  using Kernel = std::conditional_t<Profile, typename Binding::TelemetryKernel, typename Binding::Kernel>;
+#else
+  using Gemm = typename Binding::Gemm;
+  using Comm = typename Binding::Comm;
+  using Kernel = typename Binding::Kernel;
+#endif
+  const auto& projection = p.projection;
+  const auto& g = projection.gemm;
+  const auto& route = projection.route;
+  if (!Comm::supported_geometry(g, route)) return cudaErrorNotSupported;
+  if (!std::isfinite(projection.alpha) || projection.num_comm_ctas <= 0 ||
+      projection.epoch == 0 || projection.lhs_policy != A2ALhsGemmPolicy::kAuto ||
+      !mxfp8_aligned(projection.rhs_nt, 16) || !mxfp8_aligned(projection.output, 16) ||
+      !mxfp8_aligned(p.workspace)) return cudaErrorInvalidValue;
+  const auto workspace = Mxfp8A2AWorkspace::make(g, p.workspace);
+  if (p.workspace_bytes < workspace.bytes) return cudaErrorInvalidValue;
+  size_t data_bytes = 0, scale_bytes = 0;
+  auto status = a2a_gemm_mxfp8_activation_size(g, route, &data_bytes, &scale_bytes);
+  if (status != cudaSuccess) return status;
+  for (int peer = 0; peer < route.world_size; ++peer) {
+    const auto& activation = p.activation[peer];
+    if (!mxfp8_aligned(activation.data) || !mxfp8_aligned(activation.scales) ||
+        activation.data_bytes < data_bytes || activation.scale_bytes < scale_bytes ||
+        (projection.input_epoch && !mxfp8_aligned(projection.peer_input_ready[peer], 4)))
+      return cudaErrorInvalidValue;
+  }
+  DeviceInfo info{};
+  status = device_info(&info);
+  if (status != cudaSuccess) return status;
+  if (projection.num_comm_ctas >= info.sm_count) return cudaErrorInvalidValue;
+
+  GemmProblem packed = g;
+  packed.stride_a.row = packed.stride_b.row = g.k;
+  if constexpr (Operation == Mxfp8OprojOperation::kCompute) {
+    // Same collective/epilogue and resource floor, but no A/W readiness adapter
+    // or producer CTAs. A/W must already be materialized outside this boundary.
+    using PureGemm = typename Binding::Types::PureGemm;
+    using Reference = detail::GemmReferenceKernel<PureGemm, Kernel>;
+    auto pure = gemm_arguments<PureGemm>(packed, workspace.a, workspace.weights.b,
+        projection.output, projection.alpha, projection.num_comm_ctas, info, GemmRaster::kAlongN);
+    pure.mainloop.ptr_SFA = workspace.sfa;
+    pure.mainloop.ptr_SFB = workspace.weights.sfb;
+    pure.mainloop.layout_SFA = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(pure.problem_shape);
+    pure.mainloop.layout_SFB = Mxfp8ScaleConfig::tile_atom_to_shape_SFB(pure.problem_shape);
+    pure.scheduler.block_offset = 0;
+    pure.scheduler.m_window_tiles = p.m_window_tiles;
+    pure.scheduler.n_group_tiles = p.n_group_tiles;
+    if (!PureGemm::TileScheduler::can_implement(pure.scheduler)) return cudaErrorInvalidValue;
+    if (!PureGemm::can_implement(pure) || PureGemm::get_workspace_size(pure) != 0)
+      return cudaErrorNotSupported;
+    return launch_mxfp8_reference<Reference>(PureGemm::to_underlying_arguments(pure, nullptr),
+        info, info.sm_count - projection.num_comm_ctas, stream);
+  }
+  auto args = gemm_arguments<Gemm>(packed, workspace.a, workspace.weights.b,
+      projection.output, projection.alpha, projection.num_comm_ctas, info, GemmRaster::kAlongN);
+  args.scheduler.m_window_tiles = p.m_window_tiles;
+  args.scheduler.n_group_tiles = p.n_group_tiles;
+  if (!Gemm::TileScheduler::can_implement(args.scheduler)) return cudaErrorInvalidValue;
+  args.mainloop.ptr_SFA = workspace.sfa;
+  args.mainloop.ptr_SFB = workspace.weights.sfb;
+  args.mainloop.layout_SFA = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(args.problem_shape);
+  args.mainloop.layout_SFB = Mxfp8ScaleConfig::tile_atom_to_shape_SFB(args.problem_shape);
+  args.mainloop.weight_ready = workspace.weights.ready;
+  args.mainloop.weight_panels = workspace.weights.panels;
+  args.mainloop.weight_epoch = projection.epoch;
+
+  typename Comm::Arguments comm{};
+  comm.params = projection;
+  comm.workspace = workspace;
+  for (int peer = 0; peer < route.world_size; ++peer) comm.activation[peer] = p.activation[peer];
+  comm.weights.source = projection.rhs_nt;
+  comm.weights.workspace = workspace.weights;
+  comm.weights.scales = args.mainloop.layout_SFB;
+  comm.weights.n = g.n;
+  comm.weights.k = g.k;
+  comm.weights.row_stride = b_row_stride(g);
+  comm.weights.epoch = projection.epoch;
+  using Scheduler = typename Gemm::TileScheduler;
+  comm.producer_order = Scheduler::to_underlying_arguments(args.problem_shape,
+      typename Gemm::TileShape{}, typename Gemm::AtomThrShapeMNK{},
+      typename Gemm::ClusterShape{}, args.hw_info, args.scheduler);
+  comm.input_order = detail::A2AInputTileOrder::make(comm.producer_order,
+      g.m / Comm::kReadyBlockM, comm.producer_order.oproj_order);
+  status = Comm::initialize(comm);
+  if (status != cudaSuccess) return status;
+  if constexpr (Operation == Mxfp8OprojOperation::kCopy ||
+                Operation == Mxfp8OprojOperation::kProducer) {
+    // Only A-only diagnostics disable W. Joint producer service uses exactly
+    // production's progress/drain work and full A/W publication granularity.
+    if constexpr (Operation == Mxfp8OprojOperation::kCopy) comm.weights.source = nullptr;
+    using Reference = detail::CopyReferenceKernel<Comm, Kernel, true>;
+    return launch_mxfp8_reference<Reference>(Comm::to_underlying_arguments(comm),
+        info, projection.num_comm_ctas, stream);
+  }
+  args.mainloop.ready = workspace.ready;
+  args.mainloop.world_size = route.world_size;
+  args.mainloop.m_tiles = g.m / Comm::kReadyBlockM;
+  args.mainloop.arrivals_per_peer = Comm::arrivals_per_peer(comm);
+  args.mainloop.k_tiles_per_peer = g.k / route.world_size / Comm::kTileK;
+  // A counters reset every invocation: target is one complete ready unit,
+  // independent of the caller's epoch. W has its separate release epoch.
+  args.mainloop.epoch = 1;
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Profile) {
+    if (!timeline || capacity < info.sm_count) return cudaErrorInvalidValue;
+    args.mainloop.timeline = timeline;
+    args.mainloop.timeline_capacity = capacity;
+    args.mainloop.peer_timeline = peers;
+    args.mainloop.peer_timeline_capacity = peer_capacity;
+    args.mainloop.n_tiles = ceil_div(g.n, 256);
+    args.mainloop.weight_probe = weight;
+    if (const auto* probe = detail::oproj_pipeline_sink) {
+      if (!probe->tiles || probe->m_tiles != args.mainloop.m_tiles ||
+          probe->n_tiles != args.mainloop.n_tiles || probe->k_tiles != g.k / Comm::kTileK ||
+          probe->comm_ctas != projection.num_comm_ctas ||
+          probe->compute_ctas != std::min(probe->m_tiles * probe->n_tiles,
+              info.sm_count - projection.num_comm_ctas)) return cudaErrorInvalidValue;
+      args.mainloop.probe = *probe;
+      args.mainloop.pipeline_probe = *probe;
+      args.epilogue.probe = *probe;
+    }
+    comm.peer_timeline = peers;
+    comm.peer_timeline_capacity = peer_capacity;
+    comm.weights.probe = weight;
+  }
+#endif
+  typename Kernel::Arguments launch_args{};
+  launch_args.gemm = args;
+  launch_args.comm = comm;
+  launch_args.num_comm_ctas = projection.num_comm_ctas;
+#if FUSE_ENABLE_PROFILING
+  if constexpr (Profile) {
+    launch_args.timeline = timeline;
+    launch_args.timeline_capacity = capacity;
+  }
+#endif
+  return launch_monolithic<Kernel>(launch_args, info, stream);
+}
+
+template <Mxfp8OprojOperation Operation>
+cudaError_t dispatch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream) {
+  if (p.epilogue_n == 32) return launch_mxfp8_oproj<32, Operation>(p, stream);
+  if (p.epilogue_n == 64) return launch_mxfp8_oproj<64, Operation>(p, stream);
+  return cudaErrorInvalidValue;
+}
+
+}  // namespace
+
+cudaError_t a2a_gemm_mxfp8_activation_size(const GemmProblem& g,
+    const UlyssesRoute& r, size_t* data_bytes, size_t* scale_bytes) {
+  if (!data_bytes || !scale_bytes) return cudaErrorInvalidValue;
+  if (!Mxfp8A2ALhsInputComm::supported_geometry(g, r)) return cudaErrorNotSupported;
+  const int rows = r.batch * r.global_seq, k = g.k / r.world_size;
+  *data_bytes = Mxfp8Workspace::align(size_t(rows) * k);
+  *scale_bytes = Mxfp8Workspace::align(cute::size(cute::filter_zeros(
+      Mxfp8ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(rows, g.n, k, 1)))));
+  return cudaSuccess;
+}
+
+cudaError_t a2a_gemm_mxfp8_workspace_size(const GemmProblem& g, size_t* bytes) {
+  if (!bytes || !supported_mxfp8_problem(g)) return cudaErrorInvalidValue;
+  *bytes = Mxfp8A2AWorkspace::make(g).bytes;
+  return cudaSuccess;
+}
+
+cudaError_t launch_a2a_gemm_mxfp8_cutlass(const Mxfp8A2AGemmParams& p, cudaStream_t stream) {
+  Mxfp8A2AGemmParams resolved{};
+  auto status = resolve_mxfp8_oproj_communication(p,&resolved);
+  if (status != cudaSuccess) return status;
+  return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kFused>(resolved, stream);
+}
+
+#if FUSE_ENABLE_PROFILING
+cudaError_t launch_a2a_gemm_mxfp8_role_telemetry(
+    const Mxfp8A2AGemmParams& p, A2AGemmCtaTimeline* timeline, int32_t capacity,
+    A2AGemmPeerTimeline* peers, int32_t peer_capacity, Mxfp8ProfileView weight,
+    cudaStream_t stream) {
+  Mxfp8A2AGemmParams resolved{};
+  auto status = resolve_mxfp8_oproj_communication(p, &resolved);
+  if (status != cudaSuccess) return status;
+  if (p.epilogue_n == 32)
+    return launch_mxfp8_oproj<32, Mxfp8OprojOperation::kFused, true>(
+        resolved, stream, timeline, capacity, peers, peer_capacity, weight);
+  if (p.epilogue_n == 64)
+    return launch_mxfp8_oproj<64, Mxfp8OprojOperation::kFused, true>(
+        resolved, stream, timeline, capacity, peers, peer_capacity, weight);
+  return cudaErrorInvalidValue;
+}
+#endif
+
+cudaError_t launch_a2a_gemm_mxfp8_compute_reference(const Mxfp8A2AGemmParams& p, cudaStream_t s) {
+  return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kCompute>(p, s);
+}
+
+cudaError_t launch_a2a_gemm_mxfp8_copy_reference(const Mxfp8A2AGemmParams& p, cudaStream_t s) {
+  return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kCopy>(p, s);
+}
+
+cudaError_t launch_a2a_gemm_mxfp8_producer_reference(const Mxfp8A2AGemmParams& p, cudaStream_t s) {
+  return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kProducer>(p, s);
+}
+
+KernelTraits mxfp8_oproj_cutlass_kernel_traits(int32_t epilogue_n) {
+  if (epilogue_n == 32) return kernel_traits<typename Mxfp8OprojBinding<32>::Kernel>();
+  if (epilogue_n == 64) return kernel_traits<typename Mxfp8OprojBinding<64>::Kernel>();
+  return {};
+}
+
+cudaError_t a2a_gemm_mxfp8_staging_view(const Mxfp8A2AGemmParams& p, Mxfp8Activation* a) {
+  const auto& g = p.projection.gemm;
+  if (!a || !supported_mxfp8_problem(g) || !mxfp8_aligned(p.workspace))
+    return cudaErrorInvalidValue;
+  const auto w = Mxfp8A2AWorkspace::make(g, p.workspace);
+  if (p.workspace_bytes < w.bytes) return cudaErrorInvalidValue;
+  a->data = w.a;
+  a->scales = reinterpret_cast<const uint8_t*>(w.sfa);
+  return gemm_a2a_mxfp8_activation_size(g, &a->data_bytes, &a->scale_bytes);
+}
+
 }  // namespace fuse

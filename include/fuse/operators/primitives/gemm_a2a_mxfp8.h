@@ -7,15 +7,6 @@
 
 namespace fuse {
 
-// Packed row-major E4M3 [M,K], with the pinned CUTLASS native SFA layout.
-// Each consecutive group of 32 K elements shares one UE8M0 scale. The size
-// query includes native scale padding; upstream quantizers must use this layout.
-struct Mxfp8Activation {
-  const Fp8E4m3* data = nullptr;
-  const uint8_t* scales = nullptr;
-  size_t data_bytes = 0, scale_bytes = 0;
-};
-
 enum class Mxfp8WeightPreparation {
   kCommunicationCtas,  // Default: quantize ahead while waiting/sending outputs.
   kAllCtas,           // Control: all resident CTAs quantize, then start GEMM/A2A.

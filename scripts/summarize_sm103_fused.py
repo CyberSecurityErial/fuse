@@ -38,7 +38,7 @@ CONTROL_FILES = ('job.json', 'status.json', 'source-installed.json', 'environmen
 KINDS = {'config', 'device', 'input', 'candidate', 'component_resources', 'correctness', 'route', 'warmup',
          'sample', 'summary', 'candidate_verified', 'validation_self_test', 'validation_oracle',
          'profile_host', 'host_stage', 'input_oracle', 'epilogue_resources', 'epilogue_sample', 'epilogue_cta',
-         'graph_prepare', 'auto_comm', 'quant_validation'}
+         'graph_prepare', 'auto_comm', 'quant_validation', 'producer_validation'}
 GRAPH_EPOCH_MODE = 'recapture_update_v1'
 GRAPH_PREPARE_FIELDS = {'kind', 'line', 'label', 'candidate', 'comm_sm', 'tile', 'generation',
     'component', 'rank', 'launch', 'graph_epoch_mode', 'calls', 'first_epoch', 'last_epoch',
@@ -426,6 +426,8 @@ def parse_log(text, *, completion='last', components=COMPONENTS):
         require(row.get('component', 'fused') in components, 'Unsupported measurement component')
         require(kind != 'quant_validation' or row.get('component') == 'quantize_reference',
                 'Quantization validation requires its explicit reference boundary')
+        require(kind != 'producer_validation' or row.get('component') == 'producer_reference',
+                'Joint production validation requires its explicit reference boundary')
         if kind == 'config':
             profile_detail = row.get('profile_detail')
             profile_world = count(row, 'world', 1)

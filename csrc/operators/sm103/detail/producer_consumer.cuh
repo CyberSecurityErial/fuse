@@ -2,6 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
 
 namespace fuse::detail {
 
@@ -109,6 +110,128 @@ struct ProducerTileOrder {
   }
 };
 
+// Optional OProj rectangle order. Complete an M window through all N groups,
+// preserving the resolved raster/swizzle INSIDE each rectangle. H/P are powers
+// of two; a group narrower than the original minor swizzle clips that swizzle.
+// For AlongN, H=64/P=4/swizzle=8 and C=128, the logical first two waves are:
+//
+//   M 0..31 x N 0..3 -> M32..63 x N 0..3 -> M 0..31 x N 4..7 -> ...
+//
+// A few early W panels can thus feed many compute CTAs, without asking A
+// communication to prepare the entire M dimension first. This is a priority
+// order, not a wave barrier: CTAs still stride by C and wait only on their own
+// complete A[M,peer] and W[N] releases. A uses the exact first-use/inverse below;
+// W's first-use order remains increasing N. Neither ready granularity nor K
+// order changes. H=P=0 uses ProducerTileOrder bit-for-bit, including padding.
+// Tail rectangles are compact (no extra tiles), so the persistent grid and
+// total work count do not change. Host-precomputed divisors avoid new device
+// integer divisions; full-window/group arithmetic uses shifts.
+struct OprojTileOrder {
+  int32_t m_tiles = 0;
+  int32_t m_window_tiles = 0, n_group_tiles = 0;
+  int8_t log_m_window = 0, log_n_group = 0, log_swizzle = 0;
+  bool along_n = true;
+  cutlass::FastDivmodU64 divmod_n{}, divmod_tail_m{}, divmod_tail_n{};
+
+  CUTLASS_HOST_DEVICE bool enabled() const { return m_window_tiles > 0; }
+
+  template <class Params>
+  CUTLASS_HOST static OprojTileOrder make(const Params& p, int32_t h, int32_t g) {
+    OprojTileOrder order{};
+    if (h <= 0 || g <= 0 || (h & (h - 1)) || (g & (g - 1))) return order;
+    order.along_n = p.raster_order_ == Params::RasterOrder::AlongN;
+    const auto major = p.divmod_cluster_blk_major_.divisor;
+    const auto minor = p.divmod_batch_.divisor / major;
+    order.m_tiles = static_cast<int32_t>(order.along_n ? minor : major);
+    const uint64_t n_tiles = order.along_n ? major : minor;
+    order.m_window_tiles = h;
+    order.n_group_tiles = g;
+    while ((uint64_t{1} << order.log_m_window) < static_cast<uint64_t>(h)) ++order.log_m_window;
+    while ((uint64_t{1} << order.log_n_group) < static_cast<uint64_t>(g)) ++order.log_n_group;
+    const int32_t log_minor = order.along_n ? order.log_m_window : order.log_n_group;
+    order.log_swizzle = p.log_swizzle_size_ < log_minor ? p.log_swizzle_size_ : log_minor;
+    order.divmod_n = cutlass::FastDivmodU64(n_tiles);
+    order.divmod_tail_m = cutlass::FastDivmodU64(order.m_tiles % h ? order.m_tiles % h : h);
+    order.divmod_tail_n = cutlass::FastDivmodU64(n_tiles % g ? n_tiles % g : g);
+    return order;
+  }
+
+  template <class Params>
+  CUTLASS_HOST_DEVICE ProducerTileOrder::Tile decode(const Params& p, uint64_t linear) const {
+    if (!enabled()) return ProducerTileOrder::decode(p, linear);
+    if (linear >= p.blocks_per_problem_) return {};
+    uint64_t batch, rest;
+    p.divmod_batch_(batch, rest, linear);
+    const uint64_t m_base = divmod_n.divide(rest >> log_m_window) << log_m_window;
+    rest -= m_base * divmod_n.divisor;
+    const bool tail_m = m_base + m_window_tiles > static_cast<uint64_t>(m_tiles);
+    const uint64_t height = tail_m ? divmod_tail_m.divisor : m_window_tiles;
+    const uint64_t n_base = (tail_m ? divmod_tail_m.divide(rest >> log_n_group)
+                                   : rest >> (log_m_window + log_n_group)) << log_n_group;
+    rest -= n_base * height;
+    const bool tail_n = n_base + n_group_tiles > divmod_n.divisor;
+    const uint64_t major_extent = along_n ? (tail_n ? divmod_tail_n.divisor : n_group_tiles) : height;
+    const uint64_t major_linear = rest >> log_swizzle;
+    const uint64_t group = along_n
+        ? (tail_n ? divmod_tail_n.divide(major_linear) : major_linear >> log_n_group)
+        : (tail_m ? divmod_tail_m.divide(major_linear) : major_linear >> log_m_window);
+    const uint64_t major = major_linear - group * major_extent;
+    const uint64_t minor = (group << log_swizzle) + (rest & ((uint64_t{1} << log_swizzle) - 1));
+    return {static_cast<int32_t>(m_base + (along_n ? minor : major)),
+            static_cast<int32_t>(n_base + (along_n ? major : minor)),
+            static_cast<int32_t>(batch), true};
+  }
+
+  template <class Params>
+  CUTLASS_HOST_DEVICE uint64_t linear(const Params& p, int32_t m, int32_t n, int32_t batch = 0) const {
+    if (!enabled()) return ProducerTileOrder::linear(p, m, n, batch);
+    const uint64_t m_base = (uint64_t(m) >> log_m_window) << log_m_window;
+    const uint64_t n_base = (uint64_t(n) >> log_n_group) << log_n_group;
+    const uint64_t height = m_base + m_window_tiles > static_cast<uint64_t>(m_tiles)
+        ? divmod_tail_m.divisor : m_window_tiles;
+    const uint64_t width = n_base + n_group_tiles > divmod_n.divisor ? divmod_tail_n.divisor : n_group_tiles;
+    const uint64_t minor = along_n ? m - m_base : n - n_base;
+    const uint64_t major = along_n ? n - n_base : m - m_base;
+    const uint64_t in_group = (((minor >> log_swizzle) * (along_n ? width : height) + major)
+        << log_swizzle) + (minor & ((uint64_t{1} << log_swizzle) - 1));
+    return uint64_t(batch) * p.divmod_batch_.divisor + m_base * divmod_n.divisor + n_base * height + in_group;
+  }
+
+  // N=0 is every M's first consumer, and these first-use indices increase
+  // strictly with M. Later N groups leave gaps, not additional A ready units.
+  CUTLASS_HOST_DEVICE uint64_t first_use(uint64_t m) const {
+    const uint64_t m_base = (m >> log_m_window) << log_m_window;
+    const uint64_t local_m = m - m_base;
+    const uint64_t first_n = divmod_n.divisor < static_cast<uint64_t>(n_group_tiles)
+        ? divmod_n.divisor : n_group_tiles;
+    return m_base * divmod_n.divisor + (along_n
+        ? ((local_m >> log_swizzle) * first_n << log_swizzle) +
+            (local_m & ((uint64_t{1} << log_swizzle) - 1))
+        : local_m << log_swizzle);
+  }
+
+  CUTLASS_HOST_DEVICE int32_t lower_bound(uint64_t logical, int32_t real_m_tiles) const {
+    const uint64_t m_base = divmod_n.divide(logical >> log_m_window) << log_m_window;
+    if (m_base >= static_cast<uint64_t>(real_m_tiles)) return real_m_tiles;
+    const uint64_t rest = logical - m_base * divmod_n.divisor;
+    const uint64_t width = uint64_t{1} << log_swizzle;
+    uint64_t local_m;
+    if (along_n) {
+      const bool tail_n = divmod_n.divisor < static_cast<uint64_t>(n_group_tiles);
+      const uint64_t first_n = tail_n ? divmod_tail_n.divisor : n_group_tiles;
+      const uint64_t group = tail_n ? divmod_tail_n.divide(rest >> log_swizzle)
+                                    : rest >> (log_swizzle + log_n_group);
+      const uint64_t offset = rest - (group * first_n << log_swizzle);
+      local_m = (group << log_swizzle) + (offset < width ? offset : width);
+    } else {
+      local_m = (rest + width - 1) >> log_swizzle;
+    }
+    const uint64_t candidate = m_base + (local_m < static_cast<uint64_t>(m_window_tiles)
+        ? local_m : m_window_tiles);
+    return static_cast<int32_t>(candidate < static_cast<uint64_t>(real_m_tiles) ? candidate : real_m_tiles);
+  }
+};
+
 // GEMM-consumption-driven communication scheduling (OProj):
 // OProj communication produces A[M, peer]; all N tiles at that M reuse it.
 // GEMM's resolved tile/raster/swizzle/compute-CTA budget is the input to this
@@ -173,9 +296,11 @@ struct A2AInputTileOrder {
   uint64_t compute_ctas = 0;
   uint64_t group_stride = 1;
   bool along_n = true;
+  OprojTileOrder gemm_order{};
 
   template <class Params>
-  CUTLASS_HOST_DEVICE static A2AInputTileOrder make(const Params& p, int32_t m) {
+  CUTLASS_HOST_DEVICE static A2AInputTileOrder make(
+      const Params& p, int32_t m, const OprojTileOrder& gemm_order = {}) {
     A2AInputTileOrder order{};
     order.m_tiles = m;
     order.log_swizzle = p.log_swizzle_size_;
@@ -185,12 +310,15 @@ struct A2AInputTileOrder {
         ? p.divmod_cluster_blk_major_.divisor
         : p.divmod_batch_.divisor / p.divmod_cluster_blk_major_.divisor);
     order.group_stride = p.divmod_cluster_blk_major_.divisor << order.log_swizzle;
+    order.gemm_order = gemm_order;
+    if (gemm_order.enabled()) order.log_swizzle = gemm_order.log_swizzle;
     return order;
   }
 
   // Factored ProducerTileOrder::linear(m, 0). Its monotonicity lets us find
   // window endpoints in O(1), without scanning tiles or storing a lookup table.
   CUTLASS_HOST_DEVICE uint64_t first_use(uint64_t m) const {
+    if (gemm_order.enabled()) return gemm_order.first_use(m);
     const uint64_t width = uint64_t{1} << log_swizzle;
     return along_n ? (m >> log_swizzle) * group_stride + (m & (width - 1))
                    : m << log_swizzle;
@@ -198,6 +326,7 @@ struct A2AInputTileOrder {
 
   // First valid M whose first_use >= logical; m_tiles is the end sentinel.
   CUTLASS_HOST_DEVICE int32_t lower_bound(uint64_t logical) const {
+    if (gemm_order.enabled()) return gemm_order.lower_bound(logical, m_tiles);
     const uint64_t width = uint64_t{1} << log_swizzle;
     uint64_t m;
     if (along_n) {

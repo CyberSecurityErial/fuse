@@ -52,7 +52,20 @@ class RuntimeModelTests(unittest.TestCase):
         cls.addClassCleanup(cls.directory.cleanup)
         root = Path(cls.directory.name)
         (root / 'cutlass').mkdir()
-        (root / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST_DEVICE\n')
+        (root / 'cutlass/cutlass.h').write_text(
+            '#pragma once\n#define CUTLASS_HOST\n#define CUTLASS_HOST_DEVICE\n')
+        (root / 'cutlass/fast_math.h').write_text(r'''
+#pragma once
+#include <cstdint>
+namespace cutlass {
+struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t v) const { return v / divisor; }
+};
+}
+''')
         source = r'''
 #include <iomanip>
 #include <iostream>

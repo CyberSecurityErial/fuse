@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v20.0
+        default: v21.0
 
 permissions:
   contents: write
@@ -27,9 +27,18 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v20.0");
+              : (process.env.REQUESTED_TAG || "v21.0");
 
             const releases = {
+              "v21.0": {
+                name: "v21.0 — SM103 MXFP8 OProj manual SOTA",
+                body: [
+                  "输入已量化 MXFP8 activation；单个持久化 kernel 完成 A2A、BF16 权重量化和 MXFP8 GEMM，FP32 累加、BF16 输出。",
+                  "优化：搬运与量化分 warp 并行；FP8 使用 cp.async→TMA 混合搬运，scale 成组读取；GEMM/通信共用有界 M/N 遍历；实测选择通信 CTA。",
+                  "36/36 大尺寸长序列物理点，CP4/8×128K/256K/512K，Graph10+50 完整数值/路由校验通过。手工优胜配置 GM1.915 PFLOPS/卡，为满 SM 纯 cuBLASLt 的70.5%；相对历史对照+20.97%，不是单独窗口的同场消融。",
+                  "固化当前手工 SOTA（H64/P4、通信 CTA 20/32/48），不改默认值、不宣称全局最优或 Auto 已适配。最终结果、配置与复现：results/sm103/v21.0；不附调参过程或 profile。",
+                ].join("\n\n"),
+              },
               "v20.0": {
                 name: "v20.0 — SM103 MXFP8 QKV forward and offline CTA autotune",
                 body: [

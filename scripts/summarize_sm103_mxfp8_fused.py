@@ -24,11 +24,19 @@ BOUNDARIES = {
     'copy_reference': 'ready_local_BF16 + BF16_A2A_without_GEMM_or_quantization',
     'quantize_reference': 'BF16_W_to_MXFP8 + panel_ready_reset_and_publication_without_GEMM_or_A2A',
 }
+OPROJ_BOUNDARIES = {
+    'fused': 'MXFP8_A_and_SFA_A2A + BF16_W_quantization + MXFP8_GEMM_to_BF16',
+    'compute_reference': 'prepared_MXFP8_A_and_W + GEMM_to_BF16_without_readiness_or_producers',
+    'copy_reference': 'MXFP8_A_and_SFA_A2A_without_GEMM_or_weight_quantization',
+    'producer_reference': 'MXFP8_A_and_SFA_A2A + BF16_W_quantization_without_GEMM',
+}
+MXFP8_COMPONENTS = tuple(dict.fromkeys((*BOUNDARIES, *OPROJ_BOUNDARIES)))
 
 
 def audit_auto_selection(rows, job, config):
     """Resolve requested zeros using native rank evidence, not inferred timings."""
-    comm, policies, _ = l20d.fused_candidates(job)
+    comm, qkv_policies, oproj_policies = l20d.fused_candidates(job)
+    policies = oproj_policies if job.get('fused_direction') == 'oproj' else qkv_policies
     expected = [(c, policy) for policy in policies for c in comm]
     enabled = job.get('auto_mxfp8_comm', False)
     sf.require(type(enabled) is bool and int(config.get('auto_mxfp8_comm', 0)) == int(enabled),
@@ -49,11 +57,12 @@ def audit_auto_selection(rows, job, config):
         index, rank, budget = (int(row[k]) for k in ('candidate', 'rank', 'comm_sm'))
         sf.require(index in groups and 0 <= rank < world and rank not in groups[index],
                    'Duplicate or unexpected MXFP8 auto candidate/rank')
-        sf.require(row['label'] == 'GEMM_A2A' and row['tile'] == expected[index - 1][1]
+        sf.require(row['label'] == ('A2A_GEMM' if job.get('fused_direction') == 'oproj' else 'GEMM_A2A')
+                   and row['tile'] == expected[index - 1][1]
                    and row['requested_comm'] == row['launch_comm'] == '0'
                    and int(row['resolved_comm']) == budget and 0 < budget < 148,
                    'MXFP8 auto launch/resolved budget mismatch')
-        sf.require(row['model_version'] and 'empty' not in row['model_version'].lower(),
+        sf.require(row['model_version'] and not any(s in row['model_version'].lower() for s in ('empty','unmeasured')),
                    'MXFP8 auto has no measured calibration version')
         sf.finite(row['query_us'], 'auto query_us', 0)
         sf.finite(row['repeat_query_us'], 'auto repeat_query_us', 0)
@@ -77,10 +86,13 @@ def audit_auto_selection(rows, job, config):
 
 def audit_component(rows, job, config, shape, candidate_id, component, epilogue_n):
     """Audit one boundary; shared production bindings do not become C/R/Q work."""
-    sf.require(component in BOUNDARIES, 'Unknown MXFP8 measurement component')
+    sf.require(component in (OPROJ_BOUNDARIES if job.get('fused_direction') == 'oproj' else BOUNDARIES),
+               'Unknown MXFP8 measurement component')
     calibrate, world = bool(job.get('calibrate')), int(job['world'])
     sf.require(component == 'fused' or calibrate, 'Reference requires calibration job')
-    selected = [r for r in rows if r.get('label') == 'GEMM_A2A'
+    oproj = job.get('fused_direction') == 'oproj'
+    label = 'A2A_GEMM' if oproj else 'GEMM_A2A'
+    selected = [r for r in rows if r.get('label') == label
                 and r.get('candidate') == str(candidate_id)]
     candidate = [r for r in selected if r.get('component') == component]
     resolved = [r for r in selected if r['kind'] == 'candidate' and r.get('component') == 'fused']
@@ -92,7 +104,7 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
     sf.require(all(int(r['comm_sm']) == expected_comm and r['tile'] == expected_tile for r in selected),
                'Candidate differs from requested budget/tile')
     timing = sf.audit_timing(candidate, world, mpi=True, launch='graph')
-    domains = ('correctness', 'route') if component == 'fused' else (
+    domains = ('correctness', 'route') if component in ('fused', 'producer_reference') else (
         ('route',) if component == 'copy_reference' else ('correctness',))
     checked = [r for r in candidate if r['kind'] in ('correctness', 'route')]
     checks = {}
@@ -105,7 +117,8 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
                     for phase in (('pre', 'post') if g == 0 else ('pre',)) for rank in range(world))
     sf.require(set(checks) == expected, 'Missing before/after-measurement and changed-payload checks')
     for row in checked:
-        sf.audit_validation(row, shape['seq_local'] * shape['projection_width'])
+        width = (shape['hidden'] if row['kind'] == 'correctness' else shape['q_width']) if oproj else shape['projection_width']
+        sf.audit_validation(row, shape['seq_local'] * width)
     first_warmup = min(r['line'] for r in candidate if r['kind'] == 'warmup')
     for kind in domains:
         for rank in range(world):
@@ -113,8 +126,10 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
                        and checks[kind, 0, 'post', rank]['line'] > timing['summary_line']
                        and checks[kind, 1, 'pre', rank]['line'] > timing['summary_line'],
                        'Checks do not bracket measurement or changed payload precedes measurement')
-    quant_checks = [r for r in candidate if r['kind'] == 'quant_validation']
-    if component == 'quantize_reference':
+    quant_checks = [r for r in candidate if r['kind'] in ('quant_validation', 'producer_validation')]
+    if component in ('quantize_reference', 'producer_reference'):
+        sf.require(all(r['kind'] == ('producer_validation' if component == 'producer_reference' else 'quant_validation')
+                       for r in quant_checks), 'Wrong operand validation boundary')
         sf.require(Counter((int(r['generation']), r.get('validation_phase', 'pre')) for r in quant_checks)
                    == Counter(((0, 'pre'), (0, 'post'), (1, 'pre'))),
                    'Missing quantization represented-operand validation')
@@ -146,19 +161,22 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
     sf.require(Counter(int(r['rank']) for r in devices) == Counter(range(world))
                and all(r.get('runtime_cc') == '10.3' and int(r['sms']) == 148 for r in devices),
                'Missing rank/device budget identity')
-    schedule = sf.resolved_schedule(sf.audit_schedule_config(job, config, rows), 'GEMM_A2A',
-                                    shape['seq_local'], shape['projection_width'], 256)
+    schedule = sf.resolved_schedule(sf.audit_schedule_config(job, config, rows), label,
+                                    shape['seq_local'], shape['hidden'] if oproj else shape['projection_width'], 256)
     compute = min(schedule['scheduled_work_tiles_derived'], 148 - expected_comm)
     sf.require(compute > 0 and expected_comm > 0, 'Invalid compute/communication budget')
     fields = ('comm_sm', 'tile', 'tile_m', 'tile_n', 'tile_k', 'raster', 'max_swizzle_size',
               'effective_swizzle_size', 'scheduled_compute_ctas', 'dynamic_smem')
     configs = {tuple(r[k] for k in fields) for r in resolved}
     sf.require(len(configs) == 1, 'Resolved configurations disagree between ranks/payloads')
+    window = {key: job.get(key, 0) for key in ('oproj_m_window_tiles', 'oproj_n_group_tiles')}
     for row in resolved:
         sf.require(row.get('state') == 'resolved' and tuple(int(row[k]) for k in ('tile_m', 'tile_n', 'tile_k'))
                    == (128, 256, 128) and int(row['threads']) == 256 and int(row['dynamic_smem']) > 0,
                    'Production MXFP8 tile/resources mismatch')
         sf.audit_schedule_row(row, schedule, compute)
+        sf.require(all(int(row.get(key, 0)) == value for key, value in window.items()),
+                   'Production OProj window differs from requested configuration')
     resources = [r for r in candidate if r['kind'] == 'component_resources']
     sf.require(Counter((int(r['generation']), int(r['rank'])) for r in resources)
                == (Counter((g, r) for g in (0, 1) for r in range(world)) if calibrate else Counter()),
@@ -167,6 +185,8 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
         production = checks['candidate', int(row['generation']), 'pre', int(row['rank'])]
         component_compute = compute if component in ('fused', 'compute_reference') else 0
         sf.audit_schedule_row(row, schedule, component_compute)
+        sf.require(all(int(row.get(key, 0)) == value for key, value in window.items()),
+                   'Reference OProj window differs from production configuration')
         sf.require(all(row[k] == production[k] for k in ('tile_m', 'tile_n', 'tile_k'))
                    and int(row['compute_budget']) == 148 - expected_comm
                    and int(row['scheduled_compute_ctas']) == component_compute
@@ -180,9 +200,9 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
                    'Component resources/precision differ from production contract')
         if component != 'fused':
             sf.require(row.get('reference_weight_preparation') == (
-                'inside_timing' if component == 'quantize_reference' else 'outside_timing'),
+                'inside_timing' if component in ('quantize_reference','producer_reference') else 'outside_timing'),
                 'Reference weight preparation boundary mismatch')
-    return timing, dict(zip(fields, next(iter(configs)))), resources, preparation
+    return timing, dict(zip(fields, next(iter(configs)))) | window, resources, preparation
 
 
 def audit_mpi(job, records, data, attempt):
@@ -223,10 +243,10 @@ def audit_mpi(job, records, data, attempt):
                    and entry['sha256'] == sf.digest(raw) and entry['bytes'] == len(raw)
                    and previous <= begin <= end <= len(merged) and merged[begin:end] == raw,
                    'MPI rank evidence differs from manifest/merged bytes')
-        outside, diag = sf.parse_log(merged[previous:begin].decode(), completion='none', components=BOUNDARIES)
+        outside, diag = sf.parse_log(merged[previous:begin].decode(), completion='none', components=MXFP8_COMPONENTS)
         sf.require(not outside and not diag, 'Unowned MPI log evidence')
         rows, diag = sf.parse_log(raw.decode(), completion='last' if rank == 0 and stream == 'stdout' else 'none',
-                                  components=BOUNDARIES)
+                                  components=MXFP8_COMPONENTS)
         if stream == 'stderr':
             sf.require(not rows and not diag, 'Harness evidence in stderr')
         else:
@@ -236,17 +256,19 @@ def audit_mpi(job, records, data, attempt):
                 native = row['kind'] in ('device','input','candidate','component_resources','graph_prepare','auto_comm')
                 sf.require(int(row['rank']) == rank if native else rank == 0, 'Wrong MPI evidence owner')
         previous = end
-    outside, diag = sf.parse_log(merged[previous:].decode(), completion='none', components=BOUNDARIES)
+    outside, diag = sf.parse_log(merged[previous:].decode(), completion='none', components=MXFP8_COMPONENTS)
     sf.require(not outside and not diag, 'Unowned MPI log tail')
 
 
 def audit_run(directory, candidate_id=1, component='fused'):
-    sf.require(component in BOUNDARIES, 'Unknown MXFP8 measurement component')
+    sf.require(component in MXFP8_COMPONENTS, 'Unknown MXFP8 measurement component')
     directory = Path(directory).resolve()
     requested = sf.json_bytes(sf.read_bytes(directory/'job.json', directory))
     sf.require(requested.get('mxfp8') and requested.get('mpi') and not requested.get('profile')
-               and requested.get('fused_direction') == 'qkv' and requested.get('fused_launch') == 'graph'
-               and not requested.get('quick'), 'Not formal MXFP8 QKV MPI')
+               and requested.get('fused_direction') in ('qkv', 'oproj') and requested.get('fused_launch') == 'graph'
+               and not requested.get('quick'), 'Not formal MXFP8 forward MPI')
+    oproj = requested.get('fused_direction') == 'oproj'
+    sf.require(not oproj or component in OPROJ_BOUNDARIES, 'Unknown OProj boundary')
     sf.require(component == 'fused' or requested.get('calibrate'), 'Reference requires calibration job')
     original_workspace, original_mpi_audit = str(l20d.WORKSPACE), sf.audit_mpi_receipts
     try:
@@ -257,7 +279,7 @@ def audit_run(directory, candidate_id=1, component='fused'):
         sf.audit_mpi_receipts = original_mpi_audit
         l20d.configure_workspace(original_workspace)
     attempt = receipts['status.json']['attempt']
-    rows, diagnostics = sf.parse_log(data[f'attempt{attempt}.log'].decode(), completion='any', components=BOUNDARIES)
+    rows, diagnostics = sf.parse_log(data[f'attempt{attempt}.log'].decode(), completion='any', components=MXFP8_COMPONENTS)
     sf.require(not diagnostics, 'Profiling records in formal measurement')
     configs = [r for r in rows if r['kind'] == 'config']
     sf.require(len(configs) == 1, 'Missing/duplicate config')
@@ -269,13 +291,17 @@ def audit_run(directory, candidate_id=1, component='fused'):
                and int(config['warmup']) >= 10 and int(config['samples']) == 50
                and int(config['seed']) == job.get('seed',20260906) and config['profile'] == '0'
                and config['launch'] == 'graph' and config['process_layout'] == 'mpi_one_process_per_gpu'
-               and config['fused_direction'] == 'qkv', 'Measurement config mismatch')
+               and config['fused_direction'] == requested['fused_direction'], 'Measurement config mismatch')
     sf.require(int(config.get('calibrate', 0)) == int(bool(job.get('calibrate'))),
                'Calibration job/config mismatch')
+    sf.require(all(int(config.get(key, 0)) == job.get(key, 0)
+                   for key in ('oproj_m_window_tiles', 'oproj_n_group_tiles')),
+               'OProj window job/config mismatch')
     rank_swizzle = 'rank_n_band_v1' if job.get('qkv_rank_swizzle') else 'off'
     sf.require(config.get('qkv_rank_swizzle', 'off') == rank_swizzle, 'Rank swizzle job/config mismatch')
-    comm, qkv, _ = l20d.fused_candidates(job)
-    sf.require(int(config['candidates']) == len(comm)*len(qkv) and 1 <= candidate_id <= len(comm)*len(qkv),
+    comm, qkv, op = l20d.fused_candidates(job)
+    policies = op if oproj else qkv
+    sf.require(int(config['candidates']) == len(comm)*len(policies) and 1 <= candidate_id <= len(comm)*len(policies),
                'Candidate count/index mismatch')
     precision = [line for line in data[f'attempt{attempt}.log'].decode().splitlines()
                  if line.startswith('precision,mxfp8,')]
@@ -298,7 +324,7 @@ def audit_run(directory, candidate_id=1, component='fused'):
     sf.require(Counter((int(r['generation']),int(r['rank'])) for r in weights)
                == Counter((g,r) for g in (0,1) for r in range(world)), 'Missing regenerated master weights')
     for r in weights:
-        count = shape['hidden'] * shape['projection_width']
+        count = shape['hidden'] * (shape['q_width'] if oproj else shape['projection_width'])
         sf.require(int(r['count']) == count and int(r['finite']) == count
                    and int(r['seed']) == (int(config['seed'])+int(r['generation'])*100003+11)%2**32
                    and r['generator']=='gpu_philox' and r['algorithm']=='curand_philox4x32_10'
@@ -315,17 +341,20 @@ def audit_run(directory, candidate_id=1, component='fused'):
         rows, job, config, shape, candidate_id, component, epilogue_n)
     _, automatic = audit_auto_selection(rows, job, config)
     telemetry = sf.audit_telemetry(data['gpu-telemetry.csv'],receipts['gpu-before.json'],job)
-    flops = 2*shape['seq_local']*shape['projection_width']*shape['hidden']
+    n, k = (shape['hidden'], shape['q_width']) if oproj else (shape['projection_width'], shape['hidden'])
+    flops = 2*shape['seq_local']*n*k
     executed_flops = flops if component in ('fused', 'compute_reference') else 0
     return dict(run_id=job['run_id'],candidate_id=candidate_id,component=component,
         measurement_role='production' if component == 'fused' else 'calibration',
         epilogue_n=epilogue_n,experiment=job['experiment'],world=world,global_seq=shape['global_seq'],
-        m=shape['seq_local'],n=shape['projection_width'],k=shape['hidden'],
+        m=shape['seq_local'],n=n,k=k,
         q_heads=shape['q_heads'],kv_heads=shape['kv_heads'],head_dim=shape['head_dim'],
         qkv_rank_swizzle=rank_swizzle,weight_preparation=fields_precision['weight_preparation'],
-        precision={'copy_reference': 'BF16_copy', 'quantize_reference': 'BF16_to_MXFP8_E4M3_UE8M0'}.get(
+        precision={'copy_reference': 'MXFP8_A_and_SFA_copy' if oproj else 'BF16_copy',
+                   'producer_reference': 'MXFP8_A_and_SFA_copy_plus_BF16_W_quantization',
+                   'quantize_reference': 'BF16_to_MXFP8_E4M3_UE8M0'}.get(
             component, 'MXFP8_E4M3_UE8M0_accFP32_BF16out'),
-        boundary=BOUNDARIES[component], executed_gemm_flops=executed_flops,
+        boundary=(OPROJ_BOUNDARIES if oproj else BOUNDARIES)[component], executed_gemm_flops=executed_flops,
         p50_ms=timing['p50_ms'],p95_ms=timing['p95_ms'],
         pflops_per_rank=executed_flops/timing['p50_ms']/1e12 if executed_flops else None,
         half_drift=timing['half_drift'],selected_round=timing['selected_round'],warmup_calls=timing['warmup_calls'],
@@ -730,7 +759,7 @@ def archive_services(run_paths, output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--component', choices=(*BOUNDARIES, 'all'), default='fused')
+    parser.add_argument('--component', choices=(*MXFP8_COMPONENTS, 'all'), default='fused')
     parser.add_argument('--output', type=Path, help='Explicit destination for the unique aggregate F/C/R/Q table')
     parser.add_argument('--compare-best', type=Path, help='Historical fused-current.json with independent confirmations')
     parser.add_argument('runs', nargs='+')

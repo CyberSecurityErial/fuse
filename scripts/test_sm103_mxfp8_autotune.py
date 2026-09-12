@@ -243,7 +243,20 @@ class Mxfp8AutotuneTests(unittest.TestCase):
         cls.addClassCleanup(temporary.cleanup)
         directory = Path(temporary.name)
         (directory / 'cutlass').mkdir()
-        (directory / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/cutlass.h').write_text(
+            '#pragma once\n#define CUTLASS_HOST\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/fast_math.h').write_text(r'''
+#pragma once
+#include <cstdint>
+namespace cutlass {
+struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t v) const { return v / divisor; }
+};
+}
+''')
         cls.binary = directory / 'model'
         flags = ['-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror']
         # Probe sanitizer support independently so model compile errors cannot

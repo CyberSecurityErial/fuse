@@ -38,17 +38,25 @@ class PersistentTileSchedulerSm100Monolithic
   struct Arguments : BaseArguments {
     int32_t block_offset = 0;
     int32_t n_band_rank = 0;
+    int32_t m_window_tiles = 0;
+    int32_t n_group_tiles = 0;
   };
 
   struct Params : BaseParams {
     uint64_t compute_grid_size = 0;
     int32_t block_offset = 0;
     NBandSwizzle n_band_swizzle{};
+    OprojTileOrder oproj_order{};
   };
 
   static bool can_implement(const Arguments& args) {
     const int swizzle = args.max_swizzle_size;
+    const auto power_of_two = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+    const bool window = args.m_window_tiles != 0 || args.n_group_tiles != 0;
     return args.block_offset >= 0 && args.n_band_rank >= 0 &&
+        (!window || (args.n_band_rank == 0 && power_of_two(args.m_window_tiles) &&
+                     power_of_two(args.n_group_tiles) &&
+                     int64_t{args.m_window_tiles} * args.n_group_tiles <= INT32_MAX)) &&
         (swizzle == 1 || swizzle == 2 || swizzle == 4 || swizzle == 8) &&
         Base::can_implement(static_cast<const BaseArguments&>(args));
   }
@@ -74,6 +82,8 @@ class PersistentTileSchedulerSm100Monolithic
         args, workspace, epilogue_subtiles);
     params.block_offset = args.block_offset;
     params.n_band_swizzle = NBandSwizzle::make(base_params, args.n_band_rank);
+    params.oproj_order = OprojTileOrder::make(
+        base_params, args.m_window_tiles, args.n_group_tiles);
     if (hardware.sm_count > 0) {
       // hardware.sm_count is the caller's COMPUTE budget, excluding comm.
       // CUTLASS truncates this grid to the number of initial work tiles.
@@ -119,7 +129,8 @@ class PersistentTileSchedulerSm100Monolithic
              block_id_in_cluster),
         current_(static_cast<uint64_t>(blockIdx.x) - params.block_offset),
         stride_(params.compute_grid_size),
-        n_band_swizzle_(params.n_band_swizzle) {
+        n_band_swizzle_(params.n_band_swizzle),
+        oproj_order_(params.oproj_order) {
     CUTLASS_ASSERT(blockIdx.y == 0 && blockIdx.z == 0);
     CUTLASS_ASSERT(valid_initial_worker(params, blockIdx.x));
   }
@@ -130,6 +141,10 @@ class PersistentTileSchedulerSm100Monolithic
   }
 
   CUTLASS_DEVICE WorkTileInfo get_current_work() const {
+    if (oproj_order_.enabled()) {
+      const auto tile = oproj_order_.decode(this->scheduler_params, current_);
+      return {tile.m, tile.n, tile.batch, tile.valid};
+    }
 #if FUSE_SM103_QKV_RANK_SWIZZLE
     const auto tile = ProducerTileOrder::decode(this->scheduler_params, current_, n_band_swizzle_);
 #else
@@ -163,6 +178,7 @@ class PersistentTileSchedulerSm100Monolithic
   uint64_t current_;
   uint64_t stride_;
   NBandSwizzle n_band_swizzle_;
+  OprojTileOrder oproj_order_;
 };
 
 // One physical cooperative grid, two persistent CTA roles. Keep exactly
@@ -303,7 +319,7 @@ struct GemmReferenceKernel {
   }
 };
 
-template <class CommOp, class FusedKernel>
+template <class CommOp, class FusedKernel, bool ResetInputs = false>
 struct CopyReferenceKernel {
   using ProductionKernel = FusedKernel;
   using Params = typename CommOp::Params;
@@ -323,6 +339,9 @@ struct CopyReferenceKernel {
   static dim3 get_block_shape() { return FusedKernel::get_block_shape(); }
 
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
+    // Input producers may own invocation-private counters. Preserve their
+    // exact reset/barrier in the standalone service, without dummy GEMM CTAs.
+    if constexpr (ResetInputs) CommOp::initialize_grid(params);
     const int32_t comm_id = static_cast<int32_t>(blockIdx.x);
     const int32_t comm_ctas = params.params.num_comm_ctas;
     if constexpr (CommOp::kNeedsGridFinalize) {

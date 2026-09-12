@@ -21,6 +21,30 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_frozen_source_uses_exact_archive_and_rejects_tampering(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            parent, output = root/'source-test', root/'new-test'
+            parent.mkdir(); output.mkdir()
+            content = b'original native bytes'
+            with tarfile.open(parent/'source.tar.gz', 'w:gz') as tar:
+                item = tarfile.TarInfo('csrc/test.cu')
+                item.size = len(content)
+                tar.addfile(item, io.BytesIO(content))
+            files = {'csrc/test.cu':hashlib.sha256(content).hexdigest()}
+            source_id = hashlib.sha256(json.dumps(files,sort_keys=True).encode()).hexdigest()
+            job = dict(files=files,source_id=source_id,git_head='old-head',
+                       archive_sha256=l20d.sha(parent/'source.tar.gz'))
+            (parent/'job.json').write_text(json.dumps(job))
+            with mock.patch.object(l20d,'LOCAL',root):
+                archive, identity, manifest, head = l20d.frozen_source_package(output,'source-test')
+                self.assertEqual((identity,manifest,head),(source_id,files,'old-head'))
+                self.assertEqual(l20d.sha(archive),job['archive_sha256'])
+                (parent/'source.tar.gz').write_bytes(b'changed')
+                with self.assertRaisesRegex(ValueError,'digest mismatch'):
+                    l20d.frozen_source_package(output,'source-test')
+
     def test_mxfp8_search_is_explicit_and_budgeted(self):
         job = self.fused_job(stage='gemm-probe', directions='qkv', launches='graph',
             gemm_precision='mxfp8', mxfp8_gemm_search=True, gemm_sm_budget=132)
@@ -34,6 +58,15 @@ class WorkflowContracts(unittest.TestCase):
                 l20d.validate_job(job | change)
         ordinary = job | {'mxfp8_gemm_search':False, 'gemm_sm_budget':None}
         self.assertTrue(l20d.gemm_probe_argv(ordinary, Path('/tmp/search-contract'))[0].endswith('/mxfp8_gemm_bench'))
+
+    def test_mxfp8_oproj_independent_calibration_is_explicit(self):
+        job = self.fused_job(mxfp8=True, mpi=True, fused_direction='oproj', fused_launch='graph',
+            oproj_policy_list='m128n256',qkv_policy_list='m128n256',calibrate=True,
+            qkv_policy='m128n256',hidden=4096,q_heads=32,head_dim=128,seq_local=16384,causal=True)
+        l20d.validate_job(job)
+        self.assertIn('--calibrate',l20d.fused_argv(job))
+        with self.assertRaises(ValueError):
+            l20d.validate_job(job | dict(mxfp8_prequantized=True))
 
     @contextlib.contextmanager
     def user_workspace(self):
@@ -136,6 +169,23 @@ class WorkflowContracts(unittest.TestCase):
         argv = l20d.fused_argv(specialized)
         self.assertEqual(argv[argv.index('--mxfp8-weight-preparation') + 1], 'comm_warp')
         self.assertEqual(l20d.fused_device_memory(job), l20d.fused_device_memory(specialized))
+
+    def test_mxfp8_oproj_profile_matches_existing_protocol(self):
+        job = self.fused_job(mxfp8=True, profile=True, fused_direction='oproj',
+            directions='oproj', qkv_policy='m128n256', oproj_policy_list='m128n256',
+            profile_detail='full', host_launch='per_gpu_thread', world=8,
+            hidden=16384, q_heads=128, kv_heads=8, head_dim=128,
+            global_seq=131072, seq_local=None, comm_sm=64, oproj_raster='along_m', max_swizzle_size=8)
+        l20d.validate_job(job)
+        argv = l20d.fused_argv(job)
+        self.assertEqual(argv[argv.index('--profile-direction')+1], 'oproj')
+        detailed = job | {'oproj_pipeline_probe': True}
+        l20d.validate_job(detailed)
+        self.assertIn('--oproj-pipeline-probe', l20d.fused_argv(detailed))
+        for change in ({'mpi':True}, {'directions':'qkv'},
+                       {'mxfp8_prequantized':True}, {'oproj_gap_probe':True}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
 
     def test_mxfp8_comm_warp_cli_reaches_validation_without_external_work(self):
         validate = l20d.validate_job
@@ -731,16 +781,16 @@ int main() {
 enum class Direction { kQkv, kOproj };
 const char* direction_name(Direction d) { return d == Direction::kQkv ? "GEMM_A2A" : "A2A_GEMM"; }
 struct Options {
- bool auto_mxfp8_comm=true, auto_oproj_comm=false, profile=false;
+ bool auto_mxfp8_comm=true, auto_oproj_comm=false, profile=false, oproj=false;
  std::string profile_direction="both";
  std::vector<int> comm_sm_list{16,32,0};
  std::vector<std::string> qkv_policy_list{"m128n256"}, oproj_policy_list{"m128n128"};
- bool run_qkv() const { return true; }
- bool run_oproj() const { return false; }
+ bool run_qkv() const { return !oproj; }
+ bool run_oproj() const { return oproj; }
 };
 struct RankRuntime {
  int device=0, sm_count=148, mxfp8_epilogue_n=32;
- struct { int gemm=1, route=2; } qkv;
+ struct { int gemm=1, route=2; } qkv, oproj;
 };
 int cudaSetDevice(int) { return 0; }
 void set_tile_policy(Direction, const std::string&) {}
@@ -749,8 +799,10 @@ namespace fused_mpi {
  void agree(const std::string&) {}
 }
 namespace fuse {
- namespace detail { constexpr char kMxfp8QkvCalibrationVersion[]="synthetic-test-only"; }
- int mode=0, calls=0;
+ namespace detail { constexpr char kMxfp8QkvCalibrationVersion[]="synthetic-test-only";
+                    constexpr char kMxfp8OprojCalibrationVersion[]="synthetic-op-test-only"; }
+ int mode=0, calls=0, op_calls=0;
+ int recommended_a2a_gemm_mxfp8_comm_ctas(int,int,int e) { assert(e==32); ++op_calls; return 64; }
  int recommended_gemm_a2a_mxfp8_comm_ctas(int, int, int epilogue) {
    assert(epilogue==32); int call=calls++;
    return mode==1 ? 0 : mode==2 ? (call%2 ? 24 : 32) : mode==3 ? (call>=2 ? 24 : 32) : 32;
@@ -770,6 +822,10 @@ int main() {
    try { resolve_auto_candidates(ranks,candidates); } catch (const std::runtime_error&) { rejected=true; }
    assert(rejected);
  }
+ o.oproj=true; fuse::mode=0; candidates=make_candidates(o);
+ assert(candidates.size()==3 && candidates[2].auto_comm && !candidates[0].auto_comm);
+ resolve_auto_candidates(ranks,candidates);
+ assert(candidates[2].comm_sm==64 && fuse::op_calls==4);
 }
 ''')
         executable = self.root / 'mxfp8_auto_query'
@@ -976,6 +1032,33 @@ int main() {
         for layout in ('', 'Rows', 'rows,columns', None, True):
             with self.subTest(layout=layout), self.assertRaises(ValueError):
                 l20d.validate_job(default | dict(oproj_comm_layout=layout))
+
+    def test_mxfp8_oproj_window_is_explicit_and_shared_by_components(self):
+        default = self.fused_job(mxfp8=True, mpi=True, fused_direction='oproj', fused_launch='graph',
+            oproj_policy_list='m128n256', qkv_policy_list='m128n256', calibrate=True,
+            qkv_policy='m128n256', hidden=4096, q_heads=32, head_dim=128, seq_local=16384,
+            causal=True, comm_sm=20)
+        self.assertNotIn('--oproj-m-window-tiles', l20d.fused_argv(default))
+        for h in (64, 128):
+            job = default | dict(oproj_m_window_tiles=h, oproj_n_group_tiles=4)
+            l20d.validate_job(job)
+            argv = l20d.fused_argv(job)
+            self.assertEqual(argv[argv.index('--oproj-m-window-tiles') + 1], str(h))
+            self.assertEqual(argv[argv.index('--oproj-n-group-tiles') + 1], '4')
+            self.assertEqual(l20d.fused_candidates(job), l20d.fused_candidates(default))
+            self.assertEqual(l20d.fused_geometry(job), l20d.fused_geometry(default))
+        grouped = default | dict(oproj_m_window_tiles=64, oproj_n_group_tiles=4)
+        for change in ({'oproj_m_window_tiles': -1}, {'oproj_m_window_tiles': True},
+                       {'oproj_m_window_tiles': '64'}, {'oproj_m_window_tiles': None},
+                       {'oproj_m_window_tiles': 0}, {'oproj_n_group_tiles': 3},
+                       {'oproj_m_window_tiles': 2**30}, {'oproj_n_group_tiles': 2**31},
+                       {'auto_mxfp8_comm': True}, {'comm_sm': None, 'comm_sm_list': None},
+                       {'fused_direction': 'qkv'}, {'stage': 'fused-build'}, {'mxfp8': False}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(grouped | change)
+        list_job = grouped | dict(comm_sm_list='20,24')
+        l20d.validate_job(list_job)
+        self.assertIn('--comm-sm-list', l20d.fused_argv(list_job))
 
     def test_scheduler_padding_is_explicit_and_profile_rejects_only_padded_cases(self):
         self.assertEqual(l20d.fused_scheduler_geometry(128, 128, 128, 8), (1, 1, 1, False))
@@ -1837,6 +1920,25 @@ int main() {
             with self.assertRaisesRegex(RuntimeError, 'heartbeat is stale'):
                 l20d.wait_for_run('stale-test')
         screen.assert_not_called()
+        submit.assert_not_called()
+
+    def test_watch_long_job_transient_read_uses_last_receipt_timeout(self):
+        clock = [0]
+        states = iter([dict(state='running', attempt=1, elapsed_s=300),
+                       None, dict(state='succeeded', attempt=1, elapsed_s=302)])
+        def read(_):
+            clock[0] = max(300, clock[0] + 1)
+            state = next(states)
+            if state is None:
+                raise OSError('temporary object read failure')
+            return state
+        with mock.patch.object(l20d, 'LOCAL', self.root), \
+                mock.patch.object(l20d, 'get_status', side_effect=read), \
+                mock.patch.object(l20d.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(l20d.time, 'sleep'), \
+                mock.patch.object(l20d, 'submit') as submit, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(l20d.wait_for_run('transient-test'), 0)
         submit.assert_not_called()
 
     def test_watch_failure_fetches_diagnostics_without_retry(self):

@@ -15,7 +15,7 @@ def fields(line):
     return dict(re.findall(r'(\w+)=([^,\n]+)', line))
 
 
-def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False):
+def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False, baseline_config=BASELINE):
     folder = Path(folder).resolve()
     fetched = json.loads((folder / 'fetched.json').read_text())
     directories = sorted(folder.glob('artifacts-attempt*/control'))
@@ -38,8 +38,9 @@ def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False):
             if member is None or member.read() != (control / name).read_bytes():
                 raise ValueError('Extracted evidence differs from the verified artifact')
     job = json.loads((control / 'job.json').read_text())
-    if not job.get('mxfp8_gemm_search') or job.get('gemm_sm_budget') != 132:
-        raise ValueError('This report requires explicit 132-CTA pure MXFP8 search')
+    budget = job.get('gemm_sm_budget')
+    if not job.get('mxfp8_gemm_search') or type(budget) is not int or not 1 <= budget <= 148:
+        raise ValueError('This report requires an explicit 1..148-CTA pure MXFP8 search')
     receipt = json.loads((control / 'mxfp8-search-build.json').read_text())
     matrix = {row['id']: row for row in job['gemm_matrix_payload']['shapes']}
     current = None
@@ -84,7 +85,7 @@ def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False):
                 raise ValueError('Missing dual-payload validation or stable samples')
             ms, p95, drift, accepted_round = samples[key]
             shape = matrix[row['id']]
-            if any(row[k] != shape[k] for k in ('m', 'n', 'k')) or row['compute_ctas'] != 132:
+            if any(row[k] != shape[k] for k in ('m', 'n', 'k')) or row['compute_ctas'] != budget:
                 raise ValueError('Result geometry/budget mismatch')
             for reported, measured in ((row['p50_ms'], ms), (row['p95_ms'], p95), (row['drift'], drift)):
                 if not math.isclose(reported, measured, rel_tol=2e-5, abs_tol=2e-7):
@@ -104,7 +105,7 @@ def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False):
                 raise ValueError(f'Missing matrix point: {name}')
             rows.append(skips[name])
             continue
-        baseline = candidates.get((name, BASELINE))
+        baseline = candidates.get((name, baseline_config))
         winner = min(group, key=lambda row: row['p50_ms'])
         grid_best = min((r for r in group if r['search_pass'] == 0), key=lambda r: r['p50_ms'])
         rows.append(dict(**shape, status='passed', candidates=len(group), baseline=baseline,
@@ -114,7 +115,8 @@ def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False):
     gains = [r['gain'] for r in rows if r.get('gain') is not None]
     return dict(schema='sm103_mxfp8_cutlass_search_v1', run_id=job['run_id'],
                 source_id=job.get('source_id'),
-                compute_ctas=132, includes_quantization=False, includes_communication=False,
+                compute_ctas=budget, baseline_config=baseline_config,
+                includes_quantization=False, includes_communication=False,
                 collector='single_gpu_CUDAEvent_around_host_GraphLaunch', warmup=10, samples=50,
                 artifact_sha256=artifact_hash, raw_evidence=str(control), build=receipt,
                 geometric_mean_gain=math.exp(sum(math.log1p(g) for g in gains)/len(gains))-1 if gains else None,
@@ -147,8 +149,8 @@ def merge(first, remaining):
 
 
 def render(report):
-    lines = ['# MXFP8 QKV：独立 GEMM 网格＋邻域搜索', '',
-        '单 GPU、132 个计算 CTA，原配置与优胜配置同轮 Graph 10+50；双随机 payload 全量数值校验。',
+    lines = ['# MXFP8：独立 GEMM 网格＋邻域搜索', '',
+        f"单 GPU、{report['compute_ctas']} 个计算 CTA，原配置与优胜配置同轮 Graph 10+50；双随机 payload 全量数值校验。",
         '不含量化、通信与 overlap；候选范围内最优，不代表融合收益或全局最优。', '',
         '| 矩阵 ID | M×N×K | 原配置 PFLOPS | 最优 PFLOPS | 提升 | 最优参数 | 合格候选 |',
         '|---|---|---:|---:|---:|---|---:|']

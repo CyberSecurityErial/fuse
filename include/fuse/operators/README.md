@@ -24,9 +24,15 @@ be registered once in the selected architecture's private launch layer.
 and `detail/{gemm,cutlass_pipeline,persistent_gemm,a2a_gemm,gemm_a2a,launch}.cuh`
 layout. CMake selects one
 backend for the common public entry points. SM90 retains BF16/FP8 and its
-backward/reference extensions; SM103 currently implements only the two BF16
-forward primitives and their optional role telemetry. Declarations for other SM90 capabilities are not an
-assertion that those symbols are implemented by the SM103 library.
+backward/reference extensions. SM103 provides BF16 forward/backward and
+separate MXFP8 forward primitive headers, `primitives/gemm_a2a_mxfp8.h` and
+`primitives/a2a_gemm_mxfp8.h`. The MXFP8 operands are prequantized activation
+plus BF16 master weights; weight quantization is inside the persistent kernel,
+and the output is BF16. Their shared activation view lives in `types.h`, not
+in either direction's API. These precision-specific headers are included
+explicitly; they are not extra entries in the BF16/FP8 semantic registry.
+MXFP8 OProj role telemetry is not yet implemented. Declarations for other SM90
+capabilities are not an assertion that SM103 implements those symbols.
 
 Do not put model or projection branches into a primitive. A primitive may use
 the specification's declared dataflow contract at compile time, while runtime

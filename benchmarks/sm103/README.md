@@ -1,5 +1,40 @@
 # SM103 Ulysses forward baseline bench
 
+## MXFP8 OProj forward — v21.0 manual SOTA
+
+Input is prequantized MXFP8 E4M3 plus native SFA. A single persistent kernel
+pulls peer activation shards and scales, quantizes BF16 master W, and computes
+MXFP8 GEMM with FP32 accumulation and BF16 output. Upstream activation
+quantization is excluded; A2A and weight quantization are included.
+
+The released [final table and configurations](../../results/sm103/v21.0/README.md)
+cover 36 physical points / 42 model rows, CP4/8 × 128K/256K/512K. Every point
+passed Graph10+50 and two-payload full numerical and byte-exact FP8/SFA routing
+checks. Full-148-SM pure cuBLASLt and same-budget standalone CUTLASS GEMM are
+separate references; neither includes communication or quantization.
+
+The current explicit SOTA uses M128/N256/K128, E32, AlongN, per-point swizzle,
+H64/P4 and measured communication budgets 20/32/48. Four communication warps
+copy A/SFA while four quantize W. FP8 uses cp.async G2S then TMA S2G; scales
+use aligned word gathers. GEMM and A delivery share the bounded M-window /
+N-group mapping; W retains increasing-N first-use order. Full ready units
+and K order are unchanged.
+
+Pass `--oproj-m-window-tiles 64 --oproj-n-group-tiles 4` with the released
+positive communication budget. H/P are GEMM-tile counts, not element counts.
+Defaults remain 0/0 (original traversal). The standalone compute reference
+uses the identical window and compute budget.
+
+This is a manual-SOTA release, not runtime Auto or a global-optimum claim.
+OProj's current producer revision has no matching Auto service calibration:
+`num_comm_ctas=0` returns NotSupported. Existing service/model tools remain
+diagnostic; do not relabel old calibration as current. Profiling is supported
+through the existing OProj protocol and Perfetto exporter.
+
+The catalog runner's historical default c16/AlongN/sw1 is only a bring-up
+baseline, not the released SOTA. Use the per-point commands in the release
+results for replay. Exact source/binary/environment hashes accompany results.
+
 ## MXFP8 QKV forward baseline (v20 development)
 
 The public operands are **prequantized MXFP8 activations and BF16 master weights**:
