@@ -60,6 +60,15 @@ E32 complete/prepared/bare register counts are112/112/99, with no local spills.
 Separately, BLOOM's six-component harness wall time falls434.6→108.9s with
 the independent reference cache; this is testing efficiency, not operator speed.
 
+Rejected transport trial aa7ecaa1: replace the two64-row FP8/BF16 cp.async
+slices with paired2D TMA loads into the same private stage, normal eviction,
+same SFA/full-head release and C20. CPU CP4/8 and all five controls pass, but
+full P/GPU is1.770997/1.616185/0.654029/1.215440/2.209439 in the table's order:
+four regressions, only negligible BLOOM improvement. Runs014842-4efaf4,
+014910-3e6017,014943-52a248,015001-bbeb2c,015025-8b5318 (20260914).
+The TMA code/descriptors are removed; this rejects this concrete transfer
+organization, not TMA in general. Keep the measured parallel-ready baseline.
+
 ## Backward component checkpoint
 
 Register-owned K32 preparation trial: BF16 shared32x256 tile,16B coalesced
