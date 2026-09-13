@@ -433,6 +433,13 @@ G2S/S2G 内含 W progress，不能将新语义套到旧记录。只记录最终�
 BF16 专用 MMA 阶段镜像不用于 block-scaled MXFP8；本入口不声称记录精确 Tensor
 Core 执行时间。可观察每 tile 的 peer acquire 和实际 W panel 等待。
 
+导出元数据 `mxfp8.quant_workers` 保存每个量化 worker 的 chunk 数、首个 begin、
+最后 end，以及最后 chunk 到本 CTA role 结束的尾段。起止先以整数减去本 GPU
+原点再转换为微秒；跨 rank 时间不能直接相减。它只复用已有记录，不增加打点。
+固定 A/W 分工的 OProj 中，W warp 后续不再搬 A；但 QKV 单向交接会在量化后
+继续 route，所以该尾段通称 `after_last_quant_to_role_end_us`，不能统一叫空闲。
+它不是整个量化阶段的关键路径，也不能跨 warp 求和当作可回收的 kernel 时间。
+
 使用独立 profiling 构建、单进程每 GPU 一个 host 线程并发提交，预热诊断 kernel
 10 次后清空记录采一次；输出经完整数值和逐字节 FP8/SFA 路由校验。该入口没有
 host API 内部分段记录，只保留现有 launch/event 诊断。各 rank 独立时间原点。

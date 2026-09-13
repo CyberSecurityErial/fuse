@@ -36,6 +36,9 @@ class QkvPerfettoTests(unittest.TestCase):
         self.assertEqual(result['panel_releases'],2)
         self.assertEqual(result['publication_subphase_chunks'],0)
         self.assertEqual(result['publication_protocol_chunks'],{'legacy_unsplit':48})
+        self.assertEqual(len(result['quant_workers']),8)
+        self.assertEqual(result['quant_workers'][0],dict(rank=0,cta=0,warp=0,chunks=6,
+            first_begin_us=.1,last_end_us=.17,after_last_quant_to_role_end_us=.73))
         self.assertTrue(any(e['name']=='W quantize BF16 -> MXFP8' for e in events))
         self.assertEqual(sum(e['name']=='W fence + arrival counter + warp join' for e in events),48)
         self.assertFalse(any(e['name'] in dict(MXFP8_PUBLICATION_PHASES).values() for e in events))
@@ -44,6 +47,24 @@ class QkvPerfettoTests(unittest.TestCase):
         self.log.write_text('\n'.join(lines[1:]))
         with self.assertRaises(AssertionError):
             append_mxfp8_events([],self.log,job,{0:100},records)
+
+    def test_quant_worker_bounds_subtract_integer_gpu_origin(self):
+        job, records, lines = self.mxfp8_fixture()
+        offset = 2**60
+        stamps = {'begin','quant_done','end','release'}
+        shifted = []
+        for line in lines:
+            fields = line.split(',')
+            for i, field in enumerate(fields[1:],1):
+                key,value = field.split('=')
+                if key in stamps and int(value): fields[i] = f'{key}={int(value)+offset}'
+            shifted.append(','.join(fields))
+        self.log.write_text('\n'.join(shifted))
+        records = {key:{name:value+offset for name,value in row.items()} for key,row in records.items()}
+        result = append_mxfp8_events([],self.log,job,{0:100+offset},records)
+        self.assertEqual(result['quant_workers'][0]['first_begin_us'],.1)
+        self.assertEqual(result['quant_workers'][0]['last_end_us'],.17)
+        self.assertEqual(result['quant_workers'][0]['after_last_quant_to_role_end_us'],.73)
 
     def assert_mxfp8_subspans(self, events, parent_name, phases, protocol):
         parents = [e for e in events if e['name']==parent_name]
