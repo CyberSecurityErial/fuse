@@ -352,6 +352,9 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 
 def validate_job(job, hostname=None):
+    if job.get('cuda_resource_info') and not (job['stage']=='fused-build' or
+            (job['stage']=='build' and job.get('mxfp8_gemm_search'))):
+        raise ValueError('CUDA resource inspection is an opt-in build-only diagnostic')
     weight_tuning = {'backward_weight_epilogue_n': (32,64),
                      'backward_weight_swizzle': (1,2,4,8),
                      'backward_weight_raster': ('along_m','along_n')}
@@ -1415,6 +1418,20 @@ def fused_build_receipt(job, env_id):
     return recorded
 
 
+def collect_cuda_resources(binary, folder):
+    binary=Path(binary).resolve()
+    if not binary.is_relative_to(REMOTE.resolve()) or not binary.is_file():
+        raise ValueError('CUDA resource target must be this workspace executable')
+    tool='/usr/local/cuda/bin/cuobjdump'
+    raw=read_command([tool,'--dump-resource-usage',str(binary)])
+    report=folder/'cuda-resource-info.txt'
+    report.write_text(raw+'\n')
+    write_json(folder/'cuda-resource-info.json',dict(
+        schema='cuda_static_resource_info_v1',binary=str(binary),binary_sha256=sha(binary),
+        tool=tool,version=read_command([tool,'--version']),report_sha256=sha(report),
+        diagnostic_only=True,gpu_work_launched=False))
+
+
 def check_fused_build(job, env_id, folder):
     path = fused_build_dir(job) / '.l20d-build.json'
     if not path.is_file():
@@ -2159,10 +2176,12 @@ def remote(job_path):
             receipt = mxfp8_search_receipt(job, env_id)
             write_json(REMOTE / 'build/sm103-mxfp8-search/.l20d-build.json', receipt)
             write_json(folder / 'mxfp8-search-build.json', receipt)
+            if job.get('cuda_resource_info'): collect_cuda_resources(receipt['binary'],folder)
         elif stage == 'fused-build':
             build_receipt = fused_build_receipt(job, env_id)
             write_json(fused_build_dir(job) / '.l20d-build.json', build_receipt)
             write_json(folder / 'fused-build.json', build_receipt)
+            if job.get('cuda_resource_info'): collect_cuda_resources(build_receipt['binary'],folder)
         elif stage == 'gemm-cutlass-build':
             build_receipt = cutlass_probe_build_receipt(job, env_id)
             write_json(cutlass_probe_library().parent / '.l20d-build.json', build_receipt)
@@ -2227,6 +2246,8 @@ def main():
     run.add_argument('--node', choices=tuple(NODES), default='09')
     run.add_argument('--workspace', type=str, help='Remote user workspace; saved in the job for safe resume')
     run.add_argument('--source-run', help='Reuse the verified local source snapshot of this run, not current Mac edits')
+    run.add_argument('--cuda-resource-info', action='store_true',
+                     help='build-only: archive cuobjdump register/local/shared usage; launches no GPU work')
     run.add_argument('--profile', action='store_true', help='fused stages: separate instrumented build/run')
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
     run.add_argument('--backward', action='store_true', help='reuse BF16 reverse-route harness, separate build directory')

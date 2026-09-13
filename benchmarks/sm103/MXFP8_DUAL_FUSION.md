@@ -658,3 +658,18 @@ These are compute-only, single-GPU measurements with independent random inputs,
 not substitutes for the eight-rank fused boundary. The gap to prepared dX
 warrants testing repeated head-wise acquire/load control and N-tile input reuse;
 it is not by itself a profiler attribution of every microsecond to fences.
+
+A tagged32-bit completed-M cache was tested and removed: source6d50a0e7,
+Llama C32 run211140-150ee2 full3.669848ms versus3.674536ms before (negligible),
+Kimi C32 run211219-671057 full13.075896ms versus12.591144ms (regression).
+All five component audits and bounded CP4 causal test210955-a2c282 passed,
+but semantic correctness without a useful full-boundary gain is insufficient
+to retain this extra state. No completed-row cache remains in production.
+
+Already-ready contiguous-prefix coalescing was also tested and removed:
+source677885c2, bounded causal test212011-15bfea and both large five-component
+audits pass, but Llama run212127-740c11 rises to3.876848ms and Kimi
+run212206-549a4e to13.231496ms. No prefix probe/cache is retained. Static
+resource inspection212818-919314 shows zero stack/local bytes for the QKV
+backward entries; CUTLASS device_kernel already uses GRID_CONSTANT. This
+does not establish a register-spill explanation for the ready-input dX gap.

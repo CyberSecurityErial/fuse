@@ -1840,12 +1840,33 @@ int main() {
         self.assertEqual(memory['headroom_bytes'],
                          (memory['buffer_bytes'] + memory['flag_bytes'] + 9) // 10)
 
+    def test_cuda_resource_inspection_is_read_only_and_workspace_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); workspace=root/'fuse'; folder=root/'report'
+            workspace.mkdir();folder.mkdir()
+            binary=workspace/'kernel';binary.write_bytes(b'private executable')
+            outside=root/'other';outside.write_bytes(b'other executable')
+            with mock.patch.object(l20d,'REMOTE',workspace), mock.patch.object(
+                    l20d,'read_command',side_effect=['REG: 128 LOCAL: 0','CUDA13']) as inspect:
+                l20d.collect_cuda_resources(binary,folder)
+                info=json.loads((folder/'cuda-resource-info.json').read_text())
+                self.assertEqual(info['binary_sha256'],l20d.sha(binary))
+                self.assertFalse(info['gpu_work_launched'])
+                self.assertEqual(info['report_sha256'],l20d.sha(folder/'cuda-resource-info.txt'))
+                with self.assertRaises(ValueError):l20d.collect_cuda_resources(outside,folder)
+                self.assertEqual(inspect.call_count,2)
+                self.assertEqual(inspect.call_args_list[0].args[0][1],'--dump-resource-usage')
+        with self.assertRaises(ValueError):
+            l20d.validate_job(self.fused_job(cuda_resource_info=True))
+
     def test_fused_build_receipt_ignores_controller_docs_but_rejects_stale_binary(self):
         job = self.fused_job(files={'CMakeLists.txt': 'cmake', 'include/fuse/kernel.h': 'header',
                                   'csrc/operators/sm103/entry.cu': 'entry', 'scripts/l20d.py': 'old'})
         same_build = job | {'files': job['files'] | {'scripts/l20d.py': 'new', 'docs/notes.md': 'new',
                                                    'csrc/operators/sm103/README.md': 'new'}}
         self.assertEqual(l20d.fused_build_inputs(job), l20d.fused_build_inputs(same_build))
+        self.assertEqual(l20d.fused_build_inputs(job),
+                         l20d.fused_build_inputs(job|dict(cuda_resource_info=True)))
         validation_header = 'benchmarks/sm103/fused_validation.cuh'
         with_validation = job | {'files': job['files'] | {validation_header: 'gpu-validation-v1'}}
         changed_validation = job | {'files': job['files'] | {validation_header: 'gpu-validation-v2'}}
