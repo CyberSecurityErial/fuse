@@ -174,4 +174,61 @@ cudaError_t launch_oproj_backward_fp8(
     const Fp8OprojBackwardParams& params,
     cudaStream_t stream);
 
+#if FUSE_ARCH_SM103
+// MXFP8 training convention: use the linear layer's usual (straight-through)
+// backward GEMMs, not derivatives of rounding/amax/scale selection. Every
+// required K32 orientation is quantized independently from BF16 master data;
+// a transpose of forward FP8 bytes/scales is NOT the backward representation.
+// FP32 accumulation and BF16 outputs match the existing B/W API. This defines
+// a numerical operator contract, not a claim of end-to-end training convergence.
+//
+// B: upstream provides dY[M,H] quantized along H (same Mxfp8Activation format
+// as forward GEMM+A2A). projection.grad_output is unused. The stored forward
+// BF16 weight remains [H,A]; this call quantizes its [A,H] orientation, computes
+// dA, then performs the exact inverse of forward OProj's HeadToSequence route.
+// All W preparation is INSIDE this boundary; upstream dY quantization is not.
+// Positive num_comm_ctas is required; no BF16 calibration is reused as Auto.
+struct Mxfp8OprojBackwardDataParams {
+  OprojBackwardDataParams projection{};
+  Mxfp8Activation grad_output{};
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
+};
+
+// W: quantize dY^T[H,M] and saved A^T[A,M] independently from their ORIGINAL
+// BF16 [M,H]/[M,A] sources, then dWo=alpha*dY^T*A+beta*dWo. This includes both
+// transpose/quantization kernels and GEMM. saved_attention is the sequence-local
+// full-head forward input, not a head-sharded or forward-quantized byte buffer.
+// Cross-CP dWo reduction is caller-owned, as in BF16. Deferred W requires these
+// BF16 sources to remain alive; no hidden stash or dequantize/requantize occurs.
+struct Mxfp8OprojBackwardWeightParams {
+  OprojBackwardWeightParams projection{};
+  BackwardGemmTuning gemm_tuning{};
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
+};
+
+// Scratch is caller-owned, device-local, 256-byte aligned, and disjoint from
+// operands, outputs and live invocations. B and W may reuse scratch on one
+// stream after B completes. An immediate call is timed as the complete B+W
+// launch sequence; summing independent timings is not that measurement.
+// Tile128x256x128, epilogue_n=0/32 ->32, or64; raster/swizzle stay explicit.
+struct Mxfp8OprojBackwardParams {
+  Mxfp8OprojBackwardDataParams data{};
+  Mxfp8OprojBackwardWeightParams weight{};
+  WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
+};
+
+cudaError_t oproj_backward_mxfp8_data_workspace_size(
+    const OprojBackwardDataParams& params, size_t* bytes);
+cudaError_t oproj_backward_mxfp8_weight_workspace_size(
+    const OprojBackwardWeightParams& params, size_t* bytes);
+cudaError_t launch_oproj_backward_mxfp8_data(
+    const Mxfp8OprojBackwardDataParams& params, cudaStream_t stream);
+cudaError_t launch_oproj_backward_mxfp8_weight(
+    const Mxfp8OprojBackwardWeightParams& params, cudaStream_t stream);
+cudaError_t launch_oproj_backward_mxfp8(
+    const Mxfp8OprojBackwardParams& params, cudaStream_t stream);
+#endif
+
 }  // namespace fuse

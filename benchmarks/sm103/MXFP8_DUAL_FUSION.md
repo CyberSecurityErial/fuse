@@ -339,8 +339,11 @@ into the earlier full-run mean. No new kernel code is needed for this result.
 
 ## Backward implementation boundary
 
-Existing SM103 backward production bindings are BF16. MXFP8 backward is not
-implemented merely because the two forward MXFP8 directions exist.
+The existing released backward bindings are BF16. The new explicit MXFP8
+OProj B/W baseline is implemented and passes small CP4/8 CPU-oracle bring-up;
+its full-matrix performance and profiling are not implemented/verified yet.
+QKV MXFP8 backward remains unimplemented. Neither backward performance target
+is achieved merely because the forward MXFP8 directions exist.
 
 | Projection | B/data-gradient phase | W/weight-gradient phase |
 |---|---|---|
@@ -355,10 +358,47 @@ boundary is timed and preserve any required saved-operand lifetime.
 MXFP8 scales describe groups of32 along a specific reduction axis. Transposing
 FP8 bytes and reusing their original scales does not generally produce a
 valid K32 representation for a transposed GEMM. Before implementing the new
-interfaces, explicitly define source/saved representations, gradient and master
-weight quantization, transposed scale construction, accumulation dtype and the
-independent reference. Quantization/transpose work may not silently disappear
-from timing or be replaced by a BF16 result labelled MXFP8.
+interfaces, the source/saved representations, gradient and master weight
+quantization, transposed scale construction, accumulation dtype and independent
+reference must be explicit. Quantization/transpose work may not silently
+disappear from timing or be replaced by a BF16 result labelled MXFP8.
+
+### Explicit OProj MXFP8 backward baseline
+
+The API declares a straight-through low-precision training convention: ordinary
+linear-layer backward GEMMs, with each required operand orientation quantized
+from its original BF16 source. It does not differentiate rounding/amax or claim
+full-model training convergence. Independently quantizing both K32 orientations
+from high precision is consistent with [Transformer Engine's MXFP8 recipe](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html).
+
+| Boundary | Sources / operations | Output |
+|---|---|---|
+| B/data gradient | Upstream K-H-quantized dY[M,H]; inside B, BF16 W[H,A]→K32 MXFP8 W^T[A,H]; GEMM then inverse OProj A2A | BF16 head-sharded dA |
+| W/weight gradient | Inside W, original BF16 dY[M,H] and saved sequence-local BF16 A[M,A] independently transpose/quantize along M; GEMM with alpha/beta | BF16 local partial dW[H,A] |
+| Immediate | Actual B then W launches on one stream; preparation included | Both gradients; cross-CP dW reduction remains caller-owned |
+
+Upstream dY quantization is the declared external boundary, not W preparation.
+Saved A must be the original BF16 tensor, not dequantized forward FP8 bytes.
+Deferred W preserves the existing operand-lifetime requirement. All GEMMs use
+FP32 accumulation; BF16 gradient accumulation/output matches the older B/W API.
+The first implementation uses explicit transpose/quantization kernels, a padded
+32x32 shared tile, and the existing persistent output-tile publisher and inverse
+head route. It does not yet claim preparation/communication overlap. Forward
+BF16/SM90 and the accepted forward MXFP8 algorithms are unchanged.
+
+Build180040-d0f579 and checks180105-5ab606/180136-448f38 pass CPU-oracle bring-up
+at CP4/8, M128/H128/A1024: two Philox payloads with row/column-varying dynamic
+range, ordinary/causal-balanced routing, E32/E64 with different raster/swizzle,
+full dA/dW numerical checks and byte-exact inverse routing. Deferred B leaves
+dW untouched; subsequent beta1 W passes. All16 case summaries and both terminal
+checks were independently audited against archived receipts and hashes.
+The subsequent M256/H256/A1024 CP8 run180737-631610 (build180625-992008) also
+passes all eight cases plus deferred/beta1, exercising multiple dA output and
+dW K tiles. Native operator code is identical; only the bounded oracle harness
+accepts the larger dimensions. Its receipt and case coverage were re-audited.
+This is explicitly not a Graph10+50 long-sequence throughput result. Next,
+extend the MPI/full-matrix measurement and independent represented-operand
+reference; preserve true immediate B+W timing rather than summing isolated times.
 
 ## Evidence and iteration
 

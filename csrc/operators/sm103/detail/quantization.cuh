@@ -288,6 +288,53 @@ __global__ void quantize_mxfp8_operand(const Bf16* input, Fp8E4m3* output,
   }
 }
 
+// Transposed K32 preparation for backward. Coalesced BF16 source rows enter
+// a padded shared tile, then warps read its columns as contiguous output K32
+// groups. Padding avoids shared-bank conflicts; the two CTA barriers protect
+// both handoff and reuse. No global BF16 transpose or re-quantized FP8 source.
+//
+// source[k,row] --32x32 shared tile--> output[row,k] + scale[row,k/32]
+//   contiguous loads                     warp amax over the NEW K axis
+//
+// The destination's padded scale rows are written as zero-group scale1 too.
+// Data writes stay within actual rows. Source rows (K) are multiples of128;
+// tail output rows are predicated. This is a preparation baseline, not a
+// claim that its launches overlap with communication or reach peak bandwidth.
+template <class ScaleLayout>
+__global__ void quantize_mxfp8_transposed_operand(const Bf16* input,
+    Fp8E4m3* output, cutlass::float_ue8m0_t* scales, int rows, int k,
+    int64_t source_stride, ScaleLayout scale_layout) {
+  __shared__ float tile[32][33];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int64_t row_tiles = (int64_t{rows} + 127) / 128 * 4;
+  const int64_t k_tiles = k / 32;
+  for (int64_t t = blockIdx.x; t < row_tiles * k_tiles; t += gridDim.x) {
+    const int row_base = int(t / k_tiles) * 32;
+    const int k_base = int(t % k_tiles) * 32;
+    #pragma unroll
+    for (int i = warp; i < 32; i += 8) {
+      tile[i][lane] = row_base + lane < rows
+          ? float(input[int64_t{k_base + i} * source_stride + row_base + lane]) : 0.0f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = warp; i < 32; i += 8) {
+      const int row = row_base + i, column = k_base + lane;
+      const float value = float(tile[lane][i]);
+      float amax = fabsf(value);
+      for (int mask = 16; mask; mask >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, mask));
+      const int exponent = mxfp8_scale_exponent(amax);
+      if (row < rows)
+        output[int64_t{row} * k + column] = Fp8E4m3(mxfp8_scaled_value(value, exponent));
+      if (lane == 0)
+        reinterpret_cast<uint8_t*>(scales)[scale_layout(cute::make_coord(row, column, 0))] =
+            static_cast<uint8_t>(exponent + 127);
+    }
+    __syncthreads();
+  }
+}
+
 // A bounded SIMT side task for a communication warp. Quantization groups,
 // scheduling chunks and GEMM readiness are deliberately different units:
 //   32 K values -> one scale; 32 groups -> one progress step;

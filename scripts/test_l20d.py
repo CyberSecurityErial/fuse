@@ -137,6 +137,21 @@ class WorkflowContracts(unittest.TestCase):
                 l20d.validate_job(self.fused_job(mxfp8=True, fused_direction='qkv',
                     qkv_policy='auto', mxfp8_weight_preparation='comm_warp') | changes)
 
+    def test_mxfp8_backward_is_explicit_bringup_not_forward_or_formal(self):
+        for world in (4, 8):
+            job = self.fused_job(mxfp8=True, backward=True, mpi=False,
+                fused_direction='oproj', world=world, global_seq=128*world, seq_local=None,
+                hidden=128, q_heads=8, kv_heads=8, head_dim=128, comm_sm=4,
+                qkv_policy='auto', fused_launch='eager')
+            l20d.validate_job(job)
+            self.assertEqual(l20d.fused_binary(job).name, 'backward_mxfp8_smoke')
+            self.assertEqual(l20d.fused_argv(job)[1:], ['--world', str(world), '--m', '128', '--hidden', '128'])
+            for change in ({'mpi': True}, {'profile': True}, {'fused_direction': 'qkv'},
+                           {'global_seq': 512*world}, {'hidden': 512}, {'comm_sm': 8},
+                           {'fused_launch': 'graph'}, {'mxfp8_weight_preparation': 'all'}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    l20d.validate_job(job | change)
+
     def test_mxfp8_calibration_reuses_graph_and_separate_flags(self):
         job = self.fused_job(mxfp8=True, mpi=True, calibrate=True,
                              fused_direction='qkv', qkv_policy='auto', fused_launch='graph')

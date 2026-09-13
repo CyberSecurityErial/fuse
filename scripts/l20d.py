@@ -419,12 +419,26 @@ def validate_job(job, hostname=None):
         raise ValueError('Automatic MXFP8 CTAs require MPI Graph dynamic-weight ordinary comm and explicit raster')
     if job.get('mxfp8'):
         if job['stage'] not in FUSED_STAGES or any(job.get(k) for k in (
-                'backward', 'quick', 'compute_only', 'cpu_oracle',
+                'quick', 'compute_only', 'cpu_oracle',
                 'validation_self_test', 'fused_counters', 'auto_oproj_comm', 'qkv_rank_swizzle')):
             raise ValueError('MXFP8 baseline requires isolated forward build/smoke without BF16 tuning/diagnostics')
+        if job.get('backward'):
+            if (job.get('mpi') or job.get('profile') or job.get('calibrate') or
+                    job.get('auto_mxfp8_comm') or job.get('mxfp8_prequantized') or
+                    job.get('mxfp8_weight_preparation') not in (None, 'comm') or
+                    job.get('qkv_postprocess') or job.get('oproj_postnorm') or
+                    job.get('fused_launch', 'eager') != 'eager'):
+                raise ValueError('MXFP8 backward currently supports only isolated CPU-oracle bring-up, not formal/profile/MPI')
+            if job['stage'] == 'fused-smoke':
+                s = fused_geometry(job)
+                if (job.get('fused_direction') != 'oproj' or s['world'] not in (4, 8) or
+                        s['seq_local'] not in (128,256) or s['hidden'] not in (128,256) or
+                        s['q_heads'] != 8 or s['head_dim'] != 128 or
+                        job.get('comm_sm') != 4 or job.get('comm_sm_list') is not None):
+                    raise ValueError('MXFP8 backward bring-up is explicitly OProj M/H128|256, Q8/D128, CP4/8, C4')
         if job['stage'] == 'fused-smoke' and job.get('fused_direction') not in ('qkv', 'oproj'):
             raise ValueError('MXFP8 requires one forward direction')
-        if job['stage'] == 'fused-smoke' and job.get('fused_direction') == 'oproj':
+        if job['stage'] == 'fused-smoke' and job.get('fused_direction') == 'oproj' and not job.get('backward'):
             if (job.get('mxfp8_prequantized') or
                     job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm', 'all') or
                     job.get('oproj_policy_list') != 'm128n256' or
@@ -460,7 +474,7 @@ def validate_job(job, hostname=None):
             raise ValueError('Backward baseline requires isolated build/smoke without forward tuning or diagnostics')
         if job.get('profile') and not job.get('backward_gemm_sweep') and (not job.get('mpi') or job.get('backward_matrix') or job.get('backward_matrix_payload')):
             raise ValueError('Backward role profiling requires one MPI case')
-        if job['stage'] == 'fused-smoke' and not job.get('mpi') and job.get('world',8) != 8:
+        if job['stage'] == 'fused-smoke' and not job.get('mpi') and not job.get('mxfp8') and job.get('world',8) != 8:
             raise ValueError('Shared backward smoke validates CP4 and CP8 with eight visible GPUs')
         if job['stage'] == 'fused-smoke' and job.get('mpi'):
             if job.get('fused_direction') not in ('qkv','oproj') or job.get('warmup',10)<10 or job.get('iterations',50)<50:
@@ -1179,6 +1193,8 @@ def fused_build_dir(job):
 
 
 def fused_binary(job):
+    if job.get('backward') and job.get('mxfp8'):
+        return fused_build_dir(job) / 'backward_mxfp8_smoke'
     if job.get('mxfp8'):
         return fused_build_dir(job) / ('fused_mxfp8_mpi' if job.get('mpi') else 'fused_mxfp8')
     if job.get('backward'):
@@ -1215,7 +1231,8 @@ def fused_build_inputs(job):
     selected = {name: digest for name, digest in job['files'].items()
                 if name in ('CMakeLists.txt', 'benchmarks/sm103/fused_bf16.cu') or
                 (job.get('backward') and name.startswith('benchmarks/sm90/backward/') and name.endswith('.cu')) or
-                (job.get('backward') and name.startswith('benchmarks/sm103/backward/') and name.endswith('.cuh')) or
+                (job.get('backward') and name.startswith('benchmarks/sm103/backward/') and
+                 PurePosixPath(name).suffix in ('.cu', '.cuh')) or
                 (name.startswith('benchmarks/sm103/fused_') and
                  PurePosixPath(name).suffix in ('.h', '.hpp', '.cuh')) or
                 (name.startswith(('cmake/', 'include/', 'csrc/operators/sm103/')) and
@@ -1242,6 +1259,10 @@ def fused_argv(job):
         return ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_command)]
     if job['stage'] != 'fused-smoke':
         raise ValueError('Expected a fused stage')
+    if job.get('backward') and job.get('mxfp8'):
+        shape = fused_geometry(job)
+        return [str(fused_binary(job)), '--world', str(shape['world']),
+                '--m', str(shape['seq_local']), '--hidden', str(shape['hidden'])]
     if job.get('backward'):
         if not job.get('mpi'):
             return [str(fused_binary(job))]

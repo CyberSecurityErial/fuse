@@ -192,7 +192,8 @@ inline bool supported_mxfp8_problem(const GemmProblem& p) {
   return supported_problem(p) && p.k % 128 == 0;
 }
 
-template <int BlockN = 256, int BlockK = 128, int EpilogueN = 64, int Stages = 0>
+template <int BlockN = 256, int BlockK = 128, int EpilogueN = 64, int Stages = 0,
+          class SourceElement = void>
 struct Mxfp8GemmFamily {
   using Input = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
@@ -200,7 +201,7 @@ struct Mxfp8GemmFamily {
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, TileShape, ClusterShape,
       cute::Shape<cute::_128, cute::Int<EpilogueN>>, float, float,
-      void, LayoutD, kAlignment, Bf16, LayoutD, kAlignment,
+      SourceElement, LayoutD, kAlignment, Bf16, LayoutD, kAlignment,
       cutlass::epilogue::TmaWarpSpecialized1Sm>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass, Input, LayoutA, 16, Input, LayoutB, 16,

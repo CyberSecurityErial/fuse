@@ -28,3 +28,4 @@ thread_local const OprojPipelineView* oproj_pipeline_sink = nullptr;
 #include "api/forward_mxfp8.cuh"
 #include "api/reference.cuh"
 #include "api/backward.cuh"
+#include "api/backward_mxfp8.cuh"
