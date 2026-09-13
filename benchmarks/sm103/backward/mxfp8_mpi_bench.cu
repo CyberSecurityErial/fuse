@@ -17,9 +17,9 @@
 using fuse::Bf16;
 using mxfp8_reference::check;
 
-enum class Component { kFull, kData, kWeight, kWeightCompute, kDataCompute };
+enum class Component { kFull, kData, kWeight, kWeightCompute, kDataCompute, kDataGemm };
 const char* component_name(Component c){
-  return c==Component::kDataCompute?"data_compute":c==Component::kFull?"full":c==Component::kData?"data":
+  return c==Component::kDataGemm?"data_gemm":c==Component::kDataCompute?"data_compute":c==Component::kFull?"full":c==Component::kData?"data":
       c==Component::kWeight?"weight":"weight_compute";
 }
 
@@ -251,7 +251,7 @@ struct Runtime {
         <<" square_sum="<<stats.square_sum<<" min="<<stats.minimum<<" max="<<stats.maximum<<'\n';
   }
   void poison(const Options& o){
-    if(component==Component::kDataCompute){
+    if(component==Component::kDataCompute || component==Component::kDataGemm){
       check(cudaMemsetAsync(da,0xff,size_t(o.m)*o.h*sizeof(Bf16),stream));
       check(cudaStreamSynchronize(stream));fused_mpi::barrier();return;
     }
@@ -293,6 +293,8 @@ struct Runtime {
   std::vector<float> step(fused_graph::Operation& graph){
     graph.prepare(graph.committed_epoch()+1,[this](uint32_t epoch,cudaStream_t s){
       if(qkv){
+        if(component==Component::kDataGemm)
+          return fuse::launch_qkv_backward_mxfp8_data_gemm_reference(qkv_params.data,s);
         if(component==Component::kDataCompute)
           return fuse::launch_qkv_backward_mxfp8_data_compute_reference(qkv_params.data,s);
         if(component==Component::kWeight)return fuse::launch_qkv_backward_mxfp8_weight(qkv_params.weight,s);
@@ -416,6 +418,7 @@ void run(const Options& o){
       <<" calibrate="<<o.calibrate
       <<" weight_compute_reference="<<o.calibrate
       <<" data_compute_reference="<<(o.qkv && o.calibrate)
+      <<" data_gemm_reference="<<(o.qkv && o.calibrate)
       <<(o.qkv?" timed=weight_quant_inverse_QKV_dX_dQKV_quant_X_quant_dW upstream_dQ_dK_dV_quant=excluded original_BF16_route=included input_lease=all_ranks_until_B_complete":
           " timed=weight_quant_dA_route_dY_quant_A_quant_dW upstream_dY_quant=excluded")
       <<" CP_dW_reduce=caller_owned"
@@ -448,9 +451,10 @@ void run(const Options& o){
         <<" pflops="<<flops/(result.p50*1e12)<<" verification=pass\n"<<std::flush;
     auto components=std::vector<Component>{Component::kData,Component::kWeight,Component::kWeightCompute};
     if(o.qkv)components.insert(components.begin()+1,Component::kDataCompute);
+    if(o.qkv)components.insert(components.begin()+2,Component::kDataGemm);
     if(o.calibrate)for(Component component:components){
       r.component=component;
-      const std::vector<L> boundary=component==Component::kDataCompute?
+      const std::vector<L> boundary=(component==Component::kDataCompute || component==Component::kDataGemm)?
           std::vector<L>{L::kCooperativeDynamic}:component==Component::kData?
           std::vector<L>{L::kOrdinaryStatic,L::kCooperativeDynamic}:
           component==Component::kWeightCompute?std::vector<L>{L::kOrdinaryDynamic}:
@@ -459,6 +463,8 @@ void run(const Options& o){
           component==Component::kData?r.native_epoch():0,boundary);
       // dX compute follows completed B, before W can overwrite its scratch;
       // it preserves the original ready flags, budget and acquire adapter.
+      // The following bare dX uses the same inputs/budget/ranks but removes
+      // ONLY that adapter. Neither diagnostic may run after W reuses scratch.
       // W compute immediately follows completed full W: its exact prepared
       // operands/scales remain in scratch. Only dW is poisoned; no preparation
       // enters the single-kernel Graph. The oracle still reads original BF16.

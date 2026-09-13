@@ -211,18 +211,21 @@ int main(){check<true>();check<false>();}
                            header.index('using Bf16QkvBackwardDataParams'))
 
     def test_qkv_async_transport_slices_preserve_one_complete_head(self):
+        text=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
+        route=text[text.index('struct Mxfp8QkvBackwardPullComm'):]
+        copy_rows=int(route.split('kCopyRows = ')[1].split(';')[0])
+        self.assertEqual(128%copy_rows,0)
+        self.assertLessEqual(8*copy_rows*128*3,192*1024)
         for elements_per_vector in (16,8):
             owners=Counter()
-            for start in range(0,128,16):
+            for start in range(0,128,copy_rows):
                 for lane in range(32):
-                    for i in range(lane,16*128//elements_per_vector,32):
+                    for i in range(lane,copy_rows*128//elements_per_vector,32):
                         row=start+i//(128//elements_per_vector)
                         col=i%(128//elements_per_vector)*elements_per_vector
                         for j in range(elements_per_vector):owners[row,col+j]+=1
             self.assertEqual(set(owners),{(r,c) for r in range(128) for c in range(128)})
             self.assertEqual(set(owners.values()),{1})
-        text=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
-        route=text[text.index('struct Mxfp8QkvBackwardPullComm'):]
         self.assertIn('cute::cp_async_wait<0>()',route)
         self.assertEqual(route.count('detail::store_release_system('),1)
         self.assertLess(route.index('cute::cp_async_wait<0>()'),route.index('detail::store_release_system('))
@@ -309,6 +312,21 @@ int main(){check<true>();check<false>();}
         self.assertIn('original_BF16_route=included',text)
         self.assertIn('input_lease=all_ranks_until_B_complete',text)
         self.assertIn('(heads+(qkv?2*kv_heads:0))*128',text)
+
+    def test_bare_dx_is_a_separate_completed_input_diagnostic(self):
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        harness=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        header=(ROOT/'include/fuse/operators/ulysses/qkv_backward.h').read_text()
+        auditor=(ROOT/'scripts/summarize_sm103_mxfp8_backward.py').read_text()
+        self.assertIn('bool WaitInput = true',api)
+        self.assertIn('static_assert(WaitInput || !Prepare',api)
+        self.assertIn('std::conditional_t<WaitInput,ReadyMainloop,typename Types::Mainloop>',api)
+        self.assertIn('qkv_backward_mxfp8_data_impl<32,false,false>',api)
+        self.assertIn('components.insert(components.begin()+2,Component::kDataGemm)',harness)
+        self.assertIn('component==Component::kDataCompute || component==Component::kDataGemm',harness)
+        self.assertIn('Never use this entry while input production is in flight',header)
+        self.assertIn("c.get('data_gemm_reference')=='1'",auditor)
+        self.assertIn('prepared_dX_same_budget_stock_collective_no_adapter_quantization_or_transport',auditor)
 
 
 if __name__ == '__main__':

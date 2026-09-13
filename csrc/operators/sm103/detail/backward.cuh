@@ -425,7 +425,7 @@ struct Mxfp8QkvBackwardPullComm {
   using ScaleLayout = decltype(Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
       cute::make_shape(int{}, int{}, int{}, 1)));
   static constexpr int kMinThreads = 256;
-  static constexpr int kCopyRows = 16;
+  static constexpr int kCopyRows = 64;
   static constexpr int kWarpStageBytes = kCopyRows * 128 * 3;
   static constexpr size_t SharedStorageBytes = 8 * kWarpStageBytes;
   static constexpr bool kNeedsGridFinalize = false;
@@ -486,12 +486,14 @@ struct Mxfp8QkvBackwardPullComm {
       const int source_row=batch*a.route.global_seq+
           QkvBackwardPushCommT<128>::global_sequence_row(a.route,p.rank,row%a.route.seq_local);
       const int source_width=local_heads*128;
-      // One warp owns a 6KiB stage: 16 rows of FP8 plus original BF16.
+      // One warp owns a 24KiB stage: 64 rows of FP8 plus original BF16.
+      // Two transport slices amortize commit/wait and warp joins, with a
+      // bounded total192KiB shared reservation for the eight copy warps.
       // Issue both strided inputs asynchronously before waiting, instead of
       // serial remote-load -> dependent local-store chains. The intermediate
       // slices are PRIVATE transport stages, not smaller publication units:
       //
-      //   [FP8 G2S + BF16 G2S] -> wait -> both local stores   x8 slices
+      //   [FP8 G2S + BF16 G2S] -> wait -> both local stores   x2 slices
       //   [complete SFA atom] --------------------------------> head ready
       //
       // All128 rows/scales still precede the one existing system release.

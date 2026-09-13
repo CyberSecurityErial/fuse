@@ -738,3 +738,49 @@ prepared dX1.558416ms; dW is unchanged. Kimi222958-512a4d full10.807920ms/
 1.602279P, prepared dX5.575232ms and dW4.304376ms. Its previous direct-collective
 control still used the old dW epilogue, so its full gain cannot be attributed
 solely to the iterator. No new CUDA/public file is introduced.
+
+A private two-slot cp.async transport trial (sourcebbcc20c5, original whole-head
+publication) is rejected: same C32 Llama224207-d805e8 is1.786597P (+0.57%),
+Kimi224356-75bcf9 is1.587751P (-0.91%). Llama C20 224540-8b6a48 is1.780842P,
+but has no same-C20 single-slot control. All five component audits pass; mixed
+gains do not justify doubling communication storage48→96KiB. The extra slots,
+stage logic and trial-specific test were removed, not retained behind a flag.
+
+Whole-head M-cohort narrowing also does not transfer the independent AlongM
+winner. Source15cf21e3 uses max(1,8*comm/heads), original5e24057b uses8*comm;
+all other parameters match. Llama225906-0e6de8→230420-c0e0fc full1.336796→
+1.369708P (+2.46%), Kimi225944-55f06b→230459-16a356 1.222639→1.202496P
+(-1.65%). All five audits pass. Both remain below the existing AlongN controls;
+revert the cohort formula and trial-specific tests instead of adding a knob.
+
+Local GPU-acquire/SYSTEM-release control sourced9ae9e99 has no meaningful
+gain: Llama231718-459471 full1.778878P/prepared dX1.552168ms, Kimi231751-8f358e
+full1.602419P/prepared dX5.582312ms; all five original audits pass, as does
+CP4 causal231700-9a8fbc. The original SYSTEM consumer is restored. Earlier
+231202-b9c603 was rejected before kernel launch because the old parameter
+guard coupled head counts above8 to SYSTEM scope; it was not a numerical
+failure or valid performance sample. Neither the scope change nor its extra
+guard/tests are retained. The fixed-head iterator remains the measured winner.
+
+At C20, increasing each copy warp's private slice16→64 rows (same complete
+M128/head release, queue and GEMM) is effective. Source0a8ab986 C20 Llama
+232749-abd475 full3.086632ms/1.781086P, Kimi232828-1b3760 full10.264272ms/
+1.687144P. Same-C20 original16-row controls at sourcec0b98927 are
+233413-acc7c4 full3.824120ms/1.437601P and233451-475d98 full12.817288ms/
+1.351090P. Prepared dX is essentially unchanged (Llama1.340072/1.345040ms,
+Kimi4.968960/4.969416ms), isolating the transport improvement. The controls
+add a separately timed bare-GEMM diagnostic; their production path is the
+original16-row transport. All original five components pass independent
+audits; new bare diagnostics also pass original BF16 references on all ranks.
+C32 controls do not show the same gain: new1.782278/1.579973P versus previous
+1.776546/1.602279P. Thus24–25% is a SAME-C20 gain, not a gain over the previous
+best configuration. Retain64-row transport and evaluate finite CTA budgets.
+
+The new `data_gemm` diagnostic uses the same completed-B operands, actual
+compute budget, CTA/SMEM reservation and simultaneous MPI ranks, but removes
+the ready adapter. It runs after B and before W overwrites scratch; it never
+bypasses readiness in production. In the C20 controls, Llama adapter1.345040ms
+vs bare1.155800ms, Kimi4.969416ms vs4.050744ms. These measure total adapter
+overhead under that environment, not the latency of any one fence/instruction.
+CP4 causal233355-aa194d passes all six boundaries. Full backward still counts
+the same five kernels; neither reference substitutes for full performance.

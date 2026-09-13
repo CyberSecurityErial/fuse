@@ -329,8 +329,9 @@ cudaError_t validate_mxfp8_qkv_backward_data(const Mxfp8QkvBackwardDataParams& p
   return cudaSuccess;
 }
 
-template <int EpilogueN, bool Prepare = true>
+template <int EpilogueN, bool Prepare = true, bool WaitInput = true>
 cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
+  static_assert(WaitInput || !Prepare,"Bare GEMM is only valid for completed B scratch");
   auto status=validate_mxfp8_qkv_backward_data(p);
   if(status!=cudaSuccess)return status;
   DeviceInfo info{};
@@ -346,12 +347,13 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
   // W transpose/quantization is a preceding stream operation, not a
   // concurrent panel producer. Use the plain collective beneath input-ready
   // adaptation: no weight-panel predicate is needed at each head load.
-  using Mainloop=detail::A2ALhsReadyMainloop<
+  using ReadyMainloop=detail::A2ALhsReadyMainloop<
       typename Types::Mainloop,typename Types::TileShape
 #if FUSE_ENABLE_PROFILING
       ,false
 #endif
       ,true,true,1>;
+  using Mainloop=std::conditional_t<WaitInput,ReadyMainloop,typename Types::Mainloop>;
   using Gemm=cutlass::gemm::kernel::GemmUniversal<ProblemShape,Mainloop,
       typename Types::Epilogue,detail::MonolithicPersistentScheduler>;
   using Comm=Mxfp8QkvBackwardPullComm<!Prepare>;
@@ -364,8 +366,10 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
   main.ptr_SFA=w.sfa;main.ptr_SFB=w.rhs.sfb;
   main.layout_SFA=Mxfp8ScaleConfig::tile_atom_to_shape_SFA(args.gemm.problem_shape);
   main.layout_SFB=Mxfp8ScaleConfig::tile_atom_to_shape_SFB(args.gemm.problem_shape);
-  main.ready=d.peer_ready[d.rank];main.world_size=d.q_heads+2*d.kv_heads;
-  main.m_tiles=d.local_tokens/128;main.arrivals_per_peer=1;main.k_tiles_per_peer=1;main.epoch=1;
+  if constexpr (WaitInput) {
+    main.ready=d.peer_ready[d.rank];main.world_size=d.q_heads+2*d.kv_heads;
+    main.m_tiles=d.local_tokens/128;main.arrivals_per_peer=1;main.k_tiles_per_peer=1;main.epoch=1;
+  }
   auto& comm=args.comm;
   comm.params=d;comm.route=backward_route(d,true);comm.route.kv_heads=d.kv_heads;
   for(int peer=0;peer<d.world_size;++peer)comm.peer_input[peer]=p.peer_input[peer];
@@ -398,6 +402,12 @@ cudaError_t launch_qkv_backward_mxfp8_data_compute_reference(
     const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
   return p.projection.gemm_tuning.epilogue_n==64?qkv_backward_mxfp8_data_impl<64,false>(p,stream):
       qkv_backward_mxfp8_data_impl<32,false>(p,stream);
+}
+
+cudaError_t launch_qkv_backward_mxfp8_data_gemm_reference(
+    const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
+  return p.projection.gemm_tuning.epilogue_n==64?qkv_backward_mxfp8_data_impl<64,false,false>(p,stream):
+      qkv_backward_mxfp8_data_impl<32,false,false>(p,stream);
 }
 
 cudaError_t qkv_backward_mxfp8_weight_workspace_size(const QkvBackwardWeightParams& p, size_t* bytes) {

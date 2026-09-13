@@ -262,6 +262,13 @@ cudaError_t launch_qkv_backward_mxfp8_data(
 // This is a compute diagnostic with already-ready inputs, NOT a B boundary.
 cudaError_t launch_qkv_backward_mxfp8_data_compute_reference(
     const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
+// Diagnostic only, SAME completed-B operand/scratch lease as above. Uses the
+// stock CUTLASS collective without the input-ready adapter; preserves GEMM
+// layout, compute budget and outer CTA/SMEM reservation. This lets an all-rank
+// run isolate adapter cost from single-GPU versus multi-GPU execution effects.
+// Never use this entry while input production is in flight; it is NOT fusion.
+cudaError_t launch_qkv_backward_mxfp8_data_gemm_reference(
+    const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
 cudaError_t launch_qkv_backward_mxfp8_weight(
     const Mxfp8QkvBackwardWeightParams& params, cudaStream_t stream);
 // Diagnostic only, same prepared-scratch lease as the OProj compute reference:
