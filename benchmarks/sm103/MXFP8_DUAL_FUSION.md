@@ -82,6 +82,21 @@ the existing TMA Auto calibration to it. Runs `20260913-161046-d8d4c9`,
 `161110-63f282`, `161133-a292d9`; the temporary MXFP8 experiment gateway was
 removed. Neither rejected trial changes the accepted OProj implementation.
 
+The full all-startup control on one restored binary passes all33 physical
+points /97 finite candidates and an independent audit. Its selected geometric
+mean is2.037745P, not yet independently frozen/confirmed. Dense's six-point
+mean is1.461139P; the other families range2.034425--2.301891P. No OOM or
+missing point was removed. This remains below the separate QKV2.2P target.
+
+An all-startup `NoQkvInputWork` route control also failed to improve the best
+tested configurations materially. It removed inactive producer/progress polling
+but reused every acquire, copy and final drain. Seven full-check candidates
+passed: Dense best1.1921->1.1895P, Qwen3 CP4 2.0246->2.0208P and Llama405
+CP8 2.2347->2.2447P. Dense at20 communication CTAs fell2.49%; this is not a
+transport solution. Revert the extra route instantiation instead of retaining
+another inactive control. Source66cc5109/build163328-a75407 and runs
+`163708-e4948e`, `163731-702be9`, `163747-0277a3` retain the evidence.
+
 ## Reusable historical work
 
 | Commit | Applicable work |
