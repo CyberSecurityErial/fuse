@@ -1,9 +1,48 @@
 """Synthetic OProj timeline tests; no cluster or GPU operations."""
 import unittest
-from export_sm103_oproj_perfetto import make_trace, tile_consumption, cta_time_accounting, overlap_progress
+from export_sm103_oproj_perfetto import (make_trace, tile_consumption, cta_time_accounting,
+                                       overlap_progress, norm_worker_metadata, norm_phase_metadata, cta_physical_end,
+                                       profile_comm_sm)
 
 
 class OprojTraceTests(unittest.TestCase):
+    def test_single_candidate_list_overrides_default_comm_budget(self):
+        self.assertEqual(profile_comm_sm(dict(comm_sm=8,comm_sm_list='48')),48)
+        self.assertEqual(profile_comm_sm(dict(comm_sm=32,comm_sm_list=None)),32)
+        with self.assertRaises(AssertionError):profile_comm_sm(dict(comm_sm=8,comm_sm_list='32,48'))
+
+    def test_norm_phase_sums_are_bounded_and_old_captures_stay_unknown(self):
+        self.assertEqual(norm_phase_metadata({},100),{})
+        r=dict(norm_load_ns=50,norm_reduce_ns=10,norm_store_ns=30)
+        m=norm_phase_metadata(r,100)
+        self.assertEqual(m['other_row_work_us'],.010)
+        self.assertEqual(m['inverse_rms_reduce_us'],.010)
+        with self.assertRaises(AssertionError):norm_phase_metadata(r,89)
+        with self.assertRaises(AssertionError):norm_phase_metadata(r|{'norm_load_ns':-1},100)
+
+    def test_norm_worker_sums_do_not_become_fake_consecutive_spans(self):
+        row = dict(start=100, end=200, norm_worker_begin=205, norm_worker_end=300,
+                   norm_wait_ns=20, norm_work_ns=60, norm_rows=16, norm_threads=256)
+        self.assertEqual(cta_physical_end(row), 300)
+        attrs = norm_worker_metadata(row)
+        self.assertEqual(attrs['ready_wait_us'], .020)
+        self.assertEqual(attrs['row_work_us'], .060)
+        self.assertEqual(attrs['claim_and_other_us'], .015)
+        for changes in ({'norm_wait_ns': 36}, {'norm_rows': 17}, {'norm_threads': 64}):
+            with self.assertRaises(AssertionError):
+                norm_worker_metadata(row | changes)
+
+    def test_assist_accounting_extends_compute_without_changing_gemm_end(self):
+        ctas = {(0,0): dict(start=100,end=250),
+                (0,1): dict(start=110,end=200,norm_worker_begin=205,norm_worker_end=300,
+                           norm_wait_ns=20,norm_work_ns=60,norm_rows=16,norm_threads=256)}
+        pipes = {(0,0):dict(cta=1,mma_begin=120,acc_wait_end=180)}
+        stages = {(0,0,0):dict(wait_end=130)}
+        result = cta_time_accounting(ctas,pipes,stages,1)[0]
+        self.assertEqual(result['kernel_span_ns'],200)
+        self.assertEqual(result['compute_end_ns'],100)
+        self.assertEqual(result['sampled_ctas'][0]['closure_error_ns'],0)
+
     def test_overlap_counters_weight_tails_and_preserve_integer_clocks(self):
         offset = 1800000000000000000
         peers = {(0,0):dict(comm_valid=1,release=offset+10),
@@ -55,6 +94,21 @@ class OprojTraceTests(unittest.TestCase):
         self.assertAlmostEqual(row['effective_tile_tflops'], 2*100*200*64/15/1000)
         self.assertIsNone(row['start_interval_us'])
 
+    def test_postnorm_tail_is_not_counted_as_gemm_service(self):
+        ctas = {(0, 0): dict(start=100, end=150, postnorm_ready=210, postnorm_end=260),
+                (0, 1): dict(start=110, end=200, postnorm_ready=215, postnorm_end=270)}
+        pipes = {(0, 0): dict(cta=1, mma_begin=115, acc_wait_end=180)}
+        stages = {(0, 0, 0): dict(wait_end=120)}
+        gpu, = cta_time_accounting(ctas, pipes, stages, 1)
+        p, = gpu['sampled_ctas']
+        self.assertEqual(gpu['last_role'], 'postnorm')
+        self.assertEqual(gpu['compute_end_ns'], 100)
+        self.assertEqual(gpu['kernel_span_ns'], 170)
+        self.assertEqual(p['observed_service_sum_ns'], 60)
+        self.assertEqual(p['postnorm_wait_ns'], 15)
+        self.assertEqual(p['postnorm_service_ns'], 55)
+        self.assertEqual(p['closure_error_ns'], 0)
+
     def test_inter_tile_identity_preserves_negative_overlap(self):
         p = dict(cta=1, k_tiles=1, mma_begin=110, tmem_acquired=112,
                  mma_return=140, acc_wait_end=145, epi_return=155,
@@ -101,6 +155,16 @@ class OprojTraceTests(unittest.TestCase):
         self.assertIn('local S2G (destination complete)', names)
         self.assertFalse(result['metadata']['performance_accepted'])
         self.assertTrue(all(e.get('dur', 0) >= 0 for e in result['traceEvents']))
+
+    def test_epilogue_return_scope_is_explicit_and_legacy_is_not_relabelled(self):
+        job,lines=self.fixture()
+        self.assertEqual(make_trace(lines,job)['metadata']['epilogue_return_scope'],'legacy_unspecified')
+        marker='profile_oproj_epilogue_scope,rank=0,return_scope=whole_collective_v2'
+        self.assertEqual(make_trace(lines+[marker],job)['metadata']['epilogue_return_scope'],
+                         'whole_collective_v2')
+        for extra in ([marker,marker],[marker.replace('rank=0','rank=1')],
+                      [marker.replace('whole_collective_v2','unknown')]):
+            with self.assertRaises(AssertionError):make_trace(lines+extra,job)
 
     def test_mxfp8_keeps_roles_and_does_not_claim_bare_tma_latency(self):
         job, lines = self.fixture()

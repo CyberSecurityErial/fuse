@@ -1686,6 +1686,47 @@ int main() {
         self.assertFalse(memory['guarantees_fit'])
         self.assertIn('host reference RAM', memory['note'])
 
+    def test_attention_postprocess_buffers_are_in_memory_guard(self):
+        job = self.fused_job(mxfp8=True, seq_local=None, global_seq=131072)
+        shape = l20d.fused_geometry(job)
+        m, h, d = shape['seq_local'], shape['hidden'], shape['head_dim']
+        plain = l20d.fused_device_memory(job)['buffer_bytes']
+        q = l20d.fused_device_memory(job | {'qkv_postprocess': 'qknorm_rope'})['buffer_bytes']
+        o = l20d.fused_device_memory(job | {'oproj_postnorm': True})['buffer_bytes']
+        self.assertEqual(q-plain, 4*m*d+4*d)
+        separate = l20d.fused_device_memory(job | {'qkv_postprocess': 'qknorm_rope',
+                                                   'qkv_postprocess_separate': True})['buffer_bytes']
+        self.assertEqual(separate-q,4*(shape['global_seq']-m)*d)
+        self.assertEqual(o-plain, 10*m*h+2*h)
+        overlap = l20d.fused_device_memory(job | {'oproj_postnorm': True,
+                                                   'oproj_postnorm_overlap': True})['buffer_bytes']
+        self.assertEqual(overlap-o, ((m+127)//128)*((h+255)//256)*32*4+256)
+
+    def test_separate_qkv_postprocess_guards(self):
+        job = self.fused_job(mxfp8=True, fused_direction='qkv', qkv_postprocess='qknorm_rope',
+                             qkv_postprocess_separate=True, qkv_policy='auto',
+                             qkv_policy_list='m128n256', oproj_policy_list='m128n256')
+        l20d.validate_job(job)
+        self.assertIn('--qkv-postprocess-separate',l20d.fused_argv(job))
+        for change in ({'qkv_postprocess':None},{'profile':True},{'mxfp8_prequantized':True},
+                       {'fused_direction':'oproj'},{'auto_mxfp8_comm':True},{'calibrate':True}):
+            with self.assertRaises(ValueError):l20d.validate_job(job | change)
+
+    def test_postnorm_schedule_guards(self):
+        job = self.fused_job(mxfp8=True, fused_direction='oproj', oproj_postnorm=True,
+                             oproj_policy_list='m128n256', qkv_policy_list='m128n256', qkv_policy='auto')
+        l20d.validate_job(job)
+        l20d.validate_job(job | {'oproj_postnorm_overlap': True})
+        l20d.validate_job(job | {'oproj_postnorm_separate': True})
+        self.assertIn('--oproj-postnorm-overlap',
+                      l20d.fused_argv(job | {'oproj_postnorm_overlap': True}))
+        for changes in ({'auto_mxfp8_comm': True},
+                        {'oproj_postnorm_overlap': True, 'oproj_postnorm_separate': True},
+                        {'oproj_postnorm_separate': True, 'oproj_postnorm': False},
+                        {'oproj_postnorm_overlap': True, 'oproj_postnorm': False}):
+            with self.assertRaises(ValueError):
+                l20d.validate_job(job | changes)
+
     def test_fused_direction_decouples_oproj_from_kv_sharding(self):
         job = self.fused_job(world=8, q_heads=64, kv_heads=4, hidden=4096,
                              fused_direction='oproj')

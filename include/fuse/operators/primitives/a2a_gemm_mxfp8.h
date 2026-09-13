@@ -2,6 +2,7 @@
 #pragma once
 
 #include "fuse/operators/primitives/a2a_gemm.h"
+#include "fuse/operators/semantics/attention_postprocess.h"
 
 namespace fuse {
 
@@ -32,12 +33,18 @@ struct Mxfp8A2AGemmParams {
   // GEMM and A first-use share this order; full A/W ready units do not change.
   int32_t m_window_tiles = 0;
   int32_t n_group_tiles = 0;
+  ResidualRmsNorm postprocess{};
+  // Experimental: each CTA finishes its own A/W or GEMM role, then shares
+  // complete output-row norm tasks. Requires postprocess, hidden width <=16384
+  // and explicit communication CTAs. False retains the whole-grid tail.
+  bool overlap_postnorm = false;
 };
 
 cudaError_t a2a_gemm_mxfp8_activation_size(const GemmProblem& problem,
     const UlyssesRoute& route, size_t* data_bytes, size_t* scale_bytes);
 cudaError_t a2a_gemm_mxfp8_workspace_size(const GemmProblem& problem, size_t* bytes);
-KernelTraits mxfp8_oproj_cutlass_kernel_traits(int32_t epilogue_n = 32);
+cudaError_t a2a_gemm_mxfp8_workspace_size(const Mxfp8A2AGemmParams& params, size_t* bytes);
+KernelTraits mxfp8_oproj_cutlass_kernel_traits(int32_t epilogue_n = 32, bool overlap_postnorm = false);
 // Shape-only query sharing the production resolver. Returns 0 when no measured
 // domain applies; 0 is not a usable diagnostic/allocation budget.
 int32_t recommended_a2a_gemm_mxfp8_comm_ctas(
@@ -47,6 +54,12 @@ int32_t recommended_a2a_gemm_mxfp8_comm_ctas(
 cudaError_t a2a_gemm_mxfp8_staging_view(
     const Mxfp8A2AGemmParams& params, Mxfp8Activation* activation);
 cudaError_t launch_a2a_gemm_mxfp8_cutlass(
+    const Mxfp8A2AGemmParams& params, cudaStream_t stream);
+
+// Comparison only: original A2A/GEMM followed by a separate optimized
+// residual/RMSNorm kernel on the same stream. Both launches belong in timing.
+// Identical arithmetic/output contract; explicit budget, no row-ready overlap.
+cudaError_t launch_a2a_gemm_mxfp8_postnorm_reference(
     const Mxfp8A2AGemmParams& params, cudaStream_t stream);
 
 // Independent services with the production CTA/SMEM footprint and explicit

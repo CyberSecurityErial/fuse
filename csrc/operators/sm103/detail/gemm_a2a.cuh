@@ -4,6 +4,7 @@
 #include "fuse/profiling/sm103/host.cuh"
 #include "producer_consumer.cuh"
 #include "quantization.cuh"
+#include "attention_postprocess.cuh"
 
 #include "fuse/arch/common.cuh"
 #include "fuse/operators/primitives/gemm_a2a.h"
@@ -314,7 +315,7 @@ struct QkvGqaPackCommT {
   }
 
   template <bool TraceTasks = false, class InputWork = NoQkvInputWork,
-            int QuantWarps = 0>
+            int QuantWarps = 0, class Postprocess = NoQkvPostprocess>
   CUTLASS_DEVICE void run(
       const Params& args,
       char* smem,
@@ -324,7 +325,7 @@ struct QkvGqaPackCommT {
 #if FUSE_ENABLE_PROFILING
       , QkvRouteTimeline* route_timeline = nullptr
 #endif
-      , InputWork input_work = {}
+      , InputWork input_work = {}, Postprocess postprocess = {}
       ) {
     static_assert(QuantWarps >= 0 && QuantWarps < kQkvBulkSlots);
     static_assert(QuantWarps == 0 || InputWork::kEnabled);
@@ -477,6 +478,28 @@ struct QkvGqaPackCommT {
             if constexpr (TraceTasks) sample.g2s_done = detail::read_global_timer();
 #endif
             phase ^= 1;
+          }
+          if constexpr (Postprocess::kEnabled) {
+            // TMA completion is observed by lane zero; converge the entire
+            // owning warp before generic shared-memory reads/writes.
+            if (postprocess.params.enabled() && segment != 2) {
+              __syncwarp();
+#if FUSE_ENABLE_PROFILING
+              if constexpr (TraceTasks) { if (lane == 0) sample.post_begin = detail::read_global_timer(); }
+#endif
+              postprocess(stage, copy_m, m_begin, segment);
+#if FUSE_ENABLE_PROFILING
+              if constexpr (TraceTasks) { if (lane == 0) sample.post_math_done = detail::read_global_timer(); }
+#endif
+              // Each lane publishes its generic SMEM stores to the async proxy.
+              cute::tma_store_fence();
+              __syncwarp();
+#if FUSE_ENABLE_PROFILING
+              if constexpr (TraceTasks) { if (lane == 0) sample.post_end = detail::read_global_timer(); }
+#endif
+            }
+          }
+          if (lane == 0) {
             cute::tma_store_fence();
 
             auto* destination = p.peer_output[destination_rank];
@@ -730,10 +753,14 @@ struct QkvGqaPackCommT {
   }
 
   CUTLASS_DEVICE void finalize(const Params& args) {
+    finalize_projection(args.params);
+  }
+
+  // Reused by the separated head-postprocess control after its local grid join.
+  CUTLASS_DEVICE static void finalize_projection(const ParamsType& p) {
     if (blockIdx.x != 0 || threadIdx.x >= 32) {
       return;
     }
-    const auto& p = args.params;
     const int32_t lane = static_cast<int32_t>(threadIdx.x);
     if (lane == 0) {
       detail::fence_system();
@@ -849,7 +876,10 @@ using QkvGqaPackCommWide = QkvGqaPackCommT<
 // handoff; outer CTA roles, output task ownership and full-panel ready stay fixed.
 struct Mxfp8QkvGqaPackComm : QkvGqaPackCommWide {
   using Base = QkvGqaPackCommWide;
-  struct Arguments : Base::Arguments { Mxfp8WeightProducer::Arguments weights{}; };
+  struct Arguments : Base::Arguments {
+    Mxfp8WeightProducer::Arguments weights{};
+    QkvPostprocess postprocess{};
+  };
   using Params = Arguments;
   static bool can_implement(const Arguments& args) {
     return args.params.route.head_dim == kQkvBulkColumns &&
@@ -881,17 +911,17 @@ struct Mxfp8QkvGqaPackComm : QkvGqaPackCommWide {
         worker_warp * comm_ctas + comm, quant_warps * comm_ctas);
     // Uniform, once-per-CTA selection; both hot loops are separately compiled.
     if (weights.warp_specialized) {
-      Base::template run<TraceTasks, Mxfp8WeightProducer, 4>(p, smem, comm, comm_ctas, wait
+      Base::template run<TraceTasks, Mxfp8WeightProducer, 4, QkvHeadPostprocess>(p, smem, comm, comm_ctas, wait
 #if FUSE_ENABLE_PROFILING
           , timeline
 #endif
-          , work);
+          , work, QkvHeadPostprocess{p.postprocess});
     } else {
-      Base::template run<TraceTasks, Mxfp8WeightProducer>(p, smem, comm, comm_ctas, wait
+      Base::template run<TraceTasks, Mxfp8WeightProducer, 0, QkvHeadPostprocess>(p, smem, comm, comm_ctas, wait
 #if FUSE_ENABLE_PROFILING
           , timeline
 #endif
-          , work);
+          , work, QkvHeadPostprocess{p.postprocess});
     }
   }
   CUTLASS_DEVICE void operator()(const Params& p, char* smem, int comm, int comm_ctas) {

@@ -775,6 +775,7 @@ struct Mxfp8A2ALhsInputCommT {
     A2AGemmParams params{};
     Mxfp8Activation activation[kMaxWorldSize]{};
     Mxfp8A2AWorkspace workspace{};
+    ResidualRmsNorm postprocess{};
     Mxfp8WeightProducer::Arguments weights{};
     ScaleLayout source_scales{}, destination_scales{};
     CUtensorMap store_tma{};
@@ -842,6 +843,12 @@ struct Mxfp8A2ALhsInputCommT {
     for (int n = index; n < p.weights.workspace.panels; n += stride) {
       p.weights.workspace.arrivals[n * kReadyFlagStride] = 0;
       p.weights.workspace.ready[n * kReadyFlagStride] = 0;
+    }
+    if (p.workspace.output_ready) {
+      if (index == 0) *p.workspace.postnorm_next_row = 0;
+      const int tiles = (p.params.gemm.m / kReadyBlockM) * p.weights.workspace.panels;
+      for (int i = index; i < tiles; i += stride)
+        p.workspace.output_ready[i * kReadyFlagStride] = 0;
     }
     // One invocation-private reset, including Graph replay with a reused epoch.
     cooperative_groups::this_grid().sync();

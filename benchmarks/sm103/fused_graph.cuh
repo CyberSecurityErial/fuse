@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 // Benchmark-only Graph preparation. No production entry point caches or
 // exposes its private kernel Params. The caller supplies the actual launch.
@@ -18,9 +19,12 @@ class Operation {
   // The caller owns this device/stream and every captured tensor/IPC mapping.
   // Complete the stream before reset/destruction, then release IPC resources.
   // All methods, including destruction, must have one serialized owner.
-  Operation(int device, cudaStream_t stream, uint32_t committed_epoch = 0)
-      : device_(device), stream_(stream), committed_epoch_(committed_epoch) {
-    if (device < 0 || stream == nullptr) {
+  Operation(int device, cudaStream_t stream, uint32_t committed_epoch = 0,
+            bool separate_postprocess = false, bool cooperative_postprocess = false)
+      : device_(device), stream_(stream), separate_postprocess_(separate_postprocess),
+        cooperative_postprocess_(cooperative_postprocess),
+        committed_epoch_(committed_epoch) {
+    if (device < 0 || stream == nullptr || (cooperative_postprocess && !separate_postprocess)) {
       throw std::invalid_argument("Graph operation requires a device and explicit stream");
     }
   }
@@ -63,7 +67,7 @@ class Operation {
       const cudaError_t end_status = cudaStreamEndCapture(stream_, &captured);
       capturing = false;
       check(end_status, "end capture");
-      const Signature signature = inspect(captured);
+      const auto signature = inspect(captured);
       if (!exec_) {
         check(cudaGraphInstantiateWithFlags(&initial_exec, captured, 0), "instantiate");
         // Initial upload is preparation, not a sample or an executed epoch.
@@ -175,13 +179,42 @@ class Operation {
         a.cluster_scheduling == b.cluster_scheduling;
   }
 
-  static Signature inspect(cudaGraph_t graph) {
+  static bool same_signature(const std::vector<Signature>& a, const std::vector<Signature>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) if (!same_signature(a[i],b[i])) return false;
+    return true;
+  }
+
+  std::vector<Signature> inspect(cudaGraph_t graph) const {
     size_t count = 0;
     check(cudaGraphGetNodes(graph, nullptr, &count), "count nodes");
-    if (count != 1) throw std::runtime_error("Graph must contain exactly one operation kernel");
-    cudaGraphNode_t node = nullptr;
-    check(cudaGraphGetNodes(graph, &node, &count), "get kernel node");
-    if (count != 1 || node == nullptr) throw std::runtime_error("Graph kernel node changed during inspection");
+    const size_t expected = separate_postprocess_ ? 2 : 1;
+    if (count != expected) throw std::runtime_error("Graph operation kernel count differs from boundary");
+    std::vector<cudaGraphNode_t> nodes(count);
+    check(cudaGraphGetNodes(graph,nodes.data(),&count),"get kernel nodes");
+    if (count != expected) throw std::runtime_error("Graph nodes changed during inspection");
+    if (separate_postprocess_) {
+      // Explicit reference only: exactly base-F -> standalone norm, not two
+      // unordered nodes or hidden memcpy/memset work. Both belong to ONE graph.
+      size_t edges = 0;
+      check(cudaGraphGetEdges(graph,nullptr,nullptr,nullptr,&edges),"count reference edges");
+      if (edges != 1) throw std::runtime_error("Separate postprocess requires one dependency edge");
+      cudaGraphNode_t from = nullptr, to = nullptr;
+      cudaGraphEdgeData dependency{};
+      check(cudaGraphGetEdges(graph,&from,&to,&dependency,&edges),"get reference edge");
+      if (edges != 1 || from == to ||
+          dependency.type != 0 || dependency.from_port != 0 || dependency.to_port != 0 ||
+          !((from == nodes[0] && to == nodes[1]) || (from == nodes[1] && to == nodes[0])))
+        throw std::runtime_error("Invalid separate postprocess dependency");
+      nodes = {from,to};
+    }
+    std::vector<Signature> result;
+    for (size_t i = 0; i < count; ++i) result.push_back(inspect_node(nodes[i],i == 1));
+    return result;
+  }
+
+  Signature inspect_node(cudaGraphNode_t node, bool postprocess) const {
+    if (node == nullptr) throw std::runtime_error("Null Graph kernel node");
     cudaGraphNodeType type{};
     check(cudaGraphNodeGetType(node, &type), "get node type");
     if (type != cudaGraphNodeTypeKernel) throw std::runtime_error("Graph operation contains a non-kernel node");
@@ -200,8 +233,10 @@ class Operation {
     const bool single_cluster = cluster.clusterDim.x == 1 && cluster.clusterDim.y == 1 && cluster.clusterDim.z == 1;
     if (!params.func || params.gridDim.x == 0 || params.gridDim.y != 1 || params.gridDim.z != 1 ||
         params.blockDim.x != 256 || params.blockDim.y != 1 || params.blockDim.z != 1 ||
-        params.sharedMemBytes == 0 || cooperative.cooperative != 1 || (!implicit_cluster && !single_cluster)) {
-      throw std::runtime_error("Graph requires the SM103 cooperative one-CTA-cluster launch");
+        (postprocess && cooperative_postprocess_ ? params.sharedMemBytes != 0 : params.sharedMemBytes == 0) ||
+        cooperative.cooperative != (postprocess ? int(cooperative_postprocess_) : 1) ||
+        (!implicit_cluster && !single_cluster)) {
+      throw std::runtime_error("Graph requires the declared SM103 base/postprocess launch");
     }
     return {params.func, params.gridDim, params.blockDim, params.sharedMemBytes, cooperative.cooperative,
         cluster.clusterDim.x, cluster.clusterDim.y, cluster.clusterDim.z,
@@ -215,9 +250,11 @@ class Operation {
 
   const int device_;
   const cudaStream_t stream_;
+  const bool separate_postprocess_;
+  const bool cooperative_postprocess_;
   cudaGraph_t graph_ = nullptr;
   cudaGraphExec_t exec_ = nullptr;
-  Signature signature_{};
+  std::vector<Signature> signature_{};
   uint32_t committed_epoch_ = 0;
   uint32_t prepared_epoch_ = 0;
   bool prepared_ = false;

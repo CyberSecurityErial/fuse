@@ -35,6 +35,20 @@ def function(text, signature):
 
 
 class Mxfp8OprojContracts(unittest.TestCase):
+    def test_window_swizzle_reports_minor_extent_clipping(self):
+        from summarize_sm103_mxfp8_fused import window_effective_swizzle
+        config = dict(effective_swizzle_size='8', raster='along_m',
+                      oproj_m_window_tiles=64, oproj_n_group_tiles=4)
+        self.assertEqual(window_effective_swizzle(config), 4)
+        self.assertEqual(window_effective_swizzle(dict(config, oproj_n_group_tiles=8)), 8)
+        self.assertEqual(window_effective_swizzle(dict(config, raster='along_n')), 8)
+        self.assertEqual(window_effective_swizzle(dict(config, oproj_m_window_tiles=2,
+                                                       raster='along_n')), 2)
+        for h, p in ((0, 0), (64, 0), (3, 4), (64, 3)):
+            self.assertEqual(window_effective_swizzle(dict(config,
+                oproj_m_window_tiles=h, oproj_n_group_tiles=p)), 8)
+        self.assertEqual(config['effective_swizzle_size'], '8')
+
     def test_overlap_plan_changes_only_raster_and_preserves_aliases(self):
         import bench_sm103_mxfp8_oproj as bench
         from unittest.mock import patch

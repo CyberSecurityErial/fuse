@@ -14,6 +14,9 @@ struct QkvRouteTimeline {
   // After the original final warp join; includes reusable-stage completion,
   // not remote-global completion (that remains the trailing drain record).
   uint64_t copy_end = 0;
+  // Optional norm/RoPE; all zero on unchanged routes and V. Arithmetic ends
+  // after generic SMEM writes/warp join; publication covers the proxy fence.
+  uint64_t post_begin = 0, post_math_done = 0, post_end = 0;
 };
 
 cudaError_t launch_gemm_a2a_route_telemetry(

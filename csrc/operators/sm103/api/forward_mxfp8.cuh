@@ -13,6 +13,7 @@ struct Mxfp8ProjectionInput {
 #endif
 
   void configure_communication(Mxfp8QkvGqaPackComm::Arguments& comm) const {
+    comm.postprocess = params.postprocess;
     const auto& g = params.projection.gemm;
     comm.weights.source = dynamic_weight ? params.projection.rhs_nt : nullptr;
     comm.weights.workspace = workspace;
@@ -63,6 +64,16 @@ inline bool valid_mxfp8_activation(const GemmProblem& g, const Mxfp8Activation& 
 }
 
 inline cudaError_t validate_mxfp8(const Mxfp8GemmA2AParams& p, Mxfp8Workspace* workspace) {
+  const auto& post = p.postprocess;
+  if (bool(post.q_gamma) != bool(post.k_gamma) || bool(post.cos) != bool(post.sin) ||
+      !std::isfinite(post.epsilon) || post.epsilon <= 0.f) return cudaErrorInvalidValue;
+  for (const auto* ptr : {post.q_gamma, post.k_gamma, post.cos, post.sin})
+    if (ptr && reinterpret_cast<uintptr_t>(ptr) % 16) return cudaErrorInvalidValue;
+  // Postprocessing is only implemented on the complete-head TMA route. Auto's
+  // old service calibration excludes this work: require an explicit budget.
+  if (post.enabled() && (p.projection.gemm.m % 64 ||
+      p.projection.route.head_dim != 128 || p.projection.num_comm_ctas <= 0))
+    return cudaErrorNotSupported;
   if ((p.epilogue_n != 32 && p.epilogue_n != 64) ||
       !supported_mxfp8_problem(p.projection.gemm) || !std::isfinite(p.projection.alpha) ||
       !valid_mxfp8_activation(p.projection.gemm, p.activation) ||
@@ -93,7 +104,7 @@ cudaError_t launch_mxfp8(const Mxfp8GemmA2AParams& params, cudaStream_t stream, 
   // validation and descriptor construction. The diagnostic prequantized path
   // has a different boundary: reuse a queried positive budget, never score it
   // as if weight quantization were still present.
-  if (!dynamic_weight && params.projection.num_comm_ctas == 0) {
+  if ((!dynamic_weight || params.postprocess.enabled()) && params.projection.num_comm_ctas == 0) {
     FUSE_SM103_HOST_RETURN(cudaErrorNotSupported);
   }
   Mxfp8GemmA2AParams p{};
@@ -429,6 +440,34 @@ cudaError_t launch_mxfp8_service(const Mxfp8GemmA2AParams& p,
 }
 #endif
 
+// Diagnostic two-kernel boundary. A warp transforms64 rows of one complete
+// received head with exactly the production arithmetic, but through GMEM.
+// Tables now cover destination rank-major GLOBAL rows, not just local inputs.
+__global__ void qkv_postprocess_reference_kernel(GemmA2AParams p, QkvPostprocess post) {
+  const int q_heads = p.route.q_heads / p.route.world_size;
+  const int k_heads = p.route.kv_heads / p.route.world_size;
+  const int heads = q_heads + k_heads;
+  const int rows = p.route.global_seq;  // This diagnostic explicitly requires batch1.
+  const int64_t tasks = int64_t(rows / 64) * heads;
+  Bf16* output = p.peer_output[p.route.rank];
+  QkvHeadPostprocess transform{post};
+  for (int64_t task = blockIdx.x * 8 + threadIdx.x / 32; task < tasks; task += gridDim.x * 8) {
+    const int row = (task / heads) * 64;
+    const int head = task % heads;
+    const int segment = head >= q_heads;
+    const int width = (segment ? k_heads : q_heads) * 128;
+    const int feature = (segment ? head - q_heads : head) * 128;
+    const int64_t offset = segment ? int64_t(rows) * q_heads * 128 : 0;
+    transform(output + offset + int64_t(row) * width + feature,64,row,segment,width);
+  }
+  // A local stream edge only orders this GPU. The second all-rank completion
+  // prevents a fast rank's NEXT A2A from overwriting a slow rank's in-place
+  // norm/RoPE. Use2e for raw routing and2e+1 for postprocessing; neither an
+  // extra host barrier nor omitted inter-rank work may make this control fast.
+  cooperative_groups::this_grid().sync();
+  Mxfp8QkvGqaPackComm::finalize_projection(p);
+}
+
 }  // namespace
 
 KernelTraits mxfp8_qkv_cutlass_kernel_traits(int32_t epilogue_n) {
@@ -494,8 +533,42 @@ cudaError_t launch_gemm_a2a_mxfp8_compute_reference(
                                 : launch_mxfp8_compute_reference<64>(params, stream);
 }
 
+cudaError_t launch_gemm_a2a_mxfp8_postprocess_reference(
+    const Mxfp8GemmA2AParams& params, QkvPostprocess global_post, cudaStream_t stream) {
+  if (!params.postprocess.enabled() || params.projection.route.batch != 1 ||
+      params.projection.route.defer_v_a2a || params.projection.epoch > (UINT32_MAX-1)/2 ||
+      global_post.q_gamma != params.postprocess.q_gamma ||
+      global_post.k_gamma != params.postprocess.k_gamma ||
+      bool(global_post.cos) != bool(params.postprocess.cos) ||
+      global_post.epsilon != params.postprocess.epsilon) return cudaErrorInvalidValue;
+  Mxfp8Workspace workspace{};
+  auto check = params;
+  check.postprocess = global_post;
+  auto status = validate_mxfp8(check,&workspace);
+  if (status != cudaSuccess) return status;
+  int resident_blocks = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &resident_blocks,qkv_postprocess_reference_kernel,256,0);
+  if (status != cudaSuccess) return status;
+  DeviceInfo info{};
+  status = device_info(&info);
+  if (status != cudaSuccess) return status;
+  if (resident_blocks <= 0) return cudaErrorNotSupported;
+  auto base = params;
+  base.postprocess = {};
+  base.projection.epoch *= 2;
+  status = launch_gemm_a2a_mxfp8_cutlass(base,stream);
+  if (status != cudaSuccess) return status;
+  auto projection = base.projection;
+  ++projection.epoch;
+  void* args[] = {&projection,&global_post};
+  return cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(qkv_postprocess_reference_kernel),
+      dim3(info.sm_count * resident_blocks),dim3(256),args,0,stream);
+}
+
 cudaError_t launch_gemm_a2a_mxfp8_copy_reference(
     const Mxfp8GemmA2AParams& params, cudaStream_t stream) {
+  if (params.postprocess.enabled()) return cudaErrorNotSupported;
   return params.epilogue_n == 32 ? launch_mxfp8_copy_reference<32>(params, stream)
                                 : launch_mxfp8_copy_reference<64>(params, stream);
 }
@@ -509,6 +582,7 @@ cudaError_t launch_gemm_a2a_mxfp8_quantize_reference(
 #if FUSE_ENABLE_PROFILING
 cudaError_t launch_gemm_a2a_mxfp8_service(const Mxfp8GemmA2AParams& params,
     const Mxfp8ServiceConfig& config, Mxfp8ServiceView view, cudaStream_t stream) {
+  if (params.postprocess.enabled()) return cudaErrorNotSupported;
   return params.epilogue_n == 32 ? launch_mxfp8_service<32>(params, config, view, stream)
                                 : launch_mxfp8_service<64>(params, config, view, stream);
 }
@@ -533,8 +607,24 @@ namespace {
 
 enum class Mxfp8OprojOperation { kFused, kCompute, kCopy, kProducer };
 
+cudaError_t validate_mxfp8_postnorm(const Mxfp8A2AGemmParams& p, size_t shared_bytes) {
+  const auto& post = p.postprocess;
+  const auto& g = p.projection.gemm;
+  if (bool(post.residual) != bool(post.gamma) || bool(post.residual) != bool(post.residual_output) ||
+      !std::isfinite(post.epsilon) || post.epsilon <= 0.f) return cudaErrorInvalidValue;
+  if (!post.enabled()) return cudaSuccess;
+  if (g.n > 16384 || 4*uint64_t(g.n)*sizeof(Bf16) + kPostnormScratchFloats*sizeof(float) > shared_bytes)
+    return cudaErrorNotSupported;
+  if (!mxfp8_aligned(post.residual,16) || !mxfp8_aligned(post.gamma,16) ||
+      !mxfp8_aligned(post.residual_output,16) ||
+      post.residual == p.projection.output || post.residual_output == p.projection.output ||
+      post.residual == post.residual_output || d_row_stride(g) != g.n)
+    return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+
 template <int EpilogueN, Mxfp8OprojOperation Operation = Mxfp8OprojOperation::kFused,
-          bool Profile = false>
+          bool Profile = false, bool PublishOutput = false>
 cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
 #if FUSE_ENABLE_PROFILING
     , A2AGemmCtaTimeline* timeline = nullptr, int32_t capacity = 0,
@@ -542,7 +632,7 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
     Mxfp8ProfileView weight = {}
 #endif
     ) {
-  using Binding = Mxfp8OprojBinding<EpilogueN>;
+  using Binding = Mxfp8OprojBinding<EpilogueN, PublishOutput>;
 #if FUSE_ENABLE_PROFILING
   using Gemm = std::conditional_t<Profile, typename Binding::TelemetryGemm, typename Binding::Gemm>;
   using Comm = std::conditional_t<Profile, typename Binding::TelemetryComm, typename Binding::Comm>;
@@ -555,12 +645,24 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
   const auto& projection = p.projection;
   const auto& g = projection.gemm;
   const auto& route = projection.route;
+  const auto& post = p.postprocess;
+  if (p.overlap_postnorm != PublishOutput || (PublishOutput && !post.enabled()))
+    return cudaErrorInvalidValue;
+  if constexpr (PublishOutput) {
+    if (g.n > 16384 || int64_t(ceil_div(g.m, 128)) * ceil_div(g.n, 256) > INT32_MAX)
+      return cudaErrorNotSupported;
+  }
+  const auto post_status = validate_mxfp8_postnorm(p,Kernel::SharedStorageSize);
+  if (post_status != cudaSuccess) return post_status;
+  if (post.enabled()) {
+    if constexpr (Operation != Mxfp8OprojOperation::kFused) return cudaErrorNotSupported;
+  }
   if (!Comm::supported_geometry(g, route)) return cudaErrorNotSupported;
   if (!std::isfinite(projection.alpha) || projection.num_comm_ctas <= 0 ||
       projection.epoch == 0 || projection.lhs_policy != A2ALhsGemmPolicy::kAuto ||
       !mxfp8_aligned(projection.rhs_nt, 16) || !mxfp8_aligned(projection.output, 16) ||
       !mxfp8_aligned(p.workspace)) return cudaErrorInvalidValue;
-  const auto workspace = Mxfp8A2AWorkspace::make(g, p.workspace);
+  const auto workspace = Mxfp8A2AWorkspace::make(g, p.workspace, PublishOutput);
   if (p.workspace_bytes < workspace.bytes) return cudaErrorInvalidValue;
   size_t data_bytes = 0, scale_bytes = 0;
   auto status = a2a_gemm_mxfp8_activation_size(g, route, &data_bytes, &scale_bytes);
@@ -611,10 +713,17 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
   args.mainloop.weight_ready = workspace.weights.ready;
   args.mainloop.weight_panels = workspace.weights.panels;
   args.mainloop.weight_epoch = projection.epoch;
+  if constexpr (PublishOutput) {
+    args.epilogue.ready = workspace.output_ready;
+    args.epilogue.m_tiles = ceil_div(g.m, 128);
+    args.epilogue.n_tiles = ceil_div(g.n, 256);
+    args.epilogue.epoch = 1;
+  }
 
   typename Comm::Arguments comm{};
   comm.params = projection;
   comm.workspace = workspace;
+  comm.postprocess = post;
   for (int peer = 0; peer < route.world_size; ++peer) comm.activation[peer] = p.activation[peer];
   comm.weights.source = projection.rhs_nt;
   comm.weights.workspace = workspace.weights;
@@ -687,6 +796,13 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
 
 template <Mxfp8OprojOperation Operation>
 cudaError_t dispatch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream) {
+  if (p.overlap_postnorm) {
+    if constexpr (Operation == Mxfp8OprojOperation::kFused) {
+      if (p.epilogue_n == 32) return launch_mxfp8_oproj<32, Operation, false, true>(p, stream);
+      if (p.epilogue_n == 64) return launch_mxfp8_oproj<64, Operation, false, true>(p, stream);
+    }
+    return cudaErrorNotSupported;
+  }
   if (p.epilogue_n == 32) return launch_mxfp8_oproj<32, Operation>(p, stream);
   if (p.epilogue_n == 64) return launch_mxfp8_oproj<64, Operation>(p, stream);
   return cudaErrorInvalidValue;
@@ -711,11 +827,39 @@ cudaError_t a2a_gemm_mxfp8_workspace_size(const GemmProblem& g, size_t* bytes) {
   return cudaSuccess;
 }
 
+cudaError_t a2a_gemm_mxfp8_workspace_size(const Mxfp8A2AGemmParams& p, size_t* bytes) {
+  if (!bytes || !supported_mxfp8_problem(p.projection.gemm)) return cudaErrorInvalidValue;
+  *bytes = Mxfp8A2AWorkspace::make(p.projection.gemm, nullptr, p.overlap_postnorm).bytes;
+  return cudaSuccess;
+}
+
 cudaError_t launch_a2a_gemm_mxfp8_cutlass(const Mxfp8A2AGemmParams& p, cudaStream_t stream) {
   Mxfp8A2AGemmParams resolved{};
   auto status = resolve_mxfp8_oproj_communication(p,&resolved);
   if (status != cudaSuccess) return status;
   return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kFused>(resolved, stream);
+}
+
+cudaError_t launch_a2a_gemm_mxfp8_postnorm_reference(const Mxfp8A2AGemmParams& p, cudaStream_t stream) {
+  if (!p.postprocess.enabled() || p.overlap_postnorm || p.projection.num_comm_ctas <= 0)
+    return cudaErrorInvalidValue;
+  auto status = validate_mxfp8_postnorm(p,SIZE_MAX);
+  if (status != cudaSuccess) return status;
+  const auto& g = p.projection.gemm;
+  if (!supported_mxfp8_problem(g)) return cudaErrorInvalidValue;
+  const size_t shared_bytes = 2*size_t(g.n)*sizeof(Bf16) + 16*sizeof(float);
+  // At N16384 the two-row cache exceeds the default48KiB but fits opt-in SMEM.
+  // Keep the function-wide limit constant across shapes/streams. The actual
+  // per-launch allocation below remains shape-sized, not this upper limit.
+  status = cudaFuncSetAttribute(residual_rmsnorm_reference_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,2*16384*sizeof(Bf16) + 16*sizeof(float));
+  if (status != cudaSuccess) return status;
+  auto base = p;
+  base.postprocess = {};
+  status = launch_a2a_gemm_mxfp8_cutlass(base,stream);
+  if (status != cudaSuccess) return status;
+  residual_rmsnorm_reference_kernel<<<g.m/2,256,shared_bytes,stream>>>(p.projection.output,g.n,p.postprocess);
+  return cudaGetLastError();
 }
 
 #if FUSE_ENABLE_PROFILING
@@ -726,6 +870,15 @@ cudaError_t launch_a2a_gemm_mxfp8_role_telemetry(
   Mxfp8A2AGemmParams resolved{};
   auto status = resolve_mxfp8_oproj_communication(p, &resolved);
   if (status != cudaSuccess) return status;
+  if (p.overlap_postnorm) {
+    if (p.epilogue_n == 32)
+      return launch_mxfp8_oproj<32, Mxfp8OprojOperation::kFused, true, true>(
+          resolved, stream, timeline, capacity, peers, peer_capacity, weight);
+    if (p.epilogue_n == 64)
+      return launch_mxfp8_oproj<64, Mxfp8OprojOperation::kFused, true, true>(
+          resolved, stream, timeline, capacity, peers, peer_capacity, weight);
+    return cudaErrorInvalidValue;
+  }
   if (p.epilogue_n == 32)
     return launch_mxfp8_oproj<32, Mxfp8OprojOperation::kFused, true>(
         resolved, stream, timeline, capacity, peers, peer_capacity, weight);
@@ -748,7 +901,12 @@ cudaError_t launch_a2a_gemm_mxfp8_producer_reference(const Mxfp8A2AGemmParams& p
   return dispatch_mxfp8_oproj<Mxfp8OprojOperation::kProducer>(p, s);
 }
 
-KernelTraits mxfp8_oproj_cutlass_kernel_traits(int32_t epilogue_n) {
+KernelTraits mxfp8_oproj_cutlass_kernel_traits(int32_t epilogue_n, bool overlap_postnorm) {
+  if (overlap_postnorm) {
+    if (epilogue_n == 32) return kernel_traits<typename Mxfp8OprojBinding<32, true>::Kernel>();
+    if (epilogue_n == 64) return kernel_traits<typename Mxfp8OprojBinding<64, true>::Kernel>();
+    return {};
+  }
   if (epilogue_n == 32) return kernel_traits<typename Mxfp8OprojBinding<32>::Kernel>();
   if (epilogue_n == 64) return kernel_traits<typename Mxfp8OprojBinding<64>::Kernel>();
   return {};
@@ -758,7 +916,7 @@ cudaError_t a2a_gemm_mxfp8_staging_view(const Mxfp8A2AGemmParams& p, Mxfp8Activa
   const auto& g = p.projection.gemm;
   if (!a || !supported_mxfp8_problem(g) || !mxfp8_aligned(p.workspace))
     return cudaErrorInvalidValue;
-  const auto w = Mxfp8A2AWorkspace::make(g, p.workspace);
+  const auto w = Mxfp8A2AWorkspace::make(g, p.workspace, p.overlap_postnorm);
   if (p.workspace_bytes < w.bytes) return cudaErrorInvalidValue;
   a->data = w.a;
   a->scales = reinterpret_cast<const uint8_t*>(w.sfa);

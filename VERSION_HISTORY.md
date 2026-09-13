@@ -1,5 +1,18 @@
 # 版本演进手册
 
+## v22.0：实验性 MXFP8 norm/RoPE 前向融合
+
+- 可选 Q/K head RMSNorm＋RoPE、RoPE-only、OProj 后残差＋完整 hidden RMSNorm；
+  默认关闭，原纯 GEMM＋通信边界及历史基线独立保留。没有 OProj RoPE。
+- QKV 在通信 SMEM 槽中以双 lane/head、BF16 成对运算完成后处理；OProj 在
+  完整行 ready 后复用已完成工作的 CTA，以异步输入暂存和容量适配的2/4行归约
+  完成残差与 norm，保留独立残差和，不弱化完整 ready/TMA drain。
+- Graph10+50：QKV15/15合计1.918P（Qwen3 1.785P，Llama 1.953P）；
+  OProj16/18已通过点1.743P，两405B CP4数值失败明确保留，不称全量正确或全类1.9P。
+- 独立同配置融合/分离对照：QKV几何平均1.0901x，OProj1.0308x；
+  不将历史纯双融合的不同边界冒充同场消融。显式预算，无新增 Auto/反向。
+  [最终结果与复现](results/sm103/v22.0/README.md)。
+
 ## v21.0：SM103 MXFP8 A2A→OProj 手工 SOTA
 
 - 搬运与权重量化分 warp 并行；FP8 cp.async→TMA 混合搬运，scale 成组读取。

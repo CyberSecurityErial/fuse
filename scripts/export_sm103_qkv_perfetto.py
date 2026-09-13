@@ -489,6 +489,13 @@ def export(run, output):
                                    transfer_args(rank, r['peer'], task, r['rows'], r['columns'], 'g2s')),
                                   ('peer S2G (SMEM read complete)', r['s2g_begin'], r['s2g_read_done'],
                                    transfer_args(rank, r['peer'], task, r['rows'], r['columns'], 's2g'))]
+                        if job.get('qkv_postprocess') and r['segment'] < 2:
+                            assert r['g2s_done'] <= r['post_begin'] <= r['post_math_done'] <= r['post_end'] <= r['s2g_begin']
+                            mode = 'Q/K RMSNorm + RoPE' if job['qkv_postprocess'] == 'qknorm_rope' else 'Q/K RoPE'
+                            phases[2:2] = [(mode + ' arithmetic + SMEM writes', r['post_begin'], r['post_math_done'], attrs),
+                                           ('postprocess SMEM proxy publication', r['post_math_done'], r['post_end'], attrs)]
+                        else:
+                            assert not any(r.get(k, 0) for k in ('post_begin', 'post_math_done', 'post_end'))
                     for name, start, stop, attrs in phases:
                         stream.write(',')
                         json.dump(dict(ph='X', name=name, pid=rank, tid=grouped_tid(1000+cta*8+warp, comm, bool(job.get('mxfp8'))),

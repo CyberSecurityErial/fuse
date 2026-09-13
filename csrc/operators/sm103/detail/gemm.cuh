@@ -233,24 +233,36 @@ struct Mxfp8GemmFamily {
 using Mxfp8GemmTypes = Mxfp8GemmFamily<>;
 
 // The same block-scaled collective serves either fusion direction. OProj
-// waits for complete A peer shards and W panels, then uses the ordinary BF16
-// output epilogue: there is no output-router ready publication to perform.
-template <int EpilogueN = 32>
+// waits for complete A peer shards and W panels. Ordinary OProj needs no
+// output publication; the optional row-ready norm uses the existing drained
+// tile publisher so a consumer can wait for every N tile of a complete row.
+template <int EpilogueN = 32, bool PublishOutput = false>
 struct Mxfp8A2ALhsGemmTypes : Mxfp8GemmFamily<256, 128, EpilogueN> {
   using Types = Mxfp8GemmFamily<256, 128, EpilogueN>;
   using Collective = detail::Mxfp8OprojMainloop<typename Types::Mainloop>;
   using Mainloop = detail::A2ALhsReadyMainloop<
       detail::WeightReadyMainloop<Collective>, typename Types::TileShape>;
+  using Epilogue = std::conditional_t<PublishOutput,
+      detail::SignalingEpilogue<typename Types::Epilogue, typename Types::TileShape>,
+      typename Types::Epilogue>;
   using Gemm = cutlass::gemm::kernel::GemmUniversal<ProblemShape, Mainloop,
-      typename Types::Epilogue, detail::MonolithicPersistentScheduler>;
+      Epilogue, detail::MonolithicPersistentScheduler>;
 #if FUSE_ENABLE_PROFILING
   // Reuse the ready/CTA protocol, not the BF16-only MMA diagnostic mirror:
   // block-scaled MMA has additional scale operands and a different contract.
   using TelemetryMainloop = detail::A2ALhsReadyMainloop<
       detail::WeightReadyMainloop<detail::OprojMxfp8MainloopObserver<Collective>>, typename Types::TileShape,
       true, false, false>;
+  // Observe the WHOLE selected collective, including optional publication.
+  // Its return record is written only after release, not immediately before
+  // release where the profiling store could add an ordering dependency.
+  // Other observer writes still have overhead: this is not production timing.
+  using TelemetryEpilogueBase = std::conditional_t<PublishOutput,
+      detail::SignalingEpilogue<typename Types::Epilogue, typename Types::TileShape>,
+      typename Types::Epilogue>;
+  using TelemetryEpilogue = detail::OprojEpilogueObserver<TelemetryEpilogueBase>;
   using TelemetryGemm = cutlass::gemm::kernel::GemmUniversal<ProblemShape,
-      TelemetryMainloop, detail::OprojEpilogueObserver<typename Types::Epilogue>, detail::MonolithicPersistentScheduler>;
+      TelemetryMainloop, TelemetryEpilogue, detail::MonolithicPersistentScheduler>;
 #endif
 };
 

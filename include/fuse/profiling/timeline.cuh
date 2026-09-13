@@ -30,6 +30,20 @@ struct A2AGemmCtaTimeline {
   uint64_t fence_done = 0;
   uint64_t publish_done = 0;
   uint64_t source_ready[kMaxWorldSize]{};
+  // Optional OProj residual/RMSNorm tail. end remains the original role end;
+  // these stamps describe the subsequent grid join and whole-CTA norm tail.
+  uint64_t postnorm_ready = 0;
+  uint64_t postnorm_end = 0;
+  // Row-ready exploration: one whole-CTA norm worker after its own role ends.
+  // norm_threads also identifies historical W128-cohort diagnostic captures.
+  // The interval includes claims/readiness; sums are disjoint observed phases,
+  // not separately placeable timeline spans and not Tensor Core utilization.
+  uint64_t norm_worker_begin = 0, norm_worker_end = 0;
+  uint64_t norm_wait_ns = 0, norm_work_ns = 0;
+  // Diagnostic sums per complete row group: input/add/partial reduction,
+  // cross-warp inverse RMS, then normalization/gamma/writeback. Not bare IO.
+  uint64_t norm_load_ns = 0, norm_reduce_ns = 0, norm_store_ns = 0;
+  uint32_t norm_rows = 0, norm_threads = 0;
 };
 
 // Per-peer publication and observation timestamps for one logical GEMM tile.

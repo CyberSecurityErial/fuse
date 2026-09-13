@@ -269,6 +269,13 @@ MPI role summary 将同一批 CTA 时间戳压缩成以下字段：
 
 ### SM103 QKV 逐 route tile 诊断
 
+独立 norm/RoPE 探索分支在实际 Q/K route 的 G2S 完成后、S2G 发起前记录
+`post_begin/post_math_done/post_end`：第一段是算术、通用 SMEM 写入与 warp 汇合，
+第二段是 async proxy fence 与汇合。只在 profiling 宏内打点，时间戳暂存寄存器，
+随原有 route record 一起写回；不增加同步。V 和关闭后处理的记录全为0。
+新阶段显示在所属通信 warp 内，严格验证 G2S→后处理→S2G 的包含顺序。
+不能把这段归到裸 TMA 时间，也不能由短 trace 代替正式10+50性能。
+
 SM103 `fused_bf16 --profile --profile-direction qkv --profile-detail full`
 在原 CTA/finalize 时间线上增加每个通信 warp 的逐任务记录。目前只接受
 64×128 BF16 tensor-copy 路径，其他路径拒绝而非输出缺失记录。每个 task
@@ -457,6 +464,13 @@ load/MMA 阶段累计值；仅 GPU0 的 worker 0、1、`compute_ctas-min(swizzle
 | MMA issue / stage release | 原有 block-scaled MMA 与 consumer_release 的发起区间；不是 Tensor Core busy |
 | Epilogue | 原有 accumulator wait、TMEM release 和 store 边界，沿用 BF16 observer |
 
+带 `profile_oproj_epilogue_scope,return_scope=whole_collective_v2` 的新记录，
+`epi_return` 覆盖完整 collective，包含启用时的输出ready发布。observer位于
+SignalingEpilogue外层，return时间戳的全局写回在release之后，避免把该紧邻的
+诊断写入加入release的排序前驱。其他打点仍有干扰，不能称零开销。旧日志没有
+该标记时导出为`legacy_unspecified`，不能混用前后epi主体/间隙的统计口径。
+任何发布路径优化必须用无打点Graph性能复核，不能用profile中的间隙直接预测收益。
+
 镜像严格对应固定 CUTLASS `57e3cfb` 的
 `sm100_blockscaled_mma_warpspecialized.hpp`。N256 使用 overlapping accumulator：
 第一个 K-stage 先等输入、送 scale，再等 TMEM slot；不能套用 BF16 的先 acquire
@@ -529,7 +543,31 @@ Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终
 计算首 tile/周期仍由逐 tile 记录直接统计，不用整段 C 除 waves 代替。
 细分发布记录保留用于诊断，不作为新整段模型的决策系数。
 
+- 探索性 OProj residual/RMSNorm 尾部复用 CTA timeline：`end` 仍是原通信/GEMM role 的结束，
+  `postnorm_ready` 是原 role 后全 grid 汇合完成，`postnorm_end` 是该 CTA 全部 norm warp
+  汇合后的结束。后两条带放在各自 CTA 主轨道、原 role 之后；kernel 外框延长到全部
+  `postnorm_end` 的最大值。不能把归一化尾部算成 GEMM 算力时间。末尾 CTA 汇合仅用于
+  profile，正式 kernel 不额外加此屏障。无 postnorm 时新增字段必须为零。
 - 不比较不同 rank 的绝对 `%globaltimer` 值；每个 rank 在 JSON 中使用自己的时间原点。
+- Row-ready OProj norm 使用每 CTA 一个 `norm_worker_begin/end` 区间：通信和计算
+  CTA 均在各自原 role 完成、局部汇合后使用256线程。实际 ready 等待与
+  八行处理段分别累计为 `norm_wait_ns`、`norm_work_ns`，放在条带元数据中；不能把
+  累计值伪造为连续的子条带。剩余时间包括任务领取/屏障/打点。每 rank 的 `norm_rows`
+  总和必须等于本地 M。条带放在所属 CTA 下，外框包含 norm worker 的最晚结束。
+  该模式无全 grid norm join，`postnorm_ready/end` 为零；原 `end` 不含后续 norm。
+  导出器兼容早期128线程 W cohort trace：那一版通信 `end` 已包含 W norm，
+  应按 `norm_threads` 和区间是否相交识别，不能混作纯通信时长。
+- 归一化主体的诊断累计值：`norm_load_ns` 包含向量读取、BF16残差相加、残差和写出、
+  warp内平方和及第一次CTA屏障；`norm_reduce_ns` 为跨warp归约/rsqrt/广播屏障；
+  `norm_store_ns` 为归一化、gamma乘法、输出写回及末尾屏障。它们不是纯访存延迟。
+  三项之和不得超过所属row-work或tail区间。只作为同CTA条带元数据展示，不把累计
+  阶段伪造为连续子条带；历史没有这些字段的trace不补造阶段时间。
+- `--oproj-postnorm-separate` 仅为非 profiling 对照：原 A2A/GEMM 和优化过的
+  独立 residual/RMSNorm 是同一 Graph 内的两个 kernel，以默认完整完成依赖相连。
+  检查器显式验证两节点/一条普通依赖、各自的 launch 属性与跨 epoch 不变性；
+  普通融合测量仍必须只有一个 cooperative kernel，不能借此放开任意多节点图。
+  两个 kernel 都包含在同一对 CUDA events 中，使用同样10+50及双输入验证。
+  此对照标为 `separate_postprocess_reference`，不记作单-kernel融合吞吐。
 - `GEMM` 轨道不是纯 Tensor Core 时间，不能直接拿它计算 WGMMA 吞吐。
 - profile kernel 多写 global-memory 时间戳，数值会受观测开销影响；正式延迟仍以 profiling 关闭后的 10+50 benchmark 为准。
 - Perfetto 先看同一 rank 内的通信完成、peer 发布顺序、首包等待和 CTA 长尾，再用正式 benchmark 判断这些现象是否影响端到端时间。

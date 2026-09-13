@@ -2,6 +2,7 @@
 #pragma once
 
 #include "fuse/operators/primitives/gemm_a2a.h"
+#include "fuse/operators/semantics/attention_postprocess.h"
 #include "fuse/profiling/sm103/mxfp8.cuh"
 #include <cstddef>
 
@@ -34,6 +35,7 @@ struct Mxfp8GemmA2AParams {
   // CUTLASS epilogue subtile N; independent of the full N256 ready panel.
   // Raster/swizzle remain explicit in projection.gemm. 64 preserves the baseline.
   int32_t epilogue_n = 64;
+  QkvPostprocess postprocess{};
 };
 
 KernelTraits mxfp8_qkv_cutlass_kernel_traits(int32_t epilogue_n = 64);
@@ -54,6 +56,17 @@ cudaError_t quantize_gemm_a2a_mxfp8_activation(const GemmProblem& problem,
 cudaError_t gemm_a2a_mxfp8_workspace_size(const GemmProblem& problem, size_t* bytes);
 cudaError_t launch_gemm_a2a_mxfp8_cutlass(
     const Mxfp8GemmA2AParams& params, cudaStream_t stream);
+
+// Diagnostic: original GEMM+A2A followed by optimized Q/K norm/RoPE in-place.
+// Same complete boundary in TWO cooperative kernels. batch1, explicit budget,
+// no deferred V. global_post uses destination rank-major [global_seq,128]
+// position tables; gamma/epsilon/mode match params.postprocess. Input tables are
+// caller-prepared, as in production. V and raw local_output remain unchanged.
+// Uses underlying route/ready epochs2e and2e+1; caller epoch e must be positive
+// and <=(UINT32_MAX-1)/2. Do not mix normal and diagnostic epoch conventions
+// on the same flags without completing all ranks and resetting those flags.
+cudaError_t launch_gemm_a2a_mxfp8_postprocess_reference(
+    const Mxfp8GemmA2AParams& params, QkvPostprocess global_post, cudaStream_t stream);
 
 // Diagnostic control: prepare W separately, then measure GEMM+A2A alone.
 // Re-prepare after W changes; this is not the dynamic-weight fused boundary.

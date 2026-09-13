@@ -62,6 +62,8 @@ const char* cudaGetErrorString(cudaError_t);
 cudaError_t cudaStreamBeginCapture(cudaStream_t,cudaStreamCaptureMode);
 cudaError_t cudaStreamEndCapture(cudaStream_t,cudaGraph_t*);
 cudaError_t cudaGraphGetNodes(cudaGraph_t,cudaGraphNode_t*,size_t*);
+struct cudaGraphEdgeData { unsigned char from_port=0,to_port=0,type=0,reserved[5]{}; };
+cudaError_t cudaGraphGetEdges(cudaGraph_t,cudaGraphNode_t*,cudaGraphNode_t*,cudaGraphEdgeData*,size_t*);
 cudaError_t cudaGraphNodeGetType(cudaGraphNode_t,cudaGraphNodeType*);
 cudaError_t cudaGraphKernelNodeGetParams(cudaGraphNode_t,cudaKernelNodeParams*);
 cudaError_t cudaGraphKernelNodeGetAttribute(cudaGraphNode_t,cudaKernelNodeAttrID,cudaKernelNodeAttrValue*);
@@ -94,6 +96,7 @@ struct Executable { uint32_t epoch=0; };
 cudaStream_t stream=reinterpret_cast<void*>(0x2000);
 std::string fault;
 Graph next;
+Graph post;
 int owner_device=0, begins=0, ends=0, instantiates=0, uploads=0, updates=0, launches=0;
 int graph_live=0, exec_live=0;
 bool capturing=false, busy=false;
@@ -115,7 +118,16 @@ int cudaStreamEndCapture(cudaStream_t s,cudaGraph_t* out) {
 int cudaGraphGetNodes(cudaGraph_t graph,cudaGraphNode_t* nodes,size_t* count) {
   CHECK(graph);
   if(fault=="get_nodes") return 1;
-  *count=graph->count; if(nodes && graph->count) *nodes=graph; return 0;
+  *count=graph->count;
+  if(nodes && graph->count) { nodes[0]=graph; if(graph->count==2) nodes[1]=&post; }
+  return 0;
+}
+int cudaGraphGetEdges(cudaGraph_t graph,cudaGraphNode_t* from,cudaGraphNode_t* to,cudaGraphEdgeData* data,size_t* count) {
+  *count=fault=="unordered"?0:1;
+  if(from) *from=fault=="reverse_edge"?&post:graph;
+  if(to) *to=fault=="reverse_edge"?graph:&post;
+  if(data) data->type=fault=="programmatic_edge"?1:0;
+  return 0;
 }
 int cudaGraphNodeGetType(cudaGraphNode_t node,cudaGraphNodeType* type) { *type=node->type; return 0; }
 int cudaGraphKernelNodeGetParams(cudaGraphNode_t node,cudaKernelNodeParams* params) {
@@ -198,6 +210,23 @@ int main(int argc,char** argv) {
       complete(); op.reset(19); CHECK(graph_live==0 && exec_live==0);
       op.prepare(20,actual_launch); complete(); op.launch(); complete(); op.reset(20);
       CHECK(instantiates==2 && op.committed_epoch()==20 && executed==std::vector<uint32_t>({18,19,20}));
+    } else if(mode=="separate" || mode=="separate_qkv") {
+      const bool qkv=mode=="separate_qkv";
+      next.count=2; post.cooperative=qkv?1:0; post.smem=qkv?0:16448; post.grid={16384,1,1};
+      post.function=reinterpret_cast<void*>(0x4000);
+      fused_graph::Operation op(0,stream,0,true,qkv);
+      if(argc==3) {
+        fault=argv[2];
+        if(fault=="bad_post") post.cooperative=qkv?0:1;
+        rejects([&]{op.prepare(1,actual_launch);});
+      } else {
+        op.prepare(1,actual_launch); complete(); op.launch(); complete();
+        op.prepare(2,actual_launch); op.launch(); complete();
+        CHECK(launches==2 && updates==1 && op.committed_epoch()==2);
+        post.smem+=16;
+        rejects([&]{op.prepare(3,actual_launch);});
+      }
+      op.reset(op.committed_epoch());
     } else if(mode=="epochs") {
       fused_graph::Operation op(0,stream);
       rejects([&]{op.prepare(0,actual_launch);}); rejects([&]{op.prepare(2,actual_launch);});
@@ -262,6 +291,13 @@ int main(int argc,char** argv) {
 
     def test_capture_never_executes_and_replay_commits_contiguous_epochs(self):
         self.run_probe("normal")
+
+    def test_separate_reference_is_one_ordered_two_kernel_graph(self):
+        for mode in ('separate','separate_qkv'):
+            self.run_probe(mode)
+            for fault in ('unordered','reverse_edge','bad_post','programmatic_edge'):
+                with self.subTest(mode=mode,fault=fault):
+                    self.run_probe(mode,fault)
 
     def test_duplicate_skipped_zero_wrapped_and_unlaunched_epochs_are_rejected(self):
         self.run_probe("epochs")

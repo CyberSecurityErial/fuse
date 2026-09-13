@@ -51,9 +51,12 @@ struct Mxfp8A2AWorkspace {
   Fp8E4m3* a = nullptr;
   cutlass::float_ue8m0_t* sfa = nullptr;
   uint32_t* ready = nullptr;
+  uint32_t* output_ready = nullptr;
+  uint32_t* postnorm_next_row = nullptr;
   size_t bytes = 0;
 
-  static Mxfp8A2AWorkspace make(const GemmProblem& p, void* memory = nullptr) {
+  static Mxfp8A2AWorkspace make(const GemmProblem& p, void* memory = nullptr,
+                              bool output_ready = false) {
     Mxfp8A2AWorkspace w;
     w.weights = Mxfp8Workspace::make(p, memory);
     const auto shape = cute::make_shape(p.m, p.n, p.k, 1);
@@ -70,6 +73,15 @@ struct Mxfp8A2AWorkspace {
       w.a = reinterpret_cast<Fp8E4m3*>(base);
       w.sfa = reinterpret_cast<cutlass::float_ue8m0_t*>(base + data_bytes);
       w.ready = reinterpret_cast<uint32_t*>(base + data_bytes + scale_bytes);
+      if (output_ready)
+        w.output_ready = reinterpret_cast<uint32_t*>(static_cast<unsigned char*>(memory) + w.bytes);
+    }
+    if (output_ready) {
+      w.bytes += Mxfp8Workspace::align(size_t(ceil_div(p.m, 128)) *
+          ceil_div(p.n, 256) * kReadyFlagStride * sizeof(uint32_t));
+      if (memory)
+        w.postnorm_next_row = reinterpret_cast<uint32_t*>(static_cast<unsigned char*>(memory) + w.bytes);
+      w.bytes += 256;
     }
     return w;
   }

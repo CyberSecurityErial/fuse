@@ -97,6 +97,17 @@ def audit(folder, allow_timeout_partial=False, allow_boundary_partial=False, bas
     rows, pending = [], []
     for name, shape in matrix.items():
         group = [v for (sid, _), v in candidates.items() if sid == name]
+        # A terminated stdout stream may contain only the beginning of the
+        # final RESULT loop even though every trial finished payload1. Do not
+        # call that matrix complete or choose a winner from its printed prefix.
+        verified = {key for key, phases in checks.items() if key[0] == name and
+                    phases == {(0, 'pre'), (0, 'post'), (1, 'post')}} & samples.keys()
+        emitted = {key for key in candidates if key[0] == name}
+        if verified != emitted:
+            if timed_out or allow_boundary_partial:
+                pending.append(shape)
+                continue
+            raise ValueError(f'Incomplete result emission: {name}')
         if not group:
             if name not in skips:
                 if timed_out or allow_boundary_partial:

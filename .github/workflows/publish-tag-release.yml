@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v21.0
+        default: v22.0
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v21.0");
+              : (process.env.REQUESTED_TAG || "v22.0");
 
             const releases = {
+              "v22.0": {
+                name: "v22.0 — Experimental SM103 MXFP8 norm/RoPE forward fusion",
+                body: [
+                  "新增默认关闭的实验功能：Qwen3 QKV→Q/K head RMSNorm→RoPE→A2A；Llama QKV→RoPE→A2A；A2A→OProj→残差相加→完整 hidden RMSNorm。保留独立残差和供后续 MLP 使用；没有 OProj RoPE。原纯 GEMM＋通信及 v20/v21 表独立保留。",
+                  "优化：QKV 在现有通信 SMEM 槽完成双 lane/head、BF16 成对 norm/RoPE；OProj 复用已完成原工作的 CTA，完整行 ready 后异步暂存输入、容量适配2/4行归约。完整 TMA drain/ready 数值与同步合同不放宽。",
+                  "Graph10+50，双非零 payload：QKV15/15合计1.918 PFLOPS/卡，其中 Qwen3三点1.785P、Llama十二点1.953P；OProj16/18已通过点1.743P，两 Llama405B CP4/256K、512K数值失败明确留空。不是所有类别均达到1.9P，也不是全量正确性通过。",
+                  "独立同配置融合/分离对照：QKV几何平均1.0901x，OProj1.0308x；部分最终配置不同，不能用主表除以旧分离时间冒充配对收益。完整新边界含动态W量化/A2A/新增操作；上游激活量化和位置表生成不包含。",
+                  "显式通信预算；没有新增 Auto、MXFP8/norm/RoPE反向或整模型训练验收声明。最终表、配置、样本与证据：results/sm103/v22.0；不附调参过程、profile或依赖。",
+                ].join("\n\n"),
+              },
               "v21.0": {
                 name: "v21.0 — SM103 MXFP8 OProj manual SOTA",
                 body: [

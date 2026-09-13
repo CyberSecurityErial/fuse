@@ -289,6 +289,14 @@ def fused_device_memory(job):
     # Count only selected directions, including their independent full references.
     buffer_bytes = 2 * (qkv * (m * h + 3 * m * p + h * p) +
                         oproj * (3 * m * q + 2 * m * h + h * q))
+    if qkv and job.get('qkv_postprocess') not in (None, 'none'):
+        buffer_bytes += 4 * m * shape['head_dim'] + 4 * shape['head_dim']  # cos/sin and Q/K gamma
+        if job.get('qkv_postprocess_separate'):
+            buffer_bytes += 4 * (shape['global_seq'] - m) * shape['head_dim']
+    if oproj and job.get('oproj_postnorm'):
+        buffer_bytes += 10 * m * h + 2 * h  # residual, sum/reference, two repeat snapshots, gamma
+        if job.get('oproj_postnorm_overlap'):
+            buffer_bytes += ((m + 127) // 128) * ((h + 255) // 256) * 32 * 4 + 256
     if job.get('mxfp8'):
         # Packed FP8 A/W + independent BF16 decoded-oracle A/W + native scales.
         if oproj:
@@ -365,6 +373,22 @@ def validate_job(job, hostname=None):
     if job.get('mxfp8_epilogue_n') is not None and (
             not job.get('mxfp8') or job['mxfp8_epilogue_n'] not in (32, 64)):
         raise ValueError('--mxfp8-epilogue-n requires MXFP8 and 32 or 64')
+    if job.get('qkv_postprocess') and (
+            not job.get('mxfp8') or job.get('fused_direction') != 'qkv' or
+            job.get('calibrate') or job.get('auto_mxfp8_comm') or job.get('cpu_oracle')):
+        raise ValueError('QKV postprocess requires explicit-budget MXFP8 QKV, no calibration/CPU oracle')
+    if job.get('qkv_postprocess_separate') and (not job.get('qkv_postprocess') or
+            job.get('profile') or job.get('mxfp8_prequantized')):
+        raise ValueError('Separate QKV postprocess requires dynamic-weight non-profile postprocessing')
+    if job.get('oproj_postnorm') and (
+            not job.get('mxfp8') or job.get('fused_direction') != 'oproj' or
+            job.get('calibrate') or job.get('auto_mxfp8_comm') or job.get('cpu_oracle')):
+        raise ValueError('OProj postnorm requires MXFP8 OProj, no calibration/CPU oracle')
+    if job.get('oproj_postnorm_overlap') and not job.get('oproj_postnorm'):
+        raise ValueError('Overlap postnorm requires postnorm')
+    if job.get('oproj_postnorm_separate') and (not job.get('oproj_postnorm') or
+            job.get('oproj_postnorm_overlap') or job.get('profile')):
+        raise ValueError('Separate postnorm requires non-profile postnorm without overlap')
     window = tuple(job.get(key, 0) for key in ('oproj_m_window_tiles', 'oproj_n_group_tiles'))
     if any(type(value) is not int or value < 0 or value > 2**31 - 1 for value in window):
         raise ValueError('OProj window dimensions must be nonnegative int32 values')
@@ -1239,6 +1263,20 @@ def fused_argv(job):
         argv += ['--mxfp8-weight-preparation', job['mxfp8_weight_preparation']]
     if job.get('mxfp8_epilogue_n') is not None:
         argv += ['--mxfp8-epilogue-n', str(job['mxfp8_epilogue_n'])]
+    if job.get('qkv_postprocess'):
+        argv += ['--qkv-postprocess', job['qkv_postprocess']]
+    if job.get('qkv_postprocess_separate'):
+        argv.append('--qkv-postprocess-separate')
+    if job.get('oproj_postnorm'):
+        argv.append('--oproj-postnorm')
+    if job.get('oproj_postnorm_overlap'):
+        argv.append('--oproj-postnorm-overlap')
+    if job.get('oproj_postnorm_separate'):
+        argv.append('--oproj-postnorm-separate')
+    if job.get('norm_epsilon') is not None:
+        argv += ['--norm-epsilon', str(job['norm_epsilon'])]
+    if job.get('rope_policy'):
+        argv += ['--rope-policy', job['rope_policy']]
     if job.get('mxfp8_service_probe'):
         argv.append('--mxfp8-service-probe')
     if job.get('quick'):
@@ -2134,6 +2172,18 @@ def main():
     run.add_argument('--backward-matrix', help='BF16 backward same-CP case list; persistent MPI ranks')
     run.add_argument('--mxfp8', action='store_true', help='QKV MXFP8 activation + BF16 W -> fused weight quantization/GEMM/BF16 A2A')
     run.add_argument('--mxfp8-prequantized', action='store_true', help='MXFP8 diagnostic: exclude weight preparation')
+    run.add_argument('--qkv-postprocess', choices=('rope', 'qknorm_rope'),
+                     help='Experimental real-model post-GEMM Q/K RMSNorm/RoPE, included in F timing')
+    run.add_argument('--qkv-postprocess-separate', action='store_true',
+                     help='Comparison: original GEMM/A2A then separate head norm/RoPE with all-rank completion')
+    run.add_argument('--oproj-postnorm', action='store_true',
+                     help='Experimental OProj -> residual add -> full-hidden RMSNorm, included in F timing')
+    run.add_argument('--oproj-postnorm-overlap', action='store_true',
+                     help='Experimental row-ready norm shared by CTAs after their own A/W or GEMM role drains')
+    run.add_argument('--oproj-postnorm-separate', action='store_true',
+                     help='Comparison: original A2A/GEMM then separate optimized norm in the same Graph')
+    run.add_argument('--norm-epsilon', type=float, help='Model RMSNorm epsilon (default 1e-6)')
+    run.add_argument('--rope-policy', choices=('qwen3', 'llama31'), help='Upstream RoPE table policy for validation fixture')
     run.add_argument('--mxfp8-epilogue-n', type=int, choices=(32, 64),
                      help='MXFP8 CUTLASS epilogue subtile; default 64 preserves baseline')
     run.add_argument('--mxfp8-weight-preparation', choices=('comm', 'all', 'comm_warp'), help='Weight quantization by communication CTAs (default), all CTAs at startup, or comm_warp: warps 0..3 route immediately; warps 4..7 quantize then join routing (warp_then_route_v1)')

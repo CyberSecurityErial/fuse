@@ -1,6 +1,11 @@
 # Benchmark Index
 
-当前版本：v17.0
+当前版本：v22.0
+
+- [实验性 norm/RoPE 增强前向：独立结果与完整计时边界](results/sm103/v22.0/README.md)
+  （默认关闭；QKV15/15，OProj16/18，数值失败点保留；不混入下面纯双融合基线）
+- [纯双融合 MXFP8 A2A＋OProj：v21.0 手工优胜配置](results/sm103/v21.0/README.md)
+- [纯双融合 MXFP8 QKVProj＋A2A：v20.0 Auto与手工配置](results/sm103/v20.0/README.md)
 
 - [SM103 OProj：离线选优与生产消费调度，23/30 点 Graph 1+5 快筛](results/sm103/v17.0/README.md)
   （不是运行时自动选优或正式10+50复测；历史正式基线保留）

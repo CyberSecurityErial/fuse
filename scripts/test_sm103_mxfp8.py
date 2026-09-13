@@ -72,6 +72,23 @@ class Mxfp8QuantizationContracts(unittest.TestCase):
             save()
             summary=report.audit(root)
             self.assertEqual(summary['rows'][0]['winner']['p50_ms'],1.)
+            complete_lines = list(lines)
+            missing = 'm128n256k128e32s0sw8N'
+            lines += [f'RUN cutlass_mxfp8,id=example,candidate={missing}']
+            for generation,phase in ((0,'pre'),(0,'post'),(1,'post')):
+                lines.append(f'correctness,pure_mxfp8,id=example,generation={generation},phase={phase},'
+                             'checked=32768,mismatches=0,nonfinite=0')
+            lines += [f'samples,cutlass_mxfp8,id=example,config={missing},round=0,ms='+json.dumps([.5]*50), '']
+            # The first candidate has a RESULT; the faster verified second
+            # candidate does not. A printed prefix cannot select the winner.
+            save()
+            with self.assertRaisesRegex(ValueError,'Incomplete result emission'):
+                report.audit(root)
+            partial = report.audit(root,allow_boundary_partial=True)
+            self.assertEqual(partial['pending'],[shape])
+            self.assertEqual(partial['rows'],[])
+            lines = complete_lines
+            save()
             tail=json.loads(json.dumps(summary))
             tail['run_id']='unit-tail'
             tail['rows'][0]['id']='example-tail'
@@ -369,7 +386,7 @@ int main() {
         self.assertIn('cute::initialize_barrier', route)
         self.assertNotIn('__syncthreads', route)
         self.assertNotIn('atomic', route)
-        self.assertIn('run<TraceTasks, Mxfp8WeightProducer, 4>', comm)
+        self.assertIn('run<TraceTasks, Mxfp8WeightProducer, 4, QkvHeadPostprocess>', comm)
         self.assertIn('quant_warps * comm_ctas', comm)
         # Independent strided queues must cover every item exactly once even
         # when the work size is not a multiple of either worker population.

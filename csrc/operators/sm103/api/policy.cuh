@@ -108,6 +108,8 @@ inline cudaError_t resolve_mxfp8_oproj_communication(
   if (!resolved || params.projection.num_comm_ctas < 0) return cudaErrorInvalidValue;
   *resolved = params;
   if (params.projection.num_comm_ctas > 0) return cudaSuccess;
+  // The old service calibration excludes the new residual/RMSNorm work.
+  if (params.postprocess.enabled()) return cudaErrorNotSupported;
   // Bounded traversal changes A first-use windows; old Auto calibration does
   // not describe that service. Explicit budgets do not consult this model.
   if (params.m_window_tiles != 0 || params.n_group_tiles != 0) return cudaErrorNotSupported;

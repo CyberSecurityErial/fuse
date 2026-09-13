@@ -9,6 +9,7 @@
 #include "fused_mpi.cuh"
 #if FUSE_BENCH_MXFP8
 #include "fused_mxfp8.cuh"
+#include "fused_attention_postprocess.cuh"
 #include "../../csrc/operators/sm103/detail/model_calibration.cuh"
 #endif
 #if FUSE_BENCH_MPI
@@ -76,6 +77,13 @@ const char* component_name(MeasurementComponent component) {
 struct Options {
 #if FUSE_BENCH_MXFP8
   bool mxfp8_prequantized = false;
+  std::string qkv_postprocess = "none";
+  bool qkv_postprocess_separate = false;
+  bool oproj_postnorm = false;
+  bool oproj_postnorm_overlap = false;
+  bool oproj_postnorm_separate = false;
+  float norm_epsilon = 1.e-6f;
+  std::string rope_policy = "qwen3";
   std::string mxfp8_weight_preparation = "comm";
   int mxfp8_epilogue_n = 64;
   int oproj_m_window_tiles = 0;
@@ -441,6 +449,29 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error("window dimensions must fit int32");
       (argument == "--oproj-m-window-tiles" ? options.oproj_m_window_tiles : options.oproj_n_group_tiles) =
           static_cast<int>(value);
+    } else if (argument == "--norm-epsilon") {
+      if (++index >= argc) throw std::runtime_error("--norm-epsilon requires a value");
+      options.norm_epsilon = std::stof(argv[index]);
+      if (!std::isfinite(options.norm_epsilon) || options.norm_epsilon <= 0.f)
+        throw std::runtime_error("norm epsilon must be positive and finite");
+    } else if (argument == "--rope-policy") {
+      if (++index >= argc) throw std::runtime_error("--rope-policy requires qwen3|llama31");
+      options.rope_policy = argv[index];
+      if (options.rope_policy != "qwen3" && options.rope_policy != "llama31")
+        throw std::runtime_error("invalid RoPE policy");
+    } else if (argument == "--oproj-postnorm") {
+      options.oproj_postnorm = true;
+    } else if (argument == "--oproj-postnorm-overlap") {
+      options.oproj_postnorm_overlap = true;
+    } else if (argument == "--oproj-postnorm-separate") {
+      options.oproj_postnorm_separate = true;
+    } else if (argument == "--qkv-postprocess-separate") {
+      options.qkv_postprocess_separate = true;
+    } else if (argument == "--qkv-postprocess") {
+      if (++index >= argc) throw std::runtime_error("--qkv-postprocess requires none|rope|qknorm_rope");
+      options.qkv_postprocess = argv[index];
+      if (options.qkv_postprocess != "none" && options.qkv_postprocess != "rope" &&
+          options.qkv_postprocess != "qknorm_rope") throw std::runtime_error("invalid QKV postprocess");
     } else if (argument == "--mxfp8-epilogue-n") {
       options.mxfp8_epilogue_n = positive_int();
       if (options.mxfp8_epilogue_n != 32 && options.mxfp8_epilogue_n != 64)
@@ -696,6 +727,10 @@ Options parse_options(int argc, char** argv) {
   if (options.profile) throw std::runtime_error("rebuild with FUSE_ENABLE_PROFILING=ON for --profile");
 #endif
 #if FUSE_BENCH_MXFP8
+  if (options.qkv_postprocess_separate && (options.fused_direction != "qkv" ||
+      options.qkv_postprocess == "none" || options.profile || options.calibrate ||
+      options.auto_mxfp8_comm || options.mxfp8_prequantized))
+    throw std::runtime_error("Separate QKV postprocess requires explicit-budget non-profile dynamic-weight QKV");
   if (options.oproj_m_window_tiles || options.oproj_n_group_tiles) {
     const int h = options.oproj_m_window_tiles, p = options.oproj_n_group_tiles;
     if (h <= 0 || p <= 0 || (h & (h - 1)) || (p & (p - 1)) ||
@@ -757,6 +792,12 @@ struct RankRuntime {
   void* mxfp8_workspace = nullptr;
   size_t mxfp8_workspace_bytes = 0;
   fuse::Mxfp8Activation mxfp8_activation{};
+  fuse::QkvPostprocess qkv_postprocess{};
+  fuse::QkvPostprocess qkv_global_postprocess{};
+  bool qkv_postprocess_separate = false;
+  Bf16* residual_reference = nullptr;
+  Bf16* postnorm_repeat_output = nullptr;
+  bool postnorm_separate = false;
   fuse::Mxfp8A2AGemmParams mxfp8_oproj{};
   fuse::Mxfp8WeightPreparation mxfp8_weight_preparation = fuse::Mxfp8WeightPreparation::kCommunicationCtas;
   int mxfp8_epilogue_n = 64;
@@ -969,7 +1010,12 @@ void bind_graph(std::vector<RankRuntime>& runtimes, const Options& options, uint
     CUDA_CHECK(cudaSetDevice(runtime.device));
     if (runtime.graph) runtime.graph->reset(committed_epoch);
     else runtime.graph = std::make_unique<fused_graph::Operation>(
-        runtime.device, runtime.stream, committed_epoch);
+        runtime.device, runtime.stream, committed_epoch
+#if FUSE_BENCH_MXFP8
+        , options.oproj_postnorm_separate || options.qkv_postprocess_separate,
+          options.qkv_postprocess_separate
+#endif
+        );
     runtime.graph_bound_epoch = committed_epoch;
     runtime.graph_prepare_calls = 0;
     runtime.graph_prepare_wall_s = 0;
@@ -1104,7 +1150,13 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
     CUDA_CHECK(cudaEventCreate(&runtime.end));
     CUBLAS_CHECK(cublasCreate(&runtime.blas));
     CUBLAS_CHECK(cublasSetStream(runtime.blas, runtime.stream));
-    CUBLAS_CHECK(cublasSetMathMode(runtime.blas, CUBLAS_DEFAULT_MATH));
+    // New norm boundaries can amplify a BF16 reference rounding difference.
+    // Keep this independent oracle's intermediate reductions in FP32; this
+    // handle is not the timed cuBLASLt baseline. Legacy modes are unchanged.
+    const auto reference_math = options.oproj_postnorm ?
+        static_cast<cublasMath_t>(CUBLAS_DEFAULT_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION) :
+        CUBLAS_DEFAULT_MATH;
+    CUBLAS_CHECK(cublasSetMathMode(runtime.blas, reference_math));
     for (int peer = 0; peer < options.world; ++peer) {
       if (fused_mpi::enabled) break; // CUDA IPC opens enable directed peer access.
       if (peer == rank) continue;
@@ -1155,6 +1207,30 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
 #if FUSE_BENCH_MXFP8
       runtime.mxfp8_prequantized = options.mxfp8_prequantized;
       runtime.mxfp8_epilogue_n = options.mxfp8_epilogue_n;
+      if (options.qkv_postprocess_separate &&
+          (options.qkv_postprocess == "none" || options.profile || options.mxfp8_prequantized))
+        throw std::runtime_error("Separate QKV postprocess requires dynamic-weight non-profile postprocessing");
+      runtime.qkv_postprocess_separate = options.qkv_postprocess_separate;
+      if (options.qkv_postprocess != "none") {
+        if (options.head_dim != 128 || options.cpu_oracle || options.auto_mxfp8_comm || options.calibrate)
+          throw std::runtime_error("postprocess requires head128, explicit CTA budget, GPU reference, no calibration");
+        auto* q = allocate<Bf16>(runtime, 128);
+        auto* k = allocate<Bf16>(runtime, 128);
+        const int table_rows = options.qkv_postprocess_separate ? options.global_seq() : m;
+        auto* c = allocate<Bf16>(runtime, checked_product(table_rows, 128));
+        auto* s = allocate<Bf16>(runtime, checked_product(table_rows, 128));
+        fused_attention::initialize<<<256, 256, 0, runtime.stream>>>(q, k, c, s, table_rows,
+            options.qkv_postprocess_separate ? 0 : rank,
+            options.rope_policy == "llama31");
+        CUDA_CHECK(cudaGetLastError());
+        runtime.qkv_postprocess = {options.qkv_postprocess == "qknorm_rope" ? q : nullptr,
+            options.qkv_postprocess == "qknorm_rope" ? k : nullptr, c, s, options.norm_epsilon};
+        if (options.qkv_postprocess_separate) {
+          runtime.qkv_global_postprocess = runtime.qkv_postprocess;
+          runtime.qkv_postprocess.cos += int64_t(rank)*m*128;
+          runtime.qkv_postprocess.sin += int64_t(rank)*m*128;
+        }
+      }
       runtime.mxfp8_weight_preparation = options.mxfp8_weight_preparation == "all"
           ? fuse::Mxfp8WeightPreparation::kAllCtas
           : (options.mxfp8_weight_preparation == "comm_warp"
@@ -1200,7 +1276,15 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
           &activation.data_bytes, &activation.scale_bytes));
       activation.data = reinterpret_cast<fuse::Fp8E4m3*>(allocate<uint8_t>(runtime, activation.data_bytes));
       activation.scales = allocate<uint8_t>(runtime, activation.scale_bytes);
-      CUDA_CHECK(fuse::a2a_gemm_mxfp8_workspace_size(runtime.oproj.gemm, &runtime.mxfp8_workspace_bytes));
+      if (options.oproj_postnorm_overlap && !options.oproj_postnorm)
+        throw std::runtime_error("overlap postnorm requires postnorm");
+      if (options.oproj_postnorm_separate &&
+          (!options.oproj_postnorm || options.oproj_postnorm_overlap || options.profile))
+        throw std::runtime_error("separate postnorm requires non-profile postnorm without overlap");
+      runtime.postnorm_separate = options.oproj_postnorm_separate;
+      runtime.mxfp8_oproj.projection = runtime.oproj;
+      runtime.mxfp8_oproj.overlap_postnorm = options.oproj_postnorm_overlap;
+      CUDA_CHECK(fuse::a2a_gemm_mxfp8_workspace_size(runtime.mxfp8_oproj, &runtime.mxfp8_workspace_bytes));
       runtime.mxfp8_workspace = allocate<uint8_t>(runtime, runtime.mxfp8_workspace_bytes);
       runtime.mxfp8_reference_a = allocate<Bf16>(runtime, checked_product(m, options.q_width()));
       runtime.mxfp8_reference_b = allocate<Bf16>(runtime, oproj_weight_count);
@@ -1209,6 +1293,21 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.mxfp8_oproj.epilogue_n = options.mxfp8_epilogue_n;
       runtime.mxfp8_oproj.m_window_tiles = options.oproj_m_window_tiles;
       runtime.mxfp8_oproj.n_group_tiles = options.oproj_n_group_tiles;
+      if (options.oproj_postnorm) {
+        if (options.cpu_oracle || options.calibrate || options.run_qkv())
+          throw std::runtime_error("OProj postnorm: OProj-only, GPU reference, no calibration");
+        const auto count = checked_product(m, options.hidden);
+        auto* residual = allocate<Bf16>(runtime, count);
+        auto* gamma = allocate<Bf16>(runtime, options.hidden);
+        auto* added = allocate<Bf16>(runtime, count);
+        runtime.residual_reference = allocate<Bf16>(runtime, count);
+        runtime.postnorm_repeat_output = allocate<Bf16>(runtime, checked_product(count, 2));
+        make_gpu_values(runtime, residual, count, options.seed + 71 + rank,
+                         "OProj-residual,rank=" + std::to_string(rank), 0.2f);
+        fused_attention::initialize_gamma<<<4, 256, 0, runtime.stream>>>(gamma, options.hidden);
+        CUDA_CHECK(cudaGetLastError());
+        runtime.mxfp8_oproj.postprocess = {residual, gamma, added, options.norm_epsilon};
+      }
 #endif
     }
     runtime.validation = allocate<fused_validation::Scratch>(runtime, 1);
@@ -1257,7 +1356,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
 #endif
         const auto oproj_traits =
 #if FUSE_BENCH_MXFP8
-            fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+            fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n, runtime.mxfp8_oproj.overlap_postnorm);
 #else
             fuse::cutlass_kernel_traits();
 #endif
@@ -1468,7 +1567,7 @@ void select_candidate(std::vector<RankRuntime>& runtimes, const Candidate& candi
     const auto traits =
 #if FUSE_BENCH_MXFP8
         qkv ? fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
-            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n, runtime.mxfp8_oproj.overlap_postnorm);
 #else
         qkv
         ? fuse::qkv_cutlass_kernel_traits(runtime.qkv.gemm, runtime.qkv.route,
@@ -1557,7 +1656,7 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
     const auto traits =
 #if FUSE_BENCH_MXFP8
         qkv ? fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
-            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
+            : fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n, runtime.mxfp8_oproj.overlap_postnorm);
 #else
         qkv
         ? fuse::qkv_cutlass_kernel_traits(problem, runtime.qkv.route, options.comm_sm, runtime.sm_count)
@@ -1759,13 +1858,16 @@ void enqueue_operation(const RankLaunch& job, int rank) {
         runtime.mxfp8_workspace_bytes, runtime.mxfp8_activation, runtime.mxfp8_weight_preparation,
         runtime.mxfp8_epilogue_n};
     params.projection.lhs = nullptr; // Prove the fused input is the MXFP8 view.
+    params.postprocess = runtime.qkv_postprocess;
 #if FUSE_ENABLE_PROFILING
     if (job.profile) CUDA_CHECK(fuse::launch_gemm_a2a_mxfp8_role_telemetry(
         params, runtime.timeline, runtime.sm_count, runtime.stream,
         runtime.mxfp8_probe, runtime.qkv_route_timeline, runtime.qkv_route_capacity));
     else
 #endif
-    CUDA_CHECK(runtime.mxfp8_prequantized
+    CUDA_CHECK(runtime.qkv_postprocess_separate
+        ? fuse::launch_gemm_a2a_mxfp8_postprocess_reference(params,runtime.qkv_global_postprocess,runtime.stream)
+        : runtime.mxfp8_prequantized
         ? fuse::launch_gemm_a2a_mxfp8_prequantized(params, runtime.stream)
         : fuse::launch_gemm_a2a_mxfp8_cutlass(params, runtime.stream));
 #else
@@ -1800,7 +1902,9 @@ void enqueue_operation(const RankLaunch& job, int rank) {
     }
     else
 #endif
-    CUDA_CHECK(fuse::launch_a2a_gemm_mxfp8_cutlass(runtime.mxfp8_oproj, runtime.stream));
+    CUDA_CHECK(runtime.postnorm_separate
+        ? fuse::launch_a2a_gemm_mxfp8_postnorm_reference(runtime.mxfp8_oproj,runtime.stream)
+        : fuse::launch_a2a_gemm_mxfp8_cutlass(runtime.mxfp8_oproj,runtime.stream));
 #else
 #if FUSE_ENABLE_PROFILING
     if (job.profile) {
@@ -2035,6 +2139,18 @@ void prepare_references(std::vector<RankRuntime>& runtimes, const Options& optio
         runtime.reference_lhs, runtime.oproj.rhs_nt, runtime.oproj_reference);
 #endif
   }
+#if FUSE_BENCH_MXFP8
+  if (options.oproj_postnorm) {
+    for (const int rank : fused_mpi::owned_ranks(options.world)) {
+      auto& r = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(r.device));
+      const auto& post = r.mxfp8_oproj.postprocess;
+      fused_attention::residual_reference<<<256, 256, 0, r.stream>>>(r.oproj_reference,
+          post.residual, r.residual_reference, post.gamma, options.seq_local, options.hidden, post.epsilon);
+      CUDA_CHECK(cudaGetLastError());
+    }
+  }
+#endif
   finish_all(runtimes);
   // Only this generation's independent OProj oracle is needed on the host.
   // Inputs remain on device, and the next generation is regenerated once.
@@ -2065,6 +2181,21 @@ std::vector<ValidationResult> gpu_validation(
     const bool qkv = direction == Direction::kQkv;
     const auto* actual = reinterpret_cast<const uint16_t*>(qkv ? runtime.qkv.local_output : runtime.oproj.output);
     const auto* expected = reinterpret_cast<const uint16_t*>(qkv ? runtime.qkv_reference : runtime.oproj_reference);
+#if FUSE_BENCH_MXFP8
+    if (!qkv && options.oproj_postnorm) {
+      CUDA_CHECK(fused_validation::launch<true>(
+          reinterpret_cast<const uint16_t*>(runtime.mxfp8_oproj.postprocess.residual_output),
+          fused_validation::DenseOracle{reinterpret_cast<const uint16_t*>(runtime.residual_reference)},
+          checked_product(options.seq_local, options.hidden), runtime.validation, 0, runtime.stream));
+      CUDA_CHECK(cudaStreamSynchronize(runtime.stream));
+      fused_validation::Stats stats{};
+      CUDA_CHECK(cudaMemcpy(&stats, runtime.validation->result, sizeof(stats), cudaMemcpyDeviceToHost));
+      if (stats.mismatches || stats.nonfinite || stats.checked != checked_product(options.seq_local, options.hidden))
+        throw std::runtime_error("postnorm residual-output reference mismatch");
+      std::cout << "postnorm_residual,rank=" << rank << ",checked=" << stats.checked
+                << ",mismatches=" << stats.mismatches << ",max_abs=" << stats.max_abs << '\n';
+    }
+#endif
     if (numeric) {
       CUDA_CHECK(fused_validation::launch<true>(actual, fused_validation::DenseOracle{expected},
           checked_product(options.seq_local, qkv ? options.projection_width() : options.hidden),
@@ -2081,6 +2212,14 @@ std::vector<ValidationResult> gpu_validation(
       for (int source = 0; source < options.world; ++source) {
         oracle.source[source] = reinterpret_cast<const uint16_t*>(runtimes[source].qkv.local_output);
       }
+#if FUSE_BENCH_MXFP8
+      if (options.qkv_postprocess != "none") {
+        CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(runtime.peer_output),
+            fused_attention::QkvOracle{oracle, options.qkv_postprocess == "qknorm_rope",
+                options.norm_epsilon, options.rope_policy == "llama31"},
+            checked_product(options.seq_local, options.projection_width()), runtime.validation, 1, runtime.stream));
+      } else
+#endif
       CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(runtime.peer_output),
           oracle, checked_product(options.seq_local, options.projection_width()),
           runtime.validation, 1, runtime.stream));
@@ -2117,6 +2256,99 @@ std::vector<ValidationResult> gpu_validation(
                             sizeof(fused_validation::Stats), cudaMemcpyDeviceToHost));
     }
   }
+#if FUSE_BENCH_MXFP8
+  if (direction == Direction::kOproj && options.oproj_postnorm && numeric) {
+    // Failure-only conditioning diagnosis. Never change the acceptance
+    // threshold or replace the independently composed reference here.
+    const auto diagnose = [&](int rank, const char* phase) {
+      const auto& stats = results[rank][0];
+      if (!stats.mismatches) return;
+      auto& r = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(r.device));
+      const auto& post = r.mxfp8_oproj.postprocess;
+      const int width = options.hidden;
+      const int64_t row = stats.first_index / width;
+      const int col = stats.first_index % width;
+      const auto own = download(post.residual_output + row * width, width);
+      const auto reference = download(r.residual_reference + row * width, width);
+      Bf16 gamma;
+      CUDA_CHECK(cudaMemcpy(&gamma, post.gamma + col, sizeof(gamma), cudaMemcpyDeviceToHost));
+      double own_ss = 0., ref_ss = 0.;
+      for (int i = 0; i < width; ++i) {
+        own_ss += double(float(own[i])) * float(own[i]);
+        ref_ss += double(float(reference[i])) * float(reference[i]);
+      }
+      const float own_inv = float(1. / std::sqrt(own_ss / width + post.epsilon));
+      const float ref_inv = float(1. / std::sqrt(ref_ss / width + post.epsilon));
+      const float own_norm = float(Bf16(float(Bf16(float(own[col]) * own_inv)) * float(gamma)));
+      const float ref_norm = float(Bf16(float(Bf16(float(reference[col]) * ref_inv)) * float(gamma)));
+      // Audit the preceding dot independently too: the represented MXFP8
+      // operands are exactly expressible in BF16. This host FP64 dot is
+      // failure-only and outside timing; it does not replace acceptance.
+      const int k = options.q_width();
+      const auto a = download(r.mxfp8_reference_a + row * k, k);
+      const auto b = download(r.mxfp8_reference_b + int64_t(col) * k, k);
+      double dot = 0.;
+      for (int i = 0; i < k; ++i) dot += double(float(a[i])) * double(float(b[i]));
+      Bf16 residual;
+      CUDA_CHECK(cudaMemcpy(&residual, post.residual + row * width + col,
+                            sizeof(residual), cudaMemcpyDeviceToHost));
+      const float fp64_sum = float(Bf16(float(Bf16(float(dot))) + float(residual)));
+      std::cout << "postnorm_conditioning,rank=" << rank << ",phase=" << phase << ",index=" << stats.first_index
+                << ",own_sum=" << float(own[col]) << ",reference_sum=" << float(reference[col])
+                << ",own_inverse=" << own_inv << ",reference_inverse=" << ref_inv
+                << ",gamma=" << float(gamma) << ",own_fp64_norm=" << own_norm
+                << ",reference_fp64_norm=" << ref_norm
+                << ",fp64_dot=" << dot << ",residual=" << float(residual)
+                << ",fp64_residual_sum=" << fp64_sum
+                << ",actual=" << fused_validation::bf16_to_float(stats.first_actual)
+                << ",expected=" << fused_validation::bf16_to_float(stats.first_expected) << '\n';
+    };
+    for (const int rank : fused_mpi::owned_ranks(options.world)) diagnose(rank, "cublas_reference");
+    // cuBLAS FP32 accumulation is a numerical oracle, not exact real
+    // arithmetic. Near a BF16 halfway point, residual cancellation and RMSNorm
+    // can amplify its rounding error. Resolve disputed *whole rows* with an
+    // independent FP64 GEMM+norm oracle; never relax tolerance or use actual
+    // fused output as expected data. Keep the original discrepancies in logs.
+    // The bounded fallback cannot turn widespread/nonfinite failures into a
+    // long hidden recovery: unresolved errors still fail normal acceptance.
+    for (const int rank : fused_mpi::owned_ranks(options.world)) {
+      auto& stats = results[rank][0];
+      auto& r = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(r.device));
+      int64_t previous_row = -1;
+      for (int refined = 0; refined < 8 && stats.mismatches && !stats.nonfinite; ++refined) {
+        const int width = options.hidden;
+        const int64_t row = stats.first_index / width;
+        if (row == previous_row) {
+          diagnose(rank, "fp64_reference");
+          break; // A genuine disagreement remains; no tolerance change.
+        }
+        previous_row = row;
+        const uint64_t before = stats.mismatches;
+        const auto& post = r.mxfp8_oproj.postprocess;
+        fused_attention::fp64_projection_row<<<(width + 7) / 8, 256, 0, r.stream>>>(
+            r.mxfp8_reference_a + row * options.q_width(), r.mxfp8_reference_b,
+            post.residual + row * width, r.residual_reference + row * width,
+            width, options.q_width());
+        CUDA_CHECK(cudaGetLastError());
+        fused_attention::residual_reference<true><<<1, 256, 0, r.stream>>>(
+            r.oproj_reference + row * width, nullptr, r.residual_reference + row * width,
+            post.gamma, 1, width, post.epsilon);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(fused_validation::launch<true>(reinterpret_cast<const uint16_t*>(r.oproj.output),
+            fused_validation::DenseOracle{reinterpret_cast<const uint16_t*>(r.oproj_reference)},
+            checked_product(options.seq_local, width), r.validation, 0, r.stream));
+        CUDA_CHECK(cudaStreamSynchronize(r.stream));
+        CUDA_CHECK(cudaMemcpy(&stats, r.validation->result, sizeof(stats), cudaMemcpyDeviceToHost));
+        std::cout << "postnorm_reference_refinement,rank=" << rank << ",row=" << row
+                  << ",oracle=fp64_dot_and_norm,scope=whole_row,atol=0.01,rtol=0.01"
+                  << ",before_mismatches=" << before << ",after_mismatches=" << stats.mismatches
+                  << ",nonfinite=" << stats.nonfinite << '\n';
+      }
+    }
+  }
+#endif
   fused_mpi::gather_owned(results);
   return results;
 }
@@ -2299,6 +2531,59 @@ void validate(std::vector<RankRuntime>& runtimes, const Options& options, Direct
   fused_mpi::root_output() << std::flush;
   if (failed) throw std::runtime_error("full GPU numeric or route validation failed");
 }
+
+#if FUSE_BENCH_MXFP8
+void validate_postnorm_repeat(std::vector<RankRuntime>& runtimes, const Options& options,
+                             uint32_t& epoch, const std::string& context, bool snapshot = true) {
+  if (!options.oproj_postnorm) return;
+  const uint64_t count = checked_product(options.seq_local, options.hidden);
+  if (snapshot) {
+    for (int rank : fused_mpi::owned_ranks(options.world)) {
+      auto& r = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(r.device));
+      CUDA_CHECK(cudaMemcpyAsync(r.postnorm_repeat_output, r.oproj.output,
+          count * sizeof(Bf16), cudaMemcpyDeviceToDevice, r.stream));
+      CUDA_CHECK(cudaMemcpyAsync(r.postnorm_repeat_output + count, r.mxfp8_oproj.postprocess.residual_output,
+          count * sizeof(Bf16), cudaMemcpyDeviceToDevice, r.stream));
+    }
+    finish_all(runtimes);
+  }
+  // These whole-output byte comparisons are outside formal timing. The
+  // post-Graph check reuses the PRE-measurement snapshot, not a fresh copy.
+  for (int repeat = 0; repeat < (snapshot ? 3 : 1); ++repeat) {
+    if (snapshot) run_epoch(runtimes, options, Direction::kOproj, ++epoch);
+    for (int rank : fused_mpi::owned_ranks(options.world)) {
+      auto& r = runtimes[rank];
+      CUDA_CHECK(cudaSetDevice(r.device));
+      const Bf16* outputs[2] = {r.oproj.output, r.mxfp8_oproj.postprocess.residual_output};
+      for (int i = 0; i < 2; ++i)
+        CUDA_CHECK(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(outputs[i]),
+            fused_validation::DenseOracle{reinterpret_cast<const uint16_t*>(r.postnorm_repeat_output + i*count)},
+            count, r.validation, i, r.stream));
+    }
+    finish_all(runtimes);
+    std::vector<ValidationResult> results(options.world);
+    for (int rank : fused_mpi::owned_ranks(options.world)) {
+      CUDA_CHECK(cudaSetDevice(runtimes[rank].device));
+      CUDA_CHECK(cudaMemcpy(results[rank].data(), runtimes[rank].validation->result,
+          sizeof(ValidationResult), cudaMemcpyDeviceToHost));
+    }
+    fused_mpi::gather_owned(results);
+    bool failed = false;
+    for (int rank = 0; rank < options.world; ++rank) {
+      uint64_t mismatches = 0;
+      for (const auto& s : results[rank]) {
+        failed = failed || s.checked != count || s.mismatches != 0;
+        mismatches += s.mismatches;
+      }
+      fused_mpi::root_output() << "postnorm_repeat,A2A_GEMM" << context << ",rank=" << rank
+          << ",repeat=" << repeat << ",checked=" << 2*count << ",bitwise_mismatches=" << mismatches
+          << ",outputs=normalized_and_residual_sum,reference=pre_measurement_snapshot\n";
+    }
+    if (failed) throw std::runtime_error("postnorm whole-output bitwise repeatability failed");
+  }
+}
+#endif
 
 void validation_self_test(std::vector<RankRuntime>& runtimes, const Options& options,
                            Direction direction, const std::string& context) {
@@ -2988,7 +3273,7 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
     const auto timeline = download(runtime.timeline, runtime.sm_count);
 #if FUSE_BENCH_MXFP8
     const auto traits = direction == Direction::kOproj
-        ? fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n)
+        ? fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n, runtime.mxfp8_oproj.overlap_postnorm)
         : fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
     const int weight_panels = ceil_div(direction == Direction::kOproj ? options.hidden : options.projection_width(), 256);
     const auto quant = download(runtime.mxfp8_probe.quant, runtime.mxfp8_probe.quant_capacity);
@@ -3026,6 +3311,9 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
     // Thus every scheduled CTA here owns at least one unpadded physical tile.
     const int expected_compute = std::min(m_tiles * n_tiles, runtime.sm_count - options.comm_sm);
     int comm_records = 0, compute_records = 0;
+#if FUSE_BENCH_MXFP8
+    uint64_t norm_rows = 0;
+#endif
     for (int cta = 0; cta < runtime.sm_count; ++cta) {
       const auto& event = timeline[cta];
       if ((cta < options.comm_sm + expected_compute) != (event.start != 0)) {
@@ -3050,13 +3338,34 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                 << ",host_launch=" << options.host_launch
                 << ",start=" << event.start << ",end=" << event.end << ",active_start=" << event.active_start
                 << ",role_done=" << event.role_done << ",grid_sync_done=" << event.grid_sync_done
-                << ",fence_done=" << event.fence_done << ",publish_done=" << event.publish_done;
+                << ",fence_done=" << event.fence_done << ",publish_done=" << event.publish_done
+                << ",postnorm_ready=" << event.postnorm_ready << ",postnorm_end=" << event.postnorm_end
+                << ",norm_worker_begin=" << event.norm_worker_begin << ",norm_worker_end=" << event.norm_worker_end
+                << ",norm_wait_ns=" << event.norm_wait_ns << ",norm_work_ns=" << event.norm_work_ns
+                << ",norm_load_ns=" << event.norm_load_ns << ",norm_reduce_ns=" << event.norm_reduce_ns
+                << ",norm_store_ns=" << event.norm_store_ns
+                << ",norm_rows=" << event.norm_rows << ",norm_threads=" << event.norm_threads;
+#if FUSE_BENCH_MXFP8
+      if (options.oproj_postnorm_overlap) {
+        if (!(event.start <= event.norm_worker_begin && event.norm_worker_begin <= event.norm_worker_end) ||
+            event.norm_wait_ns + event.norm_work_ns > event.norm_worker_end - event.norm_worker_begin ||
+            event.norm_threads != 256 || event.norm_rows % 8)
+          throw std::runtime_error("invalid postnorm worker record");
+        norm_rows += event.norm_rows;
+      } else if (options.oproj_postnorm &&
+          !(event.end <= event.postnorm_ready && event.postnorm_ready <= event.postnorm_end))
+        throw std::runtime_error("invalid postnorm tail ordering");
+#endif
       for (int peer = 0; peer < options.world; ++peer) std::cout << ",source_ready" << peer << '=' << event.source_ready[peer];
       std::cout << '\n';
     }
     if (comm_records != options.comm_sm || compute_records != expected_compute) {
       throw std::runtime_error("incomplete CTA role records");
     }
+#if FUSE_BENCH_MXFP8
+    if (options.oproj_postnorm_overlap && norm_rows != uint64_t(runtime.oproj.gemm.m))
+      throw std::runtime_error("incomplete postnorm row coverage");
+#endif
     if (direction == Direction::kQkv) {
       const auto& event = timeline[0];
       if (event.fence_done < event.grid_sync_done || event.publish_done < event.fence_done || event.end < event.publish_done) {
@@ -3115,6 +3424,8 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                     << ",drain=" << drain << ",cta=" << r.cta << ",warp=" << r.warp
                     << ",begin=" << r.begin << ",ready=" << r.ready
                     << ",g2s_begin=" << r.g2s_begin << ",g2s_done=" << r.g2s_done
+                    << ",post_begin=" << r.post_begin << ",post_math_done=" << r.post_math_done
+                    << ",post_end=" << r.post_end
                     << ",s2g_begin=" << r.s2g_begin << ",s2g_read_done=" << r.s2g_read_done
                     << ",row=" << r.row << ",column=" << r.column
                     << ",rows=" << r.rows << ",columns=" << r.columns
@@ -3127,6 +3438,8 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
     if (options.profile_detail == "cta") continue;
     if (runtime.oproj_pipeline.tiles) {
       const auto& probe = runtime.oproj_pipeline;
+      std::cout << "profile_oproj_epilogue_scope,rank=" << rank
+                << ",return_scope=whole_collective_v2,profile_detail=full\n";
       const int count = probe.m_tiles * probe.n_tiles;
       const auto records = download(probe.tiles, count);
       const auto stages = probe.stages ? download(probe.stages, static_cast<size_t>(count) * probe.k_tiles)
@@ -3561,6 +3874,12 @@ int main(int argc, char** argv) {
     fused_mpi::agree(contract.str());
 #if FUSE_BENCH_MXFP8
     fused_mpi::agree(options.mxfp8_prequantized ? "mxfp8_prequantized" : "mxfp8_dynamic");
+    fused_mpi::agree(options.qkv_postprocess + (options.oproj_postnorm ? ":postnorm" : ":plain"));
+    std::ostringstream post_contract;
+    post_contract << options.rope_policy << ':' << std::setprecision(9) << options.norm_epsilon
+                  << ':' << options.oproj_postnorm_overlap << ':' << options.oproj_postnorm_separate
+                  << ':' << options.qkv_postprocess_separate;
+    fused_mpi::agree(post_contract.str());
     fused_mpi::agree(options.mxfp8_weight_preparation);
     fused_mpi::agree(std::to_string(options.mxfp8_epilogue_n));
     fused_mpi::agree(std::to_string(options.oproj_m_window_tiles) + " " + std::to_string(options.oproj_n_group_tiles));
@@ -3572,7 +3891,8 @@ int main(int argc, char** argv) {
         << ",epilogue_n=" << options.mxfp8_epilogue_n;
     if (options.mxfp8_weight_preparation == "comm_warp")
       fused_mpi::root_output() << ",weight_schedule=warp_then_route_v1";
-    fused_mpi::root_output() << ",publication_protocol=warp_panel_acq_rel_v3,kernel_nodes=1\n";
+    fused_mpi::root_output() << ",publication_protocol=warp_panel_acq_rel_v3,kernel_nodes="
+                             << (options.oproj_postnorm_separate || options.qkv_postprocess_separate ? 2 : 1) << '\n';
 #endif
     // One communication layout for every candidate/payload; never mutate the
     // ready arrival geometry while reusing this run's cumulative epochs.
@@ -3584,6 +3904,12 @@ int main(int argc, char** argv) {
               << ",auto_oproj_comm=" << options.auto_oproj_comm
 #if FUSE_BENCH_MXFP8
               << ",auto_mxfp8_comm=" << options.auto_mxfp8_comm
+              << ",qkv_postprocess=" << options.qkv_postprocess
+              << ",qkv_postprocess_separate=" << options.qkv_postprocess_separate
+              << ",oproj_postnorm=" << options.oproj_postnorm
+              << ",oproj_postnorm_overlap=" << options.oproj_postnorm_overlap
+              << ",oproj_postnorm_separate=" << options.oproj_postnorm_separate
+              << ",norm_epsilon=" << options.norm_epsilon << ",rope_policy=" << options.rope_policy
               << ",oproj_m_window_tiles=" << options.oproj_m_window_tiles
               << ",oproj_n_group_tiles=" << options.oproj_n_group_tiles
 #endif
@@ -3686,6 +4012,10 @@ int main(int argc, char** argv) {
           poison_outputs(runtimes, candidate_options, candidate.direction);
           run_epoch(runtimes, candidate_options, candidate.direction, ++epoch);
           validate(runtimes, candidate_options, candidate.direction, context);
+#if FUSE_BENCH_MXFP8
+          if (candidate.direction == Direction::kOproj)
+            validate_postnorm_repeat(runtimes, candidate_options, epoch, context);
+#endif
         }
         if (options.validation_self_test && !self_tested[direction_index]) {
           StageTimer timer{"validation_self_test", context + ",includes=fault_detection_restore_full_gpu_cpu_checks"};
@@ -3699,6 +4029,10 @@ int main(int argc, char** argv) {
         if (options.launch == "graph" && generation == 0 && !options.validation_self_test) {
           StageTimer timer{"validate", context + ",validation_phase=post,includes=last_graph_sample_full_checks"};
           validate(runtimes, candidate_options, candidate.direction, context + ",validation_phase=post");
+#if FUSE_BENCH_MXFP8
+          if (candidate.direction == Direction::kOproj)
+            validate_postnorm_repeat(runtimes, candidate_options, epoch, context + ",validation_phase=post", false);
+#endif
         }
         report_graph_preparation(runtimes, candidate_options, candidate.direction, context);
         }

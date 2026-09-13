@@ -238,7 +238,7 @@ template <int N, int K = 64, int E = 0> struct A2ALhsGemmTypes : Bf16GemmTypes<N
   using TelemetryPureGemm = Gemm;
 };
 template <int N, int K, int E> using Mxfp8GemmFamily = Bf16GemmTypes<N,K,E>;
-template <int E> using Mxfp8A2ALhsGemmTypes = A2ALhsGemmTypes<256,128,E>;
+template <int E, bool PublishOutput = false> using Mxfp8A2ALhsGemmTypes = A2ALhsGemmTypes<256,128,E>;
 struct Mxfp8A2ALhsInputComm { static constexpr int kReadyBlockM = 128, kTileK = 128; };
 template <bool Profile> using Mxfp8A2ALhsInputCommT = Mxfp8A2ALhsInputComm;
 template <int N> struct QkvComm { static constexpr int kBlockM = 128, kBlockN = N; };
@@ -255,6 +255,7 @@ template <class K, class P, bool Profile = false> struct InputProductionKernel {
 template <class K> struct RoleTelemetryKernel {};
 }
 template <class G, class C> struct GemmA2ARoleTelemetryKernel {};
+template <class K, bool Instrumented = false, bool Overlap = false> struct OprojPostprocessKernel : K {};
 }
 """ + bindings + r"""
 } }

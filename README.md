@@ -1,5 +1,21 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v22.0 — 实验性 SM103 MXFP8 norm/RoPE 前向融合
+
+新增三种真实模型边界的可选融合，**默认关闭**，不替代原 GEMM＋通信基线：
+Qwen3 的 QKV→Q/K head RMSNorm→RoPE→A2A，Llama 的 QKV→RoPE→A2A，
+以及 A2A→OProj→残差相加→完整 hidden RMSNorm（残差和单独保留）。
+
+Graph10+50、双非零 payload：QKV 15/15 合计 **1.918 PFLOPS/卡**，其中
+Qwen3 3 点 **1.785P**、Llama 12 点 **1.953P**；OProj 16/18 已通过点
+**1.743P**，两个 Llama405B CP4 数值失败点明确留空。不能称所有类别达到1.9P。
+这些时间包含动态权重量化、通信及新增操作；不包含上游激活量化和位置表生成。
+
+采用显式通信预算；新增融合尚无适配 Auto，不包含 MXFP8/norm/RoPE 反向，
+也不宣称已经完成整模型训练验证。原纯双融合结果仍独立保留在 v20/v21。
+[实验功能与合法边界](benchmarks/sm103/ATTENTION_FUSION.md) ·
+[最终表、配置、复现及已知限制](results/sm103/v22.0/README.md)
+
 ## v21.0 — SM103 MXFP8 A2A→OProj 手工 SOTA
 
 输入已量化的 MXFP8 activation，持久化 kernel 内完成 A2A、BF16 权重量化和

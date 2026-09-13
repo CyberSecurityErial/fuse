@@ -111,6 +111,43 @@ def tile_consumption(pipelines, stages, *, m, n, k, tile_m, tile_n, world):
     return rows
 
 
+def profile_comm_sm(job):
+    budgets = str(job['comm_sm_list']).split(',') if job.get('comm_sm_list') else [job['comm_sm']]
+    assert len(budgets) == 1, 'One explicit profiling communication budget required'
+    value = int(budgets[0])
+    assert value > 0, 'Profiling requires a positive explicit communication budget'
+    return value
+
+
+def cta_physical_end(row):
+    return max(row['end'], row.get('postnorm_end', 0), row.get('norm_worker_end', 0))
+
+
+def norm_phase_metadata(row, work_ns):
+    names = ('norm_load_ns','norm_reduce_ns','norm_store_ns')
+    phases = [row.get(k,0) for k in names]
+    assert all(v >= 0 for v in phases) and sum(phases) <= work_ns
+    if not any(phases): return {}  # Older captures have no phase breakdown.
+    return dict(load_add_partial_reduce_us=phases[0]/1000,
+                inverse_rms_reduce_us=phases[1]/1000,
+                normalize_gamma_writeback_us=phases[2]/1000,
+                other_row_work_us=(work_ns-sum(phases))/1000,
+                phase_note='load phase includes BF16 residual-sum store and first CTA barrier; sums, not bare IO')
+
+
+def norm_worker_metadata(row):
+    duration = row['norm_worker_end'] - row['norm_worker_begin']
+    wait, work = row['norm_wait_ns'], row['norm_work_ns']
+    assert duration >= 0 and wait >= 0 and work >= 0 and wait + work <= duration
+    assert row['norm_rows'] >= 0 and row['norm_rows'] % 8 == 0
+    assert row['norm_threads'] in (128, 256)
+    return dict(rows=row['norm_rows'], threads=row['norm_threads'],
+                ready_wait_us=wait/1000, row_work_us=work/1000,
+                claim_and_other_us=(duration-wait-work)/1000,
+                **norm_phase_metadata(row,work),
+                note='phase sums within this worker, not consecutive sub-spans or Tensor Core busy')
+
+
 def cta_time_accounting(ctas, pipelines, stages, comm_ctas):
     """Telescope observed timestamps, without adding overlapping warp spans.
 
@@ -122,10 +159,11 @@ def cta_time_accounting(ctas, pipelines, stages, comm_ctas):
     for rank in sorted({r for r, _ in ctas}):
         local = {c: p for (r, c), p in ctas.items() if r == rank}
         origin = min(p['start'] for p in local.values())
-        last = max(local, key=lambda c: local[c]['end'])
-        kernel_end = local[last]['end']
+        last = max(local, key=lambda c: cta_physical_end(local[c]))
+        kernel_end = cta_physical_end(local[last])
         row = dict(rank=rank, kernel_span_ns=kernel_end-origin, last_cta=last,
-            last_role='comm' if last < comm_ctas else 'compute',
+            last_role='postnorm' if local[last].get('postnorm_end') or local[last].get('norm_worker_end') else
+                ('comm' if last < comm_ctas else 'compute'),
             comm_end_ns=max(p['end'] for c, p in local.items() if c < comm_ctas)-origin,
             compute_end_ns=max(p['end'] for c, p in local.items() if c >= comm_ctas)-origin,
             sampled_ctas=[])
@@ -138,9 +176,22 @@ def cta_time_accounting(ctas, pipelines, stages, comm_ctas):
                 observed_service_sum_ns=sum(b-a for a, b in zip(starts, ends)),
                 signed_gap_sum_ns=sum(a-b for a, b in zip(starts[1:], ends[:-1])),
                 drain_ns=local[cta]['end']-ends[-1])
-            cta_end = local[cta]['end']-origin
+            physical_end = cta_physical_end(local[cta])
+            if local[cta].get('postnorm_end'):
+                parts['postnorm_wait_ns'] = local[cta]['postnorm_ready']-local[cta]['end']
+                parts['postnorm_service_ns'] = physical_end-local[cta]['postnorm_ready']
+            elif local[cta].get('norm_worker_end'):
+                c = local[cta]
+                norm_worker_metadata(c)
+                assert c['norm_worker_begin'] >= c['end']
+                parts['postnorm_setup_ns'] = c['norm_worker_begin']-c['end']
+                parts['postnorm_wait_ns'] = c['norm_wait_ns']
+                parts['postnorm_service_ns'] = c['norm_work_ns']
+                parts['postnorm_other_ns'] = (c['norm_worker_end']-c['norm_worker_begin']-
+                                             c['norm_wait_ns']-c['norm_work_ns'])
+            cta_end = physical_end-origin
             assert sum(parts.values()) == cta_end, 'CTA accounting does not close'
-            other_tail = kernel_end-local[cta]['end']
+            other_tail = kernel_end-physical_end
             assert cta_end+other_tail == row['kernel_span_ns']
             row['sampled_ctas'].append(dict(cta=cta, tiles=len(tiles), **parts,
                 end_ns=cta_end, other_cta_tail_ns=other_tail, closure_error_ns=0))
@@ -255,6 +306,7 @@ def make_trace(lines, job, omit_comm_details=False):
     ctas, peers, hosts, devices, validations = {}, {}, {}, {}, set()
     pipelines, stages = {}, {}
     weights = {}
+    epilogue_scopes = {}
     verified = passed = False
     for line in lines:
         row = parse(line)
@@ -264,6 +316,14 @@ def make_trace(lines, job, omit_comm_details=False):
             key = int(row['rank']), int(row['cta'])
             assert key not in ctas, 'Duplicate CTA'
             ctas[key] = {k: int(row[k]) for k in ('start', 'end', 'active_start')}
+            for k in ('postnorm_ready', 'postnorm_end', 'norm_worker_begin', 'norm_worker_end',
+                      'norm_wait_ns', 'norm_work_ns', 'norm_rows', 'norm_threads',
+                      'norm_load_ns', 'norm_reduce_ns', 'norm_store_ns'):
+                ctas[key][k] = int(row.get(k, 0))
+        elif line.startswith('profile_oproj_epilogue_scope,'):
+            rank = int(row['rank'])
+            assert rank not in epilogue_scopes and row['return_scope'] == 'whole_collective_v2'
+            epilogue_scopes[rank] = row['return_scope']
         elif line.startswith('profile_oproj_pipeline,'):
             key = int(row['rank']), int(row['index'])
             assert key not in pipelines, 'Duplicate pipeline tile'
@@ -298,7 +358,9 @@ def make_trace(lines, job, omit_comm_details=False):
             verified = True
         elif line.startswith('PASS:') and 'diagnostic timelines' in line:
             passed = True
-    world, comm = job['world'], job['comm_sm']
+    world, comm = job['world'], profile_comm_sm(job)
+    if epilogue_scopes:
+        assert set(epilogue_scopes) == set(range(world)), 'Incomplete epilogue scope metadata'
     m = job['global_seq'] // world
     import re
     policy = job.get('oproj_policy_list') or job.get('oproj_policy')
@@ -361,7 +423,9 @@ def make_trace(lines, job, omit_comm_details=False):
         if pipelines and rank != 0 and not job.get('mxfp8'):
             continue
         origin = min(r['start'] for r in selected.values())
-        end = max(r['end'] for r in selected.values())
+        end = max(cta_physical_end(r) for r in selected.values())
+        if job.get('oproj_postnorm_overlap'):
+            assert sum(r['norm_rows'] for r in selected.values()) == m, 'Incomplete norm row coverage'
         events.append(dict(ph='M', name='process_name', pid=rank,
                            args=dict(name=f'GPU {rank} (independent origin)')))
 
@@ -374,8 +438,9 @@ def make_trace(lines, job, omit_comm_details=False):
             events.append(dict(ph='X', name=name, cat='fuse.oproj', pid=rank, tid=tid,
                                ts=(begin-origin)/1000, dur=(finish-begin)/1000, args=attrs))
 
-        track(0, 'A2A -> GEMM diagnostic boundary')
-        span(0, 'A2A -> GEMM', origin, end)
+        boundary = 'A2A -> GEMM -> residual add -> RMSNorm' if job.get('oproj_postnorm') else 'A2A -> GEMM'
+        track(0, boundary + ' diagnostic boundary')
+        span(0, boundary, origin, end)
         if pipelines and job.get('mxfp8'):
             counters, progress = overlap_progress(rank, origin, end, peers, pipelines,
                 m=m, n=job['hidden'], bm=bm, bn=bn, world=world)
@@ -393,8 +458,25 @@ def make_trace(lines, job, omit_comm_details=False):
         for cta, row in sorted(selected.items()):
             tid = 100 + cta * (32 if job.get('mxfp8') else 16)
             track(tid, f'{"Communication" if cta < comm else "GEMM"} CTA {cta}')
+            if job.get('oproj_postnorm_overlap'):
+                assert not row['postnorm_ready'] and not row['postnorm_end']
+                assert row['norm_threads'] in ((128, 256) if cta < comm else (256,))
+                track(tid + 27, f'CTA {cta}: full-hidden norm worker')
+                span(tid + 27, 'residual + RMSNorm worker (includes ready waits)',
+                     row['norm_worker_begin'], row['norm_worker_end'], **norm_worker_metadata(row))
+            elif job.get('oproj_postnorm'):
+                assert row['end'] <= row['postnorm_ready'] <= row['postnorm_end']
+                span(tid, 'grid join before full-hidden norm', row['end'], row['postnorm_ready'])
+                span(tid, 'residual add + full-hidden RMSNorm', row['postnorm_ready'], row['postnorm_end'],
+                     **norm_phase_metadata(row,row['postnorm_end']-row['postnorm_ready']),
+                     includes='all rows/warps assigned to this CTA, diagnostic final CTA join')
+            else:
+                assert not row.get('postnorm_ready') and not row.get('postnorm_end')
             if cta < comm:
-                span(tid, 'remote A2A role (includes setup/waits)', row['start'], row['end'])
+                role = ('communication CTA role (A/W + norm worker)' if job.get('oproj_postnorm_overlap')
+                        and row['norm_worker_begin'] < row['end']
+                        else 'remote A2A role (includes setup/waits)')
+                span(tid, role, row['start'], row['end'])
                 for c, slot in sorted(slots):
                     if c == cta and not omit_comm_details:
                         assert -1 <= slot < 8
@@ -536,6 +618,7 @@ def make_trace(lines, job, omit_comm_details=False):
         omitted_details=['communication_warp_phases', 'weight_quantization_and_publication',
                          *([] if pipelines else ['weight_panel_waits'])] if omit_comm_details else [],
         pipeline_probe=bool(pipelines),
+        epilogue_return_scope='whole_collective_v2' if epilogue_scopes else 'legacy_unspecified',
         cta_time_accounting=cta_time_accounting(ctas, pipelines, stages, comm),
         tile_consumption=tile_consumption(pipelines, stages, m=m, n=job['hidden'],
             k=job.get('q_heads', 0)*job.get('head_dim', 0),
@@ -573,6 +656,7 @@ def export(run, output, tiles_csv=None, omit_comm_details=False):
                         assert not local.read(1)
                         break
     job = json.loads((control / 'job.json').read_text())
+    job = dict(job,comm_sm=profile_comm_sm(job))
     assert job['profile'] and job['directions'] == 'oproj' and not job['mpi']
     # The controller serializes an omitted --profile-detail as null; both its
     # argv builder and the harness resolve that default to full peer telemetry.
@@ -581,8 +665,9 @@ def export(run, output, tiles_csv=None, omit_comm_details=False):
         trace = make_trace(stream, job, omit_comm_details)
     trace['metadata']['config'] = {k: job.get(k) for k in (
         'run_id', 'source_id', 'node', 'global_seq', 'world', 'hidden', 'q_heads',
-        'kv_heads', 'head_dim', 'comm_sm', 'oproj_policy', 'oproj_policy_list', 'max_swizzle_size',
+        'kv_heads', 'head_dim', 'comm_sm', 'comm_sm_list', 'oproj_policy', 'oproj_policy_list', 'max_swizzle_size',
         'oproj_raster', 'oproj_comm_layout', 'oproj_m_window_tiles', 'oproj_n_group_tiles',
+        'oproj_postnorm', 'oproj_postnorm_overlap', 'oproj_postnorm_separate', 'norm_epsilon',
         'oproj_pipeline_probe', 'host_launch', 'input_generator')}
     trace['metadata']['artifact_sha256'] = receipt['artifact_sha256']
     output.parent.mkdir(parents=True, exist_ok=True)

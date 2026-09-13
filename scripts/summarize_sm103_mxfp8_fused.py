@@ -33,6 +33,43 @@ OPROJ_BOUNDARIES = {
 MXFP8_COMPONENTS = tuple(dict.fromkeys((*BOUNDARIES, *OPROJ_BOUNDARIES)))
 
 
+def window_effective_swizzle(configuration):
+    """Derived OprojTileOrder width, distinct from CUTLASS's base width.
+
+    AlongN clips the minor (M) swizzle to H; AlongM clips it to P.
+    This describes traversal, not an observed performance improvement.
+    """
+    width = int(configuration['effective_swizzle_size'])
+    h = int(configuration.get('oproj_m_window_tiles', 0))
+    p = int(configuration.get('oproj_n_group_tiles', 0))
+    # Match OprojTileOrder::make's disabled-window fallback exactly.
+    if h <= 0 or p <= 0 or h & (h - 1) or p & (p - 1):
+        return width
+    return min(width, h if configuration['raster'] == 'along_n' else p)
+
+
+def postprocess_configuration(job, config):
+    """Normalize nullable CLI defaults, then bind requested semantics to execution."""
+    qkv = job.get('qkv_postprocess') or 'none'
+    rope = job.get('rope_policy') or 'qwen3'
+    epsilon = job.get('norm_epsilon')
+    epsilon = 1.e-6 if epsilon is None else epsilon
+    sf.require(qkv in ('none', 'rope', 'qknorm_rope') and
+               config.get('qkv_postprocess', 'none') == qkv,
+               'QKV postprocess job/config mismatch')
+    sf.require(rope in ('qwen3', 'llama31') and config.get('rope_policy', 'qwen3') == rope,
+               'RoPE policy job/config mismatch')
+    sf.close(float(config.get('norm_epsilon', 1.e-6)), float(epsilon), 'Norm epsilon')
+    for key in ('qkv_postprocess_separate', 'oproj_postnorm', 'oproj_postnorm_overlap', 'oproj_postnorm_separate'):
+        sf.require(int(config.get(key, 0)) == int(bool(job.get(key))),
+                   'Postnorm job/config mismatch: ' + key)
+    return dict(qkv=qkv, oproj_residual_rmsnorm=bool(job.get('oproj_postnorm')),
+                qkv_separate=bool(job.get('qkv_postprocess_separate')),
+                oproj_overlap=bool(job.get('oproj_postnorm_overlap')),
+                oproj_separate=bool(job.get('oproj_postnorm_separate')),
+                norm_epsilon=epsilon, rope_policy=rope)
+
+
 def audit_auto_selection(rows, job, config):
     """Resolve requested zeros using native rank evidence, not inferred timings."""
     comm, qkv_policies, oproj_policies = l20d.fused_candidates(job)
@@ -84,7 +121,7 @@ def audit_auto_selection(rows, job, config):
     return expected, metadata
 
 
-def audit_component(rows, job, config, shape, candidate_id, component, epilogue_n):
+def audit_component(rows, job, config, shape, candidate_id, component, epilogue_n, *, repeat_launches=0):
     """Audit one boundary; shared production bindings do not become C/R/Q work."""
     sf.require(component in (OPROJ_BOUNDARIES if job.get('fused_direction') == 'oproj' else BOUNDARIES),
                'Unknown MXFP8 measurement component')
@@ -118,7 +155,14 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
     sf.require(set(checks) == expected, 'Missing before/after-measurement and changed-payload checks')
     for row in checked:
         width = (shape['hidden'] if row['kind'] == 'correctness' else shape['q_width']) if oproj else shape['projection_width']
-        sf.audit_validation(row, shape['seq_local'] * width)
+        if job.get('qkv_postprocess') and row['kind'] == 'route' and 'atol' in row:
+            # Q/K RMSNorm has an independent FP64 numerical oracle. Do not
+            # mislabel its tolerance comparison as the old byte-exact route.
+            sf.require(not oproj and job['qkv_postprocess'] in ('rope', 'qknorm_rope'),
+                       'Invalid postprocessing validation boundary')
+            sf.audit_validation(dict(row, kind='correctness'), shape['seq_local'] * width)
+        else:
+            sf.audit_validation(row, shape['seq_local'] * width)
     first_warmup = min(r['line'] for r in candidate if r['kind'] == 'warmup')
     for kind in domains:
         for rank in range(world):
@@ -153,7 +197,8 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
     sf.require(len(verified) == 1 and all(verified[0].get(k) == v for k, v in acceptance.items()),
                'Missing final component acceptance')
     sf.require(verified[0]['line'] > max(r['line'] for r in checked), 'Acceptance precedes checks')
-    preparation = sf.audit_graph_preparation(candidate, timing, checks, domains, world)
+    preparation = sf.audit_graph_preparation(candidate, timing, checks, domains, world,
+                                             repeat_launches=repeat_launches)
     if component != 'fused':
         sf.require(all(r['first_epoch'] == 1 for r in preparation), 'Reference epoch was not reset')
 
@@ -202,7 +247,9 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
             sf.require(row.get('reference_weight_preparation') == (
                 'inside_timing' if component in ('quantize_reference','producer_reference') else 'outside_timing'),
                 'Reference weight preparation boundary mismatch')
-    return timing, dict(zip(fields, next(iter(configs)))) | window, resources, preparation
+    configuration = dict(zip(fields, next(iter(configs)))) | window
+    configuration['window_effective_swizzle_size_derived'] = window_effective_swizzle(configuration)
+    return timing, configuration, resources, preparation
 
 
 def audit_mpi(job, records, data, attempt):
@@ -292,6 +339,7 @@ def audit_run(directory, candidate_id=1, component='fused'):
                and int(config['seed']) == job.get('seed',20260906) and config['profile'] == '0'
                and config['launch'] == 'graph' and config['process_layout'] == 'mpi_one_process_per_gpu'
                and config['fused_direction'] == requested['fused_direction'], 'Measurement config mismatch')
+    postprocess = postprocess_configuration(job, config)
     sf.require(int(config.get('calibrate', 0)) == int(bool(job.get('calibrate'))),
                'Calibration job/config mismatch')
     sf.require(all(int(config.get(key, 0)) == job.get(key, 0)
@@ -315,11 +363,74 @@ def audit_run(directory, candidate_id=1, component='fused'):
     epilogue_n = int(fields_precision.get('epilogue_n',64))
     sf.require(epilogue_n == (job.get('mxfp8_epilogue_n') or 64), 'Epilogue metadata mismatch')
     sf.require(fields_precision['includes_weight_quantization'] == '1', 'Not dynamic weight boundary')
+    if job.get('oproj_postnorm_separate') or job.get('qkv_postprocess_separate'):
+        sf.require(fields_precision.get('kernel_nodes') == '2', 'Separate boundary must contain two kernels')
     sf.require(fields_precision.get('weight_preparation') == (job.get('mxfp8_weight_preparation') or 'comm'),
                'Weight preparation job/config mismatch')
     # Original BF16 input validation still covers master setup and both activation
     # generations. MXFP8 adds regenerated master weights in both generations.
-    sf.audit_inputs([r for r in rows if not(r['kind']=='input' and r.get('label')=='MXFP8-weight')], config, shape)
+    residuals = [r for r in rows if r['kind']=='input' and r.get('label')=='OProj-residual']
+    reference_refinements = []
+    repeat_checks = []
+    if job.get('oproj_postnorm'):
+        root_text = data[f'mpi-attempt{attempt}-rank-0.stdout.log'].decode()
+        repeats = [dict(field.split('=',1) for field in line.split(',')[2:])
+                   for line in root_text.splitlines() if line.startswith('postnorm_repeat,A2A_GEMM,')]
+        if repeats:
+            seen = set()
+            for r in repeats:
+                key = (int(r['candidate']), int(r['generation']), r.get('validation_phase','pre'),
+                       int(r['repeat']), int(r['rank']))
+                sf.require(key not in seen, 'Duplicate postnorm repeatability check')
+                seen.add(key)
+                sf.require(int(r['checked']) == 2*shape['seq_local']*shape['hidden'] and
+                           int(r['bitwise_mismatches']) == 0 and
+                           r['outputs'] == 'normalized_and_residual_sum' and
+                           r['reference'] == 'pre_measurement_snapshot', 'Postnorm bitwise repeatability failed')
+                if key[0] == candidate_id: repeat_checks.append(r)
+            expected_repeats = {(c,g,'pre',i,r) for c in range(1,len(comm)*len(policies)+1)
+                                for g in (0,1) for i in range(3) for r in range(world)}
+            expected_repeats |= {(c,0,'post',0,r) for c in range(1,len(comm)*len(policies)+1)
+                                 for r in range(world)}
+            sf.require(seen == expected_repeats, 'Incomplete postnorm repeatability coverage')
+        for rank in range(world):
+            text = data[f'mpi-attempt{attempt}-rank-{rank}.stdout.log'].decode()
+            checks = [dict(field.split('=', 1) for field in line.split(',')[1:])
+                      for line in text.splitlines() if line.startswith('postnorm_residual,')]
+            sf.require(len(checks) == 3 * len(comm) * len(policies),
+                       'Missing residual-output pre/post-measurement or changed-payload checks')
+            for check in checks:
+                sf.require(int(check['rank']) == rank and int(check['mismatches']) == 0 and
+                           int(check['checked']) == shape['seq_local'] * shape['hidden'],
+                           'Residual-output validation failed or incomplete')
+                sf.finite(check['max_abs'], 'residual-output max_abs', 0)
+            for line in text.splitlines():
+                if not line.startswith('postnorm_reference_refinement,'):
+                    continue
+                refinement = dict(field.split('=', 1) for field in line.split(',')[1:])
+                sf.require(int(refinement['rank']) == rank and
+                           0 <= int(refinement['row']) < shape['seq_local'] and
+                           refinement['oracle'] == 'fp64_dot_and_norm' and
+                           refinement['scope'] == 'whole_row' and
+                           float(refinement['atol']) == float(refinement['rtol']) == 0.01 and
+                           int(refinement['before_mismatches']) > 0 and
+                           int(refinement['after_mismatches']) >= 0 and
+                           int(refinement['nonfinite']) == 0,
+                           'Invalid high-precision reference refinement')
+                reference_refinements.append(refinement)
+        sf.require(Counter(int(r['rank']) for r in residuals) == Counter(range(world)),
+                   'Missing/duplicate postnorm residual input')
+        for r in residuals:
+            count = shape['seq_local'] * shape['hidden']
+            sf.require(int(r['count']) == int(r['finite']) == count and
+                       int(r['seed']) == int(config['seed']) + 71 + int(r['rank']) and
+                       r['generator'] == 'gpu_philox' and float(r['min']) < 0 < float(r['max']) and
+                       0.99 < float(r['nonzero_fraction']) <= 1 and float(r['rms']) > 0,
+                       'Invalid postnorm residual statistics')
+    else:
+        sf.require(not residuals, 'Unexpected postnorm input on an ordinary boundary')
+    sf.audit_inputs([r for r in rows if not(r['kind']=='input' and
+        r.get('label') in ('MXFP8-weight','OProj-residual'))], config, shape)
     weights = [r for r in rows if r['kind']=='input' and r.get('label')=='MXFP8-weight']
     sf.require(Counter((int(r['generation']),int(r['rank'])) for r in weights)
                == Counter((g,r) for g in (0,1) for r in range(world)), 'Missing regenerated master weights')
@@ -338,14 +449,17 @@ def audit_run(directory, candidate_id=1, component='fused'):
                    'Degenerate master weight statistics')
         sf.close(float(r['std'])**2,max(0.,float(r['rms'])**2-float(r['mean'])**2),'weight variance')
     timing, configuration, resources, preparation = audit_component(
-        rows, job, config, shape, candidate_id, component, epilogue_n)
+        rows, job, config, shape, candidate_id, component, epilogue_n,
+        repeat_launches=3 if repeat_checks else 0)
     _, automatic = audit_auto_selection(rows, job, config)
     telemetry = sf.audit_telemetry(data['gpu-telemetry.csv'],receipts['gpu-before.json'],job)
     n, k = (shape['hidden'], shape['q_width']) if oproj else (shape['projection_width'], shape['hidden'])
     flops = 2*shape['seq_local']*n*k
     executed_flops = flops if component in ('fused', 'compute_reference') else 0
     return dict(run_id=job['run_id'],candidate_id=candidate_id,component=component,
-        measurement_role='production' if component == 'fused' else 'calibration',
+        measurement_role=('separate_postprocess_reference' if job.get('oproj_postnorm_separate') or
+                          job.get('qkv_postprocess_separate') else
+                          'production' if component == 'fused' else 'calibration'),
         epilogue_n=epilogue_n,experiment=job['experiment'],world=world,global_seq=shape['global_seq'],
         m=shape['seq_local'],n=n,k=k,
         q_heads=shape['q_heads'],kv_heads=shape['kv_heads'],head_dim=shape['head_dim'],
@@ -354,7 +468,13 @@ def audit_run(directory, candidate_id=1, component='fused'):
                    'producer_reference': 'MXFP8_A_and_SFA_copy_plus_BF16_W_quantization',
                    'quantize_reference': 'BF16_to_MXFP8_E4M3_UE8M0'}.get(
             component, 'MXFP8_E4M3_UE8M0_accFP32_BF16out'),
-        boundary=(OPROJ_BOUNDARIES if oproj else BOUNDARIES)[component], executed_gemm_flops=executed_flops,
+        boundary=(OPROJ_BOUNDARIES if oproj else BOUNDARIES)[component] + (
+            '+BF16_residual_add+full_hidden_RMSNorm' if job.get('oproj_postnorm') else
+            '+' + postprocess['qkv'] if postprocess['qkv'] != 'none' else ''),
+        postprocess=postprocess,
+        reference_refinements_run=reference_refinements,
+        bitwise_repeatability=repeat_checks,
+        executed_gemm_flops=executed_flops,
         p50_ms=timing['p50_ms'],p95_ms=timing['p95_ms'],
         pflops_per_rank=executed_flops/timing['p50_ms']/1e12 if executed_flops else None,
         half_drift=timing['half_drift'],selected_round=timing['selected_round'],warmup_calls=timing['warmup_calls'],
