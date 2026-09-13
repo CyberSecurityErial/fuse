@@ -10,6 +10,15 @@ the two QKV targets remain unachieved. The OProj forward milestone is
 published separately in [v23.0](../../results/sm103/v23.0/README.md); this is
 not a new Auto policy or completion of the remaining development goal.
 
+The current QKV backward fixed33 replay is1.836677P, versus the preceding
+finite selection's1.830344P (+0.346%). Its full-head512B scale read now precedes
+the existing FP8/BF16 asynchronous copies, with unchanged final scale stores,
+system release, communication budgets and GEMM settings. All33 pass both
+payloads and original full-boundary checks; Dense's small gains repeat, while
+other cases are mostly unchanged (worst observed regression0.84%). This is a
+small retained scheduling improvement, not the2P target. Source9e5b124e,
+build20260914-064042-a3f88c; the unique current table keeps all33 new results.
+
 The pure cuBLASLt ceiling requires its own two-timed-payload validation,
 separate from the native operator comparisons below. Historical records that
 timed only payload0 must not be described as two-payload timing results.

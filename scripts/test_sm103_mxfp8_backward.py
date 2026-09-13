@@ -302,6 +302,23 @@ int main(){for(int prefix:{0,3,4})for(bool rotate:{false,true}){
         self.assertEqual(route.count('detail::store_release_system('),1)
         self.assertLess(route.index('cute::cp_async_wait<0>()'),route.index('detail::store_release_system('))
 
+    def test_qkv_scale_prefetch_keeps_the_original_atom_and_publication_boundary(self):
+        text=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
+        route=text[text.index('struct Mxfp8QkvBackwardPullComm'):]
+        load=route.index('asm volatile("ld.global.v4.u32')
+        copies=route.index('for(int slice=0;')
+        store=route.index('[lane]=scale_value;')
+        release=route.index('detail::store_release_system(')
+        self.assertLess(route.index('detail::fence_proxy_async_global()'),load)
+        self.assertLess(load,copies)
+        self.assertLess(route.index('cute::cp_async_wait<0>()'),store)
+        self.assertLess(store,release)
+        self.assertIn('__syncwarp();',route[store:release])
+        self.assertEqual(route.count('ld.global.v4.u32'),1)
+        self.assertIn('kWarpStageBytes = kCopyRows * 128 * 3;',route)
+        owners=Counter(lane*16+byte for lane in range(32) for byte in range(16))
+        self.assertEqual(owners,Counter(range(512)))
+
     def test_static_head_index_preserves_every_ready_boundary(self):
         for heads in (24,72,80,144,288,336):
             for prologue in (1,2,3,4):

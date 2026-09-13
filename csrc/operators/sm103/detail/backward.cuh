@@ -498,6 +498,19 @@ struct Mxfp8QkvBackwardPullComm {
       //
       // All128 rows/scales still precede the one existing system release.
       detail::fence_proxy_async_global();
+      const auto src=a.source_scales[kind!=0](cute::make_coord(source_row,local_head*128,0));
+      const auto dst=a.destination_scales(cute::make_coord(row,t.peer*128,0));
+      // Read the independent 512B scale atom before issuing the two data
+      // slices. Its four registers per lane are consumed only after those
+      // slices: the remote scale read can overlap existing async transport
+      // instead of starting a new dependent read at the publication tail.
+      // Keep the aligned vector read explicit and before cp.async; no extra
+      // shared stage, flag, or smaller ready unit is introduced.
+      uint4 scale_value;
+      const auto* scale_source=reinterpret_cast<const uint4*>(quantized.scales+src)+lane;
+      asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+          : "=r"(scale_value.x), "=r"(scale_value.y), "=r"(scale_value.z), "=r"(scale_value.w)
+          : "l"(scale_source) : "memory");
       for(int slice=0;slice<128;slice+=kCopyRows) {
         for(int i=lane;i<kCopyRows*128/16;i+=32) {
           const int r=slice+i/8, col=(i%8)*16;
@@ -525,11 +538,8 @@ struct Mxfp8QkvBackwardPullComm {
         }
         __syncwarp();  // All shared reads finish before this warp reuses its stage.
       }
-      const auto src=a.source_scales[kind!=0](cute::make_coord(source_row,local_head*128,0));
-      const auto dst=a.destination_scales(cute::make_coord(row,t.peer*128,0));
       // An aligned M128/K128 scale atom is exactly 512 contiguous bytes.
-      const auto value=reinterpret_cast<const uint4*>(quantized.scales+src)[lane];
-      reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(a.scales)+dst)[lane]=value;
+      reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(a.scales)+dst)[lane]=scale_value;
       __syncwarp();
       // Reuse the existing head-granular SYSTEM acquire adapter, including its
       // async-proxy fence before TMA. This is a matched strong baseline, not a
