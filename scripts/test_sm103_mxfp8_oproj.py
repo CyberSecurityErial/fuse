@@ -673,7 +673,7 @@ struct Mxfp8WeightProducer {
 ''' + constants + '\nvoid run(const Params& a, int comm_id, int comm_ctas) {\n' + prologue + '\n++transport_visits;\n}\n' + \
             'void startup(const Params& p) {\n' + startup + r'''
 int main() {
-  for (int comm : {1,3,8,16,32,48,64,96,147})
+  for (int comm : {1,3,4,8,12,16,20,32,48,64,96,147})
       for (int compute : {1,148-comm}) for(bool all : {false,true}) for(int slots:{4,6}) {
     if(!all && slots!=4) continue;
     Params p{}; p.params.num_comm_ctas=comm; p.input_order.compute_ctas=compute;
@@ -742,7 +742,7 @@ void visit(const Args& a,int comm_ctas,int comm_id,int warp,std::vector<int>& se
 }
 int main() {
   for(int peer_k=128;peer_k<=32768;peer_k+=128)
-    for(int cp:{4,8}) for(int comm:{1,8,20,147}) for(bool all:{false,true}) {
+    for(int cp:{4,8}) for(int comm:{1,4,8,12,20,147}) for(bool all:{false,true}) {
       Args a{}; a.params.gemm.k=peer_k*cp; a.params.route.world_size=cp;
       a.params.num_comm_ctas=comm; a.weights.all_ctas=all;
       configure(a);

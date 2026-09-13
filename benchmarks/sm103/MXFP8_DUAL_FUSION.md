@@ -169,6 +169,34 @@ independent GEMM search does not set that optional window; an additional H=P=0
 control tests its original traversal without changing the collective or ready
 unit. No new runtime selector is inferred from these offline candidates.
 
+The CP8/128K unwindowed controls pass all original numerical and routing checks.
+Llama405 and BLOOM reach2.264/2.271P with four communication CTAs; Qwen reaches
+2.161P with sixteen. Kimi, representative-large and Llama70 instead favor P16
+among the tested layouts. These are finite representative candidates, not a
+universal layout rule or independently confirmed full-matrix performance.
+The remaining30 physical points now compare H64/P16 against H=P=0, retaining
+their original tile/raster/swizzle and measuring F/C/R/P separately. Reduced
+distinct-M demand can permit a smaller communication budget, but pure GEMM
+reuse also changes; neither isolated copy timing nor geometry proves overlap.
+
+Bulk C/P balance remains an approximation. At the same twelve communication
+CTAs, the Kimi projection's P8/P16 controls measure pure C at2.434/2.399P but
+F at1.990/2.120P. Executing the actual host mapping shows that the first compute
+wave needs20/12 distinct A M-tiles (30/18MiB, excluding scales). Its last required
+A chunk falls in ideal static copy rounds14/8 of86 total rounds. These counts
+assume equal task service and are not measured delays. They expose a positional
+factor missing from a total-service-only score; no fitted correction or new
+runtime selector is enabled from this diagnostic.
+
+The completed layout/budget search covers all36 physical points and yields a
+finite-candidate geometric mean of2.259959P (+6.5783% versus the same-source P4
+search). Seven individual points remain below2.2P. All original F/C/R/P and
+two-payload checks pass, with no missing or OOM points. Each winner is now
+frozen for an independent confirmation; the search mean is not the acceptance
+result. Existing same-configuration repeats are deduplicated by first valid run,
+not by choosing the fastest repeat. The unique current table retains the full
+configuration and source/run/artifact provenance.
+
 ## Backward implementation boundary
 
 Existing SM103 backward production bindings are BF16. MXFP8 backward is not
