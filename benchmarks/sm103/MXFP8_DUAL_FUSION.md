@@ -64,6 +64,24 @@ compute wave); unavailable delay services remain explicitly unavailable.
 Raw probes: `20260913-154439-92fbdb` and `20260913-154739-2faf80`;
 full trace: `20260913-154529-279069`. All original numerical/route checks passed.
 
+Replacing only the local64x128 load with warp-cooperative cp.async did not
+help. Dense independent R stayed218/226/401us at72/20/8 CTAs. With whole-W
+startup, F was1.191/1.069/0.524P versus original1.192/1.130/0.623P; ordinary
+comm also regressed. The M136 tail and all seven candidates passed their
+original checks, so the native experiment was reverted for performance, not
+relaxed validation. Preserve the source/run evidence, not an unused transport
+option. Runs `20260913-155954-79cbcf`, `160010-230625`, `160033-12d5cd`.
+
+The existing rank N-band rotation was also tested in an isolated build. All
+eight Dense trace ranks had identical8192 task-to-destination mappings; this
+motivates testing correlated traffic, not claiming measured incast. Seven
+originally validated candidates across Dense/Llama405/Qwen3 gave best
+1.1840/2.2022/1.9842P, versus nonrotated1.1916/2.1986/1.9929P. There is no
+material best-candidate gain to adopt. Keep rotation off and do not extend
+the existing TMA Auto calibration to it. Runs `20260913-161046-d8d4c9`,
+`161110-63f282`, `161133-a292d9`; the temporary MXFP8 experiment gateway was
+removed. Neither rejected trial changes the accepted OProj implementation.
+
 ## Reusable historical work
 
 | Commit | Applicable work |
