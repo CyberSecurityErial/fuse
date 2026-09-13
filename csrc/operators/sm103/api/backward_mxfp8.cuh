@@ -342,7 +342,7 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
   const auto w=Mxfp8BackwardWeightWorkspace::make(g,p.workspace);
   using Types=Mxfp8GemmFamily<256,128,EpilogueN>;
   // Logical K heads, not physical CP peers. Keep the existing backward
-  // system-scope full-head protocol and its producer-warp async-proxy fence.
+  // system-scope full-head protocol and issuing-thread async-proxy ordering.
   // W transpose/quantization is a preceding stream operation, not a
   // concurrent panel producer. Use the plain collective beneath input-ready
   // adaptation: no weight-panel predicate is needed at each head load.

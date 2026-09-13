@@ -11,8 +11,8 @@
 //   and the remaining K tiles. Keep that state continuous across both calls.
 // - In the selected SM90 collective, the K loop (including iterator advance)
 //   runs inside an elected-lane branch. In SM100, only the TMA copy is elected;
-//   iterator advance is executed by the whole producer warp. Here lane zero
-//   acquires readiness, then the warp rejoins and all producer lanes execute
+//   iterator advance is executed by the whole producer warp. In the peer-
+//   bounded path lane zero acquires, then all producer lanes rejoin and execute
 //   the async-proxy fence before entering the stock TMA load. A single-lane
 //   wait helper must not contain the warp barrier itself.
 // - The SM100 epilogue consumes TMEM accumulators and its store() requires the
@@ -20,16 +20,19 @@
 //   CUTLASS interface differences, not a change in the ready-epoch contract.
 //
 // Current implementation choices, not Blackwell requirements:
-// - Keep peer-bounded Base::load() calls and the per-CTA peer-ready cache.
+// - Variable peer shards keep peer-bounded Base::load() calls and a per-CTA
+//   peer-ready cache. Fixed K128/head backward instead uses ReadyKIterator:
+//   acquire on dereference in the TMA issuer, not on whole-warp ++. The same
+//   issuer fences before copying, with no visibility handoff between lanes.
 // - Publish output readiness at GPU scope because its consumer is a local
 //   communication CTA. Wait on every lane of the issuing epilogue warp to
 //   cover TMA stores issued by that warp before lane zero publishes. Scope
 //   selection and this issuer-coverage strategy are not inherently SM100-only rules.
 //
-// TODO: Evaluate a ReadyKIterator-style adapter or another boundary-injection
-// strategy to align more closely with SM90 and potentially reduce repeated
-// Base::load() setup. It must preserve whole-warp participation, async-proxy
-// ordering, returned state across prologue/remainder, and first-acquire
+// TODO: Evaluate extending the fixed-head iterator to variable peer shards
+// and first-acquire telemetry after measuring its benefit. Preserve whole-
+// warp iterator advancement, issuer acquire/async-proxy ordering,
+// returned state across prologue/remainder, and first-acquire
 // telemetry. The current strategy may be improvable; compare correctness and
 // measured performance before choosing a replacement, not just code size.
 
@@ -446,6 +449,36 @@ struct A2ALhsReadyMainloop : Base {
              block_rank_in_cluster),
         params_(&params) {}
 
+  // SM90 checks readiness while advancing its elected-lane K iterator.
+  // This SM100 collective advances K on the WHOLE producer warp, but
+  // dereferences it only inside the elected TMA issuer. Acquire here so the
+  // same lane performs acquire -> proxy fence -> A/B/SFA/SFB TMA issue.
+  // No warp join is needed to hand visibility to a different issuer. The
+  // per-lane cache avoids four acquires for the four dereferences of one K.
+  // This iterator is used only by the fixed one-head-per-K-tile binding;
+  // full-head publication and K accumulation order remain unchanged.
+  template <class Iterator>
+  struct ReadyKIterator {
+    Iterator iterator;
+    const uint32_t* ready;
+    uint32_t target;
+    mutable int acquired_k = -1;
+
+    CUTLASS_DEVICE decltype(auto) operator*() const {
+      const int k = static_cast<int>(*iterator);
+      if (k != acquired_k) {
+        if constexpr (SystemScope)
+          wait_acquire_system_single_lane(ready + int64_t{k} * kReadyFlagStride, target);
+        else
+          wait_acquire_gpu_single_lane(ready + int64_t{k} * kReadyFlagStride, target);
+        fence_proxy_async_global();
+        acquired_k = k;
+      }
+      return *iterator;
+    }
+    CUTLASS_DEVICE ReadyKIterator& operator++() { ++iterator; return *this; }
+  };
+
   template <class LoadParams, class TileCoord, class KTileIterator>
   CUTLASS_DEVICE auto load(
       typename Base::MainloopPipeline pipeline,
@@ -462,6 +495,15 @@ struct A2ALhsReadyMainloop : Base {
     }
 
     const uint32_t target = params_->epoch * params_->arrivals_per_peer;
+    if constexpr (StaticKTilesPerPeer == 1 && SystemScope) {
+      auto ready_iter = ReadyKIterator<KTileIterator>{k_iter,
+          params_->ready + int64_t{m} * params_->world_size * kReadyFlagStride, target};
+      auto next = Base::load(pipeline, state, inputs, tile_coord, ready_iter, k_tiles);
+      // Unwrap without dereferencing ReadyKIterator at the end sentinel:
+      // there is no publication to acquire after the final K tile.
+      k_iter.coord = *cute::get<1>(next).iterator;
+      return cute::make_tuple(cute::get<0>(next), k_iter);
+    }
     // A binding with a fixed ready-to-K-tile ratio can expose that geometry
     // to the compiler. In particular, D128 / K128 is one whole head per
     // iteration: peer=k, count=1, with no dynamic division or remainder.

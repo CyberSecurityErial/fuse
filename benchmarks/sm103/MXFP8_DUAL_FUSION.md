@@ -724,3 +724,17 @@ fuse_midfile/mxfp8-v23/oproj-backward-current.md; raw provenance is in current.j
 Core CUDA consolidation: both reverse operators share the transpose quantizer,
 operand/workspace handling and dW kernel/dispatch; only route-specific B adapters
 remain separate. No new core or public header is needed for these optimizations.
+
+QKV fixed-head ReadyKIterator (source5e24057b) acquires on the elected TMA
+issuer's dereference, then fences in that same thread; whole-warp ++ never
+polls and returning the end iterator cannot acquire an out-of-range head.
+The four A/B/SFA/SFB dereferences share a per-issuer K cache. This uses one
+stock CUTLASS load loop, not one Base::load call per head. Publication grain,
+K order, and system-scope readiness remain unchanged. Host-extracted iterator
+tests cover rotating issuers, prologue/remainder and end sentinel. CP4 causal
+222809-7673d1 and both CP8/128K cases pass all five original component audits.
+Llama222857-5f208e full3.094520ms/1.776546P (+4.77% over the beta-zero control),
+prepared dX1.558416ms; dW is unchanged. Kimi222958-512a4d full10.807920ms/
+1.602279P, prepared dX5.575232ms and dW4.304376ms. Its previous direct-collective
+control still used the old dW epilogue, so its full gain cannot be attributed
+solely to the iterator. No new CUDA/public file is introduced.

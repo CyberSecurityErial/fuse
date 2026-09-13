@@ -1,6 +1,9 @@
 """Backward preparation/contract checks; these do not prove CUDA correctness."""
 from collections import Counter
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 import summarize_sm103_mxfp8_backward as backward_summary
 
@@ -8,6 +11,68 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8BackwardContracts(unittest.TestCase):
+    def test_ready_iterator_acquires_on_dereference_not_warp_advance(self):
+        text=(ROOT/'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
+        start=text.index('  template <class Iterator>\n  struct ReadyKIterator')
+        end=text.index('\n  template <class LoadParams, class TileCoord, class KTileIterator>',start)
+        iterator=text[start:end]
+        compiler=shutil.which('c++')
+        if not compiler:self.skipTest('Host C++ compiler unavailable')
+        program=r'''
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#define CUTLASS_DEVICE
+constexpr int kReadyFlagStride=32;
+uint32_t flags[32*8];
+int acquires=0,fences=0;
+void wait_acquire_system_single_lane(const uint32_t* p,uint32_t target) {
+  assert(p>=flags && p<flags+32*8 && *p==target);++acquires;
+}
+void wait_acquire_gpu_single_lane(const uint32_t* p,uint32_t target) {
+  wait_acquire_system_single_lane(p,target);
+}
+void fence_proxy_async_global(){assert(acquires==fences+1);++fences;}
+struct Iterator {
+  int coord;const int& limit;
+  const int& operator*()const{return coord;}
+  Iterator& operator++(){++coord;return *this;}
+};
+template<bool SystemScope> struct Adapter {
+'''+iterator+r'''
+};
+template<bool Scope> void check() {
+  using R=typename Adapter<Scope>::template ReadyKIterator<Iterator>;
+  const int limit=8;acquires=fences=0;
+  for(int i=0;i<8;++i)flags[32*i]=7;
+  // Two CUTLASS calls, with all32 lanes advancing their own iterator and
+  // an elected lane issuing all four TMA operands in each K iteration.
+  for(int part=0;part<2;++part) {
+    int first=part?3:0,last=part?8:3;
+    std::vector<R> lanes;
+    for(int lane=0;lane<32;++lane)lanes.push_back(R{Iterator{first,limit},flags,7});
+    for(int k=first;k<last;++k) {
+      int issuer=(k*7)%32;
+      for(int operand=0;operand<4;++operand) {
+        assert(*lanes[issuer]==k);
+        assert(acquires==k+1 && fences==k+1);
+      }
+      for(auto& lane:lanes)++lane;
+      assert(acquires==k+1); // No poll from whole-warp ++ or end sentinel.
+    }
+    for(auto& lane:lanes)assert(*lane.iterator==last);
+  }
+  assert(acquires==8 && fences==8);
+}
+int main(){check<true>();check<false>();}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'iterator.cpp';binary=Path(directory)/'iterator'
+            source.write_text(program)
+            subprocess.run([compiler,'-std=c++17','-O2',str(source),'-o',str(binary)],check=True,
+                           capture_output=True,text=True)
+            subprocess.run([str(binary)],check=True,capture_output=True,text=True)
+
     def test_transposed_quantization_register_groups_cover_k32(self):
         stores, groups = Counter(), Counter()
         for warp in range(8):
