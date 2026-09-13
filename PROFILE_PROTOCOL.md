@@ -441,6 +441,10 @@ Core 执行时间。可观察每 tile 的 peer acquire 和实际 W panel 等待�
 `cta_role` 按实际通信前缀区分 communication/compute；该尾段通称
 `after_last_quant_to_role_end_us`，不能统一叫空闲。
 它不是整个量化阶段的关键路径，也不能跨 warp 求和当作可回收的 kernel 时间。
+OProj 计算 CTA 的启动量化放在本 CTA 的独立 warp 行（offset8..15），不复用
+MMA/load pipeline 行。省略通信细节时，计算 CTA 仍展示每个 worker 的首个 chunk
+begin→最后 chunk end 包络；明确标为 includes gaps，不当作量化忙碌时间。
+完整 chunk/发布覆盖审计仍执行；这只改变离线展示，不增加 GPU 打点。
 
 使用独立 profiling 构建、单进程每 GPU 一个 host 线程并发提交，预热诊断 kernel
 10 次后清空记录采一次；输出经完整数值和逐字节 FP8/SFA 路由校验。该入口没有

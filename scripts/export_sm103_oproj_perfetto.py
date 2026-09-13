@@ -148,6 +148,23 @@ def norm_worker_metadata(row):
                 note='phase sums within this worker, not consecutive sub-spans or Tensor Core busy')
 
 
+def append_startup_worker_envelopes(events, workers, comm_ctas):
+    """Compact observed startup spans, not quantization busy-time estimates."""
+    for w in workers:
+        if w['cta'] < comm_ctas:
+            continue
+        tid = 100 + w['cta'] * 32 + 8 + w['warp']
+        events.append(dict(ph='M', name='thread_name', pid=w['rank'], tid=tid,
+            args=dict(name=f"CTA {w['cta']} / warp {w['warp']}: startup W quantization")))
+        events.append(dict(ph='M', name='thread_sort_index', pid=w['rank'], tid=tid,
+            args=dict(sort_index=tid)))
+        events.append(dict(ph='X', name='startup W quantization envelope (includes gaps)',
+            cat='fuse.mxfp8', pid=w['rank'], tid=tid, ts=w['first_begin_us'],
+            dur=w['last_end_us']-w['first_begin_us'],
+            args=dict(cta=w['cta'], warp=w['warp'], chunks=w['chunks'],
+                      interpretation='observed first chunk to last chunk; not CUDA-core busy time')))
+
+
 def cta_time_accounting(ctas, pipelines, stages, comm_ctas):
     """Telescope observed timestamps, without adding overlapping warp spans.
 
@@ -714,6 +731,9 @@ def export(run, output, tiles_csv=None, omit_comm_details=False):
                     pass
             trace['metadata']['mxfp8'] = append_mxfp8_events(
                 AuditOnlySink() if omit_comm_details else sink, log, job, origins, records)
+            if omit_comm_details:
+                append_startup_worker_envelopes(sink,
+                    trace['metadata']['mxfp8']['quant_workers'], int(job['comm_sm']))
             trace['metadata']['track_layout'] = 'role_then_own_warps_v1'
         stream.write('],')
         stream.write(json.dumps(trace, separators=(',', ':'))[1:])

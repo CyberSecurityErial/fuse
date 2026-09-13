@@ -233,7 +233,12 @@ def append_mxfp8_events(events, log_path, job, origins, records, route_warps=8,
                     boundaries = [r['quant_done']] + [r[field] for field,_ in phases]
                     assert all(a <= b for a,b in zip(boundaries,boundaries[1:])), 'Unordered W publication timestamps'
                 publication_protocol_chunks[protocol] = publication_protocol_chunks.get(protocol, 0) + 1
-                tid = 100 + cta*32 + 2 + warp*3
+                # OProj's compute tracks +1..6 already contain the pipeline.
+                # Startup producers need their own rows, not renamed MMA/load
+                # tracks. Communication and historical QKV layouts stay intact.
+                offset = (8 + warp if job.get('fused_direction') == 'oproj' and cta >= comm
+                          else 2 + warp*3)
+                tid = 100 + cta*32 + offset
                 track(rank,tid,f'CTA {cta:03d} / warp {warp}: weight quantization + publication')
                 attrs = dict(panel=panel, chunk=step, n_begin=panel*256,
                     group_begin=step*32, groups=r['groups'], group_k=32, values=r['groups']*32,

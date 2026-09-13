@@ -58,11 +58,22 @@ class QkvPerfettoTests(unittest.TestCase):
         lines = [line.replace('cta=0,', 'cta=2,') if line.startswith('profile_mxfp8_quant,')
                  else line for line in lines]
         self.log.write_text('\n'.join(lines))
-        result = append_mxfp8_events([],self.log,job,{0:100},records)
+        events = []
+        result = append_mxfp8_events(events,self.log,job,{0:100},records)
         self.assertEqual(result['quant_chunks'],48)
         self.assertTrue(all(w['cta_role']=='compute' for w in result['quant_workers']))
         self.assertEqual(result['quant_workers'][0]['after_last_quant_to_role_end_us'],.73)
         self.assertIn('enter GEMM afterward', result['quant_worker_scope'])
+        quant = [e for e in events if e['ph']=='X' and e['name'].startswith('W quantize')]
+        self.assertEqual({e['tid'] for e in quant},set(range(100+2*32+8,100+2*32+16)))
+        from export_sm103_oproj_perfetto import append_startup_worker_envelopes
+        compact = []
+        append_startup_worker_envelopes(compact,result['quant_workers'],job['comm_sm'])
+        spans = [e for e in compact if e['ph']=='X']
+        self.assertEqual(len(spans),8)
+        self.assertEqual({e['tid'] for e in spans},{e['tid'] for e in quant})
+        self.assertTrue(all(abs(e['dur']-.07)<1e-12 and e['ts']==.1 for e in spans))
+        self.assertTrue(all('includes gaps' in e['name'] for e in spans))
 
     def test_quant_worker_bounds_subtract_integer_gpu_origin(self):
         job, records, lines = self.mxfp8_fixture()

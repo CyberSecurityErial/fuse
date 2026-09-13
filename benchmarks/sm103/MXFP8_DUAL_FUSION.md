@@ -77,7 +77,7 @@ start transport immediately. Each compute CTA finishes its W contribution and
 joins locally before entering CUTLASS; full-panel release/acquire still gates W
 consumption. There is no extra global W-completion join in this variant.
 
-This is an experiment, not a proven win. The preceding global-join control
+This remains an explicit experiment, not an automatic policy. The preceding global-join control
 helped low-communication-budget cases but only one of four CP8/128K geometries
 exceeded the original configuration's best throughput. A remains a potential
 limiter; quantization acceleration alone does not establish a fused speedup.
@@ -86,7 +86,7 @@ their work in timing. Pure-copy reference has no W source and no extra CTAs.
 Default communication-only preparation and its existing automatic policy are
 unchanged; uncalibrated all-CTA preparation requires an explicit budget.
 
-After full validation, a next **unmeasured** budget experiment can bracket the
+After full validation, a budget experiment can bracket the
 intersection using existing measured copy/compute references: from a tested
 budget `c`, estimate `c * T_copy(c) / T_compute(148-c)` and check nearby budgets.
 This is only a way to prioritize offline candidates. It assumes inverse copy
@@ -99,6 +99,32 @@ to compute time ratios are about1.32 (Qwen geometry),0.63 (Kimi),0.72
 the same small budget is not justified: large output widths have more arithmetic
 per delivered activation byte. These ratios are observations of this setup,
 not constants to embed by model name.
+
+The compute-assisted variant passed all36 physical points. The finite-candidate
+geometric mean improved from1.9125 to2.0263P against the old configuration
+replayed on the same binary. These winners have not received independent final
+confirmation; this is neither an Auto result nor the2.2P target.
+
+The subsequent22-candidate budget bracket across six CP8/128K geometries did
+not generally justify smaller budgets. Llama405 illustrates why:
+
+| Communication CTAs | Independent compute P | Fused P | A-end range across ranks, diagnostic us | Per-rank median CTA A wait, diagnostic us |
+|---:|---:|---:|---:|---:|
+|20|2.3697|2.0272|1189--1277|298--374|
+|8|2.4285|1.8811|2540--2677|911--1004|
+
+Formal F/C values are Graph10+50 from run115611-a0f3d2. Diagnostic captures
+120406-6b6d03 and120612-a8fcec use the separately instrumented same source,
+Eager10+1. W-ready waits remain small (about9 versus19us per-CTA median).
+These waits overlap other warps and asynchronous MMA; do not add them or subtract
+them from formal latency to claim an exact critical-path attribution.
+
+This motivates increasing A/SFA service per communication CTA before further
+reducing its count. W workers currently exit after their startup contribution,
+while A workers continue. Reusing those warps is only a hypothesis: the existing
+four48-KiB slots occupy192KiB, so extra active DMA warps need explicit slot
+ownership and completion ordering, or smaller payloads with more transactions.
+No such handover strategy is implemented or claimed faster by this observation.
 
 ## Backward implementation boundary
 
