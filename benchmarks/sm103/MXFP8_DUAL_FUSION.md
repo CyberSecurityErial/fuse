@@ -29,8 +29,24 @@ K32 scales and the two CTA barriers are unchanged, with packed FP8 conversion
 and4-byte stores. Qwen3 CP8/128K run191442-1b11da independently passes all
 three full/B/W boundaries, two payloads and Graph10+50. At unchanged C16/E32/
 sw8/AlongN, full1.999480→1.727992ms (+15.71% throughput), B0.648888→0.617968ms,
-W1.372248→1.132424ms. Other five physical families are being checked; this is
-not a new full36-point result or a2P claim. No GEMM or communication change.
+W1.372248→1.132424ms. All six physical families now pass all18 full/B/W
+boundaries; full B+dW geometric mean1.355396→1.505587P (+11.08%). This is
+CP8/128K coverage, not a full36-point result or a2P claim. No GEMM or
+communication change. The finite prep optimization is retained.
+
+| CP8/128K geometry | Initial full P | Subgroup quantization full P | Change |
+|---|---:|---:|---:|
+| Qwen3 235B | 1.098861 | 1.272589 | +15.81% |
+| BLOOM 176B | 1.500435 | 1.619615 | +7.94% |
+| Llama405B | 1.577801 | 1.709454 | +8.34% |
+| Representative large | 1.377749 | 1.529994 | +11.05% |
+| Kimi KDA projection geometry | 1.328494 | 1.472623 | +10.85% |
+| Llama70B/Qwen72B geometry | 1.302134 | 1.467221 | +12.68% |
+
+Runs191442-1b11da,191651-10dda5,191734-40c568,191823-cc27e0,
+191856-bfd8b9,191924-a3072e; native source4cc9e514. Exact component timings,
+previous results and fingerprints are in current JSON. These are successive
+same-configuration measurements, not a claim of simultaneous paired execution.
 
 Pure dW CUTLASS search190812-025432:254 checked grid/neighbor candidates across
 six physical matrices,148compute CTAs, no quantization/communication. Best
