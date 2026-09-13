@@ -84,12 +84,14 @@ def audit_mpi(job,records,data,attempt):
     sf.require(b'backward_' not in merged[previous:],'Unowned backward tail')
 
 
-def audit_run(directory):
+def audit_run(directory,component='full'):
     directory=Path(directory).resolve()
     request=sf.json_bytes(sf.read_bytes(directory/'job.json',directory))
     sf.require(request.get('mxfp8') and request.get('backward') and request.get('mpi') and
                request.get('fused_direction')=='oproj' and request.get('fused_launch')=='graph' and
                not request.get('profile') and not request.get('quick'),'Not complete MXFP8 backward Graph')
+    sf.require(component in ('full','data','weight') and
+               (component=='full' or request.get('calibrate')),'Backward component requires calibration')
     old_workspace,old_audit=str(l20d.WORKSPACE),sf.audit_mpi_receipts
     try:
         l20d.configure_workspace(request['workspace']);sf.audit_mpi_receipts=audit_mpi
@@ -100,9 +102,12 @@ def audit_run(directory):
     rows=[]
     for rank in range(job['world']):rows+=parse(data[f'mpi-attempt{attempt}-rank-{rank}.stdout.log'])
     def selected(kind,**fields):
-        return [r for r in rows if r['kind']==kind and all(r.get(k)==str(v) for k,v in fields.items())]
+        timed=kind in ('backward_validation','backward_warmup','backward_sample','backward_verified','backward_rejected')
+        return [r for r in rows if r['kind']==kind and (not timed or r.get('component','full')==component)
+                and all(r.get(k)==str(v) for k,v in fields.items())]
     configs=selected('backward_config');sf.require(len(configs)==1,'Missing/duplicate backward configuration')
     c=configs[0];shape=l20d.fused_geometry(job)
+    sf.require(int(c.get('calibrate',0))==int(bool(job.get('calibrate'))),'Calibration job/config mismatch')
     for key,value in dict(M=shape['seq_local'],H=shape['hidden'],A=shape['q_width'],world=job['world'],
             comm=job['comm_sm'],epilogue=job.get('mxfp8_epilogue_n') or 32,
             swizzle=job.get('max_swizzle_size',1),along_m=int(job['oproj_raster']=='along_m'),
@@ -113,6 +118,7 @@ def audit_run(directory):
                c['upstream_dY_quant']=='excluded' and c['CP_dW_reduce']=='caller_owned','Wrong backward boundary')
     m,h,a,world=shape['seq_local'],shape['hidden'],shape['q_width'],job['world']
     flops=4*m*h*a;sf.close(float(c['flops_per_rank']),flops,'Backward FLOPs')
+    if component!='full':flops//=2
     payloads=[]
     for gen in (0,1):
         inputs=selected('backward_input',generation=gen)
@@ -128,8 +134,8 @@ def audit_run(directory):
         sf.require(Counter((int(r['rank']),r['phase']) for r in checks)==
                    Counter((rank,phase) for rank in range(world) for phase in ('pre','post')),'Missing full pre/post checks')
         for r in checks:
-            for component,count in (('B',m*a),('W',h*a),('route',m*a)):
-                sf.require(int(r[component+'_checked'])==count and int(r[component+'_mismatch'])==0,'Incomplete/failed gradient validation')
+            for output,count in (('B',m*a),('W',h*a),('route',m*a)):
+                sf.require(int(r[output+'_checked'])==count and int(r[output+'_mismatch'])==0,'Incomplete/failed gradient validation')
         windows=selected('backward_warmup',generation=gen)
         for rank in range(world):
             w=[r for r in windows if int(r['rank'])==rank]
@@ -174,10 +180,13 @@ def audit_run(directory):
     p50=sum(x['p50_ms'] for x in payloads)/2
     return dict(run=job['run_id'],source=job['source_id'],binary=receipts['fused-build.json']['binary_sha256'],
         artifact=evidence['artifacts.tar.gz']['sha256'],environment=receipts['environment.json']['fingerprint'],
-        configuration=c,boundary='immediate_B_W_five_kernels',payloads=payloads,
+        configuration=c,component=component,
+        boundary={'full':'immediate_B_W_five_kernels','data':'W_quant_dA_inverse_A2A_two_kernels',
+                  'weight':'dY_quant_saved_A_quant_dW_three_kernels'}[component],payloads=payloads,
         p50_ms=p50,pflops=flops/(p50*1e12),verification='full_two_payload_pre_post_numeric_and_route')
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('runs',nargs='+',type=Path)
-    args=parser.parse_args();print(json.dumps([audit_run(run) for run in args.runs],indent=2))
+    parser.add_argument('--component',choices=('full','data','weight'),default='full')
+    args=parser.parse_args();print(json.dumps([audit_run(run,args.component) for run in args.runs],indent=2))

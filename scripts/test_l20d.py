@@ -180,6 +180,9 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn('deferred',argv)
         self.assertEqual(argv[argv.index('--m')+1],'16384')
         self.assertEqual(argv[argv.index('--comm-ctas')+1],'16')
+        self.assertIn('--calibrate',l20d.fused_argv(job|{'calibrate':True}))
+        with self.assertRaises(ValueError):
+            l20d.validate_job(job|{'calibrate':True,'mxfp8':False})
         for change in ({'fused_launch':'eager'},{'input_generator':'cpu_mt19937'},
                        {'iterations':5},{'warmup':1},{'profile':True},{'fused_direction':'qkv'},
                        {'oproj_raster':'heuristic'},{'comm_sm':0},{'comm_sm_list':'8,16'},

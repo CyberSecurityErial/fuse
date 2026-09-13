@@ -423,7 +423,7 @@ def validate_job(job, hostname=None):
                 'validation_self_test', 'fused_counters', 'auto_oproj_comm', 'qkv_rank_swizzle')):
             raise ValueError('MXFP8 baseline requires isolated forward build/smoke without BF16 tuning/diagnostics')
         if job.get('backward'):
-            if (job.get('profile') or job.get('calibrate') or
+            if (job.get('profile') or (job.get('calibrate') and not job.get('mpi')) or
                     job.get('auto_mxfp8_comm') or job.get('mxfp8_prequantized') or
                     job.get('mxfp8_weight_preparation') not in (None, 'comm') or
                     job.get('qkv_postprocess') or job.get('oproj_postnorm') or
@@ -480,7 +480,9 @@ def validate_job(job, hostname=None):
         if not job.get('backward') or not job.get('mpi') or job['stage']!='fused-smoke':
             raise ValueError('Backward matrix requires backward MPI measurement')
     if job.get('backward'):
-        if job['stage'] not in FUSED_STAGES or any(job.get(k) for k in ('quick','calibrate','fused_counters','auto_qkv_comm','auto_oproj_comm','compute_only','producer_only')):
+        if (job['stage'] not in FUSED_STAGES or
+                (job.get('calibrate') and not (job.get('mxfp8') and job.get('mpi'))) or
+                any(job.get(k) for k in ('quick','fused_counters','auto_qkv_comm','auto_oproj_comm','compute_only','producer_only'))):
             raise ValueError('Backward baseline requires isolated build/smoke without forward tuning or diagnostics')
         if job.get('profile') and not job.get('backward_gemm_sweep') and (not job.get('mpi') or job.get('backward_matrix') or job.get('backward_matrix_payload')):
             raise ValueError('Backward role profiling requires one MPI case')
@@ -1278,6 +1280,7 @@ def fused_argv(job):
                      '--epilogue-n',str(job.get('mxfp8_epilogue_n') or 32),
                      '--swizzle',str(job.get('max_swizzle_size',1)), '--raster',job['oproj_raster']]
             if job.get('causal'): argv.append('--causal')
+            if job.get('calibrate'): argv.append('--calibrate')
         return argv
     if job.get('backward'):
         if not job.get('mpi'):

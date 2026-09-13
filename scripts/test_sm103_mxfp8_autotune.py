@@ -329,7 +329,7 @@ struct FastDivmodU64 {
         self.assertIn('resolve_mxfp8_qkv_communication(params, &p)', api)
         self.assertLess(api.index('resolve_mxfp8_qkv_communication(params, &p)'),
                         api.index('status = validate_mxfp8(p, &workspace)'))
-        self.assertIn('!dynamic_weight && params.projection.num_comm_ctas == 0', api)
+        self.assertIn('(!dynamic_weight || params.postprocess.enabled()) && params.projection.num_comm_ctas == 0', api)
         for epilogue in (32, 64):
             self.assertIn(f'launch_mxfp8<false, {epilogue}>(params, stream, true)', api)
             self.assertIn(f'launch_mxfp8<true, {epilogue}>(params, stream, true,', api)

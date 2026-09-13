@@ -16,9 +16,14 @@
 using fuse::Bf16;
 using mxfp8_reference::check;
 
+enum class Component { kFull, kData, kWeight };
+const char* component_name(Component c){
+  return c==Component::kFull?"full":c==Component::kData?"data":"weight";
+}
+
 struct Options {
   int world=8,m=256,h=256,heads=8,comm=16,epilogue=32,swizzle=1;
-  bool along_m=false,causal=false;
+  bool along_m=false,causal=false,calibrate=false;
   std::string json;
 };
 
@@ -27,6 +32,7 @@ Options parse(int argc,char** argv) {
   for(int i=1;i<argc;++i){
     const std::string key=argv[i];
     if(key=="--causal"){o.causal=true;continue;}
+    if(key=="--calibrate"){o.calibrate=true;continue;}
     if(i+1==argc)throw std::invalid_argument("missing option value");
     const std::string value=argv[++i];
     if(key=="--world")o.world=std::stoi(value);
@@ -67,6 +73,7 @@ struct InverseRoute {
 };
 
 struct Runtime {
+  Component component=Component::kFull;
   cudaStream_t stream{};
   cudaEvent_t start{},end{};
   std::vector<void*> allocations,imports;
@@ -158,9 +165,12 @@ struct Runtime {
         <<" square_sum="<<stats.square_sum<<" min="<<stats.minimum<<" max="<<stats.maximum<<'\n';
   }
   void poison(const Options& o){
-    check(cudaMemsetAsync(da,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
-    check(cudaMemsetAsync(routed,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
-    check(cudaMemsetAsync(dw,0xff,size_t(o.h)*route.a*sizeof(Bf16),stream));
+    if(component!=Component::kWeight){
+      check(cudaMemsetAsync(da,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
+      check(cudaMemsetAsync(routed,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
+    }
+    if(component!=Component::kData)
+      check(cudaMemsetAsync(dw,0xff,size_t(o.h)*route.a*sizeof(Bf16),stream));
     check(cudaStreamSynchronize(stream));fused_mpi::barrier();
   }
   void validate(const Options& o,int generation,const char* phase){
@@ -175,6 +185,7 @@ struct Runtime {
     const bool bad=b.checked!=uint64_t(o.m)*route.a || w.checked!=uint64_t(o.h)*route.a ||
         transport.checked!=uint64_t(o.m)*route.a || b.mismatches || w.mismatches || transport.mismatches;
     std::cout<<"backward_validation rank="<<fused_mpi::process_rank<<" generation="<<generation
+        <<" component="<<component_name(component)
         <<" phase="<<phase<<" B_checked="<<b.checked<<" W_checked="<<w.checked
         <<" route_checked="<<transport.checked<<" B_mismatch="<<b.mismatches<<" W_mismatch="<<w.mismatches
         <<" route_mismatch="<<transport.mismatches<<" B_max_abs="<<b.max_abs<<" W_max_abs="<<w.max_abs<<'\n'<<std::flush;
@@ -182,7 +193,12 @@ struct Runtime {
   }
   std::vector<float> step(fused_graph::Operation& graph){
     graph.prepare(graph.committed_epoch()+1,[this](uint32_t epoch,cudaStream_t s){
-      params.data.projection.epoch=epoch;return fuse::launch_oproj_backward_mxfp8(params,s);
+      // W has no native ready epoch. Its Graph launch index must not advance
+      // B's publication epoch. Full/B graphs resume from the last actual B.
+      if(component==Component::kWeight)return fuse::launch_oproj_backward_mxfp8_weight(params.weight,s);
+      params.data.projection.epoch=epoch;
+      return component==Component::kData?fuse::launch_oproj_backward_mxfp8_data(params.data,s):
+          fuse::launch_oproj_backward_mxfp8(params,s);
     });
     check(cudaStreamSynchronize(stream));fused_mpi::barrier();
     check(cudaEventRecord(start,stream));graph.launch();check(cudaEventRecord(end,stream));
@@ -222,6 +238,7 @@ Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int gen
     for(int i=0;i<count;++i){
       auto& out=fused_mpi::root_output();
       out<<"backward_sample generation="<<generation<<" phase="<<phase<<" round="<<round
+          <<" component="<<component_name(r.component)
           <<" index="<<i<<" epoch="<<initial+i+1<<" maxrank_ms="<<maxima[i];
       for(int rank=0;rank<o.world;++rank)out<<" rank"<<rank<<"_ms="<<raw[i][rank];
       out<<'\n';
@@ -251,6 +268,7 @@ Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int gen
       stable=stable&&ready;
       next_count=std::min(next_count,int(std::clamp(std::ceil(20/std::max(windows[p].back(),.001)),10.,1000.)));
       fused_mpi::root_output()<<"backward_warmup generation="<<generation<<" rank="<<p
+          <<" component="<<component_name(r.component)
           <<" window="<<windows[p].size()-1<<" calls="<<calls<<" ms_per_call="<<windows[p].back()
           <<" accumulated_cuda_ms="<<accumulated[p]<<" ready="<<ready<<'\n';
     }
@@ -265,7 +283,8 @@ Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int gen
     const std::vector<float> first(samples.begin(),samples.begin()+25),second(samples.begin()+25,samples.end());
     const double p50=percentile(samples,.5),drift=std::abs(percentile(first,.5)-percentile(second,.5))/p50;
     if(drift<=.05)return {p50,percentile(samples,.95),drift,round};
-    fused_mpi::root_output()<<"backward_rejected generation="<<generation<<" round="<<round<<" half_drift="<<drift<<'\n'<<std::flush;
+    fused_mpi::root_output()<<"backward_rejected generation="<<generation<<" component="<<component_name(r.component)
+        <<" round="<<round<<" half_drift="<<drift<<'\n'<<std::flush;
   }
   throw std::runtime_error("backward sample drift exceeds 5% in all three rounds");
 }
@@ -279,10 +298,12 @@ void run(const Options& o){
   fused_mpi::root_output()<<"backward_config op=oproj_mxfp8 M="<<o.m<<" H="<<o.h<<" A="<<o.heads*128
       <<" world="<<o.world<<" comm="<<o.comm<<" epilogue="<<o.epilogue<<" swizzle="<<o.swizzle
       <<" along_m="<<o.along_m<<" causal="<<o.causal<<" launch=graph kernels=5 weight_mode=immediate"
+      <<" calibrate="<<o.calibrate
       <<" timed=weight_quant_dA_route_dY_quant_A_quant_dW upstream_dY_quant=excluded CP_dW_reduce=caller_owned"
       <<" flops_per_rank="<<flops<<'\n'<<std::flush;
   std::vector<Result> results;
   for(int generation=0;generation<2;++generation){
+    r.component=Component::kFull;
     const int rank=fused_mpi::process_rank;
     r.input(r.dy,size_t(o.m)*o.h,1234+generation*100+rank,"dY",generation);
     r.input(r.weight,size_t(o.h)*r.route.a,5678+generation*100,"W",generation);
@@ -292,10 +313,29 @@ void run(const Options& o){
     r.poison(o);r.step(graph);r.validate(o,generation,"pre");
     const auto result=measure(r,graph,o,generation);
     r.validate(o,generation,"post");results.push_back(result);
-    fused_mpi::root_output()<<"backward_verified generation="<<generation<<" p50_ms="<<result.p50
+    fused_mpi::root_output()<<"backward_verified generation="<<generation<<" component=full p50_ms="<<result.p50
         <<" p95_ms="<<result.p95<<" half_drift="<<result.drift<<" selected_round="<<result.round
         <<" pflops="<<flops/(result.p50*1e12)<<" verification=pass\n"<<std::flush;
-    graph.reset(graph.committed_epoch());
+    if(o.calibrate)for(Component component:{Component::kData,Component::kWeight}){
+      r.component=component;
+      const std::vector<L> boundary=component==Component::kData?
+          std::vector<L>{L::kOrdinaryStatic,L::kCooperativeDynamic}:
+          std::vector<L>{L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic};
+      fused_graph::Operation isolated(fused_mpi::local_device,r.stream,
+          component==Component::kData?r.params.data.projection.epoch:0,boundary);
+      // Only the active component's outputs are poisoned. Checking both full
+      // gradients also checks that this isolated component leaves the other
+      // gradient valid; it does NOT count the other gradient in timed FLOPs.
+      r.poison(o);r.step(isolated);r.validate(o,generation,"pre");
+      const auto value=measure(r,isolated,o,generation);
+      r.validate(o,generation,"post");
+      fused_mpi::root_output()<<"backward_verified generation="<<generation
+          <<" component="<<component_name(component)<<" p50_ms="<<value.p50<<" p95_ms="<<value.p95
+          <<" half_drift="<<value.drift<<" selected_round="<<value.round
+          <<" pflops="<<(flops/2)/(value.p50*1e12)<<" verification=pass\n"<<std::flush;
+      isolated.reset(isolated.committed_epoch());
+    }
+    graph.reset(r.params.data.projection.epoch);
   }
   if(fused_mpi::root() && !o.json.empty()){
     std::ofstream out(o.json);out<<std::setprecision(12);

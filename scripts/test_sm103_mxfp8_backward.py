@@ -92,6 +92,16 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertNotIn('ptr_SFB',ref)
         self.assertNotIn('quantize_mxfp8_transposed_operand',ref)
 
+    def test_isolated_components_preserve_full_boundary_and_native_epoch(self):
+        text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        weight=text.index('if(component==Component::kWeight)return fuse::launch_oproj_backward_mxfp8_weight')
+        epoch=text.index('params.data.projection.epoch=epoch;',weight)
+        self.assertLess(weight,epoch)
+        self.assertIn('graph.reset(r.params.data.projection.epoch)',text)
+        self.assertIn('component==Component::kData?r.params.data.projection.epoch:0',text)
+        self.assertIn('(flops/2)/(value.p50*1e12)',text)
+        self.assertIn('r.validate(o,generation,"post");results.push_back(result)',text)
+
 
 if __name__ == '__main__':
     unittest.main()
