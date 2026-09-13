@@ -319,6 +319,24 @@ No point is replaced by its faster search observation. The six physical-family
 means are2.2172--2.3006P; seven individual points remain below2.2P. The forward
 OProj geometric-mean target is met, not a guarantee that each point exceeds it.
 
+### OProj low-point follow-up
+
+On the unchanged accepted implementation, four sub-2.2P windowed points compare
+H64/P16 with P32, at the original communication budget and four fewer CTAs.
+All16 candidates pass independent F/C/R/P re-audits, Graph10+50 and both payloads.
+P32 reduces initial distinct A rows for two geometries, but increases W-panel
+demand and changes pure GEMM traversal. It is not adopted: the best fused results
+regress for three points, while Kimi512K gains only0.14%. Less initial A demand
+does not establish an end-to-end benefit.
+
+The retained candidate keeps P16 for the H8192/K8192, CP8/128K projection and
+reduces communication CTAs20→16. Independent fixed paired confirmation
+`20260913-174152-a24643` gives2.118781→2.188344P (+3.2832%); independent compute
+is2.504537→2.551545P. This is a measured offline configuration, not a model-name
+branch or a new Auto rule. The original36-point fixed table remains intact;
+this later single-point confirmation is recorded separately, not substituted
+into the earlier full-run mean. No new kernel code is needed for this result.
+
 ## Backward implementation boundary
 
 Existing SM103 backward production bindings are BF16. MXFP8 backward is not
