@@ -647,3 +647,14 @@ Already-ready dX remains most of B time. This rules out blaming most remaining
 time on waiting for delivery; it does not separate arithmetic from the head-wise
 acquire/load adapter. B minus prepared dX includes preparation, transport and
 concurrent/cache effects, not a measured sum of semaphore wait intervals.
+
+Single-GPU pure CUTLASS search210038-f5ff48 explicitly enforces116 compute CTAs
+and includes the exact dX tile/epilogue/raster/swizzle as a measured candidate.
+Both matrices have42 fully verified grid/neighbor candidates, with Graph10+50
+and a second nonzero payload check. At M128N256K128/E32/sw8/N, Llama70/Qwen72
+dX is1.212000ms/2.267970P and Kimi dX4.128928ms/2.097071P. Finite winners are
+sw8/M at1.178272ms/2.332890P and sw4/M at3.706992ms/2.335763P respectively.
+These are compute-only, single-GPU measurements with independent random inputs,
+not substitutes for the eight-rank fused boundary. The gap to prepared dX
+warrants testing repeated head-wise acquire/load control and N-tile input reuse;
+it is not by itself a profiler attribution of every microsecond to fences.

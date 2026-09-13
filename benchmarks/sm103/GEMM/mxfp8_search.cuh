@@ -93,8 +93,10 @@ inline cudaError_t dispatch(const Input& in,const Config& c) {
   return cudaErrorNotSupported;
 }
 inline std::vector<Config> grid() {
-  // Baseline first; the set removes its duplicate from the Cartesian grid.
-  std::vector<Config> out{{256,128,64,0,1,true}};
+  // Keep both the forward baseline and the current backward dX collective
+  // explicit. A neighbor search alone may never visit dX's swizzle8/AlongN,
+  // which would prevent an identical-configuration compute-budget comparison.
+  std::vector<Config> out{{256,128,64,0,1,true},{256,128,32,0,8,false}};
   for(int n:{128,256}) for(int k:{128,256}) for(int e:{32,64})
     for(bool along:{true,false}) for(int sw:{1,4}) {
       Config c{n,k,e,0,sw,along};

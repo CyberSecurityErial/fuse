@@ -129,7 +129,8 @@ class Mxfp8QuantizationContracts(unittest.TestCase):
         program = '#include <vector>\n#include <string>\n#include <tuple>\n#include <set>\n' + config + grid + r'''
 int main() {
   auto all=grid(); std::set<decltype(all.front().key())> keys;
-  if(all.size()!=32 || all.front().name()!="m128n256k128e64s0sw1M")return 1;
+  if(all.size()!=33 || all.front().name()!="m128n256k128e64s0sw1M" ||
+     all[1].name()!="m128n256k128e32s0sw8N")return 1;
   for(auto c:all) {
     if(!keys.insert(c.key()).second)return 2;
     for(auto v:neighbors(c)) {
