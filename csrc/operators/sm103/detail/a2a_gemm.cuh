@@ -958,41 +958,44 @@ struct Mxfp8A2ALhsInputCommT {
       for (int i = lane; i < a.comm_rows * peer_k / 16; i += 32)
         cute::SM80_CP_ASYNC_CACHEGLOBAL<uint4>::copy(vectors[i], shared_vectors[i]);
       cute::cp_async_fence();
-      // Re-index SFA logically: source rows/K extent differ from destination.
-      // Whole native scale buffers cannot be concatenated across peers.
-      // Native K32 scales store four consecutive K groups in one aligned word:
-      //   (row, K+0/32/64/96) -> four adjacent UE8M0 bytes.
-      // Transfer that word unchanged and traverse rows before K128 groups.
-      // The former scalar K-first walk scattered each warp over many separate
-      // scale atoms. Word copies reduce instructions and improve sector use;
-      // source/destination layouts still independently lower the logical row.
-      // peer_k and every peer origin are K128 aligned, so a word never crosses
-      // a peer or an atom. This changes neither K32 quantization nor A ready units.
-      const int words_per_row = peer_k / 128;
-      const int words = a.comm_rows * words_per_row;
-      // Issue independent remote reads before consuming their results. The
-      // scalar load/store pair otherwise creates a per-iteration scoreboard
-      // dependency even though these scale words have no data dependencies.
-      // Four words per lane bound register usage; tail guards retain exactly
-      // the same writers, bytes and whole-(M,peer) publication as above.
-      for (int i = lane; i < words; i += 32 * 4) {
-        uint32_t values[4];
-        int64_t destinations[4];
+      // A ready unit owns a complete M128/peer-K shard. Native K32 SFA atoms
+      // for this aligned shard are contiguous, although individual row slices
+      // are not. Lower source/destination shard origins independently, then
+      // divide the SCALE BYTES equally among the existing data chunks:
+      //
+      // chunk 0: A row slice 0 + contiguous SFA slice 0 --+
+      // chunk 1: A row slice 1 + contiguous SFA slice 1 --+-> whole-shard ready
+      // ...                                             +   (all arrivals)
+      //
+      // A scale slice need not describe the same rows as its data slice: no
+      // consumer can enter until every contributor completes both writes.
+      // Each byte has exactly one owner. No extra flags or partial-ready units
+      // are introduced. Balanced slices avoid assigning all scale work to one
+      // chunk; vector reads use full sectors instead of strided four-byte words.
+      // Round the two prefix boundaries, NOT each chunk's length: a large odd
+      // number of K128 atoms can leave 4/8/12 scale bytes per row slice. Adjacent
+      // vector intervals still meet exactly; their lengths differ by at most
+      // one vector and the final boundary includes the entire aligned shard.
+      const int scale_bytes = a.comm_rows * peer_k / 32;
+      const int scale_begin = t.chunk * scale_bytes / sizeof(uint4);
+      const int scale_end = (t.chunk + 1) * scale_bytes / sizeof(uint4);
+      const int scale_vectors = scale_end - scale_begin;
+      const int shard_source_row = source_row - t.chunk * a.comm_rows;
+      const int shard_row = row - t.chunk * a.comm_rows;
+      const auto src = a.source_scales(cute::make_coord(shard_source_row, 0, 0));
+      const auto dst = a.destination_scales(cute::make_coord(shard_row, t.peer * peer_k, 0));
+      const auto* scale_source = reinterpret_cast<const uint4*>(a.activation[peer].scales + src)
+          + scale_begin;
+      auto* scale_destination = reinterpret_cast<uint4*>(
+          reinterpret_cast<uint8_t*>(a.workspace.sfa) + dst) + scale_begin;
+      for (int i = lane; i < scale_vectors; i += 32 * 2) {
+        uint4 values[2];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const int index = i + j * 32;
-          if (index < words) {
-            const int r = index % a.comm_rows, k = (index / a.comm_rows) * 128;
-            const auto src = a.source_scales(cute::make_coord(source_row + r, k, 0));
-            destinations[j] = a.destination_scales(cute::make_coord(row + r, t.peer * peer_k + k, 0));
-            values[j] = *reinterpret_cast<const uint32_t*>(a.activation[peer].scales + src);
-          }
-        }
+        for (int j = 0; j < 2; ++j)
+          if (i + j * 32 < scale_vectors) values[j] = scale_source[i + j * 32];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          if (i + j * 32 < words)
-            *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a.workspace.sfa) + destinations[j]) = values[j];
-        }
+        for (int j = 0; j < 2; ++j)
+          if (i + j * 32 < scale_vectors) scale_destination[i + j * 32] = values[j];
       }
       // Wait for the G2S path before the common S2G/publication path.
       cute::cp_async_wait<0>();

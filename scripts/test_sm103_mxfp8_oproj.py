@@ -485,13 +485,16 @@ int main() {
             run = subprocess.run([binary], capture_output=True, text=True, timeout=60)
             self.assertEqual(run.returncode, 0, run.stderr)
 
-    def test_scale_word_copy_matches_scalar_layout(self):
+    def test_scale_chunk_copy_matches_scalar_layout(self):
         compiler = shlex.split(os.environ.get('CXX', 'c++'))
         if not compiler or not shutil.which(compiler[0]):
             self.skipTest('host C++ compiler required')
         source = (ROOT / 'csrc/operators/sm103/detail/a2a_gemm.cuh').read_text()
-        begin = source.index('      const int words_per_row = peer_k / 128;')
+        begin = source.index('      const int scale_bytes = a.comm_rows * peer_k / 32;')
         loop = source[begin:source.index('      // Wait for the G2S path', begin)]
+        store = 'scale_destination[i + j * 32] = values[j];'
+        self.assertEqual(loop.count(store), 1)
+        loop = loop.replace(store, 'checked_store(scale_destination + i + j * 32, values[j]);')
         # Independent scalar layout oracle: CUTLASS K-major SfAtom has
         # ((32,4),(32,4)) shape and ((16,4),(0,1)) byte strides.
         program = r'''
@@ -500,6 +503,15 @@ int main() {
 #include <stdexcept>
 #include <vector>
 struct Coord { int r,k; };
+struct alignas(16) uint4 { uint32_t x,y,z,w; };
+uint4* tracked_begin;
+std::vector<unsigned> writes;
+void checked_store(uint4* target, uint4 value) {
+  const auto index=target-tracked_begin;
+  if(index<0 || size_t(index)>=writes.size()) throw std::runtime_error("SFA write outside allocation");
+  if(++writes[index]!=1) throw std::runtime_error("SFA has duplicate lane/chunk owners");
+  *target=value;
+}
 namespace cute { Coord make_coord(int r,int k,int) { return {r,k}; } }
 struct Layout {
   int k;
@@ -515,12 +527,12 @@ struct Args {
   struct { const uint8_t* scales; } activation[8];
 };
 void transfer(Args a,int peer_k,int source_row,int row,int peer,int lane) {
-  struct { int peer; } t{peer};
+  struct { int peer,chunk; } t{peer,(row%128)/a.comm_rows};
 ''' + loop + r'''
 }
 int main() {
   for(int stage_bytes:{24*1024,48*1024,64*1024})
-  for(int peer_k:{128,384,1024,2048,8192,32768}) for(int world:{2,4,8}) {
+  for(int peer_k:{128,384,1024,1536,2048,3072,3584,4096,8192,16256,16512,32640,32768}) for(int world:{2,4,8}) {
     if(peer_k>stage_bytes) continue;
     int rows=128;
     while(rows*peer_k>stage_bytes) rows/=2;
@@ -532,12 +544,26 @@ int main() {
       std::fill(actual.begin(),actual.end(),0xa5a5a5a5u); expected=actual;
       int source_row=256+chunk,row=128+chunk;
       auto* out=reinterpret_cast<uint8_t*>(expected.data());
-      for(int r=0;r<rows;++r) for(int k=0;k<peer_k;k+=32)
-        out[dst({row+r,peer*peer_k+k})]=bytes[src({source_row+r,k})];
+      // Independent logical oracle: a task owns a contiguous native-scale
+      // slice, not the scales of its A row slice. Check unowned bytes too.
+      const int origin=dst({128,peer*peer_k});
+      const int begin=((chunk/rows)*(rows*peer_k/32)/16)*16;
+      const int end=(((chunk/rows+1)*(rows*peer_k/32))/16)*16;
+      for(int r=0;r<128;++r) for(int k=0;k<peer_k;k+=32) {
+        int target=dst({128+r,peer*peer_k+k});
+        if(target-origin>=begin && target-origin<end)
+          out[target]=bytes[src({256+r,k})];
+      }
       Args a{rows,src,dst,{reinterpret_cast<uint8_t*>(actual.data())},{}};
       a.activation[peer].scales=bytes;
+      tracked_begin=reinterpret_cast<uint4*>(actual.data());
+      writes.assign(actual.size()/4,0);
       for(int lane=0;lane<32;++lane) transfer(a,peer_k,source_row,row,peer,lane);
-      if(actual!=expected) throw std::runtime_error("SFA word copy changed bytes or ownership");
+      if(actual!=expected) throw std::runtime_error("SFA chunk copy changed bytes or ownership");
+      for(size_t i=0;i<writes.size();++i) {
+        const bool owned=int(i*16)>=origin+begin && int(i*16)<origin+end;
+        if(writes[i]!=unsigned(owned)) throw std::runtime_error("SFA owner coverage mismatch");
+      }
     }
   }
 }
@@ -556,8 +582,8 @@ int main() {
         source = source[source.index('struct Mxfp8A2ALhsInputComm'):]
         self.assertIn('Mxfp8WeightProducer weights(', source)
         self.assertNotIn('quantize_mxfp8_chunk(', source)  # shared producer, no copied quantizer
-        self.assertIn('a.source_scales(cute::make_coord(source_row + r, k, 0))', source)
-        self.assertIn('a.destination_scales(cute::make_coord(row + r, t.peer * peer_k + k, 0))', source)
+        self.assertIn('a.source_scales(cute::make_coord(shard_source_row, 0, 0))', source)
+        self.assertIn('a.destination_scales(cute::make_coord(shard_row, t.peer * peer_k, 0))', source)
         publish = source.index('ready.fetch_add(1, cuda::memory_order_acq_rel)')
         self.assertLess(source.index('detail::tma_store_wait_all()'), publish)
         self.assertLess(source.index('a.activation[peer].scales + src'), publish)
