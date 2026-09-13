@@ -5,9 +5,60 @@ optional, disabled experimental extension, not part of these benchmarks.
 Targets are measured separately: forward QKV/OProj each2.2 PFLOPS/GPU;
 corresponding complete backward each2.0 PFLOPS/GPU. OProj forward is independently
 confirmed at2.256462P across all36 physical points with explicit offline plans.
-The other three targets remain unachieved. The OProj forward milestone is
+OProj complete backward is also confirmed at2.038881P across36 physical points;
+the two QKV targets remain unachieved. The OProj forward milestone is
 published separately in [v23.0](../../results/sm103/v23.0/README.md); this is
 not a new Auto policy or completion of the remaining development goal.
+
+The pure cuBLASLt ceiling requires its own two-timed-payload validation,
+separate from the native operator comparisons below. Historical records that
+timed only payload0 must not be described as two-payload timing results.
+
+The backward harness uses a payload-scoped independent-reference
+cache: keep the original K32 decoder, pedantic chunk accumulation, tolerance
+and full pre/post comparison for every component. Only repeated reference
+generation is skipped while inputs remain immutable. Each new payload rebuilds
+both outputs. All ranks fall back to bounded scratch if any lacks cache space
+plus2GiB headroom. CPU-oracle smoke now cross-checks fresh/cached references and
+injects a poisoned actual value that the cached checker must reject. This
+harness change passed CP4/8 CPU-FP64/corruption checks for both routes, small
+causal MPI QKV/OProj, and six-component Llama70/Kimi-QKV/Dense controls from
+frozen source83d58293 (build20260914-011217-0d2481, nativefe8cd13). Those three
+large controls change full throughput by less than0.2%; no operator gain is
+attributed to caching. It is separate from the parallel-ready experiment.
+That experiment batches ready acquires by the actual pipeline stage count,
+then shares visibility with a warp join before the elected TMA issuer fences.
+It passes CP4/8 CPU-oracle checks (both routes, Eager/Graph, E32/E64), small
+causal MPI validation, and the five full-boundary controls below. It is retained
+for the large BLOOM gain and reduced already-ready adapter cost, not as a
+claim of full-matrix target attainment.
+The warmup watchdog becomes30s after the former5s limit expired on Llama405
+CP8/256K, CP8/512K and Kimi CP8/512K. The three per-rank5% convergence windows,
+>=100ms GPU warmup,10+50 and first-stable-round rule are unchanged. The new
+deadline is logged explicitly; these failed old runs remain failures, not
+accepted results. Llama405 CP8/256K run20260914-011836-65c095 still fails
+all-rank convergence within30s despite passing pre-numeric/route validation;
+extra settling is not a demonstrated fix and no timing is accepted for it.
+
+Parallel-ready sourcee88b416d/build20260914-012438-b46cbe versus cache-only
+source83d58293: C20, dX E32/sw8/AlongN, dW E32/sw8/AlongM, Graph10+50,
+two payloads and independent full pre/post checks for all six components.
+
+| Controlled case | Previous full P/GPU | Parallel ready P/GPU | Change |
+|---|---:|---:|---:|
+| Llama70 CP8/128K | 1.781211 | 1.793783 | +0.71% |
+| Kimi QKV-only CP8/128K | 1.685295 | 1.697695 | +0.74% |
+| Dense CP4/128K | 0.697016 | 0.697720 | +0.10% |
+| Qwen3 CP4/128K | 1.236854 | 1.235236 | -0.13% |
+| BLOOM CP4/256K | 1.762887 | 2.201077 | +24.86% |
+
+New runs013128-0b61c1/013156-bf13e1/013230-383bc5/013248-a8d233/
+013311-20140b on20260914. Kimi already-ready dX drops4.971640→3.993368ms,
+but complete B only6.356744→6.307096ms: removing adapter cost does not by
+itself remove the input-supply limitation. BLOOM B drops55.062912→38.057784ms.
+E32 complete/prepared/bare register counts are112/112/99, with no local spills.
+Separately, BLOOM's six-component harness wall time falls434.6→108.9s with
+the independent reference cache; this is testing efficiency, not operator speed.
 
 ## Backward component checkpoint
 

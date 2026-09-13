@@ -106,6 +106,20 @@ struct Runtime {
   Bf16* gradient[3]{};
   fuse::Mxfp8Activation quantized[3]{};
   mxfp8_reference::QkvGradient original_qkv{};
+  Bf16 *expected_data{}, *expected_weight{};
+  int reference_generation=-1;
+
+  void initialize_reference_cache(int m,int n,int weight_rows){
+    // Calibration checks the same unchanged payload before/after SIX graphs.
+    // Store its two independent oracle outputs once, not twelve recomputations
+    // of each GEMM. Keep a 2 GiB reserve; if any rank lacks space, ALL ranks use
+    // the original bounded reference. This is outside every timed boundary.
+    const uint64_t bytes=2ull*n*(uint64_t(m)+weight_rows);
+    size_t free=0,total=0;check(cudaMemGetInfo(&free,&total));
+    if(fused_mpi::any(free<bytes+(2ull<<30)))return;
+    expected_data=alloc<Bf16>(size_t(m)*n);
+    expected_weight=alloc<Bf16>(size_t(weight_rows)*n);
+  }
 
   uint32_t native_epoch() const {
     return qkv?qkv_params.data.projection.epoch:params.data.projection.epoch;
@@ -177,11 +191,13 @@ struct Runtime {
       d.peer_grad_attention[p]=output_peers[p];d.peer_done_epoch[p]=flag_peers[p];
       route.source[p]=reinterpret_cast<const uint16_t*>(source_peers[p]);
     }
+    initialize_reference_cache(o.m,a,o.h);
     cudaDeviceProp device{};check(cudaGetDeviceProperties(&device,fused_mpi::local_device));
     // Common launcher startup record: the controller uses this exact rank
     // identity to distinguish a launched process from an empty log file.
     std::cout<<"device,rank="<<rank<<",sm="<<device.multiProcessorCount
-        <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed<<'\n'<<std::flush;
+        <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed
+        <<",reference_cache="<<bool(expected_data)<<'\n'<<std::flush;
     fused_mpi::barrier();
   }
   void initialize_qkv(const Options& o){
@@ -234,9 +250,11 @@ struct Runtime {
         original_qkv.source[peer][kind]=masters[peer];
       }
     }
+    initialize_reference_cache(o.m,o.h,a);
     cudaDeviceProp device{};check(cudaGetDeviceProperties(&device,fused_mpi::local_device));
     std::cout<<"device,rank="<<rank<<",sm="<<device.multiProcessorCount
-        <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed<<'\n'<<std::flush;
+        <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed
+        <<",reference_cache="<<bool(expected_data)<<'\n'<<std::flush;
     fused_mpi::barrier();
   }
   void input(Bf16* target,size_t count,uint32_t seed,const char* name,int generation){
@@ -265,14 +283,18 @@ struct Runtime {
   }
   void validate(const Options& o,int generation,const char* phase){
     auto b=fused_validation::Stats::zero(),w=fused_validation::Stats::zero();
+    // Inputs are generated once per payload, then immutable across components.
+    // Changing generation MUST rebuild both reference outputs before reuse.
+    const bool reuse=expected_data && reference_generation==generation;
     if(qkv){
       auto transposed=original_qkv;transposed.transpose=true;
-      b=reference.validate_views(original_qkv,mxfp8_reference::Operand{weight,1,o.h},da,o.m,o.h,route.a,stream);
-      w=reference.validate_views(transposed,mxfp8_reference::Operand{attention,1,o.h},dw,route.a,o.h,o.m,stream);
+      b=reference.validate_views(original_qkv,mxfp8_reference::Operand{weight,1,o.h},da,o.m,o.h,route.a,stream,expected_data,reuse);
+      w=reference.validate_views(transposed,mxfp8_reference::Operand{attention,1,o.h},dw,route.a,o.h,o.m,stream,expected_weight,reuse);
     }else{
-      b=reference.validate({dy,o.h,1},{weight,1,route.a},da,o.m,route.a,o.h,stream);
-      w=reference.validate({dy,1,o.h},{attention,1,route.a},dw,o.h,route.a,o.m,stream);
+      b=reference.validate({dy,o.h,1},{weight,1,route.a},da,o.m,route.a,o.h,stream,expected_data,reuse);
+      w=reference.validate({dy,1,o.h},{attention,1,route.a},dw,o.h,route.a,o.m,stream,expected_weight,reuse);
     }
+    reference_generation=generation;
     fused_mpi::barrier();
     if(qkv)check(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(routed),original_qkv,
         uint64_t(o.m)*route.a,reference.comparison,0,stream));
@@ -340,6 +362,9 @@ struct Result{double p50,p95,drift;int round;};
 // Same convergence/cadence contract as fused_bf16: 10 initial calls, >=100ms
 // on EACH rank and three <=5% windows, 10 cadence calls, first stable 50-call
 // round out of at most three. Rejected rounds remain in the raw log.
+// Large eight-rank cases exhausted the former 5s watchdog without converging.
+// Allow more settling time, not a looser threshold or a fastest-round choice.
+constexpr double kWarmupTimeoutSeconds=30;
 Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int generation){
   auto collect=[&](int count,const char* phase,int round){
     std::vector<std::vector<float>> raw;
@@ -360,7 +385,7 @@ Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int gen
   };
   collect(10,"initial",-1);
   const auto started=std::chrono::steady_clock::now();
-  auto expired=[&]{return fused_mpi::any(std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()>=5);};
+  auto expired=[&]{return fused_mpi::any(std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count()>=kWarmupTimeoutSeconds);};
   std::vector<double> accumulated(o.world);
   std::vector<std::vector<double>> windows(o.world);
   int count=10;
@@ -387,7 +412,7 @@ Result measure(Runtime& r,fused_graph::Operation& graph,const Options& o,int gen
     }
     fused_mpi::root_output()<<std::flush;
     if(stable)break;
-    if(expired())throw std::runtime_error("backward warmup did not converge within 5s");
+    if(expired())throw std::runtime_error("backward warmup did not converge within 30s");
     count=next_count;
   }
   collect(10,"sample_cadence",-1);
@@ -415,6 +440,7 @@ void run(const Options& o){
       <<" weight_epilogue="<<o.weight_epilogue<<" weight_swizzle="<<o.weight_swizzle
       <<" weight_along_m="<<(o.weight_raster=="along_m")
       <<" along_m="<<o.along_m<<" causal="<<o.causal<<" launch=graph kernels=5 weight_mode=immediate"
+      <<" warmup_timeout_s="<<kWarmupTimeoutSeconds
       <<" calibrate="<<o.calibrate
       <<" weight_compute_reference="<<o.calibrate
       <<" data_compute_reference="<<(o.qkv && o.calibrate)

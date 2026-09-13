@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8BackwardContracts(unittest.TestCase):
-    def test_ready_iterator_acquires_on_dereference_not_warp_advance(self):
+    def test_ready_iterator_parallel_heads_join_before_tma(self):
         text=(ROOT/'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
         start=text.index('  template <class Iterator>\n  struct ReadyKIterator')
         end=text.index('\n  template <class LoadParams, class TileCoord, class KTileIterator>',start)
@@ -20,58 +20,85 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         if not compiler:self.skipTest('Host C++ compiler unavailable')
         program=r'''
 #include <cassert>
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 #define CUTLASS_DEVICE
 constexpr int kReadyFlagStride=32;
-uint32_t flags[32*8];
-int acquires=0,fences=0;
+constexpr int heads=53;
+uint32_t flags[32*heads];
+std::atomic<int> acquires[heads];
+struct ThreadIdx {int x;};
+thread_local ThreadIdx threadIdx;
+thread_local int fences;
+struct WarpBarrier {
+  std::mutex mutex;std::condition_variable cv;int count=0,phase=0;
+  void wait(){
+    std::unique_lock<std::mutex> lock(mutex);int p=phase;
+    if(++count==32){count=0;++phase;cv.notify_all();}
+    else cv.wait(lock,[&]{return phase!=p;});
+  }
+} warp;
+void __syncwarp(){warp.wait();}
 void wait_acquire_system_single_lane(const uint32_t* p,uint32_t target) {
-  assert(p>=flags && p<flags+32*8 && *p==target);++acquires;
+  assert(p>=flags && p<flags+32*heads && *p==target);
+  assert((p-flags)%32==0);++acquires[(p-flags)/32];
 }
 void wait_acquire_gpu_single_lane(const uint32_t* p,uint32_t target) {
   wait_acquire_system_single_lane(p,target);
 }
-void fence_proxy_async_global(){assert(acquires==fences+1);++fences;}
+void fence_proxy_async_global(){++fences;}
 struct Iterator {
   int coord;const int& limit;
   const int& operator*()const{return coord;}
   Iterator& operator++(){++coord;return *this;}
 };
-template<bool SystemScope> struct Adapter {
+template<bool SystemScope,int StageCount> struct Adapter {
+  struct Base {struct DispatchPolicy {static constexpr int Stages=StageCount;};};
 '''+iterator+r'''
 };
-template<bool Scope> void check() {
-  using R=typename Adapter<Scope>::template ReadyKIterator<Iterator>;
-  const int limit=8;acquires=fences=0;
-  for(int i=0;i<8;++i)flags[32*i]=7;
-  // Two CUTLASS calls, with all32 lanes advancing their own iterator and
-  // an elected lane issuing all four TMA operands in each K iteration.
-  for(int part=0;part<2;++part) {
-    int first=part?3:0,last=part?8:3;
-    std::vector<R> lanes;
-    for(int lane=0;lane<32;++lane)lanes.push_back(R{Iterator{first,limit},flags,7});
-    for(int k=first;k<last;++k) {
-      int issuer=(k*7)%32;
-      for(int operand=0;operand<4;++operand) {
-        assert(*lanes[issuer]==k);
-        assert(acquires==k+1 && fences==k+1);
+template<bool Scope,int Stages> void check(int prefix,bool rotate) {
+  using R=typename Adapter<Scope,Stages>::template ReadyKIterator<Iterator>;
+  for(int i=0;i<heads;++i){flags[32*i]=7;acquires[i]=0;}
+  std::vector<std::thread> lanes;
+  for(int lane=0;lane<32;++lane)lanes.emplace_back([&,lane]{
+    threadIdx.x=64+lane;fences=0;int expected_fences=0;
+    for(int part=0;part<2;++part){
+      const int first=part?prefix:0,last=part?heads:prefix;
+      R iter{Iterator{first,last},flags,7,last-first};iter.acquire_batch();
+      int last_fenced_end=-1;
+      for(int k=first;k<last;++k){
+        const int issuer=rotate?(k*7+part*3)%32:0;
+        if(lane==issuer){
+          const int end=std::min(last,first+((k-first)/Stages+1)*Stages);
+          if(end!=last_fenced_end){++expected_fences;last_fenced_end=end;}
+          for(int operand=0;operand<4;++operand){
+            assert(*iter==k);assert(acquires[k]==1);
+            assert(fences==expected_fences);
+          }
+        }
+        ++iter;
       }
-      for(auto& lane:lanes)++lane;
-      assert(acquires==k+1); // No poll from whole-warp ++ or end sentinel.
+      assert(*iter.iterator==last && iter.remaining==0 && iter.batch_remaining==0);
     }
-    for(auto& lane:lanes)assert(*lane.iterator==last);
-  }
-  assert(acquires==8 && fences==8);
+  });
+  for(auto& lane:lanes)lane.join();
+  for(int i=0;i<heads;++i)assert(acquires[i]==1);
 }
-int main(){check<true>();check<false>();}
+int main(){for(int prefix:{0,3,4})for(bool rotate:{false,true}){
+  check<true,4>(prefix,rotate);check<false,3>(prefix,rotate);
+}}
 '''
         with tempfile.TemporaryDirectory() as directory:
             source=Path(directory)/'iterator.cpp';binary=Path(directory)/'iterator'
             source.write_text(program)
-            subprocess.run([compiler,'-std=c++17','-O2',str(source),'-o',str(binary)],check=True,
+            subprocess.run([compiler,'-std=c++17','-O2','-pthread',str(source),'-o',str(binary)],check=True,
                            capture_output=True,text=True)
-            subprocess.run([str(binary)],check=True,capture_output=True,text=True)
+            subprocess.run([str(binary)],check=True,capture_output=True,text=True,timeout=30)
 
     def test_transposed_quantization_register_groups_cover_k32(self):
         stores, groups = Counter(), Counter()
@@ -272,6 +299,24 @@ int main(){check<true>();check<false>();}
         self.assertNotIn('ptr_SFA',ref)
         self.assertNotIn('ptr_SFB',ref)
         self.assertNotIn('quantize_mxfp8_transposed_operand',ref)
+
+    def test_reference_cache_is_payload_scoped_and_checker_remains_active(self):
+        text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        ref=(ROOT/'benchmarks/sm103/backward/mxfp8_reference.cuh').read_text()
+        smoke=(ROOT/'benchmarks/sm103/backward/mxfp8_smoke.cu').read_text()
+        self.assertIn('expected_data && reference_generation==generation',text)
+        self.assertIn('fused_mpi::any(free<bytes+(2ull<<30))',text)
+        self.assertIn('initialize_reference_cache(o.m,a,o.h)',text)
+        self.assertIn('initialize_reference_cache(o.m,o.h,a)',text)
+        self.assertIn('stream,expected_data,reuse)',text)
+        self.assertIn('stream,expected_weight,reuse)',text)
+        self.assertIn('(reuse_cache && !cache)',ref)
+        self.assertIn('cache ? cache + int64_t(row)*n : expected',ref)
+        self.assertIn('finish<<<256,256,0,stream>>>(accumulator,expected_slab',ref)
+        self.assertIn('      }\n      check(fused_validation::launch<true>',ref)
+        self.assertIn('cudaMemsetAsync(actual,0xff,sizeof(saved)',smoke)
+        self.assertIn('r.stream,cache,true)',smoke)
+        self.assertIn('cached oracle missed poisoned actual output',smoke)
 
     def test_isolated_components_preserve_full_boundary_and_native_epoch(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()

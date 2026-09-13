@@ -53,6 +53,30 @@ struct Rank {
   }
 };
 
+// Cross-check cached and freshly generated independent references on outputs
+// already checked with CPU FP64. A poisoned actual value MUST still fail after
+// caching; restore its exact original bytes before any subsequent operation.
+template<class Left,class Right>
+void check_reference_cache(Rank& r,Left a,Right bt,Bf16* actual,int m,int n,int k){
+  auto* cache=r.alloc<Bf16>(size_t(m)*n);
+  // Rank::alloc initializes on the default stream; finish that memset before
+  // the nonblocking oracle stream writes its independent expected values.
+  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+  for(bool reuse:{false,true}){
+    const auto stats=r.reference.validate_views(a,bt,actual,m,n,k,r.stream,cache,reuse);
+    if(stats.checked!=size_t(m)*n || stats.mismatches || stats.nonfinite)
+      throw std::runtime_error("cached independent oracle disagrees with CPU-checked output");
+  }
+  uint16_t saved=0;
+  CUDA_CHECK(cudaMemcpy(&saved,actual,sizeof(saved),cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemsetAsync(actual,0xff,sizeof(saved),r.stream));
+  const auto bad=r.reference.validate_views(a,bt,actual,m,n,k,r.stream,cache,true);
+  CUDA_CHECK(cudaMemcpyAsync(actual,&saved,sizeof(saved),cudaMemcpyHostToDevice,r.stream));
+  CUDA_CHECK(cudaStreamSynchronize(r.stream));
+  if(bad.checked!=size_t(m)*n || (!bad.mismatches && !bad.nonfinite))
+    throw std::runtime_error("cached oracle missed poisoned actual output");
+}
+
 std::vector<Bf16> download(Rank& r, Bf16* p, size_t count) {
   CUDA_CHECK(cudaSetDevice(r.device));
   std::vector<Bf16> result(count);
@@ -248,8 +272,12 @@ void run(int world, int m, int h) {
       if(b.checked!=size_t(m)*a || w.checked!=size_t(h)*a ||
           b.mismatches || w.mismatches || b.nonfinite || w.nonfinite)
         throw std::runtime_error("bounded GPU represented-operand reference disagrees with CPU-checked outputs");
+      check_reference_cache(r,mxfp8_reference::Operand{r.dy,h,1},
+          mxfp8_reference::Operand{r.weight,1,a},r.da,m,a,h);
+      check_reference_cache(r,mxfp8_reference::Operand{r.dy,1,h},
+          mxfp8_reference::Operand{r.attention,1,a},r.dw,h,a,m);
     }
-    std::cout<<"backward_reference generation="<<generation<<" independent_gpu=pass CPU_FP64=pass\n"<<std::flush;
+    std::cout<<"backward_reference generation="<<generation<<" independent_gpu=pass CPU_FP64=pass cache_fault_check=pass\n"<<std::flush;
   }
   // Deferred B leaves dW untouched; a subsequent explicit W applies beta=1.
   ++epoch;
@@ -485,6 +513,12 @@ void run_qkv(int world,int m,int h) {
             if(dx.checked!=size_t(m)*h || dw.checked!=size_t(packed)*h ||
                 dx.mismatches || dw.mismatches || dx.nonfinite || dw.nonfinite)
               throw std::runtime_error("QKV bounded GPU oracle cross-check");
+            if(graph && epilogue==64){
+              original.transpose=false;
+              check_reference_cache(r,original,mxfp8_reference::Operand{r.weight,1,h},r.da,m,h,packed);
+              original.transpose=true;
+              check_reference_cache(r,original,mxfp8_reference::Operand{r.attention,1,h},r.dw,packed,h,m);
+            }
             // Full W just prepared this scratch; preserve it and verify that
             // the compute-only diagnostic executes the same native GEMM.
             CUDA_CHECK(cudaMemsetAsync(r.dw,0xff,size_t(packed)*h*sizeof(Bf16),r.stream));

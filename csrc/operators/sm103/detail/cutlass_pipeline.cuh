@@ -22,8 +22,9 @@
 // Current implementation choices, not Blackwell requirements:
 // - Variable peer shards keep peer-bounded Base::load() calls and a per-CTA
 //   peer-ready cache. Fixed K128/head backward instead uses ReadyKIterator:
-//   acquire on dereference in the TMA issuer, not on whole-warp ++. The same
-//   issuer fences before copying, with no visibility handoff between lanes.
+//   up to one pipeline depth of ready loads run on distinct producer lanes,
+//   then a warp join shares acquired visibility. Each elected TMA issuer
+//   executes its own proxy fence before first using that batch.
 // - Publish output readiness at GPU scope because its consumer is a local
 //   communication CTA. Wait on every lane of the issuing epilogue warp to
 //   cover TMA stores issued by that warp before lane zero publishes. Scope
@@ -31,7 +32,7 @@
 //
 // TODO: Evaluate extending the fixed-head iterator to variable peer shards
 // and first-acquire telemetry after measuring its benefit. Preserve whole-
-// warp iterator advancement, issuer acquire/async-proxy ordering,
+// warp iterator advancement, acquired visibility/issuer async-proxy ordering,
 // returned state across prologue/remainder, and first-acquire
 // telemetry. The current strategy may be improvable; compare correctness and
 // measured performance before choosing a replacement, not just code size.
@@ -449,34 +450,57 @@ struct A2ALhsReadyMainloop : Base {
              block_rank_in_cluster),
         params_(&params) {}
 
-  // SM90 checks readiness while advancing its elected-lane K iterator.
-  // This SM100 collective advances K on the WHOLE producer warp, but
-  // dereferences it only inside the elected TMA issuer. Acquire here so the
-  // same lane performs acquire -> proxy fence -> A/B/SFA/SFB TMA issue.
-  // No warp join is needed to hand visibility to a different issuer. The
-  // per-lane cache avoids four acquires for the four dereferences of one K.
-  // This iterator is used only by the fixed one-head-per-K-tile binding;
-  // full-head publication and K accumulation order remain unchanged.
+  // Fixed whole-head input: spread one pipeline depth of independent ready
+  // loads across the producer warp instead of serializing them on its issuer.
+  // CUTLASS advances this iterator on ALL producer lanes, but dereferences it
+  // only on the elected TMA issuer. Every complete head is still acquired once:
+  //
+  //   lane0 acquire(k), lane1 acquire(k+1), ... -> warp join
+  //   elected issuer: proxy fence -> TMA(k), TMA(k+1), ...
+  //
+  // The warp join shares each lane's acquired visibility; every actual issuer
+  // fences once per batch before using it (even if election changes lanes).
+  // See PTX bar.warp.sync memory ordering. No flag, release grain, K order or
+  // accumulator changes. The batch is bounded by actual SMEM pipeline depth,
+  // not a fitted constant. Waiting for the whole batch may reduce overlap;
+  // compare full-boundary performance, not just the already-ready diagnostic.
   template <class Iterator>
   struct ReadyKIterator {
+    static constexpr int kBatchHeads = Base::DispatchPolicy::Stages;
+    static_assert(kBatchHeads > 0 && kBatchHeads <= 32);
     Iterator iterator;
     const uint32_t* ready;
     uint32_t target;
-    mutable int acquired_k = -1;
+    int remaining = 0, batch_remaining = 0, batch_end = -1;
+    mutable int fenced_end = -1;
 
-    CUTLASS_DEVICE decltype(auto) operator*() const {
+    CUTLASS_DEVICE void acquire_batch() {
+      if (remaining == 0) return;
       const int k = static_cast<int>(*iterator);
-      if (k != acquired_k) {
+      batch_remaining = remaining < kBatchHeads ? remaining : kBatchHeads;
+      batch_end = k + batch_remaining;
+      const int lane = threadIdx.x % 32;
+      if (lane < batch_remaining) {
         if constexpr (SystemScope)
-          wait_acquire_system_single_lane(ready + int64_t{k} * kReadyFlagStride, target);
+          wait_acquire_system_single_lane(ready + int64_t{k + lane} * kReadyFlagStride, target);
         else
-          wait_acquire_gpu_single_lane(ready + int64_t{k} * kReadyFlagStride, target);
+          wait_acquire_gpu_single_lane(ready + int64_t{k + lane} * kReadyFlagStride, target);
+      }
+      __syncwarp();
+    }
+    CUTLASS_DEVICE decltype(auto) operator*() const {
+      if (fenced_end != batch_end) {
         fence_proxy_async_global();
-        acquired_k = k;
+        fenced_end = batch_end;
       }
       return *iterator;
     }
-    CUTLASS_DEVICE ReadyKIterator& operator++() { ++iterator; return *this; }
+    CUTLASS_DEVICE ReadyKIterator& operator++() {
+      ++iterator;
+      --remaining;
+      if (--batch_remaining == 0 && remaining > 0) acquire_batch();
+      return *this;
+    }
   };
 
   template <class LoadParams, class TileCoord, class KTileIterator>
@@ -497,7 +521,8 @@ struct A2ALhsReadyMainloop : Base {
     const uint32_t target = params_->epoch * params_->arrivals_per_peer;
     if constexpr (StaticKTilesPerPeer == 1 && SystemScope) {
       auto ready_iter = ReadyKIterator<KTileIterator>{k_iter,
-          params_->ready + int64_t{m} * params_->world_size * kReadyFlagStride, target};
+          params_->ready + int64_t{m} * params_->world_size * kReadyFlagStride, target, k_tiles};
+      ready_iter.acquire_batch();
       auto next = Base::load(pipeline, state, inputs, tile_coord, ready_iter, k_tiles);
       // Unwrap without dereferencing ReadyKIterator at the end sentinel:
       // there is no publication to acquire after the final K tile.
