@@ -294,7 +294,15 @@ __global__ void quantize_mxfp8_operand(const Bf16* input, Fp8E4m3* output,
 // both handoff and reuse. No global BF16 transpose or re-quantized FP8 source.
 //
 // source[k,row] --32x32 shared tile--> output[row,k] + scale[row,k/32]
-//   contiguous loads                     warp amax over the NEW K axis
+//   contiguous loads                     K32 amax over the NEW K axis
+//
+// Each warp processes four independent output rows at once:
+//   lanes 0..7  -> row 4*warp+0, four adjacent K values per lane
+//   lanes 8..15 -> row 4*warp+1, ... (four 8-lane groups per warp).
+// Local four-value maxima plus an 8-lane reduction cover exactly K32. The
+// padded transpose is bank-conflict-free for each of the four shared loads:
+// bank = (4*lane_in_group+i+row) mod32. Packed FP8 conversion and one aligned
+// 32-bit store per lane preserve byte order while reducing scalar issue work.
 //
 // The destination's padded scale rows are written as zero-group scale1 too.
 // Data writes stay within actual rows. Source rows (K) are multiples of128;
@@ -317,20 +325,30 @@ __global__ void quantize_mxfp8_transposed_operand(const Bf16* input,
           ? float(input[int64_t{k_base + i} * source_stride + row_base + lane]) : 0.0f;
     }
     __syncthreads();
+    const int local_row = 4 * warp + lane / 8;
+    const int local_k = 4 * (lane % 8);
+    const int row = row_base + local_row, column = k_base + local_k;
+    cutlass::Array<float, 4> values;
+    float amax = 0.0f;
     #pragma unroll
-    for (int i = warp; i < 32; i += 8) {
-      const int row = row_base + i, column = k_base + lane;
-      const float value = float(tile[lane][i]);
-      float amax = fabsf(value);
-      for (int mask = 16; mask; mask >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, mask));
-      const int exponent = mxfp8_scale_exponent(amax);
-      if (row < rows)
-        output[int64_t{row} * k + column] = Fp8E4m3(mxfp8_scaled_value(value, exponent));
-      if (lane == 0)
-        reinterpret_cast<uint8_t*>(scales)[scale_layout(cute::make_coord(row, column, 0))] =
-            static_cast<uint8_t>(exponent + 127);
+    for (int i = 0; i < 4; ++i) {
+      values[i] = tile[local_k + i][local_row];
+      amax = fmaxf(amax, fabsf(values[i]));
     }
+    for (int mask = 4; mask; mask >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, mask, 8));
+    const int exponent = mxfp8_scale_exponent(amax);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) values[i] = mxfp8_scaled_value(values[i], exponent);
+    if (row < rows) {
+      const auto converted = cutlass::NumericArrayConverter<Fp8E4m3, float, 4>{}(values);
+      uint32_t packed;
+      memcpy(&packed, &converted, sizeof(packed));
+      *reinterpret_cast<uint32_t*>(output + int64_t{row} * k + column) = packed;
+    }
+    if (lane % 8 == 0)
+      reinterpret_cast<uint8_t*>(scales)[scale_layout(cute::make_coord(row, column, 0))] =
+          static_cast<uint8_t>(exponent + 127);
     __syncthreads();
   }
 }

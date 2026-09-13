@@ -8,6 +8,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8BackwardContracts(unittest.TestCase):
+    def test_transposed_quantization_subgroups_cover_k32_without_bank_conflicts(self):
+        stores, groups = Counter(), Counter()
+        for warp in range(8):
+            for lane in range(32):
+                row, k = 4 * warp + lane // 8, 4 * (lane % 8)
+                for i in range(4):
+                    stores[row, k+i] += 1
+                if lane % 8 == 0:
+                    groups[row] += 1
+            for i in range(4):
+                banks = [(4*(lane % 8)+i+4*warp+lane//8) % 32 for lane in range(32)]
+                self.assertEqual(len(set(banks)), 32)
+        self.assertEqual(set(stores), {(r,k) for r in range(32) for k in range(32)})
+        self.assertEqual(set(stores.values()), {1})
+        self.assertEqual(groups, Counter(range(32)))
+
     def test_backward_log_parser_rejects_unowned_or_ambiguous_records(self):
         rows=backward_summary.parse(b'device,rank=3,sm=148,compute=10.3\n')
         self.assertEqual(rows,[dict(kind='backward_device',rank='3',sm='148',compute='10.3')])

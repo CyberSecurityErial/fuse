@@ -23,6 +23,22 @@ component Graphs, while ordinary dW launches use a separate software counter.
 
 ## Baselines and scope
 
+V24 transpose-quantization trial: an8-lane subgroup owns K32 with four values
+per thread; four groups execute concurrently per warp. Padded shared transpose,
+K32 scales and the two CTA barriers are unchanged, with packed FP8 conversion
+and4-byte stores. Qwen3 CP8/128K run191442-1b11da independently passes all
+three full/B/W boundaries, two payloads and Graph10+50. At unchanged C16/E32/
+sw8/AlongN, full1.999480→1.727992ms (+15.71% throughput), B0.648888→0.617968ms,
+W1.372248→1.132424ms. Other five physical families are being checked; this is
+not a new full36-point result or a2P claim. No GEMM or communication change.
+
+Pure dW CUTLASS search190812-025432:254 checked grid/neighbor candidates across
+six physical matrices,148compute CTAs, no quantization/communication. Best
+2.5035–2.5956P; all select M128/N256/K128/E32, varying Along/swizzle. This
+supports inspecting preparation next, but pure prepared GEMM does not measure
+the current adapter's exact in-boundary dW duration. Configurations and receipts
+are retained in the single current JSON; no online selection was introduced.
+
 Post-v23 continuation: full-device pure cuBLASLt backward geometry probe
 20260913-190415-fe8d68 passed all11 physical MNK records (six dA/dW families;
 Llama405 dA and dW share one matrix). Source091e7206, Graph10+50, both payloads
