@@ -139,6 +139,23 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertGreater(header.index('struct Mxfp8QkvBackwardInput'),
                            header.index('using Bf16QkvBackwardDataParams'))
 
+    def test_qkv_async_transport_slices_preserve_one_complete_head(self):
+        for elements_per_vector in (16,8):
+            owners=Counter()
+            for start in range(0,128,16):
+                for lane in range(32):
+                    for i in range(lane,16*128//elements_per_vector,32):
+                        row=start+i//(128//elements_per_vector)
+                        col=i%(128//elements_per_vector)*elements_per_vector
+                        for j in range(elements_per_vector):owners[row,col+j]+=1
+            self.assertEqual(set(owners),{(r,c) for r in range(128) for c in range(128)})
+            self.assertEqual(set(owners.values()),{1})
+        text=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
+        route=text[text.index('struct Mxfp8QkvBackwardPullComm'):]
+        self.assertIn('cute::cp_async_wait<0>()',route)
+        self.assertEqual(route.count('detail::store_release_system('),1)
+        self.assertLess(route.index('cute::cp_async_wait<0>()'),route.index('detail::store_release_system('))
+
     def test_smoke_cannot_be_mistaken_for_full_performance(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_smoke.cu').read_text()
         self.assertIn('curandStatePhilox4_32_10_t',text)

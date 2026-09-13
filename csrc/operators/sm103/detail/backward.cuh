@@ -419,13 +419,14 @@ struct QkvBackwardPushCommT {
 // MXFP8 reverse QKV route. A full logical head, rather than one rank's QKV
 // concatenation, is the K-ready unit: [all Q][all K][all V] must match W rows.
 // Read-side packing also saves ORIGINAL BF16 masters for the later dW K-axis.
-// This initial path deliberately shares the same first-use scheduler as O;
-// vector loads/stores establish a simple baseline before transport tuning.
+// Share O's first-use scheduler and asynchronous, warp-owned input transport.
 struct Mxfp8QkvBackwardPullComm {
   using ScaleLayout = decltype(Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
       cute::make_shape(int{}, int{}, int{}, 1)));
   static constexpr int kMinThreads = 256;
-  static constexpr size_t SharedStorageBytes = 0;
+  static constexpr int kCopyRows = 16;
+  static constexpr int kWarpStageBytes = kCopyRows * 128 * 3;
+  static constexpr size_t SharedStorageBytes = 8 * kWarpStageBytes;
   static constexpr bool kNeedsGridFinalize = false;
   struct Arguments {
     QkvBackwardDataParams params{};
@@ -451,10 +452,12 @@ struct Mxfp8QkvBackwardPullComm {
       p.peer_ready[p.rank][i*kReadyFlagStride]=0;
     cooperative_groups::this_grid().sync();
   }
-  CUTLASS_DEVICE void operator()(const Params& a, char*, int comm_id, int comm_ctas) {
+  CUTLASS_DEVICE void operator()(const Params& a, char* storage, int comm_id, int comm_ctas) {
     const auto& p=a.params;
     const int heads=p.q_heads+2*p.kv_heads, width=heads*128;
     const int lane=threadIdx.x%32, warp=threadIdx.x/32;
+    auto* fp8_stage=reinterpret_cast<uint4*>(storage+warp*kWarpStageBytes);
+    auto* master_stage=fp8_stage+kCopyRows*128/16;
     const int64_t tasks=int64_t{p.local_tokens/128}*heads;
     // GEMM(M,N) consumes logical heads in K order. Each task owns ALL 128 rows
     // of one head and its 512 scale bytes; no partial-head ready is introduced.
@@ -480,18 +483,42 @@ struct Mxfp8QkvBackwardPullComm {
       const int source_row=batch*a.route.global_seq+
           QkvBackwardPushCommT<128>::global_sequence_row(a.route,p.rank,row%a.route.seq_local);
       const int source_width=local_heads*128;
-      for(int i=lane;i<128*128/16;i+=32) {
-        const int r=i/8, col=(i%8)*16;
-        const auto value=*reinterpret_cast<const uint4*>(quantized.data+
-            int64_t{source_row+r}*source_width+local_head*128+col);
-        *reinterpret_cast<uint4*>(a.activation+int64_t{row+r}*width+t.peer*128+col)=value;
-      }
-      for(int i=lane;i<128*128/8;i+=32) {
-        const int r=i/16, col=(i%16)*8;
-        const auto value=*reinterpret_cast<const uint4*>(master+
-            int64_t{source_row+r}*source_width+local_head*128+col);
-        *reinterpret_cast<uint4*>(p.peer_dqkv_staging[p.rank]+
-            int64_t{row+r}*width+t.peer*128+col)=value;
+      // One warp owns a 6KiB stage: 16 rows of FP8 plus original BF16.
+      // Issue both strided inputs asynchronously before waiting, instead of
+      // serial remote-load -> dependent local-store chains. The intermediate
+      // slices are PRIVATE transport stages, not smaller publication units:
+      //
+      //   [FP8 G2S + BF16 G2S] -> wait -> both local stores   x8 slices
+      //   [complete SFA atom] --------------------------------> head ready
+      //
+      // All128 rows/scales still precede the one existing system release.
+      detail::fence_proxy_async_global();
+      for(int slice=0;slice<128;slice+=kCopyRows) {
+        for(int i=lane;i<kCopyRows*128/16;i+=32) {
+          const int r=slice+i/8, col=(i%8)*16;
+          const auto* source_vector=reinterpret_cast<const uint4*>(quantized.data+
+              int64_t{source_row+r}*source_width+local_head*128+col);
+          cute::SM80_CP_ASYNC_CACHEGLOBAL<uint4>::copy(*source_vector,fp8_stage[i]);
+        }
+        for(int i=lane;i<kCopyRows*128/8;i+=32) {
+          const int r=slice+i/16, col=(i%16)*8;
+          const auto* source_vector=reinterpret_cast<const uint4*>(master+
+              int64_t{source_row+r}*source_width+local_head*128+col);
+          cute::SM80_CP_ASYNC_CACHEGLOBAL<uint4>::copy(*source_vector,master_stage[i]);
+        }
+        cute::cp_async_fence();
+        cute::cp_async_wait<0>();
+        __syncwarp();
+        for(int i=lane;i<kCopyRows*128/16;i+=32) {
+          const int r=slice+i/8, col=(i%8)*16;
+          *reinterpret_cast<uint4*>(a.activation+int64_t{row+r}*width+t.peer*128+col)=fp8_stage[i];
+        }
+        for(int i=lane;i<kCopyRows*128/8;i+=32) {
+          const int r=slice+i/16, col=(i%16)*8;
+          *reinterpret_cast<uint4*>(p.peer_dqkv_staging[p.rank]+
+              int64_t{row+r}*width+t.peer*128+col)=master_stage[i];
+        }
+        __syncwarp();  // All shared reads finish before this warp reuses its stage.
       }
       const auto src=a.source_scales[kind!=0](cute::make_coord(source_row,local_head*128,0));
       const auto dst=a.destination_scales(cute::make_coord(row,t.peer*128,0));

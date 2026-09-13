@@ -615,3 +615,17 @@ Formal MPI CP4 M/H256 Q16/KV8 causal run203605-03b2ec passes independent
 source/binary/rank/sample audits for full, B, W and prepared-W Graph10+50,
 with complete pre/post checks on both Philox payloads. This bounded contract
 test is not included in the long-sequence performance matrix.
+
+QKV inverse transport uses a private6KiB stage per communication warp to issue
+FP8 and original-BF16 strided loads with cp.async before dependent local stores.
+Sixteen-row transport slices do not change the M128/head ready unit, SFA atom,
+GEMM settings, system publication or first-use queue. CP4 causal bounded
+Graph10+50 run204432-09bca8 passes all four independent component audits.
+Llama70/Qwen72 CP8/128K, unchanged C16/E32/N/sw8, improves complete backward
+17.751368→4.552848ms (0.309698→1.207499P); B16.429200→3.216848ms and W stays
+1.417ms. Source67b2e513/run204503-7d32e1. At the same source, C32
+(204617-3db180) reaches1.496586P, C64 (204651-8e9eaf) falls to1.254960P;
+this finite budget comparison does not establish global optimality.
+Kimi QKV-only CP8/128K C64 (204725-206968) passes complete validation at
+1.151694P, not a full-matrix result or a measured improvement versus its old
+transport. Further data-gradient compute/communication diagnosis is required.
