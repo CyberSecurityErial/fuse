@@ -23,6 +23,16 @@ component Graphs, while ordinary dW launches use a separate software counter.
 
 ## Baselines and scope
 
+Post-v23 continuation: full-device pure cuBLASLt backward geometry probe
+20260913-190415-fe8d68 passed all11 physical MNK records (six dA/dW families;
+Llama405 dA and dW share one matrix). Source091e7206, Graph10+50, both payloads
+checked; generation0 alone is timed, unlike the two-payload backward sampler.
+Independent artifact/geometry/check/sample audits pass. Range2.6484–2.7626P.
+Qwen3 CP8/128K dA=0.409984ms, dW=0.406224ms. Its backward W phase above is
+1.372248ms including two transpose-quantization kernels; it cannot yet be
+attributed solely to dW GEMM or communication. Complete full-device pure
+GEMM remains the reference; same-budget CUTLASS will isolate our compute path.
+
 Preserve the legal physical-point catalogs and aliases in
 [QKV v20](../../results/sm103/v20.0/README.md) and
 [OProj v21](../../results/sm103/v21.0/README.md). They contain33 and36 physical
