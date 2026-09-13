@@ -8,21 +8,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8BackwardContracts(unittest.TestCase):
-    def test_transposed_quantization_subgroups_cover_k32_without_bank_conflicts(self):
+    def test_transposed_quantization_register_groups_cover_k32(self):
         stores, groups = Counter(), Counter()
         for warp in range(8):
             for lane in range(32):
-                row, k = 4 * warp + lane // 8, 4 * (lane % 8)
-                for i in range(4):
-                    stores[row, k+i] += 1
-                if lane % 8 == 0:
-                    groups[row] += 1
-            for i in range(4):
-                banks = [(4*(lane % 8)+i+4*warp+lane//8) % 32 for lane in range(32)]
-                self.assertEqual(len(set(banks)), 32)
-        self.assertEqual(set(stores), {(r,k) for r in range(32) for k in range(32)})
+                row = 32 * warp + lane
+                for k in range(32):
+                    stores[row, k] += 1
+                groups[row] += 1
+            for k in range(32):
+                banks = {}
+                for lane in range(32):
+                    word = (k*264+warp*32+lane)//2
+                    banks.setdefault(word % 32,set()).add(word)
+                # Two adjacent BF16 halves share one32-bit word, not two
+                # different words contending for the same shared-memory bank.
+                self.assertTrue(all(len(words)==1 for words in banks.values()))
+        self.assertEqual(set(stores), {(r,k) for r in range(256) for k in range(32)})
         self.assertEqual(set(stores.values()), {1})
-        self.assertEqual(groups, Counter(range(32)))
+        self.assertEqual(groups, Counter(range(256)))
 
     def test_backward_log_parser_rejects_unowned_or_ambiguous_records(self):
         rows=backward_summary.parse(b'device,rank=3,sm=148,compute=10.3\n')
@@ -33,10 +37,10 @@ class Mxfp8BackwardContracts(unittest.TestCase):
                 backward_summary.parse(raw)
 
     def test_transpose_tile_ownership_and_padded_scale_rows(self):
-        for rows, k in ((1,128), (33,128), (128,256), (129,128), (256,384)):
+        for rows, k in ((1,128), (33,128), (128,256), (129,128), (256,384), (257,128), (384,256)):
             padded = (rows+127)//128*128
             stores, scales = Counter(), Counter()
-            for rb in range(0,padded,32):
+            for rb in range(0,padded,256):
                 for kb in range(0,k,32):
                     tile = {}
                     for warp in range(8):
@@ -44,14 +48,16 @@ class Mxfp8BackwardContracts(unittest.TestCase):
                             for i in range(warp,32,8):
                                 # Label each scalar by its original physical
                                 # source coordinate, not its floating value.
-                                tile[i,lane] = (kb+i,rb+lane) if rb+lane<rows else None
-                    for warp in range(8):
-                        for lane in range(32):
-                            for i in range(warp,32,8):
-                                row,col=rb+i,kb+lane
-                                self.assertEqual(tile[lane,i],(col,row) if row<rows else None)
-                                if row<rows: stores[row,col]+=1
-                                if lane==0: scales[row,col//32]+=1
+                                for j in range(8):
+                                    r=lane*8+j
+                                    tile[i,r] = (kb+i,rb+r) if rb+r<rows else None
+                    for thread in range(256):
+                        row=rb+thread
+                        for i in range(32):
+                            col=kb+i
+                            self.assertEqual(tile[i,thread],(col,row) if row<rows else None)
+                            if row<rows: stores[row,col]+=1
+                        if row<padded: scales[row,kb//32]+=1
             self.assertEqual(set(stores),{(r,c) for r in range(rows) for c in range(k)})
             self.assertEqual(set(scales),{(r,c) for r in range(padded) for c in range(k//32)})
             self.assertEqual(set(stores.values()),{1})

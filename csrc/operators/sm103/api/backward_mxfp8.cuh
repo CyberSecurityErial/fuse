@@ -112,7 +112,7 @@ template <class Layout>
 cudaError_t prepare_mxfp8_transpose(const Bf16* source, Fp8E4m3* output,
     cutlass::float_ue8m0_t* scales, int rows, int k, int64_t source_stride,
     Layout layout, const DeviceInfo& info, cudaStream_t stream) {
-  const int64_t tiles = ((int64_t{rows} + 127) / 128 * 4) * (k / 32);
+  const int64_t tiles = ((int64_t{rows} + kMxfp8TransposeRows - 1) / kMxfp8TransposeRows) * (k / 32);
   const int blocks = int(std::min<int64_t>(tiles, int64_t{info.sm_count} * 4));
   quantize_mxfp8_transposed_operand<<<blocks, 256, 0, stream>>>(
       source, output, scales, rows, k, source_stride, layout);

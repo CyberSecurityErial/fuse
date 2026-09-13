@@ -11,6 +11,19 @@ not a new Auto policy or completion of the remaining development goal.
 
 ## Backward component checkpoint
 
+Register-owned K32 preparation trial: BF16 shared32x256 tile,16B coalesced
+input vectors, one whole K32 per thread, four local maximum chains and32B
+packed output. There are still two CTA barriers, now per8192 values. Scale
+padding remains128 rows, independently masked from the wider256-row tile.
+No shuffle reduction, new quantization rule, GEMM or communication change.
+Tail M/H128 CP8 run193559-8c7eb0 passes complete validation. Qwen3 CP8/128K
+193622-4ef864 with B sw8/N/C16 and dW sw8/M passes all four Graph10+50
+two-payload boundaries: full1.184432ms/1.856606P, B0.541904ms, W0.630936ms,
+prepared dW0.464896ms/2.365070P. Against the identical-config subgroup run
+192759-d2b729, full throughput improves43.79%; exact dW time is essentially
+unchanged, locating most improvement in preparation. Five other families are
+being checked; this is not full-matrix or2P acceptance yet.
+
 Exact native dW control192348-baf22c (Qwen3 CP8/128K, same C16/E32/sw8/N):
 full1.725632ms, B0.618024ms, W1.131832ms, prepared native dW0.480200ms/2.289695P.
 All four components have independent full pre/post two-payload checks and
