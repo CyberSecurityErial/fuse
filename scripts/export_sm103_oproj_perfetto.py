@@ -528,12 +528,12 @@ def make_trace(lines, job, omit_comm_details=False):
                 attrs['comm_layout'] = 'columns'
             span(tid, 'task setup / input-ready wait', p['task_begin'], p['input_ready'], **attrs)
             if p['g2s_issue']:
-                name = ('remote G2S + SFA repack + W progress (completion observed)' if job.get('mxfp8')
+                name = ('remote G2S interval (includes SFA work)' if job.get('mxfp8')
                         else 'remote G2S' if p['copy_path'] else 'vector copy')
                 span(tid, name, p['g2s_issue'], p['g2s_done'], **attrs)
             if p['s2g_issue']:
                 local_attrs = dict(attrs, src_gpu=rank, remote_source_gpu=p['source_rank'])
-                name = ('local S2G + W progress (destination complete)' if job.get('mxfp8')
+                name = ('local S2G interval (destination completion observed)' if job.get('mxfp8')
                         else 'local S2G (destination complete)')
                 span(tid, name, p['s2g_issue'], p['s2g_done'], **local_attrs)
             span(tid, 'ready atomic (post-publication sample)', p['publish_issue'], p['release'], **attrs)

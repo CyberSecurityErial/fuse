@@ -428,8 +428,9 @@ CTA 下按物理 warp 排列搬运与量化，发布子阶段在该 warp 的父�
 当前独立生产队列使用 warp 0..3 搬 A、warp 4..7 连续量化 W。G2S 条带从发起前
 到完成观察，期间包含 SFA 重排；S2G 等待目的 GMEM 完成，二者均不再内联 W
 progress，但仍受并发资源/调度影响，不是裸传输延迟。历史混合生产 trace 的
-G2S/S2G 内含 W progress，不能将新语义套到旧记录。只记录最终发布 chunk，
-不能从它们推算全部搬运次数。W 所有有效 chunk 仍完整记录并审计 panel 贡献。
+G2S/S2G 内含 W progress，不能将新语义套到旧记录。
+导出条带统一标作 interval，不再用旧的 W progress 名称暗示当前搬运 warp 内联量化。
+只记录最终发布 chunk，不能从它们推算全部搬运次数。W 所有有效 chunk 仍完整记录并审计 panel 贡献。
 BF16 专用 MMA 阶段镜像不用于 block-scaled MXFP8；本入口不声称记录精确 Tensor
 Core 执行时间。可观察每 tile 的 peer acquire 和实际 W panel 等待。
 

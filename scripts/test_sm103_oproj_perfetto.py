@@ -172,8 +172,9 @@ class OprojTraceTests(unittest.TestCase):
         lines = [line for line in lines if 'profile_phase=host_stages' not in line]
         result = make_trace(lines, job)
         names = {e['name'] for e in result['traceEvents']}
-        self.assertIn('remote G2S + SFA repack + W progress (completion observed)', names)
-        self.assertIn('local S2G + W progress (destination complete)', names)
+        self.assertIn('remote G2S interval (includes SFA work)', names)
+        self.assertIn('local S2G interval (destination completion observed)', names)
+        self.assertFalse(any('W progress' in name for name in names))
         self.assertFalse(result['metadata']['performance_accepted'])
         with self.assertRaises(AssertionError):
             make_trace([line for line in lines if not line.startswith('route,')], job)
