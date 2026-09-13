@@ -227,6 +227,12 @@ cudaError_t launch_oproj_backward_mxfp8_data(
     const Mxfp8OprojBackwardDataParams& params, cudaStream_t stream);
 cudaError_t launch_oproj_backward_mxfp8_weight(
     const Mxfp8OprojBackwardWeightParams& params, cudaStream_t stream);
+// Diagnostic only: the exact dW GEMM with preparation excluded. First complete
+// launch_oproj_backward_mxfp8_weight with the SAME parameters/inputs/workspace,
+// then preserve that workspace (B must not overwrite shared scratch). This is
+// not a complete W boundary. It retains alpha/beta; repeated beta!=0 accumulates.
+cudaError_t launch_oproj_backward_mxfp8_weight_compute_reference(
+    const Mxfp8OprojBackwardWeightParams& params, cudaStream_t stream);
 cudaError_t launch_oproj_backward_mxfp8(
     const Mxfp8OprojBackwardParams& params, cudaStream_t stream);
 #endif

@@ -176,7 +176,7 @@ cudaError_t oproj_backward_mxfp8_data_impl(const Mxfp8OprojBackwardDataParams& p
   return status == cudaSuccess ? launch_monolithic<Kernel>(args, info, stream) : status;
 }
 
-template <int EpilogueN>
+template <int EpilogueN, bool Prepare = true>
 cudaError_t oproj_backward_mxfp8_weight_impl(const Mxfp8OprojBackwardWeightParams& p,
                                           cudaStream_t stream) {
   auto status = validate_mxfp8_backward_weight(p);
@@ -202,12 +202,14 @@ cudaError_t oproj_backward_mxfp8_weight_impl(const Mxfp8OprojBackwardWeightParam
   Adapter op;
   if (op.initialize(args, nullptr, stream) != cutlass::Status::kSuccess)
     return cudaErrorInitializationError;
-  status = prepare_mxfp8_transpose(d.grad_output, w.lhs, w.sfa, g.m, g.k, g.m,
-      args.mainloop.layout_SFA, info, stream);
-  if (status != cudaSuccess) return status;
-  status = prepare_mxfp8_transpose(d.saved_attention, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n,
-      args.mainloop.layout_SFB, info, stream);
-  if (status != cudaSuccess) return status;
+  if constexpr (Prepare) {
+    status = prepare_mxfp8_transpose(d.grad_output, w.lhs, w.sfa, g.m, g.k, g.m,
+        args.mainloop.layout_SFA, info, stream);
+    if (status != cudaSuccess) return status;
+    status = prepare_mxfp8_transpose(d.saved_attention, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n,
+        args.mainloop.layout_SFB, info, stream);
+    if (status != cudaSuccess) return status;
+  }
   if (op.run(stream) != cutlass::Status::kSuccess) return cudaErrorLaunchFailure;
   return cudaGetLastError();
 }
@@ -231,6 +233,12 @@ cudaError_t launch_oproj_backward_mxfp8_data(const Mxfp8OprojBackwardDataParams&
 cudaError_t launch_oproj_backward_mxfp8_weight(const Mxfp8OprojBackwardWeightParams& p, cudaStream_t stream) {
   return p.gemm_tuning.epilogue_n == 64
       ? oproj_backward_mxfp8_weight_impl<64>(p, stream) : oproj_backward_mxfp8_weight_impl<32>(p, stream);
+}
+cudaError_t launch_oproj_backward_mxfp8_weight_compute_reference(
+    const Mxfp8OprojBackwardWeightParams& p, cudaStream_t stream) {
+  return p.gemm_tuning.epilogue_n == 64
+      ? oproj_backward_mxfp8_weight_impl<64, false>(p, stream)
+      : oproj_backward_mxfp8_weight_impl<32, false>(p, stream);
 }
 cudaError_t launch_oproj_backward_mxfp8(const Mxfp8OprojBackwardParams& p, cudaStream_t stream) {
   if (p.weight_mode != WeightGradientMode::kImmediate && p.weight_mode != WeightGradientMode::kDeferred)

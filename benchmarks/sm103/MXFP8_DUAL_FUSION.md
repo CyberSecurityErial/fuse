@@ -11,6 +11,17 @@ not a new Auto policy or completion of the remaining development goal.
 
 ## Backward component checkpoint
 
+Exact native dW control192348-baf22c (Qwen3 CP8/128K, same C16/E32/sw8/N):
+full1.725632ms, B0.618024ms, W1.131832ms, prepared native dW0.480200ms/2.289695P.
+All four components have independent full pre/post two-payload checks and
+Graph10+50 audits. The W-to-prepared-dW difference is0.651632ms; it indicates
+substantial preparation cost but can include changed cache/launch effects.
+The compute reference uses the EXACT native adapter/GEMM and original BF16
+oracle, not the separate search wrapper. Preparation is explicitly excluded
+only from this diagnostic. Full production remains the five-kernel boundary.
+Completed full W must immediately precede this reference with unchanged
+scratch; B cannot overwrite it between the two. No private Params are exposed.
+
 OProj backward Qwen3 CP8/128K, fixed C16/E32/sw8/AlongN: actual complete
 five-kernel Graph is1.999480ms/1.099798P. Separate B (W transpose quant,
 dA and inverse A2A) is0.648888ms; W (dY/A transpose quant and dW) is1.372248ms.

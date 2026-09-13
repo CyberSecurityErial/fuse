@@ -110,9 +110,16 @@ class Mxfp8BackwardContracts(unittest.TestCase):
 
     def test_isolated_components_preserve_full_boundary_and_native_epoch(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        self.assertIn('template <int EpilogueN, bool Prepare = true>',api)
+        self.assertIn('if constexpr (Prepare)',api)
+        self.assertIn('oproj_backward_mxfp8_weight_impl<32, false>',api)
+        self.assertIn('Component::kData,Component::kWeight,Component::kWeightCompute',text)
+        self.assertIn('component==Component::kFull || component==Component::kData',text)
         weight=text.index('if(component==Component::kWeight)return fuse::launch_oproj_backward_mxfp8_weight')
         epoch=text.index('params.data.projection.epoch=epoch;',weight)
         self.assertLess(weight,epoch)
+        self.assertLess(text.index('if(component==Component::kWeightCompute)',weight),epoch)
         self.assertIn('graph.reset(r.params.data.projection.epoch)',text)
         self.assertIn('component==Component::kData?r.params.data.projection.epoch:0',text)
         self.assertIn('(flops/2)/(value.p50*1e12)',text)

@@ -16,9 +16,10 @@
 using fuse::Bf16;
 using mxfp8_reference::check;
 
-enum class Component { kFull, kData, kWeight };
+enum class Component { kFull, kData, kWeight, kWeightCompute };
 const char* component_name(Component c){
-  return c==Component::kFull?"full":c==Component::kData?"data":"weight";
+  return c==Component::kFull?"full":c==Component::kData?"data":
+      c==Component::kWeight?"weight":"weight_compute";
 }
 
 struct Options {
@@ -165,7 +166,7 @@ struct Runtime {
         <<" square_sum="<<stats.square_sum<<" min="<<stats.minimum<<" max="<<stats.maximum<<'\n';
   }
   void poison(const Options& o){
-    if(component!=Component::kWeight){
+    if(component==Component::kFull || component==Component::kData){
       check(cudaMemsetAsync(da,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
       check(cudaMemsetAsync(routed,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
     }
@@ -196,6 +197,8 @@ struct Runtime {
       // W has no native ready epoch. Its Graph launch index must not advance
       // B's publication epoch. Full/B graphs resume from the last actual B.
       if(component==Component::kWeight)return fuse::launch_oproj_backward_mxfp8_weight(params.weight,s);
+      if(component==Component::kWeightCompute)
+        return fuse::launch_oproj_backward_mxfp8_weight_compute_reference(params.weight,s);
       params.data.projection.epoch=epoch;
       return component==Component::kData?fuse::launch_oproj_backward_mxfp8_data(params.data,s):
           fuse::launch_oproj_backward_mxfp8(params,s);
@@ -299,6 +302,7 @@ void run(const Options& o){
       <<" world="<<o.world<<" comm="<<o.comm<<" epilogue="<<o.epilogue<<" swizzle="<<o.swizzle
       <<" along_m="<<o.along_m<<" causal="<<o.causal<<" launch=graph kernels=5 weight_mode=immediate"
       <<" calibrate="<<o.calibrate
+      <<" weight_compute_reference="<<o.calibrate
       <<" timed=weight_quant_dA_route_dY_quant_A_quant_dW upstream_dY_quant=excluded CP_dW_reduce=caller_owned"
       <<" flops_per_rank="<<flops<<'\n'<<std::flush;
   std::vector<Result> results;
@@ -316,13 +320,17 @@ void run(const Options& o){
     fused_mpi::root_output()<<"backward_verified generation="<<generation<<" component=full p50_ms="<<result.p50
         <<" p95_ms="<<result.p95<<" half_drift="<<result.drift<<" selected_round="<<result.round
         <<" pflops="<<flops/(result.p50*1e12)<<" verification=pass\n"<<std::flush;
-    if(o.calibrate)for(Component component:{Component::kData,Component::kWeight}){
+    if(o.calibrate)for(Component component:{Component::kData,Component::kWeight,Component::kWeightCompute}){
       r.component=component;
       const std::vector<L> boundary=component==Component::kData?
           std::vector<L>{L::kOrdinaryStatic,L::kCooperativeDynamic}:
+          component==Component::kWeightCompute?std::vector<L>{L::kOrdinaryDynamic}:
           std::vector<L>{L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic};
       fused_graph::Operation isolated(fused_mpi::local_device,r.stream,
           component==Component::kData?r.params.data.projection.epoch:0,boundary);
+      // W compute immediately follows completed full W: its exact prepared
+      // operands/scales remain in scratch. Only dW is poisoned; no preparation
+      // enters the single-kernel Graph. The oracle still reads original BF16.
       // Only the active component's outputs are poisoned. Checking both full
       // gradients also checks that this isolated component leaves the other
       // gradient valid; it does NOT count the other gradient in timed FLOPs.
