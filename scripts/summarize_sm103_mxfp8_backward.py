@@ -110,6 +110,12 @@ def audit_run(directory,component='full'):
     sf.require(int(c.get('calibrate',0))==int(bool(job.get('calibrate'))),'Calibration job/config mismatch')
     if component=='weight_compute':
         sf.require(c.get('weight_compute_reference')=='1','Missing prepared dW diagnostic boundary')
+    for key, expected in dict(
+            weight_epilogue=job.get('backward_weight_epilogue_n') or (job.get('mxfp8_epilogue_n') or 32),
+            weight_swizzle=job.get('backward_weight_swizzle') or job.get('max_swizzle_size',1),
+            weight_along_m=int((job.get('backward_weight_raster') or job['oproj_raster'])=='along_m')).items():
+        fallback={'weight_epilogue':'epilogue','weight_swizzle':'swizzle','weight_along_m':'along_m'}[key]
+        sf.require(int(c.get(key,c[fallback]))==expected,'Independent dW config mismatch: '+key)
     for key,value in dict(M=shape['seq_local'],H=shape['hidden'],A=shape['q_width'],world=job['world'],
             comm=job['comm_sm'],epilogue=job.get('mxfp8_epilogue_n') or 32,
             swizzle=job.get('max_swizzle_size',1),along_m=int(job['oproj_raster']=='along_m'),

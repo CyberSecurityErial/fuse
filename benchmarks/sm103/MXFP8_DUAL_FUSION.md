@@ -22,6 +22,15 @@ only from this diagnostic. Full production remains the five-kernel boundary.
 Completed full W must immediately precede this reference with unchanged
 scratch; B cannot overwrite it between the two. No private Params are exposed.
 
+Independent dW layout options now preserve dA/communication settings:
+`--backward-weight-epilogue-n`, `--backward-weight-swizzle`,
+`--backward-weight-raster`; absent options inherit dA, as before.
+Qwen3 CP8/128K dW AlongM/sw8 (192759-d2b729) improves exact dW
+0.480200→0.463624ms and full1.725632→1.703096ms (+1.32%). AlongM/sw4
+(192828-e091ed) is1.708704ms full, not preferred. All eight component
+boundaries passed independent audits. B remains AlongN/sw8/C16; this is not
+communication retuning or a new Auto model. Preparation remains dominant.
+
 OProj backward Qwen3 CP8/128K, fixed C16/E32/sw8/AlongN: actual complete
 five-kernel Graph is1.999480ms/1.099798P. Separate B (W transpose quant,
 dA and inverse A2A) is0.648888ms; W (dY/A transpose quant and dW) is1.372248ms.

@@ -25,6 +25,8 @@ const char* component_name(Component c){
 struct Options {
   int world=8,m=256,h=256,heads=8,comm=16,epilogue=32,swizzle=1;
   bool along_m=false,causal=false,calibrate=false;
+  int weight_epilogue=0,weight_swizzle=0;
+  std::string weight_raster;
   std::string json;
 };
 
@@ -43,14 +45,22 @@ Options parse(int argc,char** argv) {
     else if(key=="--comm-ctas")o.comm=std::stoi(value);
     else if(key=="--epilogue-n")o.epilogue=std::stoi(value);
     else if(key=="--swizzle")o.swizzle=std::stoi(value);
+    else if(key=="--weight-epilogue-n")o.weight_epilogue=std::stoi(value);
+    else if(key=="--weight-swizzle")o.weight_swizzle=std::stoi(value);
+    else if(key=="--weight-raster" && (value=="along_m" || value=="along_n"))o.weight_raster=value;
     else if(key=="--raster" && (value=="along_m" || value=="along_n"))o.along_m=value=="along_m";
     else if(key=="--json-out")o.json=value;
     else throw std::invalid_argument("unknown option: "+key);
   }
+  if(!o.weight_epilogue)o.weight_epilogue=o.epilogue;
+  if(!o.weight_swizzle)o.weight_swizzle=o.swizzle;
+  if(o.weight_raster.empty())o.weight_raster=o.along_m?"along_m":"along_n";
   if(o.world!=fused_mpi::process_world || o.m<=0 || o.m%128 || o.h<=0 || o.h%128 ||
       o.heads<=0 || o.heads>16384 || o.heads%o.world || o.comm<=0 || o.comm>=148 ||
       (o.epilogue!=32 && o.epilogue!=64) ||
-      (o.swizzle!=1 && o.swizzle!=2 && o.swizzle!=4 && o.swizzle!=8))
+      (o.swizzle!=1 && o.swizzle!=2 && o.swizzle!=4 && o.swizzle!=8) ||
+      (o.weight_epilogue!=32 && o.weight_epilogue!=64) ||
+      (o.weight_swizzle!=1 && o.weight_swizzle!=2 && o.weight_swizzle!=4 && o.weight_swizzle!=8))
     throw std::invalid_argument("unsupported backward benchmark geometry/configuration");
   return o;
 }
@@ -112,7 +122,8 @@ struct Runtime {
     d.gemm_tuning={o.epilogue,o.swizzle,o.along_m};
     params.weight.projection.local_tokens=o.m;params.weight.projection.hidden=o.h;
     params.weight.projection.q_heads=o.heads;params.weight.projection.head_dim=128;
-    params.weight.gemm_tuning=d.gemm_tuning;
+    // Independent dW search must not change dA's GEMM or inverse-A2A schedule.
+    params.weight.gemm_tuning={o.weight_epilogue,o.weight_swizzle,o.weight_raster=="along_m"};
     size_t bbytes=0,wbytes=0,data=0,scales=0;
     check(fuse::oproj_backward_mxfp8_data_workspace_size(d,&bbytes));
     check(fuse::oproj_backward_mxfp8_weight_workspace_size(params.weight.projection,&wbytes));
@@ -300,6 +311,8 @@ void run(const Options& o){
   const double flops=4.*o.m*o.h*(o.heads*128);
   fused_mpi::root_output()<<"backward_config op=oproj_mxfp8 M="<<o.m<<" H="<<o.h<<" A="<<o.heads*128
       <<" world="<<o.world<<" comm="<<o.comm<<" epilogue="<<o.epilogue<<" swizzle="<<o.swizzle
+      <<" weight_epilogue="<<o.weight_epilogue<<" weight_swizzle="<<o.weight_swizzle
+      <<" weight_along_m="<<(o.weight_raster=="along_m")
       <<" along_m="<<o.along_m<<" causal="<<o.causal<<" launch=graph kernels=5 weight_mode=immediate"
       <<" calibrate="<<o.calibrate
       <<" weight_compute_reference="<<o.calibrate

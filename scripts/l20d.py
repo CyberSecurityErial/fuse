@@ -352,6 +352,14 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 
 def validate_job(job, hostname=None):
+    weight_tuning = {'backward_weight_epilogue_n': (32,64),
+                     'backward_weight_swizzle': (1,2,4,8),
+                     'backward_weight_raster': ('along_m','along_n')}
+    for key, allowed in weight_tuning.items():
+        if job.get(key) is not None and (job[key] not in allowed or
+                job['stage'] != 'fused-smoke' or not job.get('mxfp8') or
+                not job.get('backward') or not job.get('mpi')):
+            raise ValueError('Independent dW tuning requires MXFP8 backward MPI: '+key)
     search = job.get('mxfp8_gemm_search', False)
     if search and (job['stage'] not in ('build', 'gemm-probe') or
             (job['stage'] == 'gemm-probe' and
@@ -1281,6 +1289,10 @@ def fused_argv(job):
                      '--swizzle',str(job.get('max_swizzle_size',1)), '--raster',job['oproj_raster']]
             if job.get('causal'): argv.append('--causal')
             if job.get('calibrate'): argv.append('--calibrate')
+            for key, flag in (('backward_weight_epilogue_n','--weight-epilogue-n'),
+                              ('backward_weight_swizzle','--weight-swizzle'),
+                              ('backward_weight_raster','--weight-raster')):
+                if job.get(key) is not None: argv += [flag,str(job[key])]
         return argv
     if job.get('backward'):
         if not job.get('mpi'):
@@ -2232,6 +2244,12 @@ def main():
                      help='MXFP8 CUTLASS epilogue subtile; default 64 preserves baseline')
     run.add_argument('--mxfp8-weight-preparation', choices=('comm', 'all', 'comm_warp'), help='Weight quantization by communication CTAs (default), all CTAs at startup, or comm_warp: warps 0..3 route immediately; warps 4..7 quantize then join routing (warp_then_route_v1)')
     run.add_argument('--backward-gemm-sweep', action='store_true', help='isolated pure NN GEMM candidate sweep; production overlap unchanged')
+    run.add_argument('--backward-weight-epilogue-n', type=int, choices=(32,64),
+                     help='MXFP8 backward: independent dW epilogue, default inherits dA')
+    run.add_argument('--backward-weight-swizzle', type=int, choices=(1,2,4,8),
+                     help='MXFP8 backward: independent dW swizzle, default inherits dA')
+    run.add_argument('--backward-weight-raster', choices=('along_m','along_n'),
+                     help='MXFP8 backward: independent dW raster, default inherits dA')
     run.add_argument('--fused-launch', choices=('eager', 'graph'), default='eager',
                      help='fused-smoke: Graph is explicit MPI-only, with epoch preparation outside CUDA events')
     run.add_argument('--fused-direction', choices=('both', 'qkv', 'oproj'), default='both',

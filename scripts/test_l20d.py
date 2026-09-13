@@ -180,6 +180,18 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn('deferred',argv)
         self.assertEqual(argv[argv.index('--m')+1],'16384')
         self.assertEqual(argv[argv.index('--comm-ctas')+1],'16')
+        tuned=job|dict(backward_weight_epilogue_n=64,backward_weight_swizzle=4,
+                       backward_weight_raster='along_m')
+        l20d.validate_job(tuned)
+        tuned_argv=l20d.fused_argv(tuned)
+        self.assertEqual(tuned_argv[tuned_argv.index('--raster')+1],'along_n')
+        self.assertEqual(tuned_argv[tuned_argv.index('--weight-raster')+1],'along_m')
+        self.assertEqual(tuned_argv[tuned_argv.index('--weight-swizzle')+1],'4')
+        self.assertEqual(tuned_argv[tuned_argv.index('--weight-epilogue-n')+1],'64')
+        for changed in ({'mxfp8':False},{'mpi':False},{'backward':False},
+                        {'backward_weight_raster':'heuristic'},{'backward_weight_swizzle':3}):
+            with self.subTest(changed=changed),self.assertRaises(ValueError):
+                l20d.validate_job(tuned|changed)
         self.assertIn('--calibrate',l20d.fused_argv(job|{'calibrate':True}))
         with self.assertRaises(ValueError):
             l20d.validate_job(job|{'calibrate':True,'mxfp8':False})
