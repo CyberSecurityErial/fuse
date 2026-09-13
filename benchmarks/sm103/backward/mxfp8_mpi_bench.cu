@@ -431,7 +431,7 @@ void run(const Options& o){
   Runtime r;r.initialize(o);
   using L=fused_graph::Launch;
   fused_graph::Operation graph(fused_mpi::local_device,r.stream,0,
-      {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic});
+      {L::kOrdinaryDynamic,L::kCooperativeDynamic,L::kOrdinaryDynamic,L::kOrdinaryDynamic,L::kOrdinaryDynamic});
   const double flops=4.*o.m*o.h*o.width();
   fused_mpi::root_output()<<"backward_config op="<<(o.qkv?"qkv_mxfp8":"oproj_mxfp8")
       <<" M="<<o.m<<" H="<<o.h<<" A="<<o.width()
@@ -482,9 +482,9 @@ void run(const Options& o){
       r.component=component;
       const std::vector<L> boundary=(component==Component::kDataCompute || component==Component::kDataGemm)?
           std::vector<L>{L::kCooperativeDynamic}:component==Component::kData?
-          std::vector<L>{L::kOrdinaryStatic,L::kCooperativeDynamic}:
+          std::vector<L>{L::kOrdinaryDynamic,L::kCooperativeDynamic}:
           component==Component::kWeightCompute?std::vector<L>{L::kOrdinaryDynamic}:
-          std::vector<L>{L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic};
+          std::vector<L>{L::kOrdinaryDynamic,L::kOrdinaryDynamic,L::kOrdinaryDynamic};
       fused_graph::Operation isolated(fused_mpi::local_device,r.stream,
           component==Component::kData?r.native_epoch():0,boundary);
       // dX compute follows completed B, before W can overwrite its scratch;

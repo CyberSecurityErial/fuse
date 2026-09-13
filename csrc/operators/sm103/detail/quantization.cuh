@@ -298,65 +298,109 @@ __global__ void quantize_mxfp8_operand(const Bf16* input, Fp8E4m3* output,
 //
 // There is no warp reduction. Four local maximum chains expose independent
 // work; array conversion and vector stores retain the original K32 scale and
-// byte order. Two CTA barriers protect handoff/reuse of8192 elements, rather
-// than one barrier pair per1024. The264-element stride preserves16B alignment.
+// byte order. A CTA barrier pair protects each8192-element input handoff;
+// adjacent groups share the coalesced output writeback below. The264-element
+// input stride preserves16B alignment.
 // Padded scale rows stop at ceil(rows/128)*128; the wider tile must NOT write
 // beyond that allocation. Zero groups retain scale1, and data tails are masked.
 // This remains a separately timed preparation, not communication overlap.
 inline constexpr int kMxfp8TransposeRows = 256;
+inline constexpr int kMxfp8TransposeGroups = 4;
+inline constexpr int kMxfp8TransposeStoreGroups = 2;
 template <class ScaleLayout>
 __global__ void quantize_mxfp8_transposed_operand(const Bf16* input,
     Fp8E4m3* output, cutlass::float_ue8m0_t* scales, int rows, int k,
     int64_t source_stride, ScaleLayout scale_layout) {
+  constexpr int kGroups = kMxfp8TransposeGroups;
+  constexpr int kStoreGroups = kMxfp8TransposeStoreGroups;
+  constexpr int kVectors = kStoreGroups * 2;
   __shared__ __align__(16) uint16_t storage[32][kMxfp8TransposeRows + 8];
+  extern __shared__ __align__(16) uint4 converted_storage[];
+  auto* converted_tile = reinterpret_cast<uint4 (*)[kVectors + 1]>(converted_storage);
+  __shared__ __align__(16) uint32_t scale_words[kMxfp8TransposeRows];
   using SharedRow = Bf16[kMxfp8TransposeRows + 8];
   auto* tile = reinterpret_cast<SharedRow*>(storage);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int64_t row_tiles = (int64_t{rows} + kMxfp8TransposeRows - 1) / kMxfp8TransposeRows;
-  const int64_t k_tiles = k / 32;
+  const int64_t k_tiles = k / (32 * kGroups);
   const int padded_rows = (rows + 127) / 128 * 128;
   for (int64_t t = blockIdx.x; t < row_tiles * k_tiles; t += gridDim.x) {
     const int row_base = int(t / k_tiles) * kMxfp8TransposeRows;
-    const int k_base = int(t % k_tiles) * 32;
-    using InputVector = cutlass::AlignedArray<Bf16, 8, 16>;
+    const int k_base = int(t % k_tiles) * (32 * kGroups);
+    uint32_t scale_word = 0;
     #pragma unroll
-    for (int i = warp; i < 32; i += 8) {
-      InputVector values;
-      values.clear();
-      const int first_row = row_base + lane * 8;
-      const Bf16* source = input + int64_t{k_base + i} * source_stride;
-      if (first_row + 7 < rows && reinterpret_cast<uintptr_t>(source + first_row) % 16 == 0)
-        values = *reinterpret_cast<const InputVector*>(source + first_row);
-      else {
-        #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          if (first_row + j < rows) values[j] = source[first_row + j];
+    for (int group = 0; group < kGroups; ++group) {
+      using InputVector = cutlass::AlignedArray<Bf16, 8, 16>;
+      #pragma unroll
+      for (int i = warp; i < 32; i += 8) {
+        InputVector values;
+        values.clear();
+        const int first_row = row_base + lane * 8;
+        const Bf16* source = input + int64_t{k_base + group * 32 + i} * source_stride;
+        if (first_row + 7 < rows && reinterpret_cast<uintptr_t>(source + first_row) % 16 == 0)
+          values = *reinterpret_cast<const InputVector*>(source + first_row);
+        else {
+          #pragma unroll
+          for (int j = 0; j < 8; ++j)
+            if (first_row + j < rows) values[j] = source[first_row + j];
+        }
+        *reinterpret_cast<InputVector*>(&tile[i][lane * 8]) = values;
       }
-      *reinterpret_cast<InputVector*>(&tile[i][lane * 8]) = values;
+      __syncthreads();
+      cutlass::Array<float, 32> values;
+      cutlass::Array<float, 4> maxima;
+      maxima.clear();
+      #pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        values[i] = float(tile[i][threadIdx.x]);
+        maxima[i % 4] = fmaxf(maxima[i % 4], fabsf(values[i]));
+      }
+      const float amax = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
+      const int exponent = mxfp8_scale_exponent(amax);
+      #pragma unroll
+      for (int i = 0; i < 32; ++i) values[i] = mxfp8_scaled_value(values[i], exponent);
+      {
+        const auto converted = cutlass::NumericArrayConverter<Fp8E4m3, float, 32>{}(values);
+        cutlass::AlignedArray<uint64_t, 4, 16> packed;
+        memcpy(&packed, &converted, sizeof(packed));
+        *reinterpret_cast<decltype(packed)*>(&converted_tile[threadIdx.x][(group % kStoreGroups) * 2]) = packed;
+      }
+      scale_word |= uint32_t(exponent + 127) << (group * 8);
+      if (group == kGroups - 1) scale_words[threadIdx.x] = scale_word;
+      __syncthreads();
+      if ((group + 1) % kStoreGroups == 0) {
+        const int first_k = k_base + (group + 1 - kStoreGroups) * 32;
+        for (int i = threadIdx.x; i < kMxfp8TransposeRows * kVectors; i += blockDim.x) {
+          const int local_row = i / kVectors, vector = i % kVectors;
+          const int row = row_base + local_row;
+          if (row < rows)
+            *reinterpret_cast<uint4*>(output + int64_t{row} * k + first_k + vector * 16) =
+                converted_tile[local_row][vector];
+        }
+        if (group + 1 < kGroups) __syncthreads();
+      }
     }
-    __syncthreads();
-    const int row = row_base + threadIdx.x;
-    cutlass::Array<float, 32> values;
-    cutlass::Array<float, 4> maxima;
-    maxima.clear();
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-      values[i] = float(tile[i][threadIdx.x]);
-      maxima[i % 4] = fmaxf(maxima[i % 4], fabsf(values[i]));
+    // Quantization is still independent K32. Grouping is only a writeback
+    // choice: adjacent lanes now fill adjacent16B pieces of one output row.
+    // The extra16B shared-row pad keeps vector stores distributed over banks.
+    //
+    //   thread r: K32 -> K32 -> K32 -> K32   (unchanged local reductions)
+    //                shared FP8 row,64B, reused twice
+    //   four lanes:  [16B][16B][16B][16B] --> contiguous global K64 slice
+    //   two warps:   four scales/row   --> two complete512B SFA/SFB atoms
+    //
+    // No ready granularity or stream boundary changes: this remains the
+    // preceding preparation kernel. Public backward inputs are K128-aligned.
+    if (threadIdx.x < 64) {
+      const int local_row = warp * 128 + lane;
+      const int row = row_base + local_row;
+      if (row < padded_rows) {
+        const uint4 packed{scale_words[local_row], scale_words[local_row + 32],
+                           scale_words[local_row + 64], scale_words[local_row + 96]};
+        *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(scales) +
+            scale_layout(cute::make_coord(row, k_base, 0))) = packed;
+      }
     }
-    const float amax = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
-    const int exponent = mxfp8_scale_exponent(amax);
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) values[i] = mxfp8_scaled_value(values[i], exponent);
-    if (row < rows) {
-      const auto converted = cutlass::NumericArrayConverter<Fp8E4m3, float, 32>{}(values);
-      cutlass::AlignedArray<uint64_t, 4, 16> packed;
-      memcpy(&packed, &converted, sizeof(packed));
-      *reinterpret_cast<decltype(packed)*>(output + int64_t{row} * k + k_base) = packed;
-    }
-    if (row < padded_rows)
-      reinterpret_cast<uint8_t*>(scales)[scale_layout(cute::make_coord(row, k_base, 0))] =
-          static_cast<uint8_t>(exponent + 127);
     __syncthreads();
   }
 }

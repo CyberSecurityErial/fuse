@@ -205,8 +205,8 @@ void run(int world, int m, int h) {
       if(graph)for(auto& r:ranks){
         using L=fused_graph::Launch;
         graphs.emplace_back(new fused_graph::Operation(r.device,r.stream,epoch,
-            {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,
-             L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+            {L::kOrdinaryDynamic,L::kCooperativeDynamic,L::kOrdinaryDynamic,
+             L::kOrdinaryDynamic,L::kOrdinaryDynamic}));
       }
       // Exercise instantiate AND update, with a fresh native publication epoch
       // on each replay. Poison destinations without clearing ready counters:
@@ -349,7 +349,7 @@ void run_qkv_weight(int m, int h) {
           using L=fused_graph::Launch;
           std::unique_ptr<fused_graph::Operation> operation;
           if(graph)operation.reset(new fused_graph::Operation(0,r.stream,0,
-              {L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+              {L::kOrdinaryDynamic,L::kOrdinaryDynamic,L::kOrdinaryDynamic}));
           for(int replay=1;replay<=(graph?2:1);++replay) {
             if(graph)operation->prepare(replay,[&](uint32_t,cudaStream_t s){
               return fuse::launch_qkv_backward_mxfp8_weight(p,s);
@@ -471,8 +471,8 @@ void run_qkv(int world,int m,int h) {
           r.qkv.weight.gemm_tuning=r.qkv.data.projection.gemm_tuning;
           using L=fused_graph::Launch;
           if(graph)graphs.emplace_back(new fused_graph::Operation(r.device,r.stream,0,
-              {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,
-               L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+              {L::kOrdinaryDynamic,L::kCooperativeDynamic,L::kOrdinaryDynamic,
+               L::kOrdinaryDynamic,L::kOrdinaryDynamic}));
         }
         for(int replay=1;replay<=(graph?2:1);++replay) {
           for(auto& r:ranks) {

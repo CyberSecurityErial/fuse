@@ -155,6 +155,51 @@ int main(){for(int prefix:{0,3,4})for(bool rotate:{false,true}){
             self.assertEqual(set(stores.values()),{1})
             self.assertEqual(set(scales.values()),{1})
 
+    def test_transpose_grouped_writeback_preserves_data_and_scale_bytes(self):
+        def offset(row, kb, k):
+            return ((row//128)*((k+127)//128)+kb//128)*512 + (row%32)*16 + (row%128)//32*4 + kb%128//32
+        for rows, k in ((1,128),(33,128),(128,128),(129,256),(256,384),(257,128),(384,256)):
+            groups = 4
+            store_groups = 2
+            vectors = store_groups*2
+            padded = (rows+127)//128*128
+            data, scales = Counter(), {}
+            for rb in range(0,padded,256):
+                for kb in range(0,k,groups*32):
+                    for stage in range(0,groups,store_groups):
+                        for thread in range(256):
+                            for i in range(thread,256*vectors,256):
+                                row, col = rb+i//vectors, kb+stage*32+(i%vectors)*16
+                                if row < rows:
+                                    for j in range(16):data[row,col+j]+=1
+                    for thread in range(64):
+                        row = rb+(thread//32)*128+thread%32
+                        if row >= padded:continue
+                        start = offset(row,kb,k)
+                        self.assertEqual(start%16,0)
+                        for b in range(16):
+                            self.assertNotIn(start+b,scales)
+                            scales[start+b]=(row+(b//4)*32,kb//32+b%4)
+            self.assertEqual(data,Counter({(r,c):1 for r in range(rows) for c in range(k)}))
+            self.assertEqual(scales,{offset(r,c*32,k):(r,c) for r in range(padded) for c in range(k//32)})
+            # Each16B vector transaction's eight lanes span all32 banks once.
+            for first in range(0,32,8):
+                banks=[((lane*(vectors+1))*4+j)%32 for lane in range(first,first+8) for j in range(4)]
+                self.assertEqual(len(set(banks)),32)
+        text=(ROOT/'csrc/operators/sm103/detail/quantization.cuh').read_text()
+        self.assertIn('kMxfp8TransposeGroups = 4',text)
+        self.assertIn('kMxfp8TransposeStoreGroups = 2',text)
+        self.assertIn('extern __shared__ __align__(16) uint4 converted_storage[]',text)
+        self.assertIn('reinterpret_cast<uint4 (*)[kVectors + 1]>(converted_storage)',text)
+        self.assertIn('scale_words[local_row + 96]',text)
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        self.assertIn('cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active',api)
+        self.assertIn('int64_t{info.sm_count} * active',api)
+        for name in ('mxfp8_smoke.cu','mxfp8_mpi_bench.cu'):
+            harness=(ROOT/'benchmarks/sm103/backward'/name).read_text()
+            self.assertNotIn('L::kOrdinaryStatic',harness)
+            self.assertIn('L::kOrdinaryDynamic,L::kCooperativeDynamic',harness)
+
     def test_backward_boundaries_include_preparation_and_true_weight_gradient(self):
         api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
         header=(ROOT/'include/fuse/operators/ulysses/oproj_backward.h').read_text()

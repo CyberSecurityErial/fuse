@@ -5,7 +5,7 @@ optional, disabled experimental extension, not part of these benchmarks.
 Targets are measured separately: forward QKV/OProj each2.2 PFLOPS/GPU;
 corresponding complete backward each2.0 PFLOPS/GPU. OProj forward is independently
 confirmed at2.256462P across all36 physical points with explicit offline plans.
-OProj complete backward is also confirmed at2.038881P across36 physical points;
+OProj complete backward is also confirmed at2.092341P across36 physical points;
 the two QKV targets remain unachieved. The OProj forward milestone is
 published separately in [v23.0](../../results/sm103/v23.0/README.md); this is
 not a new Auto policy or completion of the remaining development goal.
@@ -69,7 +69,53 @@ four regressions, only negligible BLOOM improvement. Runs014842-4efaf4,
 The TMA code/descriptors are removed; this rejects this concrete transfer
 organization, not TMA in general. Keep the measured parallel-ready baseline.
 
+The subsequent frozen full-boundary confirmation passes all33 legal physical
+points at1.782729P geometric mean, still below the separate2.0P QKV backward
+target. Sourcee88b416d, Graph10+50, two timed payloads and original independent
+pre/post numeric/route checks; complete B+dW, not a sum of component timings.
+Fourteen finite communication-budget trials supplied explicit plans for this
+confirmation; dX remains E32/sw8/AlongN and dW E32/sw8/AlongM. The tested
+representatives inherit their communication budgets across sequence/CP only
+for this validation, not as a model-name-based runtime selector or new Auto.
+Compared with the previous source34feb/C20 matrix's30 valid paired points,
+geometric-mean speedup is21.886%; all30 improve (minimum6.919%). Three old
+warmup failures now pass, but their failed records are not converted to old
+performance values. This comparison combines ready and budget improvements;
+the controlled table above isolates the ready change. Runs20260914-021307-fb6662
+through023129-f1e221 and the current JSON retain every configuration and receipt.
+
+Transpose preparation now groups four independent K32 reductions for coalesced
+writeback: two K64 FP8 stages and complete512B scale atoms. The actual compiled
+occupancy determines its grid, not a fixed CTA/SM multiplier. The numerical
+reductions, input masters, ready protocol, GEMM and communication budgets do
+not change. CP4/8 CPU-FP64 and small causal MPI checks pass. The smaller
+writeback variant beats the original in three controlled complete-QKV cases:
+Dense1.061493→1.103325P, Qwen31.724069→1.793259P, Kimi1.826088→1.866554P.
+All six component checks pass; W minus prepared-W is not an isolated quantizer
+timer. The cleaned implementation removes unused non-K128 fallback machinery;
+compiled registers48, static shared18944B, dynamic shared20480B, no local spill.
+Its fixed QKV33-point replay at source0fa41585 passes all33, GM1.827869P,
++2.532% against the preceding fixed matrix, with no regressions. It retains
+70.63% of the matched full148SM cuBLASLt equivalent compute throughput; that
+reference adds two separately measured GEMM times and excludes preparation
+and communication. The separate2P QKV target is still unmet. The shared
+quantizer's OProj36-point regression also passes:2.038881→2.092341P (+2.622%),
+all36 improve. All69 fixed points pass original two-payload full-boundary
+checks; no configuration or sample is dropped. No new core/public header is
+introduced. The unique O/Q backward current tables and both provenance lists
+are in fuse_midfile/mxfp8-v23; full replay source-run20260914-033522-f255cf.
+
 ## Backward component checkpoint
+
+QKV forward large-box control: whole-W startup, complete M128/N256 ready
+unchanged, replace four64x128 copies by two128x128 copies. Six/seven route
+warps passed full/tail checks and7 same-budget controls each against a fresh
+baseline. DenseCP4 best gained1.97/1.74%, but DenseCP8 best was unchanged
+(low-C20 fell4.49/4.68%); Qwen3 and Llama405 best changes were under0.5%.
+The bounded improvement does not justify another transport organization in
+the current core. Both experiments and their temporary tests were removed;
+this is not evidence that larger boxes or seven warps always lose. Builds
+20260914-024640-754598/025354-dc64bb and current JSON preserve the controls.
 
 Register-owned K32 preparation trial: BF16 shared32x256 tile,16B coalesced
 input vectors, one whole K32 per thread, four local maximum chains and32B

@@ -114,9 +114,21 @@ template <class Layout>
 cudaError_t prepare_mxfp8_transpose(const Bf16* source, Fp8E4m3* output,
     cutlass::float_ue8m0_t* scales, int rows, int k, int64_t source_stride,
     Layout layout, const DeviceInfo& info, cudaStream_t stream) {
-  const int64_t tiles = ((int64_t{rows} + kMxfp8TransposeRows - 1) / kMxfp8TransposeRows) * (k / 32);
-  const int blocks = int(std::min<int64_t>(tiles, int64_t{info.sm_count} * 4));
-  quantize_mxfp8_transposed_operand<<<blocks, 256, 0, stream>>>(
+  // Public backward dimensions are K128-aligned. The K32 numerical groups
+  // share a K128 scale atom and two K64 writeback stages; no fallback layout
+  // or per-model tuning is needed. Static + dynamic SMEM stays below 48KiB.
+  const int64_t tiles = ((int64_t{rows} + kMxfp8TransposeRows - 1) / kMxfp8TransposeRows) *
+      (k / (32 * kMxfp8TransposeGroups));
+  const size_t shared_bytes = size_t{kMxfp8TransposeRows} *
+      (kMxfp8TransposeStoreGroups * 2 + 1) * sizeof(uint4);
+  // Use the compiled kernel's resource limit, not a fixed CTA/SM multiplier.
+  int active = 0;
+  auto status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,
+      quantize_mxfp8_transposed_operand<Layout>, 256, shared_bytes);
+  if (status != cudaSuccess) return status;
+  if (active <= 0) return cudaErrorInvalidConfiguration;
+  const int blocks = int(std::min<int64_t>(tiles, int64_t{info.sm_count} * active));
+  quantize_mxfp8_transposed_operand<<<blocks, 256, shared_bytes, stream>>>(
       source, output, scales, rows, k, source_stride, layout);
   return cudaGetLastError();
 }
