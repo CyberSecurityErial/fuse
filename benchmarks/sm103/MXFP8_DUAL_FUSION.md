@@ -691,3 +691,25 @@ source de5bc712: Llama214757-c21339 full3.373160ms/1.629795P, prepared dX
 All five component audits pass. Input head acquire/proxy fence and communication
 are unchanged. Relative to the original controls these two complete boundaries
 are8.93% and9.77% faster; this still does not meet the2P full-matrix target.
+
+The independent dX raster/swizzle winners do not transfer directly: at the
+same source and C32, Llama sw8/M215045-4d7b62 full4.389008ms (B3.069024,
+prepared dX1.823488), and Kimi sw4/M215148-f78256 full15.184480ms
+(B10.986160, prepared dX6.072960). Both pass all five audits, but full boundaries
+regress versus sw8/N; retain N for these controls. Kimi's prepared dX is almost
+unchanged while B grows, implicating the coupled production/consumption path,
+not a measured arithmetic slowdown. No model-specific dispatch is introduced.
+
+Shared dW beta-zero specialization uses the source-free epilogue only when
+beta==0; all nonzero beta values keep the original BF16 C kernel. This gives
+E32 four mainloop stages instead of three without changing explicit tuning.
+Source4945f245 QKV Llama215754-d9f949 full3.242272ms/1.695588P versus
+3.373160ms/1.629795P, with unchanged dX and dW1.421472→1.305960ms;
+prepared dW1.177592→1.074280ms. All five component audits pass.
+OProj Qwen3215646-42d7d9 measures full1.143040ms/1.923837P and prepared
+dW0.416712ms, but uses noncausal routing while the previous formal O matrix
+uses causal routing: its full result is NOT a paired speedup or a replacement
+for that table. Complete matched O-matrix replay remains required.
+CP8 M/H256 contract220127-05f105 independently verifies both operators,
+two payloads, E32/E64, eager/Graph, ordinary/causal routes, original BF16 masters,
+prepared W, deferred beta1, and CPU FP64 alpha=.75/beta0,1 weight references.

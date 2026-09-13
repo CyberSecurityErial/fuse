@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <type_traits>
+
 namespace fuse {
 namespace {
 
@@ -187,15 +189,15 @@ struct Mxfp8WeightGradientOperands {
   float alpha = 1.f, beta = 0.f;
 };
 
-template <int EpilogueN, bool Prepare = true>
-cudaError_t backward_mxfp8_weight_impl(const Mxfp8WeightGradientOperands& d,
-                                     void* workspace, cudaStream_t stream) {
+template <int EpilogueN, bool Prepare, class SourceElement>
+cudaError_t backward_mxfp8_weight_kernel(const Mxfp8WeightGradientOperands& d,
+                                       void* workspace, cudaStream_t stream) {
   DeviceInfo info{};
   auto status = device_info(&info);
   if (status != cudaSuccess) return status;
   const auto& g = d.gemm;
   const auto w = Mxfp8BackwardWeightWorkspace::make(g, workspace);
-  using Gemm = typename Mxfp8GemmFamily<256, 128, EpilogueN, 0, Bf16>::PureGemm;
+  using Gemm = typename Mxfp8GemmFamily<256, 128, EpilogueN, 0, SourceElement>::PureGemm;
   using Adapter = cutlass::gemm::device::GemmUniversalAdapter<Gemm>;
   auto args = gemm_arguments<Gemm>(g, w.lhs, w.rhs.b, d.output,
       d.alpha, 0, info, GemmRaster::kAlongN);
@@ -204,7 +206,7 @@ cudaError_t backward_mxfp8_weight_impl(const Mxfp8WeightGradientOperands& d,
   args.mainloop.layout_SFA = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(args.problem_shape);
   args.mainloop.layout_SFB = Mxfp8ScaleConfig::tile_atom_to_shape_SFB(args.problem_shape);
   args.epilogue.thread.beta = d.beta;
-  args.epilogue.ptr_C = d.output;
+  if constexpr (!std::is_void_v<SourceElement>) args.epilogue.ptr_C = d.output;
   if (Adapter::can_implement(args) != cutlass::Status::kSuccess || Adapter::get_workspace_size(args))
     return cudaErrorNotSupported;
   Adapter op;
@@ -220,6 +222,18 @@ cudaError_t backward_mxfp8_weight_impl(const Mxfp8WeightGradientOperands& d,
   }
   if (op.run(stream) != cutlass::Status::kSuccess) return cudaErrorLaunchFailure;
   return cudaGetLastError();
+}
+
+template <int EpilogueN, bool Prepare = true>
+cudaError_t backward_mxfp8_weight_impl(const Mxfp8WeightGradientOperands& d,
+                                     void* workspace, cudaStream_t stream) {
+  // beta=0 starts a local gradient: no old C values participate. A source-free
+  // epilogue also removes their compile-time SMEM/pipeline requirements.
+  // Accumulating calls keep the original BF16 C path, including beta!=1.
+  // Dispatch is scalar semantics, never a shape-specific performance choice.
+  if (d.beta == 0.f)
+    return backward_mxfp8_weight_kernel<EpilogueN, Prepare, void>(d, workspace, stream);
+  return backward_mxfp8_weight_kernel<EpilogueN, Prepare, Bf16>(d, workspace, stream);
 }
 
 template <int EpilogueN, bool Prepare = true>
