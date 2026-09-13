@@ -334,7 +334,7 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
 #if FUSE_ENABLE_PROFILING
       ,false
 #endif
-      ,true>;
+      ,true,true,1>;
   using Gemm=cutlass::gemm::kernel::GemmUniversal<ProblemShape,Mainloop,
       typename Types::Epilogue,detail::MonolithicPersistentScheduler>;
   using Comm=Mxfp8QkvBackwardPullComm<!Prepare>;

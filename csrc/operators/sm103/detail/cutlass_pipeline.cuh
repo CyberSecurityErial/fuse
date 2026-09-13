@@ -326,9 +326,10 @@ template <
 #if FUSE_ENABLE_PROFILING
     , bool Instrumented = false
 #endif
-    , bool SystemScope = false, bool ObserveMma = true
+    , bool SystemScope = false, bool ObserveMma = true, int StaticKTilesPerPeer = 0
     >
 struct A2ALhsReadyMainloop : Base {
+  static_assert(StaticKTilesPerPeer >= 0);
 #if FUSE_ENABLE_PROFILING
   static_assert(!SystemScope || !Instrumented,
                 "Head-granular backward uses outer CTA telemetry, not fixed-size peer records");
@@ -427,6 +428,7 @@ struct A2ALhsReadyMainloop : Base {
     return args.ready && args.world_size > 0 &&
         (SystemScope || args.world_size <= kMaxWorldSize) && args.arrivals_per_peer > 0 &&
         args.k_tiles_per_peer > 0 && args.epoch > 0 &&
+        (StaticKTilesPerPeer == 0 || args.k_tiles_per_peer == StaticKTilesPerPeer) &&
         static_cast<uint64_t>(args.epoch) * args.arrivals_per_peer <=
             std::numeric_limits<uint32_t>::max() &&
         m > 0 && args.m_tiles == (m + kTileM - 1) / kTileM &&
@@ -460,16 +462,23 @@ struct A2ALhsReadyMainloop : Base {
     }
 
     const uint32_t target = params_->epoch * params_->arrivals_per_peer;
+    // A binding with a fixed ready-to-K-tile ratio can expose that geometry
+    // to the compiler. In particular, D128 / K128 is one whole head per
+    // iteration: peer=k, count=1, with no dynamic division or remainder.
+    // This specializes indexing only; acquire, proxy fence, publication
+    // grain, K order, and prologue/remainder pipeline state are unchanged.
+    const int k_tiles_per_peer = StaticKTilesPerPeer > 0
+        ? StaticKTilesPerPeer : params_->k_tiles_per_peer;
     // A kernel calls load twice per output tile (prologue and remainder).
     // Split both calls at peer boundaries, preserving CUTLASS's pipeline
     // state and never reinitializing or splitting the MMA accumulator.
     CUTLASS_PRAGMA_NO_UNROLL
     while (k_tiles > 0) {
       const int32_t first_k = static_cast<int32_t>(*k_iter);
-      const int32_t peer = first_k / params_->k_tiles_per_peer;
+      const int32_t peer = first_k / k_tiles_per_peer;
       CUTLASS_ASSERT(peer >= 0 && peer < params_->world_size);
       const int32_t to_peer_end =
-          params_->k_tiles_per_peer - first_k % params_->k_tiles_per_peer;
+          k_tiles_per_peer - first_k % k_tiles_per_peer;
       const int count = k_tiles < to_peer_end ? k_tiles : to_peer_end;
 
       const bool cache_hit = acquired_m_ == m && acquired_peer_ == peer;

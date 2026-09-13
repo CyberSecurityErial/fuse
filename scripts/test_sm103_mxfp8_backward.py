@@ -156,6 +156,20 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertEqual(route.count('detail::store_release_system('),1)
         self.assertLess(route.index('cute::cp_async_wait<0>()'),route.index('detail::store_release_system('))
 
+    def test_static_head_index_preserves_every_ready_boundary(self):
+        for heads in (24,72,80,144,288,336):
+            for prologue in (1,2,3,4):
+                dynamic=[]; specialized=[]
+                for start,end in ((0,prologue),(prologue,heads)):
+                    for k in range(start,end):
+                        dynamic.append((k//1,min(end-k,1-k%1)))
+                        specialized.append((k,1))
+                self.assertEqual(dynamic,specialized)
+                self.assertEqual([p for p,_ in specialized],list(range(heads)))
+        text=(ROOT/'csrc/operators/sm103/detail/cutlass_pipeline.cuh').read_text()
+        self.assertIn('args.k_tiles_per_peer == StaticKTilesPerPeer',text)
+        self.assertIn('int StaticKTilesPerPeer = 0',text)
+
     def test_smoke_cannot_be_mistaken_for_full_performance(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_smoke.cu').read_text()
         self.assertIn('curandStatePhilox4_32_10_t',text)

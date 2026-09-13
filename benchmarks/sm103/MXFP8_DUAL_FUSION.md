@@ -673,3 +673,13 @@ run212206-549a4e to13.231496ms. No prefix probe/cache is retained. Static
 resource inspection212818-919314 shows zero stack/local bytes for the QKV
 backward entries; CUTLASS device_kernel already uses GRID_CONSTANT. This
 does not establish a register-spill explanation for the ready-input dX gap.
+
+Fixed ready geometry specialization213814-5dd5d5 (sourceaf1f55f5) retains every
+whole-head acquire/proxy fence and the original producer order, but makes
+D128/K128=1 a compile-time indexing ratio. CP4 causal214129-85950e and both
+large CP8/128K five-component audits pass. Llama214201-188884 full is3.449656ms
+(1.593654P), B2.049952ms, prepared dX1.789192ms. Kimi214253-4705cc full is
+11.717064ms (1.477956P), B7.176856ms, prepared dX6.414864ms. Relative to the
+original same-config controls, full throughput improves6.52% and7.46%; static
+register/stack/local resource counts are unchanged. This is retained indexing
+specialization, not a change in ready granularity or a full-matrix claim.
