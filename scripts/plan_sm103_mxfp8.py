@@ -739,7 +739,19 @@ int main() {
     with tempfile.TemporaryDirectory(prefix='fuse-mxfp8-score-') as temporary:
         directory = Path(temporary)
         (directory / 'cutlass').mkdir()
-        (directory / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST_DEVICE\n')
+        (directory / 'cutlass/cutlass.h').write_text('#pragma once\n#define CUTLASS_HOST\n#define CUTLASS_HOST_DEVICE\n')
+        # Host-only scoring needs integer division semantics, not CUDA's
+        # multiply/shift implementation. Keep this stand-in in the temporary
+        # bridge, never in installed CUTLASS or the device build.
+        (directory / 'cutlass/fast_math.h').write_text('''#pragma once
+#include <cstdint>
+namespace cutlass { struct FastDivmodU64 {
+  uint64_t divisor = 1;
+  FastDivmodU64() = default;
+  explicit FastDivmodU64(uint64_t d) : divisor(d) {}
+  uint64_t divide(uint64_t n) const { return n / divisor; }
+}; }
+''')
         source, binary = directory / 'score.cc', directory / 'score'
         source.write_text(program)
         built = subprocess.run([str(compiler), '-std=c++17', '-O2', '-I', str(directory),
