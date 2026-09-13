@@ -117,6 +117,23 @@ Before another route rewrite, bracket the intermediate communication budgets:
 the earlier all-startup scan used8/20/original comm-mode budget, not a dense
 search of the different all-startup service balance.
 
+The restored route's Dense budget bracket passes29 candidates over all six
+long-sequence CP4/8 points. C48 beats the same-run old C56 by2.797/4.418% at
+CP4 128/256K; the other four selected budgets do not change. The six-point
+finite-search mean is1.475347P versus the same-run original-budget1.458036P
+(+1.187%). This is not an independently fixed confirmation. The unique QKV
+current table applies these six updates to the original27 non-Dense rows and
+labels the different build identities explicitly; its descriptive mean is
+2.041334P, still short of the goal. No fast repeat replaces a slower control.
+
+Dense512K standalone component checks also pass at C48/CP4 and C64/CP8.
+Same-run comm-mode F/C/R/Q times are respectively1.26850/1.13038/1.41437/.04678ms
+and.74358/.62560/.82434/.04286ms. Prior all-mode F on the matching binary is
+1.29774/.74461ms. Isolated R actually exceeds F: a max(C,R) hard lower-bound
+interpretation is contradicted by these observations. Fresh producer data,
+traffic timing and concurrent hardware behavior differ, but this measurement
+does not isolate their individual effects or prove NVLink saturation.
+
 ## Reusable historical work
 
 | Commit | Applicable work |
