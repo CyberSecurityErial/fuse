@@ -366,6 +366,7 @@ void run_qkv(int world,int m,int h) {
     r.weight=r.alloc<Bf16>(size_t(packed)*h);r.attention=r.alloc<Bf16>(size_t(m)*h);
     r.da=r.alloc<Bf16>(size_t(m)*h);r.dw=r.alloc<Bf16>(size_t(packed)*h);
     r.routed=r.alloc<Bf16>(size_t(m)*packed);
+    r.reference.initialize(h,r.stream,[&r](size_t bytes)->void*{return r.alloc<unsigned char>(bytes);});
     for(int kind=0;kind<3;++kind) {
       const int width=(kind==0?q:kv)/world*dim;
       const fuse::GemmProblem shape{m*world,h,width,1};
@@ -468,13 +469,34 @@ void run_qkv(int world,int m,int h) {
             const auto master=download(r,r.routed,size_t(m)*packed);
             for(size_t i=0;i<master.size();++i)if(master[i].raw()!=r.hdy[i].raw())
               throw std::runtime_error("QKV ORIGINAL BF16 route bytes");
+            // Cross-check the bounded GPU oracle against outputs already
+            // checked with the independent CPU FP64/host-gather reference.
+            mxfp8_reference::QkvGradient original{};
+            original.m=m;original.q_heads=q;original.kv_heads=kv;
+            original.world=world;original.rank=r.device;original.causal=causal;
+            for(int peer=0;peer<world;++peer)for(int kind=0;kind<3;++kind)
+              original.source[peer][kind]=ranks[peer].gradients[kind];
+            CUDA_CHECK(cudaSetDevice(r.device));
+            const auto dx=r.reference.validate_views(original,
+                mxfp8_reference::Operand{r.weight,1,h},r.da,m,h,packed,r.stream);
+            original.transpose=true;
+            const auto dw=r.reference.validate_views(original,
+                mxfp8_reference::Operand{r.attention,1,h},r.dw,packed,h,m,r.stream);
+            if(dx.checked!=size_t(m)*h || dw.checked!=size_t(packed)*h ||
+                dx.mismatches || dw.mismatches || dx.nonfinite || dw.nonfinite)
+              throw std::runtime_error("QKV bounded GPU oracle cross-check");
+            // Full W just prepared this scratch; preserve it and verify that
+            // the compute-only diagnostic executes the same native GEMM.
+            CUDA_CHECK(cudaMemsetAsync(r.dw,0xff,size_t(packed)*h*sizeof(Bf16),r.stream));
+            CUDA_CHECK(fuse::launch_qkv_backward_mxfp8_weight_compute_reference(r.qkv.weight,r.stream));
+            expect(download(r,r.dw,size_t(packed)*h),r.expected_dw,"QKV prepared dW CPU FP64");
           }
         }
         for(auto& r:ranks)if(graph){CUDA_CHECK(cudaSetDevice(r.device));graphs[r.device]->reset(2);}
         std::cout<<"backward_validation op=qkv_mxfp8 world="<<world<<" M="<<m
             <<" H="<<h<<" generation="<<generation<<" causal="<<causal<<" epilogue="<<epilogue
             <<" launch="<<(graph?"graph":"eager")
-            <<" B=pass W=pass original_route_bytes=pass performance=not_measured\n"<<std::flush;
+            <<" B=pass W=pass original_route_bytes=pass bounded_GPU_oracle=pass prepared_W=pass performance=not_measured\n"<<std::flush;
       }
     }
   }

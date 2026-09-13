@@ -193,6 +193,16 @@ class WorkflowContracts(unittest.TestCase):
             with self.subTest(changed=changed),self.assertRaises(ValueError):
                 l20d.validate_job(tuned|changed)
         self.assertIn('--calibrate',l20d.fused_argv(job|{'calibrate':True}))
+        qkv=job|dict(fused_direction='qkv',qkv_raster='along_m')
+        l20d.validate_job(qkv)
+        qkv_argv=l20d.fused_argv(qkv)
+        self.assertEqual(qkv_argv[qkv_argv.index('--operator')+1],'qkv')
+        self.assertEqual(qkv_argv[qkv_argv.index('--kv-heads')+1],'8')
+        self.assertEqual(qkv_argv[qkv_argv.index('--raster')+1],'along_m')
+        for change in ({'kv_heads':4},{'qkv_raster':'heuristic'},
+                       {'causal':True,'global_seq':1024}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                l20d.validate_job(qkv|change)
         with self.assertRaises(ValueError):
             l20d.validate_job(job|{'calibrate':True,'mxfp8':False})
         for change in ({'fused_launch':'eager'},{'input_generator':'cpu_mt19937'},

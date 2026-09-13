@@ -440,14 +440,17 @@ def validate_job(job, hostname=None):
             if job['stage'] == 'fused-smoke':
                 s = fused_geometry(job)
                 if job.get('mpi'):
-                    if (job.get('fused_direction') != 'oproj' or job.get('fused_launch') != 'graph' or
+                    direction = job.get('fused_direction')
+                    if (direction not in ('oproj','qkv') or job.get('fused_launch') != 'graph' or
                             job.get('input_generator') != 'gpu_philox' or
                             job.get('warmup',10) != 10 or job.get('iterations',50) != 50 or
                             s['world'] not in (4,8) or s['seq_local'] % 128 or s['hidden'] % 128 or
                             s['head_dim'] != 128 or s['q_heads'] % s['world'] or
                             not 0 < (job.get('comm_sm') or 0) < 148 or job.get('comm_sm_list') is not None or
-                            job.get('oproj_raster') not in ('along_m','along_n')):
-                        raise ValueError('MXFP8 backward MPI requires OProj Graph10+50, Philox, M/H128 alignment, explicit comm/raster')
+                            job.get(direction+'_raster') not in ('along_m','along_n') or
+                            (direction=='qkv' and (s['kv_heads'] % s['world'] or
+                                (job.get('causal') and s['seq_local'] % 256)))):
+                        raise ValueError('MXFP8 backward MPI requires Graph10+50, Philox, M/H128 alignment, explicit comm/raster and legal inverse heads')
                 elif (job.get('fused_launch','eager') != 'eager' or
                         job.get('fused_direction') != 'oproj' or s['world'] not in (4, 8) or
                         s['seq_local'] not in (128,256) or s['hidden'] not in (128,256) or
@@ -1284,9 +1287,11 @@ def fused_argv(job):
         argv = [str(fused_binary(job)), '--world', str(shape['world']),
                 '--m', str(shape['seq_local']), '--hidden', str(shape['hidden'])]
         if job.get('mpi'):
+            direction=job['fused_direction']
+            if direction=='qkv':argv += ['--operator','qkv','--kv-heads',str(shape['kv_heads'])]
             argv += ['--q-heads',str(shape['q_heads']), '--comm-ctas',str(job['comm_sm']),
                      '--epilogue-n',str(job.get('mxfp8_epilogue_n') or 32),
-                     '--swizzle',str(job.get('max_swizzle_size',1)), '--raster',job['oproj_raster']]
+                     '--swizzle',str(job.get('max_swizzle_size',1)), '--raster',job[direction+'_raster']]
             if job.get('causal'): argv.append('--causal')
             if job.get('calibrate'): argv.append('--calibrate')
             for key, flag in (('backward_weight_epilogue_n','--weight-epilogue-n'),

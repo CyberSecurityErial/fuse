@@ -88,7 +88,7 @@ def audit_run(directory,component='full'):
     directory=Path(directory).resolve()
     request=sf.json_bytes(sf.read_bytes(directory/'job.json',directory))
     sf.require(request.get('mxfp8') and request.get('backward') and request.get('mpi') and
-               request.get('fused_direction')=='oproj' and request.get('fused_launch')=='graph' and
+               request.get('fused_direction') in ('oproj','qkv') and request.get('fused_launch')=='graph' and
                not request.get('profile') and not request.get('quick'),'Not complete MXFP8 backward Graph')
     sf.require(component in ('full','data','weight','weight_compute') and
                (component=='full' or request.get('calibrate')),'Backward component requires calibration')
@@ -107,34 +107,51 @@ def audit_run(directory,component='full'):
                 and all(r.get(k)==str(v) for k,v in fields.items())]
     configs=selected('backward_config');sf.require(len(configs)==1,'Missing/duplicate backward configuration')
     c=configs[0];shape=l20d.fused_geometry(job)
+    qkv=job['fused_direction']=='qkv'
+    raster=job[job['fused_direction']+'_raster']
+    width=shape['projection_width'] if qkv else shape['q_width']
+    sf.require(c.get('op')==job['fused_direction']+'_mxfp8','Wrong backward operator')
+    if qkv:
+        sf.require(int(c['q_heads'])==shape['q_heads'] and int(c['kv_heads'])==shape['kv_heads'],
+                   'Wrong packed QKV head geometry')
     sf.require(int(c.get('calibrate',0))==int(bool(job.get('calibrate'))),'Calibration job/config mismatch')
     if component=='weight_compute':
         sf.require(c.get('weight_compute_reference')=='1','Missing prepared dW diagnostic boundary')
     for key, expected in dict(
             weight_epilogue=job.get('backward_weight_epilogue_n') or (job.get('mxfp8_epilogue_n') or 32),
             weight_swizzle=job.get('backward_weight_swizzle') or job.get('max_swizzle_size',1),
-            weight_along_m=int((job.get('backward_weight_raster') or job['oproj_raster'])=='along_m')).items():
+            weight_along_m=int((job.get('backward_weight_raster') or raster)=='along_m')).items():
         fallback={'weight_epilogue':'epilogue','weight_swizzle':'swizzle','weight_along_m':'along_m'}[key]
         sf.require(int(c.get(key,c[fallback]))==expected,'Independent dW config mismatch: '+key)
-    for key,value in dict(M=shape['seq_local'],H=shape['hidden'],A=shape['q_width'],world=job['world'],
+    for key,value in dict(M=shape['seq_local'],H=shape['hidden'],A=width,world=job['world'],
             comm=job['comm_sm'],epilogue=job.get('mxfp8_epilogue_n') or 32,
-            swizzle=job.get('max_swizzle_size',1),along_m=int(job['oproj_raster']=='along_m'),
+            swizzle=job.get('max_swizzle_size',1),along_m=int(raster=='along_m'),
             causal=int(bool(job.get('causal'))),kernels=5).items():
         sf.require(int(c[key])==value,'Backward configuration mismatch: '+key)
     sf.require(c['launch']=='graph' and c['weight_mode']=='immediate' and
-               c['timed']=='weight_quant_dA_route_dY_quant_A_quant_dW' and
-               c['upstream_dY_quant']=='excluded' and c['CP_dW_reduce']=='caller_owned','Wrong backward boundary')
-    m,h,a,world=shape['seq_local'],shape['hidden'],shape['q_width'],job['world']
+               c['timed']==('weight_quant_inverse_QKV_dX_dQKV_quant_X_quant_dW' if qkv else
+                           'weight_quant_dA_route_dY_quant_A_quant_dW') and
+               c['upstream_dQ_dK_dV_quant' if qkv else 'upstream_dY_quant']=='excluded' and
+               c['CP_dW_reduce']=='caller_owned','Wrong backward boundary')
+    if qkv:
+        sf.require(c.get('original_BF16_route')=='included' and c.get('input_lease')=='all_ranks_until_B_complete',
+                   'Missing original-gradient route/input lease boundary')
+    m,h,a,world=shape['seq_local'],shape['hidden'],width,job['world']
     flops=4*m*h*a;sf.close(float(c['flops_per_rank']),flops,'Backward FLOPs')
     if component!='full':flops//=2
     payloads=[]
     for gen in (0,1):
         inputs=selected('backward_input',generation=gen)
+        tensors=('dQ','dK','dV','W','saved_X') if qkv else ('dY','W','saved_A')
         sf.require(Counter((int(r['rank']),r['tensor']) for r in inputs)==
-                   Counter((rank,tensor) for rank in range(world) for tensor in ('dY','W','saved_A')),'Incomplete inputs')
+                   Counter((rank,tensor) for rank in range(world) for tensor in tensors),'Incomplete inputs')
         for r in inputs:
-            count={'dY':m*h,'W':h*a,'saved_A':m*a}[r['tensor']]
-            seed={'dY':1234+int(r['rank']),'W':5678,'saved_A':9012+int(r['rank'])}[r['tensor']]+gen*100
+            rank=int(r['rank'])
+            counts=({'dQ':m*shape['q_width'],'dK':m*shape['kv_width'],'dV':m*shape['kv_width'],
+                     'W':h*a,'saved_X':m*h} if qkv else {'dY':m*h,'W':h*a,'saved_A':m*a})
+            seeds=({'dQ':1234+rank,'dK':2234+rank,'dV':3234+rank,'W':5678,'saved_X':9012+rank}
+                   if qkv else {'dY':1234+rank,'W':5678,'saved_A':9012+rank})
+            count=counts[r['tensor']];seed=seeds[r['tensor']]+gen*100
             sf.require(r['generator']=='gpu_philox' and int(r['seed'])==seed and
                        int(r['count'])==int(r['finite'])==count and 0<int(r['nonzero'])<=count and
                        math.isfinite(float(r['square_sum'])) and float(r['square_sum'])>0,'Invalid Philox payload')
@@ -142,7 +159,7 @@ def audit_run(directory,component='full'):
         sf.require(Counter((int(r['rank']),r['phase']) for r in checks)==
                    Counter((rank,phase) for rank in range(world) for phase in ('pre','post')),'Missing full pre/post checks')
         for r in checks:
-            for output,count in (('B',m*a),('W',h*a),('route',m*a)):
+            for output,count in (('B',m*h if qkv else m*a),('W',h*a),('route',m*a)):
                 sf.require(int(r[output+'_checked'])==count and int(r[output+'_mismatch'])==0,'Incomplete/failed gradient validation')
         windows=selected('backward_warmup',generation=gen)
         for rank in range(world):
@@ -189,8 +206,10 @@ def audit_run(directory,component='full'):
     return dict(run=job['run_id'],source=job['source_id'],binary=receipts['fused-build.json']['binary_sha256'],
         artifact=evidence['artifacts.tar.gz']['sha256'],environment=receipts['environment.json']['fingerprint'],
         configuration=c,component=component,
-        boundary={'full':'immediate_B_W_five_kernels','data':'W_quant_dA_inverse_A2A_two_kernels',
-                  'weight':'dY_quant_saved_A_quant_dW_three_kernels',
+        boundary={'full':'immediate_B_W_five_kernels','data':('W_quant_inverse_QKV_dX_two_kernels' if qkv else
+                  'W_quant_dA_inverse_A2A_two_kernels'),
+                  'weight':('dQKV_quant_saved_X_quant_dW_three_kernels' if qkv else
+                            'dY_quant_saved_A_quant_dW_three_kernels'),
                   'weight_compute':'prepared_dW_GEMM_one_kernel_no_quantization'}[component],payloads=payloads,
         p50_ms=p50,pflops=flops/(p50*1e12),verification='full_two_payload_pre_post_numeric_and_route')
 

@@ -26,16 +26,44 @@ inline void check(cublasStatus_t status) {
 struct Operand {
   const fuse::Bf16* source;
   int64_t row_stride, k_stride;
+  __device__ fuse::Bf16 operator()(int row,int k) const {
+    return source[int64_t(row)*row_stride+int64_t(k)*k_stride];
+  }
 };
 
-static __global__ void decode(Operand source, fuse::Bf16* output,
+// Independent virtual gradient matrix, reconstructed from ORIGINAL peer BF16
+// planes. Never read the production staging/quantization or its route decoder.
+// The transpose view changes the K32 reduction axis for dW without allocating
+// a full gathered reference tensor. This also supplies a byte-exact route oracle.
+struct QkvGradient {
+  const fuse::Bf16* source[8][3]{};
+  int m=0,q_heads=0,kv_heads=0,world=0,rank=0;
+  bool causal=false,transpose=false;
+  __device__ fuse::Bf16 operator()(int row,int k) const {
+    const int token=transpose?k:row, feature=transpose?row:k;
+    const int q=q_heads*128,kv=kv_heads*128;
+    const int kind=feature<q?0:(feature<q+kv?1:2);
+    const int within=feature-(kind==0?0:(kind==1?q:q+kv));
+    const int width=(kind==0?q:kv)/world;
+    const int owner=within/width, column=within%width;
+    const int global=causal?(token<m/2?rank*m/2+token:
+        (2*world-1-rank)*m/2+token-m/2):rank*m+token;
+    return source[owner][kind][int64_t(global)*width+column];
+  }
+  __device__ uint16_t operator()(uint64_t index) const {
+    const int width=(q_heads+2*kv_heads)*128;
+    return (*this)(int(index/width),int(index%width)).raw();
+  }
+};
+
+template<class View>
+static __global__ void decode(View source, fuse::Bf16* output,
                              int row_begin, int rows, int k_begin, int k) {
   const int lane = threadIdx.x % 32;
   for (int64_t group = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
        group < int64_t(rows) * (k / 32); group += int64_t(gridDim.x) * blockDim.x / 32) {
     const int row = int(group / (k / 32)), col = int(group % (k / 32)) * 32 + lane;
-    const float value = float(source.source[int64_t(row_begin + row) * source.row_stride +
-                                           int64_t(k_begin + col) * source.k_stride]);
+    const float value = float(source(row_begin+row,k_begin+col));
     float amax = fabsf(value);
     for (int delta = 16; delta; delta /= 2) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, delta));
     int exponent = 0;
@@ -82,6 +110,11 @@ struct Workspace {
 
   fused_validation::Stats validate(Operand a, Operand bt, const fuse::Bf16* actual,
                                   int m, int n, int k, cudaStream_t stream) {
+    return validate_views(a,bt,actual,m,n,k,stream);
+  }
+  template<class Left,class Right>
+  fused_validation::Stats validate_views(Left a, Right bt, const fuse::Bf16* actual,
+                                        int m,int n,int k,cudaStream_t stream) {
     if (!handle || m <= 0 || n != columns || k <= 0 || k % 32)
       throw std::invalid_argument("reference matrix dimensions/state");
     check(cublasSetStream(handle, stream));

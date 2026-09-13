@@ -83,7 +83,7 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertIn('(p.q_heads + 2 * p.kv_heads) * p.head_dim',api)
         self.assertIn('p.hidden, p.local_tokens, 1',api)
         self.assertIn('d.dqkv_staging, d.saved_input, d.grad_weight, d.alpha, d.beta',api)
-        self.assertIn('backward_mxfp8_weight_impl<EpilogueN>',api)
+        self.assertIn('backward_mxfp8_weight_impl<EpilogueN, Prepare>',api)
         self.assertIn('cross-CP dW summation remains caller-owned',header)
         self.assertIn('This W entry alone does not represent a complete QKV backward',header)
 
@@ -151,7 +151,7 @@ class Mxfp8BackwardContracts(unittest.TestCase):
     def test_formal_boundary_and_reference_are_independent_and_complete(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
         ref=(ROOT/'benchmarks/sm103/backward/mxfp8_reference.cuh').read_text()
-        self.assertIn('const double flops=4.*o.m*o.h*(o.heads*128)',text)
+        self.assertIn('const double flops=4.*o.m*o.h*o.width()',text)
         self.assertIn('WeightGradientMode::kImmediate',text)
         self.assertIn('r.validate(o,generation,"pre")',text)
         self.assertIn('r.validate(o,generation,"post")',text)
@@ -180,10 +180,20 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         epoch=text.index('params.data.projection.epoch=epoch;',weight)
         self.assertLess(weight,epoch)
         self.assertLess(text.index('if(component==Component::kWeightCompute)',weight),epoch)
-        self.assertIn('graph.reset(r.params.data.projection.epoch)',text)
-        self.assertIn('component==Component::kData?r.params.data.projection.epoch:0',text)
+        self.assertIn('graph.reset(r.native_epoch())',text)
+        self.assertIn('component==Component::kData?r.native_epoch():0',text)
         self.assertIn('(flops/2)/(value.p50*1e12)',text)
         self.assertIn('r.validate(o,generation,"post");results.push_back(result)',text)
+
+    def test_qkv_formal_reference_reads_original_peer_planes(self):
+        text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        ref=(ROOT/'benchmarks/sm103/backward/mxfp8_reference.cuh').read_text()
+        self.assertIn('struct QkvGradient',ref)
+        self.assertIn('source[owner][kind][int64_t(global)*width+column]',ref)
+        self.assertIn('reference.validate_views(original_qkv',text)
+        self.assertIn('original_BF16_route=included',text)
+        self.assertIn('input_lease=all_ranks_until_B_complete',text)
+        self.assertIn('(heads+(qkv?2*kv_heads:0))*128',text)
 
 
 if __name__ == '__main__':

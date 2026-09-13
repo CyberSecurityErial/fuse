@@ -257,6 +257,11 @@ cudaError_t launch_qkv_backward_mxfp8_data(
     const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
 cudaError_t launch_qkv_backward_mxfp8_weight(
     const Mxfp8QkvBackwardWeightParams& params, cudaStream_t stream);
+// Diagnostic only, same prepared-scratch lease as the OProj compute reference:
+// complete W first with identical parameters, then preserve both packed inputs.
+// It excludes both quantizers, retains alpha/beta, and is NOT a full W boundary.
+cudaError_t launch_qkv_backward_mxfp8_weight_compute_reference(
+    const Mxfp8QkvBackwardWeightParams& params, cudaStream_t stream);
 cudaError_t launch_qkv_backward_mxfp8(
     const Mxfp8QkvBackwardParams& params, cudaStream_t stream);
 #endif

@@ -428,11 +428,10 @@ into the earlier full-run mean. No new kernel code is needed for this result.
 
 ## Backward implementation boundary
 
-The existing released backward bindings are BF16. The new explicit MXFP8
-OProj B/W baseline is implemented and passes small CP4/8 CPU-oracle bring-up;
-its full-matrix performance and profiling are not implemented/verified yet.
-QKV MXFP8 backward remains unimplemented. Neither backward performance target
-is achieved merely because the forward MXFP8 directions exist.
+The released backward bindings are BF16. On the development branch, complete
+MXFP8 OProj B/W passes all36 physical points at1.961974P geometric mean. QKV
+MXFP8 B/W passes bounded CP4/8 independent CPU-oracle tests; its formal MPI
+coverage is in progress. Neither backward performance target is achieved yet.
 
 | Projection | B/data-gradient phase | W/weight-gradient phase |
 |---|---|---|
@@ -602,5 +601,17 @@ the complete validation records were independently re-audited.
 `201349-52c151` additionally verifies that deferred B leaves dW byte-identical,
 retains the original BF16 staging lease, and the later W applies beta=1.
 This establishes bounded correctness, not large-matrix throughput, full-model
-training or the 2P goal. QKV MPI performance coverage remains to be implemented;
-these new entries are not part of the published v23.0 release.
+training or the 2P goal. These new entries are not part of published v23.0.
+
+QKV MPI measurement now dispatches the same complete five-kernel boundary,
+with separate B, W and prepared-native-W diagnostics. Its independent bounded
+GPU reference reconstructs original peer BF16 Q/K/V planes, rather than using
+production staging as a numerical oracle. Run203211-298c84 (CP8 M/H256,
+source7f792e3a) cross-checks this reference against CPU FP64 for all16 cases,
+and verifies prepared W and deferred beta1. Large-matrix performance remains
+pending; upstream gradient quantization and cross-CP dW reduction stay explicit
+caller boundaries, while original-BF16 inverse routing is included in timing.
+Formal MPI CP4 M/H256 Q16/KV8 causal run203605-03b2ec passes independent
+source/binary/rank/sample audits for full, B, W and prepared-W Graph10+50,
+with complete pre/post checks on both Philox payloads. This bounded contract
+test is not included in the long-sequence performance matrix.

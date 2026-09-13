@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Complete immediate OProj backward: W preparation -> dA+inverse A2A ->
-// two saved-master preparations -> dW. Upstream dY quantization and cross-CP
-// dW reduction remain the explicit caller boundary, as in the public API.
+// Complete immediate projection backwards: W preparation -> inverse A2A/dX
+// (QKV) or dA/inverse A2A (OProj) -> two saved-master preparations -> dW.
+// Upstream gradient quantization and cross-CP dW reduction are caller-owned.
 #include "fuse/operators/ulysses/oproj_backward.h"
+#include "fuse/operators/ulysses/qkv_backward.h"
 #include "fuse/operators/primitives/gemm_a2a_mxfp8.h"
 #include "../fused_graph.cuh"
 #include "../fused_inputs.cuh"
@@ -28,6 +29,9 @@ struct Options {
   int weight_epilogue=0,weight_swizzle=0;
   std::string weight_raster;
   std::string json;
+  int kv_heads=8;
+  bool qkv=false;
+  int width() const { return (heads+(qkv?2*kv_heads:0))*128; }
 };
 
 Options parse(int argc,char** argv) {
@@ -39,6 +43,8 @@ Options parse(int argc,char** argv) {
     if(i+1==argc)throw std::invalid_argument("missing option value");
     const std::string value=argv[++i];
     if(key=="--world")o.world=std::stoi(value);
+    else if(key=="--operator" && (value=="qkv" || value=="oproj"))o.qkv=value=="qkv";
+    else if(key=="--kv-heads")o.kv_heads=std::stoi(value);
     else if(key=="--m")o.m=std::stoi(value);
     else if(key=="--hidden")o.h=std::stoi(value);
     else if(key=="--q-heads")o.heads=std::stoi(value);
@@ -60,7 +66,9 @@ Options parse(int argc,char** argv) {
       (o.epilogue!=32 && o.epilogue!=64) ||
       (o.swizzle!=1 && o.swizzle!=2 && o.swizzle!=4 && o.swizzle!=8) ||
       (o.weight_epilogue!=32 && o.weight_epilogue!=64) ||
-      (o.weight_swizzle!=1 && o.weight_swizzle!=2 && o.weight_swizzle!=4 && o.weight_swizzle!=8))
+      (o.weight_swizzle!=1 && o.weight_swizzle!=2 && o.weight_swizzle!=4 && o.weight_swizzle!=8) ||
+      (o.qkv && (o.kv_heads<=0 || o.kv_heads>o.heads || o.heads%o.kv_heads ||
+          o.kv_heads%o.world || (o.causal && o.m%256))))
     throw std::invalid_argument("unsupported backward benchmark geometry/configuration");
   return o;
 }
@@ -93,6 +101,15 @@ struct Runtime {
   fused_inputs::Scratch* input_stats{};
   mxfp8_reference::Workspace reference;
   InverseRoute route{};
+  bool qkv=false;
+  fuse::Mxfp8QkvBackwardParams qkv_params{};
+  Bf16* gradient[3]{};
+  fuse::Mxfp8Activation quantized[3]{};
+  mxfp8_reference::QkvGradient original_qkv{};
+
+  uint32_t native_epoch() const {
+    return qkv?qkv_params.data.projection.epoch:params.data.projection.epoch;
+  }
 
   template<class T> T* alloc(size_t count){
     T* p{};check(cudaMalloc(&p,count*sizeof(T)));allocations.push_back(p);
@@ -114,6 +131,8 @@ struct Runtime {
     return peers;
   }
   void initialize(const Options& o){
+    qkv=o.qkv;
+    if(qkv){initialize_qkv(o);return;}
     const int rank=fused_mpi::process_rank,a=o.heads*128;
     auto& d=params.data.projection;
     d.local_tokens=o.m;d.hidden=o.h;d.q_heads=o.heads;d.head_dim=128;
@@ -165,6 +184,61 @@ struct Runtime {
         <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed<<'\n'<<std::flush;
     fused_mpi::barrier();
   }
+  void initialize_qkv(const Options& o){
+    const int rank=fused_mpi::process_rank,a=o.width();
+    route.m=o.m;route.a=a;route.world=o.world;route.rank=rank;route.causal=o.causal;
+    auto& d=qkv_params.data.projection;
+    d.local_tokens=o.m;d.hidden=o.h;d.q_heads=o.heads;d.kv_heads=o.kv_heads;d.head_dim=128;
+    d.world_size=o.world;d.rank=rank;d.num_comm_ctas=o.comm;d.epoch=1;
+    d.causal_load_balanced=o.causal;d.gemm_policy=fuse::BackwardGemmPolicy::kM128N256;
+    d.gemm_tuning={o.epilogue,o.swizzle,o.along_m};
+    auto& w=qkv_params.weight.projection;
+    w.local_tokens=o.m;w.hidden=o.h;w.q_heads=o.heads;w.kv_heads=o.kv_heads;w.head_dim=128;
+    qkv_params.weight.gemm_tuning={o.weight_epilogue,o.weight_swizzle,o.weight_raster=="along_m"};
+    size_t bbytes=0,wbytes=0;
+    check(fuse::qkv_backward_mxfp8_data_workspace_size(d,&bbytes));
+    check(fuse::qkv_backward_mxfp8_weight_workspace_size(w,&wbytes));
+    const uint64_t needed=8ull*o.m*a+6ull*o.h*a+6ull*o.m*o.h+(2ull<<30);
+    size_t free=0,total=0;check(cudaMemGetInfo(&free,&total));
+    if(fused_mpi::any(free<needed))throw std::runtime_error("OOM admission: insufficient free memory; no benchmark launched");
+    check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    check(cudaEventCreate(&start));check(cudaEventCreate(&end));
+    weight=alloc<Bf16>(size_t(a)*o.h);attention=alloc<Bf16>(size_t(o.m)*o.h);
+    da=alloc<Bf16>(size_t(o.m)*o.h);routed=alloc<Bf16>(size_t(o.m)*a);dw=alloc<Bf16>(size_t(a)*o.h);
+    d.weight=weight;d.grad_input=da;d.peer_dqkv_staging[rank]=routed;
+    d.peer_ready[rank]=alloc<uint32_t>(fuse::qkv_backward_ready_elements(d));
+    w.dqkv_staging=routed;w.saved_input=attention;w.grad_weight=dw;
+    auto* scratch=alloc<unsigned char>(std::max(bbytes,wbytes));
+    qkv_params.data.workspace=qkv_params.weight.workspace=scratch;
+    qkv_params.data.workspace_bytes=qkv_params.weight.workspace_bytes=std::max(bbytes,wbytes);
+    input_stats=alloc<fused_inputs::Scratch>(1);
+    reference.initialize(o.h,stream,[this](size_t bytes)->void*{return alloc<unsigned char>(bytes);});
+    original_qkv.m=o.m;original_qkv.q_heads=o.heads;original_qkv.kv_heads=o.kv_heads;
+    original_qkv.world=o.world;original_qkv.rank=rank;original_qkv.causal=o.causal;
+    for(int kind=0;kind<3;++kind){
+      const int width=(kind==0?o.heads:o.kv_heads)/o.world*128;
+      size_t data=0,scales=0;
+      check(fuse::gemm_a2a_mxfp8_activation_size({o.m*o.world,o.h,width,1},&data,&scales));
+      gradient[kind]=alloc<Bf16>(size_t(o.m)*o.world*width);
+      auto* bytes=alloc<fuse::Fp8E4m3>(data);auto* sf=alloc<uint8_t>(scales);
+      quantized[kind]={bytes,sf,data,scales};
+      check(cudaStreamSynchronize(stream));fused_mpi::barrier();
+      const auto masters=share(gradient[kind],o.world);
+      const auto fp8=share(bytes,o.world);
+      const auto scales_peers=share(sf,o.world);
+      for(int peer=0;peer<o.world;++peer){
+        auto& input=qkv_params.data.peer_input[peer];
+        auto& view=kind==0?input.grad_q:(kind==1?input.grad_k:input.grad_v);
+        auto& master=kind==0?input.master_q:(kind==1?input.master_k:input.master_v);
+        view={fp8[peer],scales_peers[peer],data,scales};master=masters[peer];
+        original_qkv.source[peer][kind]=masters[peer];
+      }
+    }
+    cudaDeviceProp device{};check(cudaGetDeviceProperties(&device,fused_mpi::local_device));
+    std::cout<<"device,rank="<<rank<<",sm="<<device.multiProcessorCount
+        <<",compute="<<device.major<<'.'<<device.minor<<",free_bytes="<<free<<",admission_bytes="<<needed<<'\n'<<std::flush;
+    fused_mpi::barrier();
+  }
   void input(Bf16* target,size_t count,uint32_t seed,const char* name,int generation){
     check(fused_inputs::generate(reinterpret_cast<uint16_t*>(target),count,seed,.25f,input_stats,stream));
     fused_inputs::Stats stats{};
@@ -178,7 +252,7 @@ struct Runtime {
   }
   void poison(const Options& o){
     if(component==Component::kFull || component==Component::kData){
-      check(cudaMemsetAsync(da,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
+      check(cudaMemsetAsync(da,0xff,size_t(o.m)*(qkv?o.h:route.a)*sizeof(Bf16),stream));
       check(cudaMemsetAsync(routed,0xff,size_t(o.m)*route.a*sizeof(Bf16),stream));
     }
     if(component!=Component::kData)
@@ -186,15 +260,24 @@ struct Runtime {
     check(cudaStreamSynchronize(stream));fused_mpi::barrier();
   }
   void validate(const Options& o,int generation,const char* phase){
-    const auto b=reference.validate({dy,o.h,1},{weight,1,route.a},da,o.m,route.a,o.h,stream);
-    const auto w=reference.validate({dy,1,o.h},{attention,1,route.a},dw,o.h,route.a,o.m,stream);
+    auto b=fused_validation::Stats::zero(),w=fused_validation::Stats::zero();
+    if(qkv){
+      auto transposed=original_qkv;transposed.transpose=true;
+      b=reference.validate_views(original_qkv,mxfp8_reference::Operand{weight,1,o.h},da,o.m,o.h,route.a,stream);
+      w=reference.validate_views(transposed,mxfp8_reference::Operand{attention,1,o.h},dw,route.a,o.h,o.m,stream);
+    }else{
+      b=reference.validate({dy,o.h,1},{weight,1,route.a},da,o.m,route.a,o.h,stream);
+      w=reference.validate({dy,1,o.h},{attention,1,route.a},dw,o.h,route.a,o.m,stream);
+    }
     fused_mpi::barrier();
-    check(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(routed),route,
+    if(qkv)check(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(routed),original_qkv,
+        uint64_t(o.m)*route.a,reference.comparison,0,stream));
+    else check(fused_validation::launch<false>(reinterpret_cast<const uint16_t*>(routed),route,
         uint64_t(o.m)*route.a,reference.comparison,0,stream));
     fused_validation::Stats transport{};
     check(cudaMemcpyAsync(&transport,reference.comparison->result,sizeof(transport),cudaMemcpyDeviceToHost,stream));
     check(cudaStreamSynchronize(stream));
-    const bool bad=b.checked!=uint64_t(o.m)*route.a || w.checked!=uint64_t(o.h)*route.a ||
+    const bool bad=b.checked!=uint64_t(o.m)*(qkv?o.h:route.a) || w.checked!=uint64_t(o.h)*route.a ||
         transport.checked!=uint64_t(o.m)*route.a || b.mismatches || w.mismatches || transport.mismatches;
     std::cout<<"backward_validation rank="<<fused_mpi::process_rank<<" generation="<<generation
         <<" component="<<component_name(component)
@@ -205,6 +288,14 @@ struct Runtime {
   }
   std::vector<float> step(fused_graph::Operation& graph){
     graph.prepare(graph.committed_epoch()+1,[this](uint32_t epoch,cudaStream_t s){
+      if(qkv){
+        if(component==Component::kWeight)return fuse::launch_qkv_backward_mxfp8_weight(qkv_params.weight,s);
+        if(component==Component::kWeightCompute)
+          return fuse::launch_qkv_backward_mxfp8_weight_compute_reference(qkv_params.weight,s);
+        qkv_params.data.projection.epoch=epoch;
+        return component==Component::kData?fuse::launch_qkv_backward_mxfp8_data(qkv_params.data,s):
+            fuse::launch_qkv_backward_mxfp8(qkv_params,s);
+      }
       // W has no native ready epoch. Its Graph launch index must not advance
       // B's publication epoch. Full/B graphs resume from the last actual B.
       if(component==Component::kWeight)return fuse::launch_oproj_backward_mxfp8_weight(params.weight,s);
@@ -308,24 +399,39 @@ void run(const Options& o){
   using L=fused_graph::Launch;
   fused_graph::Operation graph(fused_mpi::local_device,r.stream,0,
       {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic});
-  const double flops=4.*o.m*o.h*(o.heads*128);
-  fused_mpi::root_output()<<"backward_config op=oproj_mxfp8 M="<<o.m<<" H="<<o.h<<" A="<<o.heads*128
+  const double flops=4.*o.m*o.h*o.width();
+  fused_mpi::root_output()<<"backward_config op="<<(o.qkv?"qkv_mxfp8":"oproj_mxfp8")
+      <<" M="<<o.m<<" H="<<o.h<<" A="<<o.width()
+      <<" q_heads="<<o.heads<<" kv_heads="<<o.kv_heads
       <<" world="<<o.world<<" comm="<<o.comm<<" epilogue="<<o.epilogue<<" swizzle="<<o.swizzle
       <<" weight_epilogue="<<o.weight_epilogue<<" weight_swizzle="<<o.weight_swizzle
       <<" weight_along_m="<<(o.weight_raster=="along_m")
       <<" along_m="<<o.along_m<<" causal="<<o.causal<<" launch=graph kernels=5 weight_mode=immediate"
       <<" calibrate="<<o.calibrate
       <<" weight_compute_reference="<<o.calibrate
-      <<" timed=weight_quant_dA_route_dY_quant_A_quant_dW upstream_dY_quant=excluded CP_dW_reduce=caller_owned"
+      <<(o.qkv?" timed=weight_quant_inverse_QKV_dX_dQKV_quant_X_quant_dW upstream_dQ_dK_dV_quant=excluded original_BF16_route=included input_lease=all_ranks_until_B_complete":
+          " timed=weight_quant_dA_route_dY_quant_A_quant_dW upstream_dY_quant=excluded")
+      <<" CP_dW_reduce=caller_owned"
       <<" flops_per_rank="<<flops<<'\n'<<std::flush;
   std::vector<Result> results;
   for(int generation=0;generation<2;++generation){
     r.component=Component::kFull;
     const int rank=fused_mpi::process_rank;
-    r.input(r.dy,size_t(o.m)*o.h,1234+generation*100+rank,"dY",generation);
     r.input(r.weight,size_t(o.h)*r.route.a,5678+generation*100,"W",generation);
-    r.input(r.attention,size_t(o.m)*r.route.a,9012+generation*100+rank,"saved_A",generation);
-    check(fuse::quantize_gemm_a2a_mxfp8_activation({o.m,r.route.a,o.h,1},r.dy,r.params.data.grad_output,r.stream));
+    if(o.qkv){
+      for(int kind=0;kind<3;++kind){
+        const int width=(kind==0?o.heads:o.kv_heads)/o.world*128;
+        r.input(r.gradient[kind],size_t(o.m)*o.world*width,1234+kind*1000+generation*100+rank,
+            kind==0?"dQ":(kind==1?"dK":"dV"),generation);
+        check(fuse::quantize_gemm_a2a_mxfp8_activation({o.m*o.world,o.h,width,1},
+            r.gradient[kind],r.quantized[kind],r.stream));
+      }
+      r.input(r.attention,size_t(o.m)*o.h,9012+generation*100+rank,"saved_X",generation);
+    }else{
+      r.input(r.dy,size_t(o.m)*o.h,1234+generation*100+rank,"dY",generation);
+      r.input(r.attention,size_t(o.m)*r.route.a,9012+generation*100+rank,"saved_A",generation);
+      check(fuse::quantize_gemm_a2a_mxfp8_activation({o.m,r.route.a,o.h,1},r.dy,r.params.data.grad_output,r.stream));
+    }
     check(cudaStreamSynchronize(r.stream));fused_mpi::barrier();
     r.poison(o);r.step(graph);r.validate(o,generation,"pre");
     const auto result=measure(r,graph,o,generation);
@@ -340,7 +446,7 @@ void run(const Options& o){
           component==Component::kWeightCompute?std::vector<L>{L::kOrdinaryDynamic}:
           std::vector<L>{L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic};
       fused_graph::Operation isolated(fused_mpi::local_device,r.stream,
-          component==Component::kData?r.params.data.projection.epoch:0,boundary);
+          component==Component::kData?r.native_epoch():0,boundary);
       // W compute immediately follows completed full W: its exact prepared
       // operands/scales remain in scratch. Only dW is poisoned; no preparation
       // enters the single-kernel Graph. The oracle still reads original BF16.
@@ -356,11 +462,12 @@ void run(const Options& o){
           <<" pflops="<<(flops/2)/(value.p50*1e12)<<" verification=pass\n"<<std::flush;
       isolated.reset(isolated.committed_epoch());
     }
-    graph.reset(r.params.data.projection.epoch);
+    graph.reset(r.native_epoch());
   }
   if(fused_mpi::root() && !o.json.empty()){
     std::ofstream out(o.json);out<<std::setprecision(12);
-    out<<"{\"schema\":\"sm103_mxfp8_oproj_backward_v1\",\"verified\":true,\"launch\":\"graph\","
+    out<<"{\"schema\":\"sm103_mxfp8_"<<(o.qkv?"qkv":"oproj")
+        <<"_backward_v1\",\"verified\":true,\"launch\":\"graph\","
         <<"\"boundary\":\"immediate_B_W_five_kernels\",\"M\":"<<o.m<<",\"H\":"<<o.h
         <<",\"A\":"<<r.route.a<<",\"world\":"<<o.world<<",\"comm\":"<<o.comm
         <<",\"epilogue\":"<<o.epilogue<<",\"swizzle\":"<<o.swizzle<<",\"along_m\":"<<int(o.along_m)

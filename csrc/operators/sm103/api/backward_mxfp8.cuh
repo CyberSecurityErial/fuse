@@ -263,14 +263,14 @@ cudaError_t validate_mxfp8_qkv_backward_weight(const Mxfp8QkvBackwardWeightParam
   return cudaSuccess;
 }
 
-template <int EpilogueN>
+template <int EpilogueN, bool Prepare = true>
 cudaError_t qkv_backward_mxfp8_weight_impl(const Mxfp8QkvBackwardWeightParams& p,
                                         cudaStream_t stream) {
   auto status=validate_mxfp8_qkv_backward_weight(p);
   if(status!=cudaSuccess)return status;
   const auto& d=p.projection;
   const auto g=mxfp8_qkv_backward_weight_problem(d,p.gemm_tuning);
-  return backward_mxfp8_weight_impl<EpilogueN>(
+  return backward_mxfp8_weight_impl<EpilogueN, Prepare>(
       {g, d.dqkv_staging, d.saved_input, d.grad_weight, d.alpha, d.beta}, p.workspace, stream);
 }
 
@@ -386,6 +386,11 @@ cudaError_t qkv_backward_mxfp8_weight_workspace_size(const QkvBackwardWeightPara
 cudaError_t launch_qkv_backward_mxfp8_weight(const Mxfp8QkvBackwardWeightParams& p, cudaStream_t stream) {
   return p.gemm_tuning.epilogue_n == 64
       ? qkv_backward_mxfp8_weight_impl<64>(p, stream) : qkv_backward_mxfp8_weight_impl<32>(p, stream);
+}
+cudaError_t launch_qkv_backward_mxfp8_weight_compute_reference(
+    const Mxfp8QkvBackwardWeightParams& p,cudaStream_t stream) {
+  return p.gemm_tuning.epilogue_n==64?qkv_backward_mxfp8_weight_impl<64,false>(p,stream):
+      qkv_backward_mxfp8_weight_impl<32,false>(p,stream);
 }
 cudaError_t launch_qkv_backward_mxfp8(const Mxfp8QkvBackwardParams& p,cudaStream_t stream) {
   if(p.weight_mode!=WeightGradientMode::kImmediate && p.weight_mode!=WeightGradientMode::kDeferred)
