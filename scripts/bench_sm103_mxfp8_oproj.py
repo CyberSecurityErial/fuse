@@ -525,7 +525,7 @@ def audit_pure(folder):
     evidence.require(contract.get('shapes') == job['gemm_matrix_payload']['shapes'],
                      'Pure contract geometry mismatch')
     shapes = {r['id']: r for r in job['gemm_matrix_payload']['shapes']}
-    checks, samples, inputs, output, plans = {}, {}, {}, {}, {}
+    checks, samples, inputs, output, plans, warmups = {}, {}, {}, {}, {}, {}
     for line in text.splitlines():
         if line.startswith('plan,pure_mxfp8,'):
             prefix, encoded = line.split(',config=',1)
@@ -549,26 +549,48 @@ def audit_pure(folder):
             evidence.require(int(f['count']) == count and float(f['rms']) > 0
                              and float(f['min']) < 0 < float(f['max']), 'Invalid random pure input')
             inputs.setdefault(f['id'], set()).add((int(f['generation']), int(f['operand'])))
+        elif line.startswith('warmup,pure_mxfp8,'):
+            f = fields(line)
+            if 'generation' in f:
+                key = f['id'], int(f['generation'])
+                evidence.require(key[0] in shapes and key[1] in (0,1) and key not in warmups,
+                                 'Duplicate/unknown pure warmup')
+                evidence.require(int(f['windows']) >= 3 and float(f['gpu_ms']) >= 100
+                                 and f['converged'] == '1', 'Pure warmup did not converge')
+                warmups[key] = f
         elif line.startswith('samples,pure_mxfp8,'):
             prefix, values = line.split(',ms=', 1)
             f, values = fields(prefix), json.loads(values)
             evidence.require(len(values) == 50 and all(math.isfinite(v) and v > 0 for v in values),
                              'Missing pure samples')
-            if evidence.drift(values) <= .05 and f['id'] not in samples:
-                samples[f['id']] = values
+            key = f['id'], int(f.get('generation',0))
+            evidence.require(key[0] in shapes and key[1] in (0,1), 'Unknown pure sample payload')
+            if evidence.drift(values) <= .05 and key not in samples:
+                samples[key] = values
         elif line.startswith('RESULT '):
             r = json.loads(line[7:])
             name = r['id']
             evidence.require(name in shapes and name not in output, 'Unknown/duplicate pure result')
             if r['status'] == 'passed':
-                evidence.require(checks.get(name) == {(0, 'pre'), (0, 'post'), (1, 'pre')} and
-                                 inputs.get(name) == {(0,0),(0,1),(1,0),(1,1)} and name in samples,
+                timed = r.get('timed_payloads',1)
+                evidence.require(timed in (1,2), 'Unknown pure sampling protocol')
+                expected_checks = {(0,'pre'),(0,'post'),(1,'pre')}
+                if timed == 2:
+                    expected_checks.add((1,'post'))
+                    evidence.require(all((name,g) in warmups for g in (0,1)),
+                                     'Missing two-payload pure warmup')
+                evidence.require(checks.get(name) == expected_checks and
+                                 inputs.get(name) == {(0,0),(0,1),(1,0),(1,1)} and
+                                 all((name,g) in samples for g in range(timed)),
                                  'Incomplete pure payload checks')
                 evidence.require(all(r[k] == shapes[name][k] for k in ('m','n','k')), 'Pure geometry mismatch')
                 evidence.require(name in plans and r.get('plan')==plans[name],'Pure selected plan mismatch')
-                evidence.close(r['p50_ms'], evidence.percentile(samples[name], .5), 'Pure p50')
+                per_payload = [samples[name,g] for g in range(timed)]
+                evidence.close(r['p50_ms'], sum(evidence.percentile(v,.5) for v in per_payload)/timed,
+                               'Pure p50')
                 evidence.close(r['pflops'], 2*r['m']*r['n']*r['k']/r['p50_ms']/1e12, 'Pure PFLOPS')
-                r['raw_samples_ms'] = samples[name]
+                r['timed_payloads'] = timed
+                r['raw_samples_ms'] = per_payload[0] if timed == 1 else per_payload
             else:
                 evidence.require(r['status'] in ('memory_skip', 'unstable'), 'Failed pure reference')
             output[name] = r

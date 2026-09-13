@@ -42,6 +42,44 @@ class Mxfp8QuantizationContracts(unittest.TestCase):
             self.assertIn(',compute_ctas=132,',lines[1])
             self.assertNotIn('sm_budget=full_device',lines[1])
 
+    def test_pure_native_aggregation_requires_both_timed_payloads(self):
+        compiler = shlex.split(os.environ.get('CXX', 'c++'))
+        if not compiler or not shutil.which(compiler[0]):
+            self.skipTest('host C++ compiler required')
+        text=(ROOT/'benchmarks/sm103/GEMM/mxfp8_bench.cu').read_text()
+        median=text[text.index('double median('):text.index('\nstruct Shape')]
+        body=text[text.index('  if(payload_samples[0].empty()'):text.index('\n}\n}\n\nint main')]
+        program=r'''
+#include <algorithm>
+#include <array>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+const char* sm103_plan_info(void*) { return "{}"; }
+'''+median+r'''
+void trial(bool missing) {
+  struct { std::string id="test"; int m=128,n=256,k=128; } s;
+  struct { void* plan=nullptr; } r;
+  std::array<std::vector<float>,2> payload_samples{std::vector<float>(50,1.f),
+      missing?std::vector<float>{}:std::vector<float>(50,2.f)};
+  std::vector<float> accepted;
+  double max_payload_drift=0;
+'''+body+r'''
+}
+int main() { trial(false); trial(true); }
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'aggregation.cpp'; source.write_text(program)
+            executable=Path(folder)/'aggregation'
+            subprocess.run([*compiler,'-std=c++17',str(source),'-o',str(executable)],check=True,capture_output=True)
+            good, missing=[json.loads(line.removeprefix('RESULT ')) for line in
+                           subprocess.check_output([str(executable)],text=True).splitlines()]
+            self.assertEqual(good['p50_ms'],1.5)
+            self.assertEqual(good['p95_ms'],2.)
+            self.assertEqual(good['timed_payloads'],2)
+            self.assertEqual(missing['status'],'unstable')
+
     def test_search_report_requires_full_evidence_and_first_stable_round(self):
         import summarize_sm103_mxfp8_search as report
         with tempfile.TemporaryDirectory() as folder:

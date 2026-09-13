@@ -87,6 +87,8 @@ void measure(const Shape& s,int candidates,int compute_budget=0) {
   auto* inputs=r.allocate<fused_inputs::Scratch>(1);
   auto* validation=r.allocate<fused_validation::Scratch>(1);
   std::vector<float> accepted;
+  std::array<std::vector<float>,2> payload_samples;
+  double max_payload_drift=0;
   double drift=0;
   auto launch=[&]() { check(cudaGraphLaunch(r.executable,r.stream)); };
   auto collect=[&]() {
@@ -240,7 +242,8 @@ void measure(const Shape& s,int candidates,int compute_budget=0) {
       check(cudaStreamSynchronize(r.stream));
     }
     check(cudaMemsetAsync(y,0xff,2*s.m*s.n,r.stream)); launch(); verify(generation,"pre");
-    if(generation==0) {
+    {
+      accepted.clear();
       // Three converged windows and >=100 ms actual GPU warmup. Large GEMMs
       // can need more than 5 s just to produce those three 50-sample windows;
       // only apply the wall-time watchdog once convergence can be evaluated.
@@ -258,7 +261,7 @@ void measure(const Shape& s,int candidates,int compute_budget=0) {
            std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()>5)
           throw std::runtime_error("warmup did not converge");
       }
-      std::cout<<"warmup,pure_mxfp8,id="<<s.id<<",windows="<<windows.size()
+      std::cout<<"warmup,pure_mxfp8,id="<<s.id<<",generation="<<generation<<",windows="<<windows.size()
                <<",gpu_ms="<<gpu_ms<<",converged=1\n";
       for(int round=0;round<3;++round) {
         for(int i=0;i<10;++i) { launch(); check(cudaStreamSynchronize(r.stream)); }
@@ -266,12 +269,14 @@ void measure(const Shape& s,int candidates,int compute_budget=0) {
         const double first=median({values.begin(),values.begin()+25});
         const double second=median({values.begin()+25,values.end()});
         drift=std::abs(second/first-1);
-        std::cout<<"samples,pure_mxfp8,id="<<s.id<<",round="<<round<<",drift="<<drift<<",ms=[";
+        std::cout<<"samples,pure_mxfp8,id="<<s.id<<",generation="<<generation<<",round="<<round<<",drift="<<drift<<",ms=[";
         for(size_t i=0;i<values.size();++i) std::cout<<(i?",":"")<<values[i];
         std::cout<<"]\n";
         if(drift<=.05) { accepted=std::move(values); break; }
       }
       verify(generation,"post");
+      payload_samples[generation]=accepted;
+      max_payload_drift=std::max(max_payload_drift,drift);
     }
   }
 #ifdef FUSE_MXFP8_SEARCH
@@ -286,15 +291,20 @@ void measure(const Shape& s,int candidates,int compute_budget=0) {
     return;
   }
 #endif
-  if(accepted.empty()) {
+  if(payload_samples[0].empty() || payload_samples[1].empty()) {
     std::cout<<"RESULT {\"id\":"<<std::quoted(s.id)<<",\"status\":\"unstable\"}\n"<<std::flush; return;
   }
-  const double p50=median(accepted);
+  // Equal weight for both reproducible payloads, matching the fused report.
+  // Never select the faster payload, nor replace a drift-failed first round
+  // with a faster later round when the first already passed.
+  const double p50=(median(payload_samples[0])+median(payload_samples[1]))/2;
+  accepted=payload_samples[0];
+  accepted.insert(accepted.end(),payload_samples[1].begin(),payload_samples[1].end());
   std::sort(accepted.begin(),accepted.end());
   std::cout<<"RESULT {\"id\":"<<std::quoted(s.id)<<",\"status\":\"passed\",\"m\":"<<s.m
-           <<",\"n\":"<<s.n<<",\"k\":"<<s.k<<",\"p50_ms\":"<<p50<<",\"p95_ms\":"<<accepted[47]
-           <<",\"pflops\":"<<2.0*s.m*s.n*s.k/p50*1e-12<<",\"drift\":"<<drift
-           <<",\"full_numeric\":true,\"payloads\":2,\"plan\":"<<sm103_plan_info(r.plan)<<"}\n"<<std::flush;
+           <<",\"n\":"<<s.n<<",\"k\":"<<s.k<<",\"p50_ms\":"<<p50<<",\"p95_ms\":"<<accepted[94]
+           <<",\"pflops\":"<<2.0*s.m*s.n*s.k/p50*1e-12<<",\"drift\":"<<max_payload_drift
+           <<",\"full_numeric\":true,\"payloads\":2,\"timed_payloads\":2,\"plan\":"<<sm103_plan_info(r.plan)<<"}\n"<<std::flush;
 }
 }
 

@@ -386,6 +386,32 @@ int main() {
             lines[0]=lines[0].replace(',compute_ctas=0','')
             save()
             self.assertEqual(bench.audit_pure(root)['rows'][0]['p50_ms'],1.)
+            self.assertEqual(bench.audit_pure(root)['rows'][0]['timed_payloads'],1)
+            legacy = list(lines)
+            lines = [line for line in legacy if not line.startswith(('RESULT ', 'samples,'))]
+            lines.append('correctness,pure_mxfp8,id=test,generation=1,phase=post,'
+                         'checked=32768,mismatches=0,nonfinite=0')
+            for generation, ms in ((0,1.),(1,2.)):
+                lines.append(f'warmup,pure_mxfp8,id=test,generation={generation},windows=3,'
+                             'gpu_ms=150,converged=1')
+                for round_, value in ((0,ms),(1,ms/2)):
+                    lines.append(f'samples,pure_mxfp8,id=test,generation={generation},round={round_},ms='
+                                 +json.dumps([value]*50))
+            lines.append('RESULT '+json.dumps(dict(shape,status='passed',p50_ms=1.5,
+                         pflops=8388608/1.5e12,plan=plan,timed_payloads=2)))
+            save()
+            result=bench.audit_pure(root)['rows'][0]
+            self.assertEqual(result['p50_ms'],1.5)
+            self.assertEqual(result['timed_payloads'],2)
+            self.assertEqual(result['raw_samples_ms'],[[1.]*50,[2.]*50])
+            complete = list(lines)
+            for missing in ('warmup,pure_mxfp8,id=test,generation=1',
+                            'correctness,pure_mxfp8,id=test,generation=1,phase=post',
+                            'samples,pure_mxfp8,id=test,generation=1'):
+                lines=[line for line in complete if not line.startswith(missing)]
+                save()
+                with self.assertRaises(Exception): bench.audit_pure(root)
+            lines=legacy
             contract['math_sms']=132
             save()
             with self.assertRaises(Exception): bench.audit_pure(root)
