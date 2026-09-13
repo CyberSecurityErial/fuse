@@ -364,6 +364,8 @@ void run(const Options& o){
         <<"\"boundary\":\"immediate_B_W_five_kernels\",\"M\":"<<o.m<<",\"H\":"<<o.h
         <<",\"A\":"<<r.route.a<<",\"world\":"<<o.world<<",\"comm\":"<<o.comm
         <<",\"epilogue\":"<<o.epilogue<<",\"swizzle\":"<<o.swizzle<<",\"along_m\":"<<int(o.along_m)
+        <<",\"weight_epilogue\":"<<o.weight_epilogue<<",\"weight_swizzle\":"<<o.weight_swizzle
+        <<",\"weight_along_m\":"<<int(o.weight_raster=="along_m")
         <<",\"causal\":"<<int(o.causal)<<",\"flops_per_rank\":"<<flops<<",\"payloads\":[";
     for(size_t i=0;i<results.size();++i){const auto& x=results[i];if(i)out<<',';
       out<<"{\"generation\":"<<i<<",\"warmup\":10,\"samples\":50,\"p50_ms\":"<<x.p50
