@@ -587,7 +587,7 @@ int main() {
         publish = source.index('ready.fetch_add(1, cuda::memory_order_acq_rel)')
         self.assertLess(source.index('detail::tma_store_wait_all()'), publish)
         self.assertLess(source.index('a.activation[peer].scales + src'), publish)
-        quant = function(source, 'if (warp >= kA2ALhsBulkSlots)')
+        quant = function(source, 'if (warp >= a.bulk_slots)')
         self.assertIn('weights.drain();', quant)
         self.assertIn('return;', quant)
         self.assertNotIn('weights.progress()', source)
@@ -654,7 +654,9 @@ int main() {
 #include <vector>
 struct { int x; } threadIdx, blockIdx;
 void __syncthreads() {}
+int transport_visits=0;
 struct Params { struct { int route=0, num_comm_ctas=0; } params;
+  int bulk_slots=4;
   struct { int compute_ctas=0; } input_order;
   struct { bool all_ctas=false, source=true; operator int() const { return 0; } } weights;
   int producer_order=0; };
@@ -668,23 +670,27 @@ struct Mxfp8WeightProducer {
   }
   void drain() { ++drains; }
 };
-''' + constants + '\nvoid run(const Params& a, int comm_id, int comm_ctas) {\n' + prologue + '\n}\n' + \
+''' + constants + '\nvoid run(const Params& a, int comm_id, int comm_ctas) {\n' + prologue + '\n++transport_visits;\n}\n' + \
             'void startup(const Params& p) {\n' + startup + r'''
 int main() {
   for (int comm : {1,3,8,16,32,48,64,96,147})
-      for (int compute : {1,148-comm}) for(bool all : {false,true}) {
+      for (int compute : {1,148-comm}) for(bool all : {false,true}) for(int slots:{4,6}) {
+    if(!all && slots!=4) continue;
     Params p{}; p.params.num_comm_ctas=comm; p.input_order.compute_ctas=compute;
     p.weights.all_ctas=all;
+    p.bulk_slots=slots;
     auto& seen=Mxfp8WeightProducer::seen;
-    int workers=comm*kWeightQuantWarps+(all ? compute*8 : 0);
+    int workers=comm*(8-slots)+(all ? compute*8 : 0);
     Mxfp8WeightProducer::workers=workers;
     Mxfp8WeightProducer::drains=0; seen.assign(workers,0);
     for(int c=comm-1;c>=0;--c) for(int warp=0;warp<kMinThreads/32;++warp) {
       threadIdx.x=warp*32; blockIdx.x=c;
       startup(p);
       int before=Mxfp8WeightProducer::drains;
+      int before_transport=transport_visits;
       run(p,c,comm);
-      assert(Mxfp8WeightProducer::drains-before==(warp>=kA2ALhsBulkSlots));
+      assert(Mxfp8WeightProducer::drains-before==(warp>=slots));
+      assert(transport_visits-before_transport==(warp<slots));
     }
     for(int c=comm;c<comm+compute;++c) for(int warp=0;warp<8;++warp) {
       threadIdx.x=warp*32; blockIdx.x=c; startup(p);
@@ -696,6 +702,76 @@ int main() {
         with tempfile.TemporaryDirectory() as folder:
             binary=str(Path(folder)/'cohort')
             build=subprocess.run([compiler,'-std=c++17','-fsanitize=undefined',
+                '-x','c++','-','-o',binary],input=program,text=True,capture_output=True)
+            self.assertEqual(build.returncode,0,build.stderr)
+            subprocess.run([binary],check=True,timeout=30)
+
+    def test_assisted_transport_slots_fit_and_cover_the_task_queue(self):
+        compiler = shutil.which('c++')
+        if not compiler: self.skipTest('host C++ compiler required')
+        source = (ROOT/'csrc/operators/sm103/detail/a2a_gemm.cuh').read_text()
+        source = source[source.index('struct Mxfp8A2ALhsInputComm'):]
+        constants = source[source.index('  static constexpr int kReadyBlockM'):source.index('  static constexpr size_t')]
+        init = function(source, 'static cudaError_t initialize(')
+        init = init[init.index('    const int peer_k'):init.index('    a.source_scales')]
+        body = function(source, 'CUTLASS_DEVICE void operator()')
+        start = body.index('    for (int64_t task =')
+        task_loop = body[start:body.index(') {', start)+3]
+        program = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <vector>
+''' + constants + r'''
+struct Args {
+  struct { struct { int k=0; } gemm; struct { int world_size=0; } route;
+           int num_comm_ctas=0; } params;
+  struct { bool all_ctas=false; } weights;
+  struct { int ready_group_m_tiles=0; } input_order;
+  int comm_rows=0,bulk_slots=0,bulk_stage_bytes=0;
+};
+int arrivals_per_peer(const Args& a) { return 128/a.comm_rows; }
+void configure(Args& a) { const auto& p=a.params;
+''' + init + r'''
+}
+void visit(const Args& a,int comm_ctas,int comm_id,int warp,std::vector<int>& seen) {
+  const int64_t tasks=seen.size();
+''' + task_loop + r'''
+    assert(task>=0 && ++seen[task]==1);
+  }
+}
+int main() {
+  for(int peer_k=128;peer_k<=32768;peer_k+=128)
+    for(int cp:{4,8}) for(int comm:{1,8,20,147}) for(bool all:{false,true}) {
+      Args a{}; a.params.gemm.k=peer_k*cp; a.params.route.world_size=cp;
+      a.params.num_comm_ctas=comm; a.weights.all_ctas=all;
+      configure(a);
+      assert(all ? (a.bulk_slots==4 || a.bulk_slots==6) : a.bulk_slots==4);
+      assert(a.bulk_slots*a.bulk_stage_bytes==192*1024);
+      assert(a.comm_rows>0 && 128%a.comm_rows==0);
+      assert(a.comm_rows*peer_k<=a.bulk_stage_bytes);
+      int old_rows=128;
+      while(old_rows*peer_k>48*1024) old_rows/=2;
+      assert(a.bulk_slots*a.comm_rows*peer_k>=4*old_rows*peer_k);
+      assert(a.input_order.ready_group_m_tiles>0);
+      std::vector<int> seen(2*cp*arrivals_per_peer(a));
+      // All A workers start immediately and retain fixed disjoint ownership.
+      for(int warp=a.bulk_slots-1;warp>=0;--warp)
+        for(int c=comm-1;c>=0;--c) visit(a,comm,c,warp,seen);
+      for(int count:seen) assert(count==1);
+      // Include queues shorter than the worker cohort and unaligned tails.
+      for(int total:{1,17,127,1024}) {
+        seen.assign(total,0);
+        for(int warp=0;warp<a.bulk_slots;++warp)
+          for(int c=0;c<comm;++c) visit(a,comm,c,warp,seen);
+        for(int count:seen) assert(count==1);
+      }
+    }
+}
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            binary=str(Path(folder)/'transport-slots')
+            build=subprocess.run([compiler,'-std=c++17','-fsanitize=address,undefined',
                 '-x','c++','-','-o',binary],input=program,text=True,capture_output=True)
             self.assertEqual(build.returncode,0,build.stderr)
             subprocess.run([binary],check=True,timeout=30)

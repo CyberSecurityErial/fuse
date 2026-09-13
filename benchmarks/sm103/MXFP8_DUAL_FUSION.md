@@ -120,11 +120,54 @@ These waits overlap other warps and asynchronous MMA; do not add them or subtrac
 them from formal latency to claim an exact critical-path attribution.
 
 This motivates increasing A/SFA service per communication CTA before further
-reducing its count. W workers currently exit after their startup contribution,
-while A workers continue. Reusing those warps is only a hypothesis: the existing
-four48-KiB slots occupy192KiB, so extra active DMA warps need explicit slot
-ownership and completion ordering, or smaller payloads with more transactions.
-No such handover strategy is implemented or claimed faster by this observation.
+reducing its count. Balanced contiguous SFA slices now distribute a complete
+M128-peer shard over its existing A chunks, without changing the ready unit.
+Independent confirmation of all36 frozen configurations on the alignment-hardened
+implementation gives2.084644P (previous compute-assisted2.026349P, +2.8769%).
+This is the current accepted finite-candidate baseline, not Auto or the2.2P target.
+
+An unaccepted W-to-A handoff experiment uses six32-KiB or eight24-KiB private
+slots in the same192KiB allocation. Copy alone accelerates, but three of four
+representative fused cases regress. The paired Llama405 CP8/128K/C20 profiles
+show nearly unchanged startup and W waiting, but larger A waiting: late W warps
+own chunks of the first GEMM wave even before they can begin copying. A faster
+final A completion is therefore insufficient. The next controlled variant
+reserves the exact initial compute-wave M prefix for immediate A warps and
+hands only the suffix to all active A warps. The prefix follows the resolved
+GEMM order/budget, not a model-specific latency guess. It added no completion
+barrier or ready granularity. This restored Llama near its accepted baseline
+and improved representative-large to2.00835P at20 communication CTAs, but
+Qwen/Kimi still regressed; it was not adopted.
+
+The current experiment instead starts all A workers immediately. With
+compute-assisted W production, use six32-KiB A slots and two W warps only when
+row rounding gives more resident A payload than four48-KiB slots; otherwise
+keep four A/four W. The dense W worker interval is recomputed from this actual
+cohort plus the compute startup workers. No late handoff or protected-prefix
+queue remains. This trades a small fraction of the augmented W pool for more
+immediately usable A workers, not additional communication CTAs. All36 physical
+points pass the original Graph10+50/F/C/R/P/two-payload checks. Finite-candidate
+GM is2.120467P (+1.7184% versus the fixed2.084644P baseline);15 points select
+fewer communication CTAs. Four observed regressions are0.11--0.50%; they remain
+in the result set. This is not independent frozen confirmation or the2.2P goal.
+
+### Revisit the existing GEMM window after changing W startup
+
+The optional H/P window changes the GEMM traversal itself, not just A delivery.
+Increasing P reuses an A M-tile over more N tiles, reducing the distinct M rows
+needed by the initial compute wave, but requiring more distinct W panels.
+For128K/CP8 Llama geometry with140 compute CTAs, H64 and swizzle8, host execution
+of the actual mapping gives P4/8/16 initial A demands of80/48/32MiB, respectively;
+the corresponding W demands are16/32/64MiB (FP8 payloads, scales excluded).
+These are data requirements, not measured transfer times or a speed prediction.
+
+Compute-assisted W startup changes the tradeoff that motivated a small P.
+The four representative P8/P16 tests improve each best F result; some pure C
+results also improve, so this is not solely a communication optimization.
+Pure C references intentionally use the same H/P mapping as F. The ordinary
+independent GEMM search does not set that optional window; an additional H=P=0
+control tests its original traversal without changing the collective or ready
+unit. No new runtime selector is inferred from these offline candidates.
 
 ## Backward implementation boundary
 

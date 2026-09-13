@@ -782,6 +782,8 @@ struct Mxfp8A2ALhsInputCommT {
     detail::A2AInputTileOrder input_order{};
     Schedule producer_order{};
     int32_t comm_rows = 0;
+    int32_t bulk_slots = kA2ALhsBulkSlots;
+    int32_t bulk_stage_bytes = kA2ALhsBulkStageBytes;
   };
   using Params = Arguments;
 
@@ -820,10 +822,23 @@ struct Mxfp8A2ALhsInputCommT {
     const auto& p = a.params;
     if (!supported_geometry(p.gemm, p.route)) return cudaErrorNotSupported;
     const int peer_k = p.gemm.k / p.route.world_size;
+    // Compute-assisted W production permits a larger immediate A cohort.
+    // Compare four 48-KiB and six 32-KiB slots in the same 192-KiB allocation.
+    // Keep four when row rounding would lose resident payload (e.g. peer-K
+    // 1536: 4*48KiB versus 6*24KiB). This is a capacity rule, not a fitted
+    // bandwidth prediction. Each cohort keeps its private slots until exit.
+    a.bulk_slots = kA2ALhsBulkSlots;
+    if (a.weights.all_ctas) {
+      int old_rows = kReadyBlockM, rows = kReadyBlockM;
+      while (old_rows * peer_k > kA2ALhsBulkStageBytes) old_rows /= 2;
+      while (rows * peer_k > 32 * 1024) rows /= 2;
+      if (6 * rows > kA2ALhsBulkSlots * old_rows) a.bulk_slots = 6;
+    }
+    a.bulk_stage_bytes = kA2ALhsBulkSlots * kA2ALhsBulkStageBytes / a.bulk_slots;
     a.comm_rows = kReadyBlockM;
-    while (a.comm_rows * peer_k > kA2ALhsBulkStageBytes) a.comm_rows /= 2;
+    while (a.comm_rows * peer_k > a.bulk_stage_bytes) a.comm_rows /= 2;
     a.input_order.ready_group_m_tiles = std::max(1,
-        p.num_comm_ctas * kA2ALhsBulkSlots / arrivals_per_peer(a));
+        p.num_comm_ctas * a.bulk_slots / arrivals_per_peer(a));
     a.source_scales = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(
         p.route.batch * p.route.global_seq, p.gemm.n, peer_k, 1));
     a.destination_scales = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
@@ -857,14 +872,15 @@ struct Mxfp8A2ALhsInputCommT {
       // Communication CTAs start A immediately; their W cohort and all compute
       // warps share one dense, exclusive chunk assignment:
       //
-      // comm W workers [0, C*4)       -> W panels --+
-      // compute workers [C*4, C*4+G*8) -> W -> GEMM| (same full-panel ready)
+      // comm W workers [0, C*W)       -> W panels --+
+      // compute workers [C*W, C*W+G*8) -> W -> GEMM| (same full-panel ready)
       // comm A workers               -> A -------+
+      // W = 8 - bulk_slots; all A workers start immediately.
       //
       // Each compute CTA enters GEMM after its own contribution, not a grid
       // join. The unchanged aggregated acq_rel publication includes EVERY
       // panel contributor, so an early CTA cannot consume incomplete weights.
-      const int first_compute_worker = p.params.num_comm_ctas * kWeightQuantWarps;
+      const int first_compute_worker = p.params.num_comm_ctas * (kMinThreads / 32 - p.bulk_slots);
       const int worker = first_compute_worker +
           (int(blockIdx.x) - p.params.num_comm_ctas) * (kMinThreads / 32) + threadIdx.x / 32;
       const int workers = first_compute_worker + p.input_order.compute_ctas * (kMinThreads / 32);
@@ -881,8 +897,8 @@ struct Mxfp8A2ALhsInputCommT {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     // Independent producer queues inside the existing communication CTA:
     //
-    //   warp 0..3: A data + SFA -> complete (M,peer) ready --+
-    //   warp 4..7: W quantize  -> complete N-panel ready ---+-> GEMM(M,N)
+    //   warp [0, slots): A + SFA -> complete (M,peer) ready --+
+    //   warp [slots, 8): W      -> complete N-panel ready ---+-> GEMM(M,N)
     //
     // Normally only the quantization cohort owns W chunks. With all-CTA help,
     // compute startup workers extend the dense IDs after this cohort, so each
@@ -892,16 +908,20 @@ struct Mxfp8A2ALhsInputCommT {
     // never waits for W. Do not add a CTA barrier between these unequal loops.
     // Both still share hardware resources; this removes a scheduling dependency,
     // not memory-system contention. GEMM CTAs and all ready units are unchanged.
-    if (warp >= kA2ALhsBulkSlots) {
-      const int workers = comm_ctas * kWeightQuantWarps +
+    // There is no W-to-A handoff: an initial ready unit never depends on a
+    // copy worker that must first finish quantization. Both cohorts keep the
+    // same static ownership/stride throughout; no extra queue or barrier.
+    if (warp >= a.bulk_slots) {
+      const int weight_warps = kMinThreads / 32 - a.bulk_slots;
+      const int workers = comm_ctas * weight_warps +
           (a.weights.all_ctas ? a.input_order.compute_ctas * (kMinThreads / 32) : 0);
       Mxfp8WeightProducer weights(a.weights, a.producer_order, {},
-          comm_id * kWeightQuantWarps + warp - kA2ALhsBulkSlots,
+          comm_id * weight_warps + warp - a.bulk_slots,
           workers);
       weights.drain();
       return;
     }
-    auto* stage = smem + warp * kA2ALhsBulkStageBytes;
+    auto* stage = smem + warp * a.bulk_stage_bytes;
     if (lane == 0) {
       cute::prefetch_tma_descriptor(&a.store_tma);
     }
@@ -922,7 +942,7 @@ struct Mxfp8A2ALhsInputCommT {
     // W's independently draining cohort cannot abandon work when A is short.
     // First-use order is a priority, not a cross-worker completion barrier.
     for (int64_t task = int64_t{warp} * comm_ctas + comm_id;
-         task < tasks; task += int64_t{comm_ctas} * kA2ALhsBulkSlots) {
+         task < tasks; task += int64_t{comm_ctas} * a.bulk_slots) {
 #if FUSE_ENABLE_PROFILING
       A2ALhsCommStageSample<Instrumented> sample{};
       if constexpr (Instrumented) {
