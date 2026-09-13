@@ -13,6 +13,7 @@
 
 namespace fuse {
 struct GemmA2AParams;
+struct Mxfp8GemmA2AParams;
 namespace detail {
 
 // One writer: lane zero of the issuing epilogue warp, indexed by physical
@@ -71,6 +72,16 @@ cudaError_t launch_qkv_epilogue_telemetry(
 
 cudaError_t query_qkv_epilogue_resources(
     const GemmA2AParams& params, QkvEpilogueResources* resources);
+
+// MXFP8 N256/K128/E32 uses the same store/drain observer and record schema.
+// Dynamic weight preparation remains inside the measured fused boundary;
+// this diagnostic accepts explicit budgets and ordinary QKV without postprocessing.
+cudaError_t launch_qkv_epilogue_telemetry(
+    const Mxfp8GemmA2AParams& params,
+    A2AGemmCtaTimeline* timeline, int32_t timeline_capacity,
+    QkvEpilogueRecord* records, int32_t record_capacity, cudaStream_t stream);
+cudaError_t query_qkv_epilogue_resources(
+    const Mxfp8GemmA2AParams& params, QkvEpilogueResources* resources);
 
 #if defined(__CUDACC__)
 CUTLASS_DEVICE uint64_t epilogue_timestamp() {

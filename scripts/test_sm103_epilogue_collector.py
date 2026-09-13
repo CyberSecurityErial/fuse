@@ -55,7 +55,15 @@ class EpilogueCollectorContracts(unittest.TestCase):
 #define CUDA_CHECK(value) CHECK((value)==0)
 constexpr int kWarmup=10, kSamples=50;
 enum class Direction { kQkv, kOproj };
-namespace fuse { struct GemmA2AParams {}; }
+namespace fuse {
+struct GemmA2AParams { const void* lhs=nullptr; };
+struct Mxfp8GemmA2AParams {
+  GemmA2AParams projection;
+  void* workspace=nullptr;
+  size_t workspace_bytes=0;
+  int activation=0, weight_preparation=0, epilogue_n=32;
+};
+}
 struct Options {
   bool qkv_epilogue_probe=true, profile=true;
   std::string profile_detail="cta", host_launch="per_gpu_thread";
@@ -66,6 +74,9 @@ struct RankRuntime {
   int device=0, sm_count=8;
   cudaStream_t stream=nullptr;
   fuse::GemmA2AParams qkv;
+  void* mxfp8_workspace=nullptr;
+  size_t mxfp8_workspace_bytes=0;
+  int mxfp8_activation=0, mxfp8_weight_preparation=0, mxfp8_epilogue_n=32;
   fuse::A2AGemmCtaTimeline* timeline=nullptr;
   fuse::detail::QkvEpilogueRecord* qkv_epilogue=nullptr;
   uint32_t simulated_ready=17;
@@ -104,6 +115,12 @@ cudaError_t query_qkv_epilogue_resources(const GemmA2AParams&,QkvEpilogueResourc
   }
   if (scenario=="resources") result->tile_n=128;
   return 0;
+}
+cudaError_t query_qkv_epilogue_resources(const Mxfp8GemmA2AParams& p,QkvEpilogueResources* result) {
+  CHECK(p.epilogue_n==32 && p.projection.lhs==nullptr);
+  auto status=query_qkv_epilogue_resources(p.projection,result);
+  result->tile_k=128;
+  return status;
 }
 }
 void corrupt(fuse::detail::QkvEpilogueRecord& r,fuse::A2AGemmCtaTimeline& t,
@@ -211,6 +228,24 @@ int main(int argc,char** argv) {
             text=True, capture_output=True)
         if result.returncode:
             raise AssertionError(result.stderr)
+        cls.mxfp8_probe = directory / "collector-mxfp8"
+        result = subprocess.run([*compiler, "-std=c++17", "-DFUSE_ENABLE_PROFILING=1",
+            "-DFUSE_BENCH_MXFP8=1", "-Wall", "-Wextra", "-Werror", "-I", str(directory),
+            "-I", str(ROOT), "-I", str(ROOT / "include"), str(path), "-o", str(cls.mxfp8_probe)],
+            text=True, capture_output=True)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+
+    def test_mxfp8_uses_same_collector_with_k128_and_rejects_incomplete_records(self):
+        for world in (4, 8):
+            for scenario in ('normal', 'count', 'order', 'epoch', 'overflow', 'resources'):
+                with self.subTest(world=world, scenario=scenario):
+                    result = subprocess.run([str(self.mxfp8_probe), scenario, str(world)],
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, int(scenario != 'normal'), result.stderr)
+                    if scenario == 'normal':
+                        self.assertIn('tile_k=128,performance_accepted=0', result.stdout)
+                        self.assertIn('PASS launches=181 epoch=198', result.stdout)
 
     def run_probe(self, scenario="normal", world=4):
         return subprocess.run([str(self.probe), scenario, str(world)],

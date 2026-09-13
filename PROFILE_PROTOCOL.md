@@ -316,6 +316,21 @@ GPU 编号为 trace 的逻辑 rank，不是 PCI ordinal。local G2S 两端在同
 
 ### SM103 MXFP8 QKV 权重量化诊断
 
+`--qkv-epilogue-probe --profile-detail cta` 还可单独检查 MXFP8
+N256/K128/E32 的输出发布（显式 CTA 预算，无 norm/RoPE）。它复用 BF16 的
+`QkvEpilogueProbe` 和96字节 `QkvEpilogueRecord`，动态权重量化仍在 kernel 内。
+三个模式 production/role/epilogue 分别10次预热、交替顺序50次诊断采样，
+各模式最后样本独立完整校验；另一个明确 epoch 记录所有计算 CTA 的汇总。
+`store_ns_sum` 含 CUTLASS 内部 accumulator wait；`drain_ns_sum` 是发起
+epilogue warp 的完整目的写入等待及 warp join，不是纯 NVLink 延迟。
+两项只在同一 CTA 内与其角色时间比较，不跨 CTA 相加当关键路径。
+Perfetto 将该 epoch 放在独立 GPU process 下，不能与较早的完整角色 trace
+叠放。只有首 tile 的 store/drain/publish 有真实绝对时间；全部 tile 的累计
+值只作为角色条带元数据，不伪造连续子条带。正常生产构建不实例化此探针。
+该选项不分配/采集逐权重量化与 W-ready 数组；日志明确记录
+`profile_mxfp8_scope,profile_detail=cta,quantization_records=0,reason=epilogue_only`。
+量化工作仍在完整边界内，只是不采其内部时间。普通 MXFP8 profile 不受影响。
+
 沿用上面的 QKV CTA/warp、route 三阶段、finalize 与独立 GPU 时钟原点。
 激活在入口已是 MXFP8；本 trace 包含持久化 kernel 内 BF16 master weight 的
 量化，不包含上游激活量化。`FUSE_ENABLE_PROFILING=OFF` 时无这些记录与打点。

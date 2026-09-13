@@ -636,9 +636,17 @@ Options parse_options(int argc, char** argv) {
       options.profile_direction != "oproj" || options.oproj_pipeline_probe || fused_mpi::enabled)) {
     throw std::runtime_error("OProj gap probe requires standalone full OProj profiling without the K-stage probe");
   }
-  if (options.qkv_epilogue_probe && (!options.profile || options.profile_detail != "cta" ||
-                                    options.qkv_policy_list.front() != "m128n256k64e32")) {
-    throw std::runtime_error("--qkv-epilogue-probe requires --profile --profile-detail cta and QKV m128n256k64e32");
+  if (options.qkv_epilogue_probe) {
+    const bool supported = options.profile && options.profile_detail == "cta" &&
+#if FUSE_BENCH_MXFP8
+        options.qkv_policy_list.front() == "m128n256" && options.mxfp8_epilogue_n == 32 &&
+        options.qkv_postprocess == "none" && options.fused_direction == "qkv" &&
+        !options.mxfp8_prequantized && !fused_mpi::enabled;
+#else
+        options.qkv_policy_list.front() == "m128n256k64e32";
+#endif
+    if (!supported)
+      throw std::runtime_error("--qkv-epilogue-probe requires CTA-only QKV N256/E32 profiling with its precision-specific K tile");
   }
   if (options.calibrate && (options.profile || options.validation_self_test)) {
     throw std::runtime_error("--calibrate is mutually exclusive with --profile and --validation-self-test");
@@ -1330,12 +1338,17 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
     if (options.profile && (!options.mxfp8_service_probe || rank == 0)) {
       runtime.timeline = allocate<fuse::A2AGemmCtaTimeline>(runtime, runtime.sm_count);
 #if FUSE_BENCH_MXFP8
+      // The epilogue-only observer needs no per-weight/per-panel arrays.
+      // Keep ordinary MXFP8 profiling unchanged: this bounded observer must
+      // not collect an unrelated large quantization trace.
+      if (!options.qkv_epilogue_probe) {
       const int quant_n = options.run_oproj() ? options.hidden : options.projection_width();
       const int quant_k = options.run_oproj() ? options.q_width() : options.hidden;
       runtime.mxfp8_probe.quant_capacity = ceil_div(quant_n, 256) * (256 * (quant_k / 32) / 32);
       runtime.mxfp8_probe.wait_capacity = ceil_div(options.seq_local, 128) * ceil_div(quant_n, 256);
       runtime.mxfp8_probe.quant = allocate<fuse::Mxfp8QuantRecord>(runtime, runtime.mxfp8_probe.quant_capacity);
       runtime.mxfp8_probe.waits = allocate<fuse::Mxfp8WaitRecord>(runtime, runtime.mxfp8_probe.wait_capacity);
+      }
 #endif
       if (options.qkv_epilogue_probe) {
         runtime.qkv_epilogue = allocate<fuse::detail::QkvEpilogueRecord>(runtime, runtime.sm_count);
@@ -1875,7 +1888,10 @@ void enqueue_operation(const RankLaunch& job, int rank) {
     params.projection.lhs = nullptr; // Prove the fused input is the MXFP8 view.
     params.postprocess = runtime.qkv_postprocess;
 #if FUSE_ENABLE_PROFILING
-    if (job.profile) CUDA_CHECK(fuse::launch_gemm_a2a_mxfp8_role_telemetry(
+    if (job.qkv_epilogue_probe) CUDA_CHECK(fuse::detail::launch_qkv_epilogue_telemetry(
+        params, runtime.timeline, runtime.sm_count,
+        runtime.qkv_epilogue, runtime.sm_count, runtime.stream));
+    else if (job.profile) CUDA_CHECK(fuse::launch_gemm_a2a_mxfp8_role_telemetry(
         params, runtime.timeline, runtime.sm_count, runtime.stream,
         runtime.mxfp8_probe, runtime.qkv_route_timeline, runtime.qkv_route_capacity));
     else
@@ -2880,15 +2896,28 @@ void profile_qkv_epilogue(std::vector<RankRuntime>& runtimes, const Options& opt
   }
   constexpr const char* modes[] = {"production", "role_telemetry", "epilogue_telemetry"};
   using Resources = fuse::detail::QkvEpilogueResources;
+#if FUSE_BENCH_MXFP8
+  constexpr int tile_k = 128;
+#else
+  constexpr int tile_k = 64;
+#endif
   for (int rank = 0; rank < options.world; ++rank) {
     auto& runtime = runtimes[rank];
     CUDA_CHECK(cudaSetDevice(runtime.device));
     Resources resources{};
+#if FUSE_BENCH_MXFP8
+    fuse::Mxfp8GemmA2AParams packed{runtime.qkv, runtime.mxfp8_workspace,
+        runtime.mxfp8_workspace_bytes, runtime.mxfp8_activation,
+        runtime.mxfp8_weight_preparation, runtime.mxfp8_epilogue_n};
+    packed.projection.lhs = nullptr;
+    CUDA_CHECK(fuse::detail::query_qkv_epilogue_resources(packed, &resources));
+#else
     CUDA_CHECK(fuse::detail::query_qkv_epilogue_resources(runtime.qkv, &resources));
+#endif
     const cudaFuncAttributes attributes[] = {
         resources.production, resources.role_telemetry, resources.epilogue_telemetry};
     if (resources.dynamic_smem_bytes <= 0 || resources.tile_m != 128 ||
-        resources.tile_n != 256 || resources.tile_k != 64 || resources.cluster_ctas != 1) {
+        resources.tile_n != 256 || resources.tile_k != tile_k || resources.cluster_ctas != 1) {
       throw std::runtime_error("unexpected QKV epilogue diagnostic resources");
     }
     for (int mode = 0; mode < 3; ++mode) {
@@ -2908,7 +2937,7 @@ void profile_qkv_epilogue(std::vector<RankRuntime>& runtimes, const Options& opt
                 << ",static_smem=" << attr.sharedSizeBytes
                 << ",dynamic_smem=" << resources.dynamic_smem_bytes
                 << ",max_threads=" << attr.maxThreadsPerBlock << ",cluster_ctas=1"
-                << ",tile_m=128,tile_n=256,tile_k=64,performance_accepted=0\n";
+                << ",tile_m=128,tile_n=256,tile_k=" << tile_k << ",performance_accepted=0\n";
     }
   }
   auto clear = [&]() {
@@ -3201,9 +3230,9 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
       auto& runtime = runtimes[rank];
       CUDA_CHECK(cudaMemsetAsync(runtime.timeline, 0, runtime.sm_count * sizeof(*runtime.timeline), runtime.stream));
 #if FUSE_BENCH_MXFP8
-      CUDA_CHECK(cudaMemsetAsync(runtime.mxfp8_probe.quant, 0,
+      if (runtime.mxfp8_probe.quant) CUDA_CHECK(cudaMemsetAsync(runtime.mxfp8_probe.quant, 0,
           runtime.mxfp8_probe.quant_capacity * sizeof(fuse::Mxfp8QuantRecord), runtime.stream));
-      CUDA_CHECK(cudaMemsetAsync(runtime.mxfp8_probe.waits, 0,
+      if (runtime.mxfp8_probe.waits) CUDA_CHECK(cudaMemsetAsync(runtime.mxfp8_probe.waits, 0,
           runtime.mxfp8_probe.wait_capacity * sizeof(fuse::Mxfp8WaitRecord), runtime.stream));
 #endif
       if (runtime.qkv_route_timeline) {
@@ -3291,7 +3320,9 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
         ? fuse::mxfp8_oproj_cutlass_kernel_traits(runtime.mxfp8_epilogue_n, runtime.mxfp8_oproj.overlap_postnorm)
         : fuse::mxfp8_qkv_cutlass_kernel_traits(runtime.mxfp8_epilogue_n);
     const int weight_panels = ceil_div(direction == Direction::kOproj ? options.hidden : options.projection_width(), 256);
-    const auto quant = download(runtime.mxfp8_probe.quant, runtime.mxfp8_probe.quant_capacity);
+    const auto quant = runtime.mxfp8_probe.quant
+        ? download(runtime.mxfp8_probe.quant, runtime.mxfp8_probe.quant_capacity)
+        : std::vector<fuse::Mxfp8QuantRecord>{};
     for (int i = 0; i < static_cast<int>(quant.size()); ++i) {
       const auto& r = quant[i];
       if (!r.begin) continue; // Only native padding beyond the final N panel can be absent.
@@ -3303,7 +3334,9 @@ void profile(std::vector<RankRuntime>& runtimes, const Options& options, Directi
                 << ",arrival_done=" << r.arrival_done
                 << ",end=" << r.end << ",release=" << r.release << '\n';
     }
-    const auto waits = download(runtime.mxfp8_probe.waits, runtime.mxfp8_probe.wait_capacity);
+    const auto waits = runtime.mxfp8_probe.waits
+        ? download(runtime.mxfp8_probe.waits, runtime.mxfp8_probe.wait_capacity)
+        : std::vector<fuse::Mxfp8WaitRecord>{};
     for (int i = 0; i < static_cast<int>(waits.size()); ++i) {
       const auto& r = waits[i];
       if (!r.begin) continue; // Repeated N panel uses reuse the mainloop's acquired panel.
@@ -3964,6 +3997,11 @@ int main(int argc, char** argv) {
       fused_mpi::root_output() << ",collector=mpi_graph_rank_events_v1,graph_epoch_mode=recapture_update_v1";
     }
     fused_mpi::root_output() << '\n' << std::flush;
+    if (options.qkv_epilogue_probe) {
+#if FUSE_BENCH_MXFP8
+      fused_mpi::root_output() << "profile_mxfp8_scope,profile_detail=cta,quantization_records=0,reason=epilogue_only\n";
+#endif
+    }
     std::vector<RankRuntime> runtimes;
     {
       StageTimer timer{"setup", options.input_generator == "gpu_philox"

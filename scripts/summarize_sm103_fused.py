@@ -882,8 +882,9 @@ def audit_host_stages(rows, validations, world, host_launch):
             'performance_accepted': False, 'groups': groups}
 
 
-def audit_epilogue(rows, validations, host_stages, shape, sm_counts, comm, host_launch, *, legacy_join=False):
+def audit_epilogue(rows, validations, host_stages, shape, sm_counts, comm, host_launch, *, legacy_join=False, tile_k=64):
     """Bounded single-process diagnostics, never accepted benchmark samples."""
+    require(tile_k in (64, 128), 'Unsupported epilogue diagnostic K tile')
     world = shape['world']
     for row in rows:
         fields = set(EPILOGUE_FIELDS[row['kind']]) | {'kind', 'line'}
@@ -911,7 +912,7 @@ def audit_epilogue(rows, validations, host_stages, shape, sm_counts, comm, host_
                 row['drain_interval'] == 'issuing_warp_global_wait_and_warp_join' and
                 count(row, 'record_bytes') == 96 and count(row, 'regs', 1) > 0 and
                 count(row, 'max_threads', 256) >= 256 and count(row, 'cluster_ctas') == 1 and
-                (count(row, 'tile_m'), count(row, 'tile_n'), count(row, 'tile_k')) == (128, 256, 64),
+                (count(row, 'tile_m'), count(row, 'tile_n'), count(row, 'tile_k')) == (128, 256, tile_k),
                 'Epilogue resource geometry/semantics mismatch')
         count(row, 'local_bytes')  # Nonzero spills are reported, not hidden or rejected.
         count(row, 'static_smem')

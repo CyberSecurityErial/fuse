@@ -765,6 +765,30 @@ int main() {
             with self.subTest(change=change), self.assertRaises(ValueError):
                 l20d.validate_job(job | change)
 
+    def test_mxfp8_epilogue_probe_reuses_cta_observer_without_changing_boundary(self):
+        job = self.fused_job(mxfp8=True, profile=True, profile_detail='cta',
+            qkv_epilogue_probe=True, mpi=False, world=8, directions='qkv',
+            fused_direction='qkv', fused_launch='eager', qkv_policy='m128n256',
+            qkv_raster='along_m', max_swizzle_size=8, seq_local=16384,
+            hidden=2048, q_heads=16, kv_heads=8, mxfp8_epilogue_n=32,
+            comm_sm=16, host_launch='per_gpu_thread', mxfp8_weight_preparation='all')
+        l20d.validate_job(job)
+        self.assertIn('--qkv-epilogue-probe', l20d.fused_argv(job))
+        for change in ({'mxfp8_epilogue_n': 64}, {'qkv_postprocess': 'rope'},
+                       {'profile_detail': 'full'}, {'mpi': True}, {'fused_direction': 'oproj'},
+                       {'mxfp8_prequantized': True}, {'qkv_policy': 'm128n256k64e32'}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                l20d.validate_job(job | change)
+        source = (l20d.REPO / 'csrc/operators/sm103/api/forward_mxfp8.cuh').read_text()
+        probe = source.split('using Mxfp8EpilogueProbeTypes', 1)[1].split('}  // namespace detail', 1)[0]
+        self.assertIn('QkvEpilogueProbe<', probe)
+        self.assertIn('Mxfp8WeightProducer, true>', probe)
+        self.assertIn('Mxfp8ProjectionInput{p, workspace, true}', probe)
+        self.assertNotIn('store_release', probe)  # Original observer owns publication.
+        self.assertNotIn('tma_store_wait', probe)  # No copied/new synchronization path.
+        self.assertLess(l20d.fused_device_memory(job)['profile_bytes'],
+                        l20d.fused_device_memory(job | {'qkv_epilogue_probe': False})['profile_bytes'])
+
     def test_mxfp8_service_probe_is_isolated_profile_artifact(self):
         job = self.fused_job(mxfp8=True, mxfp8_service_probe=True, profile=True,
             mpi=False, world=8, directions='qkv', fused_direction='qkv', fused_launch='eager',

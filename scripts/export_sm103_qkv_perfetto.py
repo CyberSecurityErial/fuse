@@ -321,6 +321,59 @@ def reorder_trace(path):
     print(f'Grouped {path.name}: {count} existing events preserved')
 
 
+def append_epilogue_events(events, log_path, job):
+    """Separate epoch/processes: never overlay aggregate samples on the role trace.
+
+    Only the FIRST tile has absolute phase timestamps. Per-CTA lifetime sums
+    stay metadata; laying those sums out as invented contiguous spans would
+    hide the gaps and misrepresent overlap.
+    """
+    world, comm = int(job['world']), int(job['comm_sm'])
+    with log_path.open() as stream:
+        rows = [dict(part.split('=', 1) for part in line.strip().split(',')[1:])
+                for line in stream if line.startswith('epilogue_cta,')]
+    seen = set()
+    for row in rows:
+        key = int(row['rank']), int(row['cta'])
+        assert key not in seen and 0 <= key[0] < world and comm <= key[1] < 148
+        seen.add(key)
+        assert row['schema'] == 'qkv_epilogue_cta_v1' and row['performance_accepted'] == '0'
+    for rank in range(world):
+        selected = [r for r in rows if int(r['rank']) == rank]
+        assert selected, 'Missing epilogue diagnostic rank'
+        origin = min(int(r['cta_start']) for r in selected)
+        epochs = {r['epoch'] for r in selected}
+        assert len(epochs) == 1, 'Mixed epilogue epochs'
+        pid = world + rank
+        events.append(dict(ph='M', name='process_name', pid=pid,
+            args=dict(name=f'GPU rank {rank}: separate epilogue epoch {next(iter(epochs))}')))
+        for row in selected:
+            cta = int(row['cta'])
+            fields = ('cta_start', 'first_store_begin', 'first_store_end', 'first_drain_end',
+                      'first_ready_after', 'last_ready_after', 'cta_role_done', 'cta_end')
+            times = [int(row[k]) for k in fields]
+            assert times == sorted(times) and times[0] >= origin
+            start, store, returned, drained, published, _, done, _ = times
+            sums = {k: int(row[k]) for k in ('store_ns_sum', 'drain_ns_sum', 'tile_count')}
+            assert sums['tile_count'] > 0 and sums['store_ns_sum'] + sums['drain_ns_sum'] <= done - start
+            for offset, name in ((0, 'GEMM role'), (1, 'First tile: store / drain / publish')):
+                events.append(dict(ph='M', name='thread_name', pid=pid, tid=cta*2+offset,
+                                   args=dict(name=f'CTA {cta}: {name}')))
+                events.append(dict(ph='M', name='thread_sort_index', pid=pid, tid=cta*2+offset,
+                                   args=dict(sort_index=cta*2+offset)))
+            spans = ((0, 'GEMM role (separate epilogue epoch)', start, done, sums),
+                     (1, 'CUTLASS store (includes accumulator wait)', store, returned, {}),
+                     (1, 'Destination completion + issuing warp join', returned, drained, {}),
+                     (1, 'Publish complete output tile', drained, published, {}))
+            for offset, name, begin, end, args in spans:
+                events.append(dict(ph='X', cat='fuse.qkv.epilogue', name=name, pid=pid,
+                    tid=cta*2+offset, ts=(begin-origin)/1000, dur=(end-begin)/1000,
+                    args=dict(args, epoch=int(row['epoch']), m=int(row['first_m_tile']),
+                              n=int(row['first_n_tile']), diagnostic_only=True)))
+    return dict(records=len(rows), scope='separate epoch; only first-tile phases have absolute timestamps',
+                aggregate_sums='metadata only, not contiguous time intervals')
+
+
 def export(run, output):
     receipt = json.loads((run / 'fetched.json').read_text())
     assert receipt['state'] == 'succeeded' and receipt['exit_code'] == 0
@@ -335,9 +388,10 @@ def export(run, output):
     log_path = control / 'attempt1.log'
     with log_path.open() as stream:
         selected = [line for line in stream if line.startswith(
-            ('profile_cta,', 'profile_host,', 'profile_qkv_order,', 'candidate_verified,', 'PASS:'))]
+            ('profile_cta,', 'profile_host,', 'profile_qkv_order,', 'profile_mxfp8_scope,', 'candidate_verified,', 'PASS:'))]
     assert any('and diagnostic timelines' in line for line in selected)
     assert any('candidate_verified,GEMM_A2A' in line for line in selected)
+    epilogue_only = [line.strip() for line in selected if line.startswith('profile_mxfp8_scope,')]
     records, hosts, orders = {}, {}, {}
     for line in selected:
         if line.startswith('profile_qkv_order,'):
@@ -442,10 +496,19 @@ def export(run, output):
         transfer_endpoints=TRANSFER_ENDPOINTS))
     group_role_tracks(events, comm, bool(job.get('mxfp8')), route_warps, weight_schedule)
     quant_ends = {}
-    if job.get('mxfp8'):
+    if epilogue_only:
+        assert epilogue_only == ['profile_mxfp8_scope,profile_detail=cta,quantization_records=0,reason=epilogue_only']
+        assert job.get('mxfp8') and job.get('qkv_epilogue_probe') and profile_detail == 'cta'
+        with log_path.open() as stream:
+            assert not any(line.startswith(('profile_mxfp8_quant,', 'profile_mxfp8_wait,')) for line in stream)
+        payload['metadata']['mxfp8'] = dict(quantization_recorded=False, scope='epilogue_only',
+            includes_dynamic_weight_quantization=True)
+    elif job.get('mxfp8'):
         payload['metadata']['mxfp8'] = append_mxfp8_events(
             events, log_path, job, origins, records, route_warps, weight_schedule, quant_ends)
         payload['metadata']['track_layout'] = 'role_then_own_warp_route_and_quantization_v1'
+    if job.get('qkv_epilogue_probe'):
+        payload['metadata']['epilogue'] = append_epilogue_events(events, log_path, job)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Stream tile events: largest traces have over a million spans. Do not
     # retain a second full trace/log object in RAM during export.

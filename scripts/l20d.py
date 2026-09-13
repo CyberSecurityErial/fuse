@@ -320,7 +320,7 @@ def fused_device_memory(job):
         # Current peer events fit in 256 bytes; 1 MiB also covers CTA records.
         # Update this allowance if the profiling record/layout contract changes.
         profile_bytes = (0 if job.get('profile_detail') == 'cta' else peer_capacity * 256) + (1 << 20)
-        if job.get('mxfp8'):
+        if job.get('mxfp8') and not job.get('qkv_epilogue_probe'):
             # Mxfp8QuantRecord includes publication timestamps and the aggregated
             # chunk contribution (72 bytes); Mxfp8WaitRecord remains 24 bytes.
             quant_n, quant_k = (h, q) if not qkv else (p, h)
@@ -611,9 +611,12 @@ def validate_job(job, hostname=None):
         raise ValueError('QKV epilogue probe must be a boolean')
     if job.get('qkv_epilogue_probe'):
         _, qkv, _ = fused_candidates(job)
+        expected = ['m128n256'] if job.get('mxfp8') else ['m128n256k64e32']
         if (job['stage'] != 'fused-smoke' or not job.get('profile') or
-                job.get('profile_detail') != 'cta' or qkv != ['m128n256k64e32']):
-            raise ValueError('QKV epilogue probe requires fused-smoke --profile --profile-detail cta and QKV m128n256k64e32')
+                job.get('profile_detail') != 'cta' or qkv != expected or
+                (job.get('mxfp8') and (job.get('fused_direction') != 'qkv' or
+                    job.get('mxfp8_epilogue_n') != 32 or job.get('qkv_postprocess') not in (None, 'none')))):
+            raise ValueError('QKV epilogue probe requires CTA-only N256/E32 profiling with the precision-specific K tile')
     if job.get('rebuild') and job['stage'] != 'fused-build':
         raise ValueError('Explicit rebuild is only valid for fused-build')
     if job['stage'] == 'baseline-replay':

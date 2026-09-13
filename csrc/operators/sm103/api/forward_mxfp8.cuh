@@ -470,6 +470,69 @@ __global__ void qkv_postprocess_reference_kernel(GemmA2AParams p, QkvPostprocess
 
 }  // namespace
 
+#if FUSE_ENABLE_PROFILING
+namespace detail {
+// Reuse the BF16 diagnostic's exact store/drain/publish bridge, not a new
+// signaling implementation. Only the CUTLASS operand/mainloop family differs.
+using Mxfp8EpilogueProbeTypes = Mxfp8GemmFamily<256, 128, 32>;
+using Mxfp8EpilogueProbeGemm = cutlass::gemm::kernel::GemmUniversal<
+    ProblemShape, WeightReadyMainloop<typename Mxfp8EpilogueProbeTypes::Mainloop>,
+    QkvEpilogueProbe<typename Mxfp8EpilogueProbeTypes::Epilogue,
+                     typename Mxfp8EpilogueProbeTypes::TileShape>,
+    MonolithicPersistentScheduler>;
+using Mxfp8EpilogueProbeKernel = InputProductionKernel<
+    GemmA2ARoleTelemetryKernel<Mxfp8EpilogueProbeGemm, Mxfp8QkvGqaPackComm, true>,
+    Mxfp8WeightProducer, true>;
+
+cudaError_t launch_qkv_epilogue_telemetry(
+    const Mxfp8GemmA2AParams& p, A2AGemmCtaTimeline* timeline, int32_t capacity,
+    QkvEpilogueRecord* records, int32_t record_capacity, cudaStream_t stream) {
+  if (p.epilogue_n != 32 || p.postprocess.enabled() || p.projection.num_comm_ctas <= 0 ||
+      p.projection.route.qkv_peer_interleaved) return cudaErrorNotSupported;
+  Mxfp8Workspace workspace;
+  auto status = validate_mxfp8(p, &workspace);
+  if (status != cudaSuccess) return status;
+  return launch_gemm_a2a_impl<Mxfp8EpilogueProbeGemm, Mxfp8EpilogueProbeKernel,
+      Mxfp8QkvGqaPackComm, true, true, Mxfp8ProjectionInput>(
+          p.projection, stream, timeline, capacity, records, record_capacity,
+          nullptr, 0, Mxfp8ProjectionInput{p, workspace, true});
+}
+
+cudaError_t query_qkv_epilogue_resources(
+    const Mxfp8GemmA2AParams& p, QkvEpilogueResources* resources) {
+  if (!resources) return cudaErrorInvalidValue;
+  if (p.epilogue_n != 32 || p.postprocess.enabled() || p.projection.num_comm_ctas <= 0 ||
+      p.projection.route.qkv_peer_interleaved) return cudaErrorNotSupported;
+  Mxfp8Workspace workspace;
+  auto status = validate_mxfp8(p, &workspace);
+  if (status != cudaSuccess) return status;
+  DeviceInfo info{};
+  status = device_info(&info);
+  if (status != cudaSuccess) return status;
+  using Binding = Mxfp8QkvBinding<32>;
+  using Production = InputProductionKernel<typename Binding::Kernel, Mxfp8WeightProducer>;
+  using Role = InputProductionKernel<typename Binding::TelemetryKernel, Mxfp8WeightProducer, true>;
+  QkvEpilogueResources result{};
+  status = cudaFuncGetAttributes(&result.production, cutlass::device_kernel<Production>);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncGetAttributes(&result.role_telemetry, cutlass::device_kernel<Role>);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncGetAttributes(&result.epilogue_telemetry, cutlass::device_kernel<Mxfp8EpilogueProbeKernel>);
+  if (status != cudaSuccess) return status;
+  size_t dynamic_smem = 0;
+  status = launch_shared_memory<Mxfp8EpilogueProbeKernel>(info, &dynamic_smem);
+  if (status != cudaSuccess) return status;
+  result.dynamic_smem_bytes = static_cast<int32_t>(dynamic_smem);
+  result.tile_m = 128;
+  result.tile_n = 256;
+  result.tile_k = 128;
+  result.cluster_ctas = cute::size(typename Mxfp8EpilogueProbeKernel::ClusterShape{});
+  *resources = result;
+  return cudaSuccess;
+}
+}  // namespace detail
+#endif
+
 KernelTraits mxfp8_qkv_cutlass_kernel_traits(int32_t epilogue_n) {
   if (epilogue_n == 32) return kernel_traits<detail::InputProductionKernel<
       Mxfp8QkvBinding<32>::Kernel, Mxfp8WeightProducer>>();

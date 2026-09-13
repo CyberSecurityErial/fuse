@@ -11,10 +11,33 @@ from export_sm103_qkv_perfetto import (
     export, group_role_tracks, annotate_trace, annotate_transfer_events,
     append_mxfp8_events, MXFP8_PUBLICATION_PHASES, MXFP8_NO_SC_PUBLICATION_PHASES,
     resolve_route_schedule,
+    append_epilogue_events,
 )
 
 
 class QkvPerfettoTests(unittest.TestCase):
+    def test_epilogue_epoch_is_separate_and_sums_are_not_fake_intervals(self):
+        row = dict(rank=0, cta=1, epoch=199, schema='qkv_epilogue_cta_v1', performance_accepted=0,
+            cta_start=1000, first_store_begin=1100, first_store_end=1200, first_drain_end=1250,
+            first_ready_after=1260, last_ready_after=1900, cta_role_done=2000, cta_end=2100,
+            store_ns_sum=500, drain_ns_sum=200, tile_count=4, first_m_tile=0, first_n_tile=1)
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder)/'profile.log'
+            def run(values):
+                log.write_text('epilogue_cta,' + ','.join(f'{k}={v}' for k,v in values.items()) + '\n')
+                events = []
+                metadata = append_epilogue_events(events, log, dict(world=1, comm_sm=1))
+                return events, metadata
+            events, metadata = run(row)
+            self.assertEqual(metadata['records'], 1)
+            self.assertEqual({e['pid'] for e in events}, {1})  # Ordinary rank0 remains pid0.
+            spans = [e for e in events if e['ph'] == 'X']
+            self.assertEqual([e['dur'] for e in spans], [1, .1, .05, .01])
+            self.assertEqual(spans[0]['args']['drain_ns_sum'], 200)
+            self.assertEqual(len(spans), 4)  # No span invented from sum=200ns.
+            for values in (row | {'first_drain_end':1199}, row | {'drain_ns_sum':900}):
+                with self.assertRaises(AssertionError): run(values)
+
     def mxfp8_fixture(self, phases=None):
         job = dict(world=1, comm_sm=1, global_seq=128, q_heads=1, kv_heads=1, head_dim=128, hidden=128)
         records = {(0,c):dict(start=100,role_done=1000) for c in range(148)}

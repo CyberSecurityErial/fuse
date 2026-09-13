@@ -864,8 +864,9 @@ struct Mxfp8ServiceEpilogue : SignalingEpilogue<Base, TileShape> {
 // The original SignalingEpilogue above is deliberately unchanged. This
 // diagnostic adapter duplicates only its narrow store/drain/publish bridge,
 // calling the same CUTLASS Base::store and preserving the 32-lane drain.
-// It is instantiated only by the private N256/K64/e32 probe, not CTA-only
-// telemetry or production. No shared-memory storage is added.
+// It is instantiated only by private BF16 N256/K64/E32 and MXFP8
+// N256/K128/E32 probes, not ordinary CTA-only telemetry or production.
+// No shared-memory storage is added.
 template <class Base, class TileShape>
 struct QkvEpilogueProbe : SignalingEpilogue<Base, TileShape> {
   using Parent = SignalingEpilogue<Base, TileShape>;
