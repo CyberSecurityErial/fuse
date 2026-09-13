@@ -97,6 +97,26 @@ transport solution. Revert the extra route instantiation instead of retaining
 another inactive control. Source66cc5109/build163328-a75407 and runs
 `163708-e4948e`, `163731-702be9`, `163747-0277a3` retain the evidence.
 
+Two all-startup transport controls used six/seven route warps, each with two
+16KiB stages. Each complete-box store committed one group; wait.read<1> retired
+the previous stage before reuse, while the final full remote drain was kept.
+Multi-group row tails retained the original single-stage route. Seventeen
+candidates, including lifecycle/tail tests, passed the original full checks.
+Six warps retained the220160-byte production SMEM floor; seven required229504
+after the launch helper's128-byte rounding. The latter passed actual device
+capacity checks. A host assertion initially forgot that rounding; the already
+successful M128 result was reaudited, not rerun or relabelled a GPU failure.
+
+Neither raised the best result materially. Six/seven-warps' best throughput
+was Dense1.1933/1.1943P, Qwen3 2.0131/2.0198P, Llama405 2.2149/2.2231P.
+Dense C20 gained2.66/1.80%, but C8 lost10.68/7.08%. The transport/worker-count
+tradeoff is not a demonstrated solution. Both implementations, their temporary
+tests and all-mode telemetry refusal were reverted; accepted profiling remains
+unchanged. Builds164604-6c8b81 and165226-a0ab4c plus current JSON retain evidence.
+Before another route rewrite, bracket the intermediate communication budgets:
+the earlier all-startup scan used8/20/original comm-mode budget, not a dense
+search of the different all-startup service balance.
+
 ## Reusable historical work
 
 | Commit | Applicable work |
