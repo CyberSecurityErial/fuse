@@ -288,12 +288,14 @@ def append_mxfp8_events(events, log_path, job, origins, records, route_warps=8,
         aggregate_publications=len(worker_panels),
         quant_warp_sum_us=[v/1000 for v in sums],
         quant_workers=[dict(rank=rank, cta=cta, warp=warp, chunks=b['chunks'],
+            cta_role='communication' if cta < comm else 'compute',
             first_begin_us=(b['first']-origins[rank])/1000,
             last_end_us=(b['last']-origins[rank])/1000,
             after_last_quant_to_role_end_us=(int(records[rank,cta]['role_done'])-b['last'])/1000)
             for (rank,cta,warp),b in sorted(worker_bounds.items())],
         quant_worker_scope='GPU-local observed first/last chunks; post-quant tail is not necessarily idle: '
-                           'QKV can perform routing afterward, OProj independent W warps do not.',
+                           'QKV can route afterward; OProj compute CTAs can enter GEMM afterward. '
+                           'Only dedicated OProj communication W warps have no subsequent A/GEMM work.',
         interpretation='Warp-time sums overlap, not critical-path latency. Release stamp is after the store; '
                        'a consumer can observe ready before this post-store stamp. Activation is already MXFP8.')
 

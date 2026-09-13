@@ -759,13 +759,16 @@ Options parse_options(int argc, char** argv) {
       !options.counter_component.empty() || options.quick)
     throw std::runtime_error("MXFP8 baseline requires one forward direction, full 10+50, without BF16-specific diagnostics");
   if (options.run_oproj() && (
-      options.mxfp8_prequantized || options.mxfp8_weight_preparation != "comm" ||
+      options.mxfp8_prequantized || (options.mxfp8_weight_preparation != "comm" &&
+                                   options.mxfp8_weight_preparation != "all") ||
       options.oproj_policy_list != std::vector<std::string>{"m128n256"}))
     throw std::runtime_error("MXFP8 OProj baseline requires explicit comm, m128n256 and no QKV diagnostics");
   if (options.profile && (options.profile_direction != options.fused_direction ||
       options.mxfp8_prequantized || options.oproj_gap_probe))
     throw std::runtime_error("MXFP8 profile requires matching direction and dynamic weight; BF16 gap probe is not applicable");
-  if (options.calibrate && (options.mxfp8_prequantized || options.mxfp8_weight_preparation != "comm"))
+  if (options.calibrate && (options.mxfp8_prequantized ||
+      (options.mxfp8_weight_preparation != "comm" &&
+       !(options.run_oproj() && options.mxfp8_weight_preparation == "all"))))
     throw std::runtime_error("MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps");
   if (options.qkv_policy_list.empty()) options.qkv_policy_list = {"m128n256"};
   if (options.qkv_policy_list != std::vector<std::string>{"m128n256"} || options.hidden % 128 ||
@@ -1283,6 +1286,8 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
         throw std::runtime_error("separate postnorm requires non-profile postnorm without overlap");
       runtime.postnorm_separate = options.oproj_postnorm_separate;
       runtime.mxfp8_oproj.projection = runtime.oproj;
+      runtime.mxfp8_weight_preparation = options.mxfp8_weight_preparation == "all"
+          ? fuse::Mxfp8WeightPreparation::kAllCtas : fuse::Mxfp8WeightPreparation::kCommunicationCtas;
       runtime.mxfp8_oproj.overlap_postnorm = options.oproj_postnorm_overlap;
       CUDA_CHECK(fuse::a2a_gemm_mxfp8_workspace_size(runtime.mxfp8_oproj, &runtime.mxfp8_workspace_bytes));
       runtime.mxfp8_workspace = allocate<uint8_t>(runtime, runtime.mxfp8_workspace_bytes);
@@ -1291,6 +1296,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.mxfp8_oproj.workspace = runtime.mxfp8_workspace;
       runtime.mxfp8_oproj.workspace_bytes = runtime.mxfp8_workspace_bytes;
       runtime.mxfp8_oproj.epilogue_n = options.mxfp8_epilogue_n;
+      runtime.mxfp8_oproj.weight_preparation = runtime.mxfp8_weight_preparation;
       runtime.mxfp8_oproj.m_window_tiles = options.oproj_m_window_tiles;
       runtime.mxfp8_oproj.n_group_tiles = options.oproj_n_group_tiles;
       if (options.oproj_postnorm) {
@@ -1693,6 +1699,15 @@ void describe_component(std::vector<RankRuntime>& runtimes, const Options& optio
                        << ",oproj_n_group_tiles=" << runtime.mxfp8_oproj.n_group_tiles;
 #endif
     if (!qkv) std::cout << ",oproj_comm_layout=" << options.oproj_comm_layout;
+#if FUSE_BENCH_MXFP8
+    if (!qkv) {
+      const bool producer = options.component == MeasurementComponent::kFused ||
+                            options.component == MeasurementComponent::kProducerReference;
+      std::cout << ",startup_quant_ctas=" <<
+          ((producer && options.mxfp8_weight_preparation == "all")
+              ? options.comm_sm + std::min(schedule.tiles(), int64_t{budget}) : 0);
+    }
+#endif
     std::cout << '\n';
   }
 }

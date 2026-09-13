@@ -20,6 +20,12 @@ constexpr int kReadyFlagStride = 32;
 using Bf16 = cutlass::bfloat16_t;
 using Fp8E4m3 = cutlass::float_e4m3_t;
 
+enum class Mxfp8WeightPreparation {
+  kCommunicationCtas,  // Communication CTAs produce W alongside transport.
+  kAllCtas,           // All CTAs help quantize W before their GEMM work.
+  kCommunicationWarps, // QKV: quantization warps subsequently join routing.
+};
+
 // Packed row-major E4M3 [rows,K], with CUTLASS native SFA scale storage.
 // Every consecutive K32 group shares one UE8M0 scale. Allocation sizes include
 // native scale padding; each operator's size query defines its logical shape.

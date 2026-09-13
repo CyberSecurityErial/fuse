@@ -648,6 +648,8 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
   const auto& post = p.postprocess;
   if (p.overlap_postnorm != PublishOutput || (PublishOutput && !post.enabled()))
     return cudaErrorInvalidValue;
+  if (p.weight_preparation != Mxfp8WeightPreparation::kCommunicationCtas &&
+      p.weight_preparation != Mxfp8WeightPreparation::kAllCtas) return cudaErrorNotSupported;
   if constexpr (PublishOutput) {
     if (g.n > 16384 || int64_t(ceil_div(g.m, 128)) * ceil_div(g.n, 256) > INT32_MAX)
       return cudaErrorNotSupported;
@@ -732,6 +734,7 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
   comm.weights.k = g.k;
   comm.weights.row_stride = b_row_stride(g);
   comm.weights.epoch = projection.epoch;
+  comm.weights.all_ctas = p.weight_preparation == Mxfp8WeightPreparation::kAllCtas;
   using Scheduler = typename Gemm::TileScheduler;
   comm.producer_order = Scheduler::to_underlying_arguments(args.problem_shape,
       typename Gemm::TileShape{}, typename Gemm::AtomThrShapeMNK{},
@@ -745,9 +748,10 @@ cudaError_t launch_mxfp8_oproj(const Mxfp8A2AGemmParams& p, cudaStream_t stream
     // Only A-only diagnostics disable W. Joint producer service uses exactly
     // production's progress/drain work and full A/W publication granularity.
     if constexpr (Operation == Mxfp8OprojOperation::kCopy) comm.weights.source = nullptr;
-    using Reference = detail::CopyReferenceKernel<Comm, Kernel, true>;
-    return launch_mxfp8_reference<Reference>(Comm::to_underlying_arguments(comm),
-        info, projection.num_comm_ctas, stream);
+    using Reference = detail::CopyReferenceKernel<Comm, Kernel, true, true>;
+    const auto lowered = Comm::to_underlying_arguments(comm);
+    return launch_mxfp8_reference<Reference>(lowered,
+        info, Reference::get_grid_shape(lowered).x, stream);
   }
   args.mainloop.ready = workspace.ready;
   args.mainloop.world_size = route.world_size;

@@ -38,6 +38,11 @@ struct Mxfp8A2AGemmParams {
   // complete output-row norm tasks. Requires postprocess, hidden width <=16384
   // and explicit communication CTAs. False retains the whole-grid tail.
   bool overlap_postnorm = false;
+  // Default preserves concurrent A/W cohorts. kAllCtas is an explicit control:
+  // compute CTAs help quantize W while communication CTAs start A/W production.
+  // Each compute CTA joins its own workers before entering the same GEMM mapping;
+  // complete-panel ready remains the consumption gate. All work is timed.
+  Mxfp8WeightPreparation weight_preparation = Mxfp8WeightPreparation::kCommunicationCtas;
 };
 
 cudaError_t a2a_gemm_mxfp8_activation_size(const GemmProblem& problem,

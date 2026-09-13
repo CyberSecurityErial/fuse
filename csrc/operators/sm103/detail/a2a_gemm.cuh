@@ -852,6 +852,27 @@ struct Mxfp8A2ALhsInputCommT {
     }
     // One invocation-private reset, including Graph replay with a reused epoch.
     cooperative_groups::this_grid().sync();
+    if (p.weights.all_ctas && p.weights.source &&
+        int(blockIdx.x) >= p.params.num_comm_ctas) {
+      // Communication CTAs start A immediately; their W cohort and all compute
+      // warps share one dense, exclusive chunk assignment:
+      //
+      // comm W workers [0, C*4)       -> W panels --+
+      // compute workers [C*4, C*4+G*8) -> W -> GEMM| (same full-panel ready)
+      // comm A workers               -> A -------+
+      //
+      // Each compute CTA enters GEMM after its own contribution, not a grid
+      // join. The unchanged aggregated acq_rel publication includes EVERY
+      // panel contributor, so an early CTA cannot consume incomplete weights.
+      const int first_compute_worker = p.params.num_comm_ctas * kWeightQuantWarps;
+      const int worker = first_compute_worker +
+          (int(blockIdx.x) - p.params.num_comm_ctas) * (kMinThreads / 32) + threadIdx.x / 32;
+      const int workers = first_compute_worker + p.input_order.compute_ctas * (kMinThreads / 32);
+      Mxfp8WeightProducer weights(p.weights, p.producer_order, {},
+          worker, workers);
+      weights.drain();
+      __syncthreads();  // All eight warps finish before CUTLASS reuses CTA resources.
+    }
   }
 
   CUTLASS_DEVICE void operator()(const Params& a, char* smem, int comm_id, int comm_ctas) {
@@ -863,17 +884,20 @@ struct Mxfp8A2ALhsInputCommT {
     //   warp 0..3: A data + SFA -> complete (M,peer) ready --+
     //   warp 4..7: W quantize  -> complete N-panel ready ---+-> GEMM(M,N)
     //
-    // Only the quantization cohort owns W chunks. Its dense worker IDs cover
-    // [0,comm_ctas*kWeightQuantWarps), so each chunk has exactly one owner and
+    // Normally only the quantization cohort owns W chunks. With all-CTA help,
+    // compute startup workers extend the dense IDs after this cohort, so each
+    // chunk still has exactly one owner and
     // no panel waits for a contribution from a DMA-paced warp. drain() has no
     // dependency on A completion or GEMM consumption; the DMA cohort likewise
     // never waits for W. Do not add a CTA barrier between these unequal loops.
     // Both still share hardware resources; this removes a scheduling dependency,
     // not memory-system contention. GEMM CTAs and all ready units are unchanged.
     if (warp >= kA2ALhsBulkSlots) {
+      const int workers = comm_ctas * kWeightQuantWarps +
+          (a.weights.all_ctas ? a.input_order.compute_ctas * (kMinThreads / 32) : 0);
       Mxfp8WeightProducer weights(a.weights, a.producer_order, {},
           comm_id * kWeightQuantWarps + warp - kA2ALhsBulkSlots,
-          comm_ctas * kWeightQuantWarps);
+          workers);
       weights.drain();
       return;
     }

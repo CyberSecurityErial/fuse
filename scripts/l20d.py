@@ -426,7 +426,7 @@ def validate_job(job, hostname=None):
             raise ValueError('MXFP8 requires one forward direction')
         if job['stage'] == 'fused-smoke' and job.get('fused_direction') == 'oproj':
             if (job.get('mxfp8_prequantized') or
-                    job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') or
+                    job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm', 'all') or
                     job.get('oproj_policy_list') != 'm128n256' or
                     job.get('oproj_comm_layout', 'rows') != 'rows'):
                 raise ValueError('MXFP8 OProj requires explicit comm, m128n256/rows and no QKV diagnostics')
@@ -435,7 +435,8 @@ def validate_job(job, hostname=None):
                     (job.get('causal') and shape['seq_local'] % 256)):
                 raise ValueError('MXFP8 OProj requires K128 peer shards and complete M128 sequence chunks')
         if job.get('calibrate') and (job.get('mxfp8_prequantized') or
-                job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm')):
+                (job.get('mxfp8_weight_preparation', 'comm') not in (None, 'comm') and
+                 not (job.get('fused_direction') == 'oproj' and job.get('mxfp8_weight_preparation') == 'all'))):
             raise ValueError('MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps')
         if job.get('profile') and (job.get('mpi') or job.get('mxfp8_prequantized') or
                 job.get('oproj_gap_probe') or

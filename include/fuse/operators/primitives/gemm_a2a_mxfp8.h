@@ -8,12 +8,6 @@
 
 namespace fuse {
 
-enum class Mxfp8WeightPreparation {
-  kCommunicationCtas,  // Default: quantize ahead while waiting/sending outputs.
-  kAllCtas,           // Control: all resident CTAs quantize, then start GEMM/A2A.
-  kCommunicationWarps, // Four warps quantize first, then join all eight route warps.
-};
-
 // Prequantized activation and BF16 master weight; neither is overwritten.
 // Each full call quantizes the weight INSIDE the persistent kernel, performs
 // MXFP8 GEMM with FP32 accumulation, and routes BF16 output. projection.lhs

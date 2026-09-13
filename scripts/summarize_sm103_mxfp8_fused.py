@@ -247,6 +247,10 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
             sf.require(row.get('reference_weight_preparation') == (
                 'inside_timing' if component in ('quantize_reference','producer_reference') else 'outside_timing'),
                 'Reference weight preparation boundary mismatch')
+        if oproj and job.get('mxfp8_weight_preparation') == 'all':
+            expected_startup = expected_comm + compute if component in ('fused','producer_reference') else 0
+            sf.require(int(row.get('startup_quant_ctas', -1)) == expected_startup,
+                       'All-CTA quantization reference/startup grid differs from production')
     configuration = dict(zip(fields, next(iter(configs)))) | window
     configuration['window_effective_swizzle_size_derived'] = window_effective_swizzle(configuration)
     return timing, configuration, resources, preparation

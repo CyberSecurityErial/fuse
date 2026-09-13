@@ -374,7 +374,8 @@ int main() {
         harness = (ROOT / 'benchmarks/sm103/fused_bf16.cu').read_text()
         self.assertIn('params.projection.lhs = nullptr', harness)
         self.assertIn('includes_activation_quantization=0', harness)
-        self.assertIn('kernel_nodes=1', harness)
+        self.assertTrue('kernel_nodes="' in harness)
+        self.assertTrue('options.oproj_postnorm_separate || options.qkv_postprocess_separate ? 2 : 1' in harness)
 
     def test_communication_warp_specialization_keeps_independent_queues(self):
         comm = (ROOT / 'csrc/operators/sm103/detail/gemm_a2a.cuh').read_text()

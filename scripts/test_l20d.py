@@ -154,6 +154,18 @@ class WorkflowContracts(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 l20d.validate_job(job | change)
 
+    def test_mxfp8_oproj_all_cta_startup_keeps_timed_calibration(self):
+        job = self.fused_job(mxfp8=True, mpi=True, calibrate=True,
+            fused_direction='oproj', oproj_policy_list='m128n256', fused_launch='graph',
+            qkv_policy='m128n256', qkv_policy_list='m128n256',
+            mxfp8_weight_preparation='all')
+        l20d.validate_job(job)
+        argv = l20d.fused_argv(job)
+        self.assertEqual(argv[argv.index('--mxfp8-weight-preparation') + 1], 'all')
+        self.assertIn('--calibrate', argv)
+        with self.assertRaises(ValueError):
+            l20d.validate_job(job | {'mxfp8_weight_preparation': 'comm_warp'})
+
     def test_mxfp8_profile_uses_existing_single_process_protocol(self):
         job = self.fused_job(mxfp8=True, profile=True, fused_direction='qkv',
             directions='qkv', qkv_policy='m128n256', profile_detail='full')

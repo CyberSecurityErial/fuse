@@ -38,6 +38,7 @@ class QkvPerfettoTests(unittest.TestCase):
         self.assertEqual(result['publication_protocol_chunks'],{'legacy_unsplit':48})
         self.assertEqual(len(result['quant_workers']),8)
         self.assertEqual(result['quant_workers'][0],dict(rank=0,cta=0,warp=0,chunks=6,
+            cta_role='communication',
             first_begin_us=.1,last_end_us=.17,after_last_quant_to_role_end_us=.73))
         self.assertTrue(any(e['name']=='W quantize BF16 -> MXFP8' for e in events))
         self.assertEqual(sum(e['name']=='W fence + arrival counter + warp join' for e in events),48)
@@ -47,6 +48,21 @@ class QkvPerfettoTests(unittest.TestCase):
         self.log.write_text('\n'.join(lines[1:]))
         with self.assertRaises(AssertionError):
             append_mxfp8_events([],self.log,job,{0:100},records)
+
+    def test_startup_quant_workers_keep_compute_role_and_timed_tail(self):
+        job, records, lines = self.mxfp8_fixture()
+        job.update(fused_direction='oproj', hidden=384, q_heads=1,
+                   mxfp8_weight_preparation='all')
+        # Move the producer records to a compute CTA. Its later GEMM work is
+        # inside the role envelope, not idle communication time to reclaim.
+        lines = [line.replace('cta=0,', 'cta=2,') if line.startswith('profile_mxfp8_quant,')
+                 else line for line in lines]
+        self.log.write_text('\n'.join(lines))
+        result = append_mxfp8_events([],self.log,job,{0:100},records)
+        self.assertEqual(result['quant_chunks'],48)
+        self.assertTrue(all(w['cta_role']=='compute' for w in result['quant_workers']))
+        self.assertEqual(result['quant_workers'][0]['after_last_quant_to_role_end_us'],.73)
+        self.assertIn('enter GEMM afterward', result['quant_worker_scope'])
 
     def test_quant_worker_bounds_subtract_integer_gpu_origin(self):
         job, records, lines = self.mxfp8_fixture()

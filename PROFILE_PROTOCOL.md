@@ -437,7 +437,9 @@ Core 执行时间。可观察每 tile 的 peer acquire 和实际 W panel 等待�
 最后 end，以及最后 chunk 到本 CTA role 结束的尾段。起止先以整数减去本 GPU
 原点再转换为微秒；跨 rank 时间不能直接相减。它只复用已有记录，不增加打点。
 固定 A/W 分工的 OProj 中，W warp 后续不再搬 A；但 QKV 单向交接会在量化后
-继续 route，所以该尾段通称 `after_last_quant_to_role_end_us`，不能统一叫空闲。
+继续 route；OProj 的计算 CTA 若参与启动量化，随后还要执行 GEMM。
+`cta_role` 按实际通信前缀区分 communication/compute；该尾段通称
+`after_last_quant_to_role_end_us`，不能统一叫空闲。
 它不是整个量化阶段的关键路径，也不能跨 warp 求和当作可回收的 kernel 时间。
 
 使用独立 profiling 构建、单进程每 GPU 一个 host 线程并发提交，预热诊断 kernel

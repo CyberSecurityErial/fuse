@@ -297,7 +297,8 @@ int main() {
         api=(ROOT/'csrc/operators/sm103/api/forward_mxfp8.cuh').read_text()
         body=function(api,'cudaError_t launch_mxfp8_oproj(')
         self.assertIn('using PureGemm = typename Binding::Types::PureGemm',body)
-        self.assertIn('CopyReferenceKernel<Comm, Kernel, true>',body)
+        self.assertIn('CopyReferenceKernel<Comm, Kernel, true, true>',body)
+        self.assertIn('Reference::get_grid_shape(lowered).x',body)
         self.assertIn('if constexpr (Operation == Mxfp8OprojOperation::kCopy) comm.weights.source = nullptr',body)
         harness=(ROOT/'benchmarks/sm103/fused_bf16.cu').read_text()
         validation=function(harness,'void validate(')
@@ -518,7 +519,7 @@ void transfer(Args a,int peer_k,int source_row,int row,int peer,int lane) {
 ''' + loop + r'''
 }
 int main() {
-  for(int stage_bytes:{24*1024,48*1024})
+  for(int stage_bytes:{24*1024,48*1024,64*1024})
   for(int peer_k:{128,384,1024,2048,8192,32768}) for(int world:{2,4,8}) {
     if(peer_k>stage_bytes) continue;
     int rows=128;
@@ -575,6 +576,43 @@ int main() {
         header = (ROOT / 'include/fuse/operators/primitives/a2a_gemm_mxfp8.h').read_text()
         self.assertNotIn('#include "fuse/operators/primitives/gemm_a2a', header)
 
+    def test_startup_reference_launches_real_quantization_participants(self):
+        compiler = shutil.which('c++')
+        if not compiler: self.skipTest('host C++ compiler required')
+        source = (ROOT/'csrc/operators/sm103/detail/persistent_gemm.cuh').read_text()
+        source = source[source.index('struct CopyReferenceKernel'):]
+        grid = function(source, 'static dim3 get_grid_shape(')
+        program = r'''
+#include <cassert>
+#include <initializer_list>
+struct dim3 { int x,y,z; dim3(int x,int y,int z):x(x),y(y),z(z){} };
+struct Params {
+  struct { int num_comm_ctas; } params;
+  struct { int compute_ctas; } input_order;
+  struct { bool all_ctas; const void* source; } weights;
+};
+template<bool StartupParticipants> struct Reference {
+''' + grid + r'''
+};
+int main() {
+  for (int comm : {1,8,20,32,48,147}) for (int compute : {1,148-comm}) {
+    Params p{{comm},{compute},{true,&comm}};
+    assert(Reference<true>::get_grid_shape(p).x==comm+compute);
+    assert(Reference<false>::get_grid_shape(p).x==comm);
+    p.weights.source=nullptr;
+    assert(Reference<true>::get_grid_shape(p).x==comm);
+    p.weights.source=&comm; p.weights.all_ctas=false;
+    assert(Reference<true>::get_grid_shape(p).x==comm);
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            binary=str(Path(folder)/'startup-grid')
+            build=subprocess.run([compiler,'-std=c++17','-fsanitize=undefined',
+                '-x','c++','-','-o',binary],input=program,text=True,capture_output=True)
+            self.assertEqual(build.returncode,0,build.stderr)
+            subprocess.run([binary],check=True,timeout=30)
+
     def test_weight_cohort_executes_dense_exclusive_worker_mapping(self):
         compiler = shutil.which('c++')
         if not compiler: self.skipTest('host C++ compiler required')
@@ -583,11 +621,17 @@ int main() {
         constants = source[source.index('  static constexpr int kReadyBlockM'):source.index('  static constexpr size_t')]
         body = function(source, 'CUTLASS_DEVICE void operator()')
         prologue = body[body.index('{')+1:body.index('    auto* stage =')]
+        startup = function(source, 'CUTLASS_DEVICE static void initialize_grid(')
+        startup = startup[startup.index('    if (p.weights.all_ctas'):]
         program = r'''
 #include <cassert>
 #include <vector>
-struct { int x; } threadIdx;
-struct Params { struct { int route; } params; int weights=0, producer_order=0; };
+struct { int x; } threadIdx, blockIdx;
+void __syncthreads() {}
+struct Params { struct { int route=0, num_comm_ctas=0; } params;
+  struct { int compute_ctas=0; } input_order;
+  struct { bool all_ctas=false, source=true; operator int() const { return 0; } } weights;
+  int producer_order=0; };
 struct Mxfp8WeightProducer {
   static inline std::vector<int> seen;
   static inline int workers=0, drains=0;
@@ -598,18 +642,26 @@ struct Mxfp8WeightProducer {
   }
   void drain() { ++drains; }
 };
-''' + constants + '\nvoid run(const Params& a, int comm_id, int comm_ctas) {\n' + prologue + r'''
-}
+''' + constants + '\nvoid run(const Params& a, int comm_id, int comm_ctas) {\n' + prologue + '\n}\n' + \
+            'void startup(const Params& p) {\n' + startup + r'''
 int main() {
-  for (int comm : {1,3,8,16,32,48,64,96,147}) {
+  for (int comm : {1,3,8,16,32,48,64,96,147})
+      for (int compute : {1,148-comm}) for(bool all : {false,true}) {
+    Params p{}; p.params.num_comm_ctas=comm; p.input_order.compute_ctas=compute;
+    p.weights.all_ctas=all;
     auto& seen=Mxfp8WeightProducer::seen;
-    Mxfp8WeightProducer::workers=comm*kWeightQuantWarps;
-    Mxfp8WeightProducer::drains=0; seen.assign(comm*kWeightQuantWarps,0);
+    int workers=comm*kWeightQuantWarps+(all ? compute*8 : 0);
+    Mxfp8WeightProducer::workers=workers;
+    Mxfp8WeightProducer::drains=0; seen.assign(workers,0);
     for(int c=comm-1;c>=0;--c) for(int warp=0;warp<kMinThreads/32;++warp) {
-      threadIdx.x=warp*32;
+      threadIdx.x=warp*32; blockIdx.x=c;
+      startup(p);
       int before=Mxfp8WeightProducer::drains;
-      run(Params{},c,comm);
+      run(p,c,comm);
       assert(Mxfp8WeightProducer::drains-before==(warp>=kA2ALhsBulkSlots));
+    }
+    for(int c=comm;c<comm+compute;++c) for(int warp=0;warp<8;++warp) {
+      threadIdx.x=warp*32; blockIdx.x=c; startup(p);
     }
     for(int n:seen) assert(n==1);
   }

@@ -319,7 +319,7 @@ struct GemmReferenceKernel {
   }
 };
 
-template <class CommOp, class FusedKernel, bool ResetInputs = false>
+template <class CommOp, class FusedKernel, bool ResetInputs = false, bool StartupParticipants = false>
 struct CopyReferenceKernel {
   using ProductionKernel = FusedKernel;
   using Params = typename CommOp::Params;
@@ -333,6 +333,10 @@ struct CopyReferenceKernel {
   static_assert(SharedStorageSize >= CommOp::SharedStorageBytes);
 
   static dim3 get_grid_shape(const Params& params) {
+    if constexpr (StartupParticipants) {
+      if (params.weights.all_ctas && params.weights.source)
+        return dim3(params.params.num_comm_ctas + params.input_order.compute_ctas, 1, 1);
+    }
     return dim3(params.params.num_comm_ctas, 1, 1);
   }
 
@@ -344,6 +348,9 @@ struct CopyReferenceKernel {
     if constexpr (ResetInputs) CommOp::initialize_grid(params);
     const int32_t comm_id = static_cast<int32_t>(blockIdx.x);
     const int32_t comm_ctas = params.params.num_comm_ctas;
+    // Extra startup CTAs performed real W work in initialize_grid; they do
+    // not execute GEMM or impersonate communication workers in this reference.
+    if constexpr (StartupParticipants) if (comm_id >= comm_ctas) return;
     if constexpr (CommOp::kNeedsGridFinalize) {
       // QKV input is already materialized. Do not wait for GEMM ready flags,
       // but retain the full production cross-rank routing completion tail.
