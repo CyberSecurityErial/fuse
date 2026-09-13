@@ -2,11 +2,20 @@
 from collections import Counter
 from pathlib import Path
 import unittest
+import summarize_sm103_mxfp8_backward as backward_summary
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8BackwardContracts(unittest.TestCase):
+    def test_backward_log_parser_rejects_unowned_or_ambiguous_records(self):
+        rows=backward_summary.parse(b'device,rank=3,sm=148,compute=10.3\n')
+        self.assertEqual(rows,[dict(kind='backward_device',rank='3',sm='148',compute='10.3')])
+        for raw in (b'FAIL bad\n',b'backward_unknown rank=0\n',
+                    b'backward_verified pflops=nan\n',b'backward_device rank=0 rank=1\n'):
+            with self.subTest(raw=raw),self.assertRaises(ValueError):
+                backward_summary.parse(raw)
+
     def test_transpose_tile_ownership_and_padded_scale_rows(self):
         for rows, k in ((1,128), (33,128), (128,256), (129,128), (256,384)):
             padded = (rows+127)//128*128
@@ -62,6 +71,26 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertIn('double sum = 0',text)
         self.assertIn('dA inverse route bytes',text)
         self.assertIn('deferred B modified dW',text)
+
+    def test_formal_boundary_and_reference_are_independent_and_complete(self):
+        text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        ref=(ROOT/'benchmarks/sm103/backward/mxfp8_reference.cuh').read_text()
+        self.assertIn('const double flops=4.*o.m*o.h*(o.heads*128)',text)
+        self.assertIn('WeightGradientMode::kImmediate',text)
+        self.assertIn('r.validate(o,generation,"pre")',text)
+        self.assertIn('r.validate(o,generation,"post")',text)
+        self.assertIn('collect(50,"measurement",round)',text)
+        self.assertIn('graph.committed_epoch()+1',text)
+        self.assertIn('fused_inputs::generate',text)
+        self.assertIn('cudaIpcOpenMemHandle',text)
+        self.assertIn('reference.validate({dy,o.h,1},{weight,1,route.a}',text)
+        self.assertIn('reference.validate({dy,1,o.h},{attention,1,route.a}',text)
+        self.assertIn('frexpf(amax, &exponent)',ref)
+        self.assertIn('CUBLAS_COMPUTE_32F_PEDANTIC',ref)
+        self.assertIn('kRows = 128, kChunk = 4096',ref)
+        self.assertNotIn('ptr_SFA',ref)
+        self.assertNotIn('ptr_SFB',ref)
+        self.assertNotIn('quantize_mxfp8_transposed_operand',ref)
 
 
 if __name__ == '__main__':

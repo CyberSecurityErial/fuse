@@ -14,6 +14,16 @@
 // exposes its private kernel Params. The caller supplies the actual launch.
 namespace fused_graph {
 
+// Declare the actual launch boundary, not private kernel parameter layouts.
+// A preparation kernel may have static shared memory and zero dynamic shared
+// memory. That is distinct from a CUTLASS/monolithic dynamic-SMEM launch.
+enum class Launch {
+  kCooperativeDynamic,
+  kCooperativeStatic,
+  kOrdinaryDynamic,
+  kOrdinaryStatic,
+};
+
 class Operation {
  public:
   // The caller owns this device/stream and every captured tensor/IPC mapping.
@@ -21,12 +31,19 @@ class Operation {
   // All methods, including destruction, must have one serialized owner.
   Operation(int device, cudaStream_t stream, uint32_t committed_epoch = 0,
             bool separate_postprocess = false, bool cooperative_postprocess = false)
-      : device_(device), stream_(stream), separate_postprocess_(separate_postprocess),
-        cooperative_postprocess_(cooperative_postprocess),
+      : Operation(device, stream, committed_epoch,
+                  forward_boundary(separate_postprocess, cooperative_postprocess)) {}
+
+  // Multi-kernel B+W uses one strictly ordered graph. For example:
+  // W quant -> dA+route -> dY quant -> saved-A quant -> dW GEMM.
+  // Each replay updates the native epoch through the public API; preparation
+  // is never detached from the measured graph or assigned a stale ready epoch.
+  Operation(int device, cudaStream_t stream, uint32_t committed_epoch,
+            std::vector<Launch> boundary)
+      : device_(device), stream_(stream), boundary_(std::move(boundary)),
         committed_epoch_(committed_epoch) {
-    if (device < 0 || stream == nullptr || (cooperative_postprocess && !separate_postprocess)) {
-      throw std::invalid_argument("Graph operation requires a device and explicit stream");
-    }
+    if (device < 0 || stream == nullptr || boundary_.empty())
+      throw std::invalid_argument("Graph operation requires a device, explicit stream and boundary");
   }
 
   Operation(const Operation&) = delete;
@@ -142,6 +159,14 @@ class Operation {
   }
 
  private:
+  static std::vector<Launch> forward_boundary(bool separate, bool cooperative) {
+    if (cooperative && !separate)
+      throw std::invalid_argument("Cooperative postprocess requires a separate kernel");
+    std::vector<Launch> boundary{Launch::kCooperativeDynamic};
+    if (separate) boundary.push_back(cooperative ? Launch::kCooperativeStatic : Launch::kOrdinaryDynamic);
+    return boundary;
+  }
+
   struct Signature {
     void* function = nullptr;
     dim3 grid{};
@@ -188,32 +213,58 @@ class Operation {
   std::vector<Signature> inspect(cudaGraph_t graph) const {
     size_t count = 0;
     check(cudaGraphGetNodes(graph, nullptr, &count), "count nodes");
-    const size_t expected = separate_postprocess_ ? 2 : 1;
+    const size_t expected = boundary_.size();
     if (count != expected) throw std::runtime_error("Graph operation kernel count differs from boundary");
     std::vector<cudaGraphNode_t> nodes(count);
     check(cudaGraphGetNodes(graph,nodes.data(),&count),"get kernel nodes");
     if (count != expected) throw std::runtime_error("Graph nodes changed during inspection");
-    if (separate_postprocess_) {
-      // Explicit reference only: exactly base-F -> standalone norm, not two
-      // unordered nodes or hidden memcpy/memset work. Both belong to ONE graph.
+    if (count > 1) {
+      // CUDA does not promise node enumeration in execution order. Resolve a
+      // single linear chain; reject forks, cycles and programmatic edges.
+      // Ordinary same-stream kernel dependencies are the declared boundary.
       size_t edges = 0;
       check(cudaGraphGetEdges(graph,nullptr,nullptr,nullptr,&edges),"count reference edges");
-      if (edges != 1) throw std::runtime_error("Separate postprocess requires one dependency edge");
-      cudaGraphNode_t from = nullptr, to = nullptr;
-      cudaGraphEdgeData dependency{};
-      check(cudaGraphGetEdges(graph,&from,&to,&dependency,&edges),"get reference edge");
-      if (edges != 1 || from == to ||
-          dependency.type != 0 || dependency.from_port != 0 || dependency.to_port != 0 ||
-          !((from == nodes[0] && to == nodes[1]) || (from == nodes[1] && to == nodes[0])))
-        throw std::runtime_error("Invalid separate postprocess dependency");
-      nodes = {from,to};
+      if (edges != count - 1) throw std::runtime_error("Graph boundary requires one linear dependency chain");
+      std::vector<cudaGraphNode_t> from(edges), to(edges);
+      std::vector<cudaGraphEdgeData> dependencies(edges);
+      check(cudaGraphGetEdges(graph,from.data(),to.data(),dependencies.data(),&edges),"get boundary edges");
+      if (edges != count - 1) throw std::runtime_error("Graph edges changed during inspection");
+      std::vector<size_t> next(count, count), previous(count, count);
+      const auto index = [&](cudaGraphNode_t node) {
+        for (size_t i = 0; i < count; ++i) if (nodes[i] == node) return i;
+        return count;
+      };
+      for (size_t e = 0; e < edges; ++e) {
+        const size_t a = index(from[e]), b = index(to[e]);
+        const auto& d = dependencies[e];
+        if (a == count || b == count || a == b || next[a] != count || previous[b] != count ||
+            d.type != 0 || d.from_port != 0 || d.to_port != 0)
+          throw std::runtime_error("Invalid Graph boundary dependency");
+        next[a] = b;
+        previous[b] = a;
+      }
+      size_t root = count;
+      for (size_t i = 0; i < count; ++i) if (previous[i] == count) {
+        if (root != count) throw std::runtime_error("Disconnected Graph boundary");
+        root = i;
+      }
+      std::vector<cudaGraphNode_t> ordered;
+      std::vector<bool> visited(count, false);
+      while (root != count) {
+        if (visited[root]) throw std::runtime_error("Cyclic Graph boundary");
+        visited[root] = true;
+        ordered.push_back(nodes[root]);
+        root = next[root];
+      }
+      if (ordered.size() != count) throw std::runtime_error("Incomplete Graph boundary");
+      nodes = std::move(ordered);
     }
     std::vector<Signature> result;
-    for (size_t i = 0; i < count; ++i) result.push_back(inspect_node(nodes[i],i == 1));
+    for (size_t i = 0; i < count; ++i) result.push_back(inspect_node(nodes[i],boundary_[i]));
     return result;
   }
 
-  Signature inspect_node(cudaGraphNode_t node, bool postprocess) const {
+  Signature inspect_node(cudaGraphNode_t node, Launch launch) const {
     if (node == nullptr) throw std::runtime_error("Null Graph kernel node");
     cudaGraphNodeType type{};
     check(cudaGraphNodeGetType(node, &type), "get node type");
@@ -231,12 +282,14 @@ class Operation {
                                         &scheduling), "get cluster scheduling attribute");
     const bool implicit_cluster = cluster.clusterDim.x == 0 && cluster.clusterDim.y == 0 && cluster.clusterDim.z == 0;
     const bool single_cluster = cluster.clusterDim.x == 1 && cluster.clusterDim.y == 1 && cluster.clusterDim.z == 1;
+    const bool expected_cooperative = launch == Launch::kCooperativeDynamic || launch == Launch::kCooperativeStatic;
+    const bool dynamic = launch == Launch::kCooperativeDynamic || launch == Launch::kOrdinaryDynamic;
     if (!params.func || params.gridDim.x == 0 || params.gridDim.y != 1 || params.gridDim.z != 1 ||
         params.blockDim.x != 256 || params.blockDim.y != 1 || params.blockDim.z != 1 ||
-        (postprocess && cooperative_postprocess_ ? params.sharedMemBytes != 0 : params.sharedMemBytes == 0) ||
-        cooperative.cooperative != (postprocess ? int(cooperative_postprocess_) : 1) ||
+        (dynamic ? params.sharedMemBytes == 0 : params.sharedMemBytes != 0) ||
+        cooperative.cooperative != int(expected_cooperative) ||
         (!implicit_cluster && !single_cluster)) {
-      throw std::runtime_error("Graph requires the declared SM103 base/postprocess launch");
+      throw std::runtime_error("Graph requires the declared SM103 launch boundary");
     }
     return {params.func, params.gridDim, params.blockDim, params.sharedMemBytes, cooperative.cooperative,
         cluster.clusterDim.x, cluster.clusterDim.y, cluster.clusterDim.z,
@@ -250,8 +303,7 @@ class Operation {
 
   const int device_;
   const cudaStream_t stream_;
-  const bool separate_postprocess_;
-  const bool cooperative_postprocess_;
+  const std::vector<Launch> boundary_;
   cudaGraph_t graph_ = nullptr;
   cudaGraphExec_t exec_ = nullptr;
   std::vector<Signature> signature_{};

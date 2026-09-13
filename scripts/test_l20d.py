@@ -167,7 +167,25 @@ class WorkflowContracts(unittest.TestCase):
         for change in ({'mxfp8_prequantized': True}, {'mxfp8_weight_preparation': 'all'},
                        {'mxfp8_weight_preparation': 'comm_warp'}):
             with self.subTest(change=change), self.assertRaises(ValueError):
-                l20d.validate_job(job | change)
+                    l20d.validate_job(job | change)
+
+    def test_mxfp8_backward_formal_is_complete_immediate_graph_not_bf16_deferred(self):
+        job=self.fused_job(mxfp8=True,backward=True,mpi=True,fused_launch='graph',
+            fused_direction='oproj',world=8,global_seq=131072,seq_local=None,hidden=8192,
+            q_heads=64,kv_heads=8,head_dim=128,comm_sm=16,oproj_raster='along_n',
+            input_generator='gpu_philox',warmup=10,iterations=50,qkv_policy='auto')
+        l20d.validate_job(job)
+        argv=l20d.fused_argv(job)
+        self.assertEqual(l20d.fused_binary(job).name,'backward_mxfp8_mpi')
+        self.assertNotIn('deferred',argv)
+        self.assertEqual(argv[argv.index('--m')+1],'16384')
+        self.assertEqual(argv[argv.index('--comm-ctas')+1],'16')
+        for change in ({'fused_launch':'eager'},{'input_generator':'cpu_mt19937'},
+                       {'iterations':5},{'warmup':1},{'profile':True},{'fused_direction':'qkv'},
+                       {'oproj_raster':'heuristic'},{'comm_sm':0},{'comm_sm_list':'8,16'},
+                       {'mxfp8_weight_preparation':'all'}):
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                l20d.validate_job(job|change)
 
     def test_mxfp8_oproj_all_cta_startup_keeps_timed_calibration(self):
         job = self.fused_job(mxfp8=True, mpi=True, calibrate=True,

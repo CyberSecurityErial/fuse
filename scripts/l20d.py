@@ -423,15 +423,25 @@ def validate_job(job, hostname=None):
                 'validation_self_test', 'fused_counters', 'auto_oproj_comm', 'qkv_rank_swizzle')):
             raise ValueError('MXFP8 baseline requires isolated forward build/smoke without BF16 tuning/diagnostics')
         if job.get('backward'):
-            if (job.get('mpi') or job.get('profile') or job.get('calibrate') or
+            if (job.get('profile') or job.get('calibrate') or
                     job.get('auto_mxfp8_comm') or job.get('mxfp8_prequantized') or
                     job.get('mxfp8_weight_preparation') not in (None, 'comm') or
                     job.get('qkv_postprocess') or job.get('oproj_postnorm') or
-                    job.get('fused_launch', 'eager') != 'eager'):
-                raise ValueError('MXFP8 backward currently supports only isolated CPU-oracle bring-up, not formal/profile/MPI')
+                    job.get('backward_matrix') or job.get('backward_matrix_payload')):
+                raise ValueError('MXFP8 backward excludes forward preparation/Auto/profile and BF16 batch modes')
             if job['stage'] == 'fused-smoke':
                 s = fused_geometry(job)
-                if (job.get('fused_direction') != 'oproj' or s['world'] not in (4, 8) or
+                if job.get('mpi'):
+                    if (job.get('fused_direction') != 'oproj' or job.get('fused_launch') != 'graph' or
+                            job.get('input_generator') != 'gpu_philox' or
+                            job.get('warmup',10) != 10 or job.get('iterations',50) != 50 or
+                            s['world'] not in (4,8) or s['seq_local'] % 128 or s['hidden'] % 128 or
+                            s['head_dim'] != 128 or s['q_heads'] % s['world'] or
+                            not 0 < (job.get('comm_sm') or 0) < 148 or job.get('comm_sm_list') is not None or
+                            job.get('oproj_raster') not in ('along_m','along_n')):
+                        raise ValueError('MXFP8 backward MPI requires OProj Graph10+50, Philox, M/H128 alignment, explicit comm/raster')
+                elif (job.get('fused_launch','eager') != 'eager' or
+                        job.get('fused_direction') != 'oproj' or s['world'] not in (4, 8) or
                         s['seq_local'] not in (128,256) or s['hidden'] not in (128,256) or
                         s['q_heads'] != 8 or s['head_dim'] != 128 or
                         job.get('comm_sm') != 4 or job.get('comm_sm_list') is not None):
@@ -1194,7 +1204,7 @@ def fused_build_dir(job):
 
 def fused_binary(job):
     if job.get('backward') and job.get('mxfp8'):
-        return fused_build_dir(job) / 'backward_mxfp8_smoke'
+        return fused_build_dir(job) / ('backward_mxfp8_mpi' if job.get('mpi') else 'backward_mxfp8_smoke')
     if job.get('mxfp8'):
         return fused_build_dir(job) / ('fused_mxfp8_mpi' if job.get('mpi') else 'fused_mxfp8')
     if job.get('backward'):
@@ -1261,8 +1271,14 @@ def fused_argv(job):
         raise ValueError('Expected a fused stage')
     if job.get('backward') and job.get('mxfp8'):
         shape = fused_geometry(job)
-        return [str(fused_binary(job)), '--world', str(shape['world']),
+        argv = [str(fused_binary(job)), '--world', str(shape['world']),
                 '--m', str(shape['seq_local']), '--hidden', str(shape['hidden'])]
+        if job.get('mpi'):
+            argv += ['--q-heads',str(shape['q_heads']), '--comm-ctas',str(job['comm_sm']),
+                     '--epilogue-n',str(job.get('mxfp8_epilogue_n') or 32),
+                     '--swizzle',str(job.get('max_swizzle_size',1)), '--raster',job['oproj_raster']]
+            if job.get('causal'): argv.append('--causal')
+        return argv
     if job.get('backward'):
         if not job.get('mpi'):
             return [str(fused_binary(job))]
@@ -1919,6 +1935,9 @@ def remote(job_path):
                     elements = 2*m*w+2*m*h+2*w*h
                     if job['fused_direction']=='oproj': elements = 2*m*h+3*m*w+2*w*h
                     backward_memory = dict(minimum_free_bytes=2*elements+(2<<30), note='backward live tensors plus bounded reference and 2 GiB headroom')
+                    if job.get('mxfp8'):
+                        backward_memory = dict(minimum_free_bytes=6*m*h+6*h*w+9*m*w+(2<<30),
+                            note='MXFP8 B+W BF16 masters, represented inputs, shared scratch, bounded reference and 2 GiB headroom')
                     if job.get('backward_matrix_payload'):
                         backward_memory = dict(minimum_free_bytes=2<<30, note='per-case collective device memory checks in backward batch')
                         fields=('id','direction','m','hidden','q_heads','kv_heads','head_dim')

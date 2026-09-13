@@ -3,10 +3,13 @@
 // no large-shape coverage or timing claim is inferred from these checks.
 #include "fuse/operators/ulysses/oproj_backward.h"
 #include "fuse/operators/primitives/gemm_a2a_mxfp8.h"
+#include "../fused_graph.cuh"
+#include "mxfp8_reference.cuh"
 #include <curand_kernel.h>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,6 +38,7 @@ struct Rank {
   fuse::Mxfp8OprojBackwardParams params{};
   Bf16 *dy{}, *weight{}, *attention{}, *da{}, *routed{}, *dw{};
   std::vector<Bf16> hdy, hw, ha, expected_da, expected_dw;
+  mxfp8_reference::Workspace reference;
   template <class T> T* alloc(size_t n) {
     T* p{}; CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
     allocations.push_back(p); CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T))); return p;
@@ -42,6 +46,7 @@ struct Rank {
   ~Rank() {
     cudaSetDevice(device);
     cudaStreamSynchronize(stream);
+    if (reference.handle) cublasDestroy(reference.handle);
     for (auto* p : allocations) cudaFree(p);
     if (stream) cudaStreamDestroy(stream);
   }
@@ -139,6 +144,7 @@ void run(int world, int m, int h) {
     CUDA_CHECK(fuse::gemm_a2a_mxfp8_activation_size({m,a,h,1},&data,&scale));
     r.params.data.grad_output={r.alloc<fuse::Fp8E4m3>(data),r.alloc<uint8_t>(scale),data,scale};
     d.peer_done_epoch[i]=r.alloc<uint32_t>(world*fuse::kReadyFlagStride);
+    r.reference.initialize(a,r.stream,[&r](size_t bytes)->void*{return r.alloc<unsigned char>(bytes);});
   }
   for(int i=0;i<world;++i)for(int peer=0;peer<world;++peer){
     auto& d=ranks[i].params.data.projection;
@@ -161,18 +167,46 @@ void run(int world, int m, int h) {
       r.expected_da=multiply(represented(r.hdy,m,h,false),represented(r.hw,a,h,true),m,a,h);
       r.expected_dw=multiply(represented(r.hdy,h,m,true),represented(r.ha,a,m,true),h,a,m);
     }
-    for(bool causal:{false,true})for(int epilogue:{32,64}){
-      ++epoch;
+    for(bool graph:{false,true})for(bool causal:{false,true})for(int epilogue:{32,64}){
       for(auto& r:ranks){
         CUDA_CHECK(cudaSetDevice(r.device));auto& d=r.params.data.projection;
-        d.epoch=epoch;d.causal_load_balanced=causal;
+        d.causal_load_balanced=causal;
         d.gemm_tuning={epilogue,epilogue==32?1:8,epilogue==64};
         r.params.weight.gemm_tuning=d.gemm_tuning;
         r.params.weight_mode=fuse::WeightGradientMode::kImmediate;
         r.params.weight.projection.beta=0;
-        CUDA_CHECK(fuse::launch_oproj_backward_mxfp8(r.params,r.stream));
       }
-      synchronize(ranks);
+      std::vector<std::unique_ptr<fused_graph::Operation>> graphs;
+      if(graph)for(auto& r:ranks){
+        using L=fused_graph::Launch;
+        graphs.emplace_back(new fused_graph::Operation(r.device,r.stream,epoch,
+            {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,
+             L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+      }
+      // Exercise instantiate AND update, with a fresh native publication epoch
+      // on each replay. Poison destinations without clearing ready counters:
+      // replaying an old epoch must not accidentally pass through old outputs.
+      for(int replay=0;replay<(graph?2:1);++replay){
+        ++epoch;
+        for(auto& r:ranks){
+          CUDA_CHECK(cudaSetDevice(r.device));
+          r.params.data.projection.epoch=epoch;
+          if(graph)graphs[r.device]->prepare(epoch,[&r](uint32_t e,cudaStream_t s){
+            r.params.data.projection.epoch=e;
+            return fuse::launch_oproj_backward_mxfp8(r.params,s);
+          });
+          CUDA_CHECK(cudaMemsetAsync(r.da,0xff,size_t(m)*a*sizeof(Bf16),r.stream));
+          CUDA_CHECK(cudaMemsetAsync(r.routed,0xff,size_t(m)*a*sizeof(Bf16),r.stream));
+          CUDA_CHECK(cudaMemsetAsync(r.dw,0xff,size_t(h)*a*sizeof(Bf16),r.stream));
+        }
+        synchronize(ranks);
+        for(auto& r:ranks){
+          CUDA_CHECK(cudaSetDevice(r.device));
+          if(graph)graphs[r.device]->launch();
+          else CUDA_CHECK(fuse::launch_oproj_backward_mxfp8(r.params,r.stream));
+        }
+        synchronize(ranks);
+      }
       for(auto& r:ranks){
         expect(download(r,r.da,m*a),r.expected_da,"dA numeric");
         expect(download(r,r.dw,h*a),r.expected_dw,"dW numeric");
@@ -197,8 +231,24 @@ void run(int world, int m, int h) {
         }
       }
       std::cout<<"backward_validation op=oproj_mxfp8 world="<<world<<" generation="<<generation
-          <<" causal="<<causal<<" epilogue="<<epilogue<<" B=pass W=pass route_bytes=pass\n"<<std::flush;
+          <<" causal="<<causal<<" epilogue="<<epilogue<<" launch="<<(graph?"graph":"eager")
+          <<" B=pass W=pass route_bytes=pass\n"<<std::flush;
+      for(auto& r:ranks)if(graph){
+        CUDA_CHECK(cudaSetDevice(r.device));graphs[r.device]->reset(epoch);
+      }
     }
+    // Cross-check the scalable GPU reference against the same outputs that
+    // passed the independent CPU FP64 oracle above. This reference is used
+    // for large matrices; it must not be introduced without a small cross-check.
+    for(auto& r:ranks){
+      CUDA_CHECK(cudaSetDevice(r.device));
+      const auto b=r.reference.validate({r.dy,h,1},{r.weight,1,a},r.da,m,a,h,r.stream);
+      const auto w=r.reference.validate({r.dy,1,h},{r.attention,1,a},r.dw,h,a,m,r.stream);
+      if(b.checked!=size_t(m)*a || w.checked!=size_t(h)*a ||
+          b.mismatches || w.mismatches || b.nonfinite || w.nonfinite)
+        throw std::runtime_error("bounded GPU represented-operand reference disagrees with CPU-checked outputs");
+    }
+    std::cout<<"backward_reference generation="<<generation<<" independent_gpu=pass CPU_FP64=pass\n"<<std::flush;
   }
   // Deferred B leaves dW untouched; a subsequent explicit W applies beta=1.
   ++epoch;

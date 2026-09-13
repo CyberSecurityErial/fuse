@@ -97,6 +97,7 @@ cudaStream_t stream=reinterpret_cast<void*>(0x2000);
 std::string fault;
 Graph next;
 Graph post;
+Graph tail[3];
 int owner_device=0, begins=0, ends=0, instantiates=0, uploads=0, updates=0, launches=0;
 int graph_live=0, exec_live=0;
 bool capturing=false, busy=false;
@@ -119,14 +120,31 @@ int cudaGraphGetNodes(cudaGraph_t graph,cudaGraphNode_t* nodes,size_t* count) {
   CHECK(graph);
   if(fault=="get_nodes") return 1;
   *count=graph->count;
-  if(nodes && graph->count) { nodes[0]=graph; if(graph->count==2) nodes[1]=&post; }
+  if(nodes && graph->count) {
+    nodes[0]=graph;
+    if(graph->count>=2) nodes[1]=&post;
+    if(graph->count==5) {
+      for(int i=0;i<3;++i) nodes[i+2]=&tail[i];
+      // Inspection must recover chain order, not trust this enumeration.
+      if(fault=="shuffled") std::swap(nodes[0],nodes[4]);
+    }
+  }
   return 0;
 }
 int cudaGraphGetEdges(cudaGraph_t graph,cudaGraphNode_t* from,cudaGraphNode_t* to,cudaGraphEdgeData* data,size_t* count) {
-  *count=fault=="unordered"?0:1;
-  if(from) *from=fault=="reverse_edge"?&post:graph;
-  if(to) *to=fault=="reverse_edge"?graph:&post;
-  if(data) data->type=fault=="programmatic_edge"?1:0;
+  *count=fault=="unordered"?0:graph->count-1;
+  if(from) {
+    Graph* chain[]={graph,&post,&tail[0],&tail[1],&tail[2]};
+    for(size_t i=0;i<*count;++i) {
+      from[i]=chain[i]; to[i]=chain[i+1];
+      data[i].type=fault=="programmatic_edge"?1:0;
+    }
+    if(fault=="reverse_edge") { from[0]=&post; to[0]=graph; }
+    if(fault=="fork") from[1]=graph;
+    if(fault=="join") to[1]=&post;
+    if(fault=="cycle") { from[1]=&post; to[1]=graph; }
+    if(fault=="foreign") to[0]=&next;
+  }
   return 0;
 }
 int cudaGraphNodeGetType(cudaGraphNode_t node,cudaGraphNodeType* type) { *type=node->type; return 0; }
@@ -227,6 +245,26 @@ int main(int argc,char** argv) {
         rejects([&]{op.prepare(3,actual_launch);});
       }
       op.reset(op.committed_epoch());
+    } else if(mode=="backward") {
+      using L=fused_graph::Launch;
+      next.count=5; next.cooperative=0; next.smem=0;
+      post.cooperative=1;
+      tail[0].cooperative=tail[1].cooperative=tail[2].cooperative=0;
+      tail[0].smem=tail[1].smem=0;
+      fused_graph::Operation op(0,stream,0,{L::kOrdinaryStatic,L::kCooperativeDynamic,
+          L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic});
+      if(argc==3) fault=argv[2];
+      if(fault=="bad_prep") tail[0].smem=128;
+      if(fault=="bad_gemm") tail[2].cooperative=1;
+      if(fault=="hidden_copy") tail[1].type=cudaGraphNodeTypeMemcpy;
+      if(fault.empty() || fault=="shuffled") {
+        op.prepare(1,actual_launch); complete(); op.launch(); complete();
+        op.prepare(2,actual_launch); op.launch(); complete();
+        CHECK(launches==2 && updates==1 && op.committed_epoch()==2);
+        tail[2].function=reinterpret_cast<void*>(0x9999);
+        rejects([&]{op.prepare(3,actual_launch);});
+      } else rejects([&]{op.prepare(1,actual_launch);});
+      op.reset(op.committed_epoch());
     } else if(mode=="epochs") {
       fused_graph::Operation op(0,stream);
       rejects([&]{op.prepare(0,actual_launch);}); rejects([&]{op.prepare(2,actual_launch);});
@@ -301,6 +339,13 @@ int main(int argc,char** argv) {
 
     def test_duplicate_skipped_zero_wrapped_and_unlaunched_epochs_are_rejected(self):
         self.run_probe("epochs")
+
+    def test_complete_backward_is_one_five_kernel_chain(self):
+        self.run_probe('backward')
+        for fault in ('shuffled', 'unordered', 'fork', 'join', 'cycle', 'foreign',
+                      'programmatic_edge', 'bad_prep', 'bad_gemm', 'hidden_copy'):
+            with self.subTest(fault=fault):
+                self.run_probe('backward', fault)
 
     def test_owner_device_stream_completion_and_reset_contracts(self):
         self.run_probe("owner")

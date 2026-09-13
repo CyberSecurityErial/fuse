@@ -402,6 +402,62 @@ reference; preserve true immediate B+W timing rather than summing isolated times
 
 ## Evidence and iteration
 
+### OProj backward Graph boundary and large-matrix measurement
+
+`backward/mxfp8_mpi_bench.cu` measures the complete immediate B+W boundary in
+one five-kernel CUDA Graph. `fused_graph.cuh` validates its linear dependency
+chain and each kernel's cooperative/dynamic-SMEM contract; every accepted
+launch advances the native epoch. The original one/two-kernel forward Graph
+contracts remain unchanged. Upstream dY quantization is outside the declared
+input boundary, while all three backward transpose/quantization preparations
+are timed. Work is `4*M*H*A` per rank; independent B and W times are not added
+to manufacture an immediate result. Cross-CP dW reduction is still caller-owned.
+
+`backward/mxfp8_reference.cuh` independently reconstructs the represented
+operands from original BF16 masters and uses FP32-accumulating cuBLAS, with
+128-row/4096-K bounded scratch. It neither reads production scales nor
+constructs a numerical reference from actual gradients. Full dA/dW numerical
+and separate byte-exact inverse-route checks run before and after measurement
+for both Philox payloads, at the original `0.01 + 0.01*abs(reference)` tolerance.
+Formal sampling keeps 10+50, per-rank 100ms/three-window convergence and the
+first stable round; both payload times are equally weighted, not selected by
+speed. Original rank logs, input statistics and device telemetry are retained.
+
+CP8 M256/H256/A1024 run182103-b01728 passed 16 CPU-oracle Eager/Graph cases,
+including consecutive Graph updates without resetting ready. Run182829-065a63
+also cross-checked the bounded GPU reference against CPU-checked results.
+Qwen3 geometry CP8/128K run183608-799fb3 then passed independent archived
+receipt/sample/numerical/routing audit: complete B+W **2.001184ms / 1.098861P**.
+This is an untuned backward baseline, not the 2P target or a forward regression
+result. Initial run183405-3468d5 computed correctly but failed collection because
+its startup record did not match the common MPI controller protocol; that failed
+receipt is retained, not promoted to a successful formal result. The startup
+record was aligned and the successful run above is a fresh confirmation.
+
+The first six physical large-matrix geometries at **CP8/128K** pass the same
+audit, with fixed C16/E32/swizzle8/AlongN for both gradients (not tuned winners):
+
+| Geometry | Complete B+W ms | PFLOPS/rank | Run suffix |
+|---|---:|---:|---|
+| Qwen3 235B | 2.001184 | 1.098861 | 183608-799fb3 |
+| BLOOM 176B | 8.976744 | 1.500435 | 183734-e0b724 |
+| Llama 3.1 405B | 11.149816 | 1.577801 | 183802-66ed3a |
+| representative_large | 5.586344 | 1.377749 | 183835-b3bbc5 |
+| Kimi K3 KDA projection geometry | 4.345096 | 1.328494 | 183903-169b3f |
+| Llama70B / Qwen72B shared geometry | 3.377568 | 1.302134 | 183931-6c23cb |
+
+Geometric mean **1.355396P**, below the 2P backward target. This is not full
+CP4/8 × 128/256/512K coverage, and projection geometry checks do not validate
+special KDA model routing. A backward full-device cuBLASLt reference is still
+missing; the forward pure-GEMM column cannot be reused for B+W.
+The long-K/CP4 cross-check, Qwen3 geometry at global512K (M131072), also passes:
+run184057-aa95d0, **15.038944ms / 1.169775P**. It is reported separately, not
+mixed into the six-point CP8/128K geometric mean.
+
+The separate read-only `scripts/summarize_sm103_mxfp8_backward.py` verifies
+hashes, per-rank ownership, full coverage and raw statistics; it does not relax
+the forward result parser or insert backward rows into the forward table.
+
 Keep one compact current table/configuration/evidence file in
 `fuse_midfile/mxfp8-v23`, not new per-trial source scripts. Preserve formal raw
 artifacts referenced by run/source/binary hashes. Profile only selected
