@@ -1,0 +1,2432 @@
+{
+  "schema": "fuse_sm103_v23_final_v1",
+  "release": "v23.0",
+  "boundary": "A2A+OProj with in-kernel BF16 master weight quantization; prequantized MXFP8 activation supplied upstream",
+  "protocol": "Graph10+50, two nonzero Philox payloads, independent full pre/post numerical/routing validation",
+  "physical_points": 36,
+  "geomean_pflops_per_gpu": 2.256462314616752,
+  "historical_v21_geomean": 1.9146931542881838,
+  "historical_full_device_cublaslt_geomean": 2.716657163231208,
+  "ratio_to_historical_cublaslt": 0.8306025306236664,
+  "selection": "Explicit offline fixed configurations, independently confirmed; not new Auto; not every point >=2.2P",
+  "rows": [
+    {
+      "id": "h14336q112d128cp4s131072",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150220-7fbea5",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "53e877824eb444a1af2fad5060381b434843fcd17cb60159887b0aec2e5ddb14",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "4",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "144",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 5.921007871627808,
+          "p95_ms": 6.124289536476136,
+          "pflops_per_rank": 2.2747845860493827,
+          "half_drift": 0.014667736307388747,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 5.5291361808776855,
+          "p95_ms": 5.580068755149841,
+          "pflops_per_rank": 2.436007542523207,
+          "half_drift": 0.003275684516989827,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 3.8604159355163574,
+          "p95_ms": 3.873832046985626,
+          "pflops_per_rank": null,
+          "half_drift": 0.0010444202538106115,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 3.8709120750427246,
+          "p95_ms": 3.8898367643356324,
+          "pflops_per_rank": null,
+          "half_drift": 0.00020664234097255064,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.945557587605231,
+      "pure_cublaslt_historical": 2.72633632,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 4 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp4s262144",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150238-be6169",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "a00a67383208fb17e98da23e2a8c0a5807cc1e4cb0c91b823f87610330c1b83d",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 11.502848148345947,
+          "p95_ms": 11.700176191329955,
+          "pflops_per_rank": 2.3418578193076085,
+          "half_drift": 0.015347784609692047,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 10.934256076812744,
+          "p95_ms": 10.993020629882812,
+          "pflops_per_rank": 2.4636367294924595,
+          "half_drift": 0.008850019473810701,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.110575914382935,
+          "p95_ms": 4.119507217407227,
+          "pflops_per_rank": null,
+          "half_drift": 0.00010892636479137962,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.117632150650024,
+          "p95_ms": 4.124369549751282,
+          "pflops_per_rank": null,
+          "half_drift": 0.0000932220019442288,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9805630881840748,
+      "pure_cublaslt_historical": 2.70841158,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp4s524288",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150256-6b2be4",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "991b201dccb4f4bfc9abd8d42cb3647a9073162f79b7a65207bd3afe01011669",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 22.876704216003418,
+          "p95_ms": 22.948916530609132,
+          "pflops_per_rank": 2.355062567244059,
+          "half_drift": 0.002183595163957857,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 21.857535362243652,
+          "p95_ms": 22.058381748199462,
+          "pflops_per_rank": 2.464873960770922,
+          "half_drift": 0.00019032005664050544,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 8.20412826538086,
+          "p95_ms": 8.214430046081542,
+          "pflops_per_rank": null,
+          "half_drift": 0.0006006287363478146,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 8.210831642150879,
+          "p95_ms": 8.220099449157715,
+          "pflops_per_rank": null,
+          "half_drift": 0.000019512918074432722,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 2.000706094929515,
+      "pure_cublaslt_historical": 2.70024304,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s131072",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150319-79e783",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "fb75c7f9a3a031bea470d52423ca7d46bc0fda4361e7e21034243cddd12dd235",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "4",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "144",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 2.9764479398727417,
+          "p95_ms": 3.017537546157837,
+          "pflops_per_rank": 2.2625991974903936,
+          "half_drift": 0.001591140430118164,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 2.7536799907684326,
+          "p95_ms": 2.768052816390991,
+          "pflops_per_rank": 2.445639559681984,
+          "half_drift": 0.0019988275092207458,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.12827205657959,
+          "p95_ms": 2.132404828071594,
+          "pflops_per_rank": null,
+          "half_drift": 0.00021049400556985735,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.139151930809021,
+          "p95_ms": 2.145639979839325,
+          "pflops_per_rank": null,
+          "half_drift": 0.000044916252087616564,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8778661280760016,
+      "pure_cublaslt_historical": 2.69111667,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 4 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s262144",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150342-10d49e",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "8f1e7f9a235f062f57119b05ad9a7cbc914ab1218d996983a3530262d658ccb0",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "4",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "144",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 6.016016006469727,
+          "p95_ms": 6.128790473937988,
+          "pflops_per_rank": 2.2388599740710777,
+          "half_drift": 0.012127610668568937,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 5.532816171646118,
+          "p95_ms": 5.675899243354797,
+          "pflops_per_rank": 2.4343873033917753,
+          "half_drift": 0.014135291547606033,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.2300639152526855,
+          "p95_ms": 4.236612868309021,
+          "pflops_per_rank": null,
+          "half_drift": 0.0002647928038581969,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.24121618270874,
+          "p95_ms": 4.250494456291198,
+          "pflops_per_rank": null,
+          "half_drift": 0.00018112367509043534,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8951911371107661,
+      "pure_cublaslt_historical": 2.72633632,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 4 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h14336q112d128cp8s524288",
+      "models": [
+        "bloom_176b"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 14336,
+      "k": 14336,
+      "run": "20260913-150411-b9f77b",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "e70b5831053e4378f210cd8c2b3018028684ceb8b386a7459d36884a7be95683",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 11.727488040924072,
+          "p95_ms": 11.748714923858643,
+          "pflops_per_rank": 2.296999560904213,
+          "half_drift": 0.00014466751984451698,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 10.91758394241333,
+          "p95_ms": 10.962011575698853,
+          "pflops_per_rank": 2.4673989247622266,
+          "half_drift": 0.00564810199305699,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.67308783531189,
+          "p95_ms": 4.677508902549744,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001917312603228381,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.6819679737091064,
+          "p95_ms": 4.689867281913758,
+          "pflops_per_rank": null,
+          "half_drift": 0.00038273521958923995,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9647196436803187,
+      "pure_cublaslt_historical": 2.70841158,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 14336 --q-heads 112 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s131072",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150439-6eef46",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "a19b9a04ce6bdba8a54aff5f6a65e049635fec2c33b931d35e5c7bdd37e56bf7",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 7.738703966140747,
+          "p95_ms": 7.861723232269287,
+          "pflops_per_rank": 2.2732729047896547,
+          "half_drift": 0.00853890957360692,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 7.15393590927124,
+          "p95_ms": 7.322222328186035,
+          "pflops_per_rank": 2.459091927510445,
+          "half_drift": 0.024342441733396582,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.1613919734954834,
+          "p95_ms": 2.170907175540924,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001480331828182231,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.1733120679855347,
+          "p95_ms": 2.1795793056488035,
+          "pflops_per_rank": null,
+          "half_drift": 0.00014722125637983918,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9690042256962033,
+      "pure_cublaslt_historical": 2.69677847,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s262144",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150457-aa05c4",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "af9cf0517af328739c765fead22f124db89a121601c8905f89152a42b970f5d1",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 15.02846384048462,
+          "p95_ms": 15.072564935684204,
+          "pflops_per_rank": 2.3411822034698004,
+          "half_drift": 0.003066157400331561,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 14.218303680419922,
+          "p95_ms": 14.350252532958985,
+          "pflops_per_rank": 2.4745829657081053,
+          "half_drift": 0.00013052543126380544,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.296079874038696,
+          "p95_ms": 4.305532646179199,
+          "pflops_per_rank": null,
+          "half_drift": 0.0010056015670069451,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.302864074707031,
+          "p95_ms": 4.311084914207458,
+          "pflops_per_rank": null,
+          "half_drift": 0.00008178409000239368,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9887866619864847,
+      "pure_cublaslt_historical": 2.69672219,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp4s524288",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150520-c05060",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "68ee7c1df8166844ac0c2bbd4cca9705b64c9307ca518e5893f9b8c6ceac6550",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 29.740975379943848,
+          "p95_ms": 29.934123706817626,
+          "pflops_per_rank": 2.366053677752544,
+          "half_drift": 0.00013666532064259123,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 28.645407676696777,
+          "p95_ms": 28.83318738937378,
+          "pflops_per_rank": 2.4565453901677032,
+          "half_drift": 0.001630927998630484,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 8.57863998413086,
+          "p95_ms": 8.599669027328492,
+          "pflops_per_rank": null,
+          "half_drift": 0.00001867630363934457,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 8.572128295898438,
+          "p95_ms": 8.59606375694275,
+          "pflops_per_rank": null,
+          "half_drift": 0.00020904423950172932,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9971005073649233,
+      "pure_cublaslt_historical": 2.69102792,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s131072",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150543-a4f1bb",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "67d454f2f95cbde8158b876a8c21aa71fef9d7a4a7acd00763dd937f877288c5",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "4",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "144",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.914544105529785,
+          "p95_ms": 3.984721636772156,
+          "pflops_per_rank": 2.2470287177968986,
+          "half_drift": 0.0024278893180178706,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.5787200927734375,
+          "p95_ms": 3.617320013046265,
+          "pflops_per_rank": 2.457887958315064,
+          "half_drift": 0.012983403329993391,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.212175965309143,
+          "p95_ms": 2.2184224128723145,
+          "pflops_per_rank": null,
+          "half_drift": 0.00007231742369770842,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.2203999757766724,
+          "p95_ms": 2.2286927938461303,
+          "pflops_per_rank": null,
+          "half_drift": 0.000562115508562866,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9034086494298725,
+      "pure_cublaslt_historical": 2.72299233,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 4 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s262144",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150606-6e4a7a",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "65aff68a733a147f7c7062289041c3ad9dc18c4a59ad31611e7759da4f2286ff",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "4",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "144",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 7.759984016418457,
+          "p95_ms": 7.95315375328064,
+          "pflops_per_rank": 2.2670389535847906,
+          "half_drift": 0.009620639619375015,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 7.170112133026123,
+          "p95_ms": 7.383963084220886,
+          "pflops_per_rank": 2.4535440615196173,
+          "half_drift": 0.016401478637597125,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.396464109420776,
+          "p95_ms": 4.402665543556213,
+          "pflops_per_rank": null,
+          "half_drift": 0.0007496702703514681,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.402623891830444,
+          "p95_ms": 4.414512014389038,
+          "pflops_per_rank": null,
+          "half_drift": 0.0008649436424665667,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9125700711248668,
+      "pure_cublaslt_historical": 2.69677847,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 4 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h16384q128d128cp8s524288",
+      "models": [
+        "llama31_405b"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 16384,
+      "k": 16384,
+      "run": "20260913-150635-ea3b4e",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "cec6bdcc5e6818a7418ca698f29250599d81a2e9e5d6580e8abaad4246cd9785",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 15.222127914428711,
+          "p95_ms": 15.270531177520752,
+          "pflops_per_rank": 2.311396428056654,
+          "half_drift": 0.0009313000648182339,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 14.178975582122803,
+          "p95_ms": 14.296620655059815,
+          "pflops_per_rank": 2.481446694441967,
+          "half_drift": 0.00012638106541255936,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.8314080238342285,
+          "p95_ms": 4.836977410316467,
+          "pflops_per_rank": null,
+          "half_drift": 0.0002979610443815887,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.8427040576934814,
+          "p95_ms": 4.8512864112854,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001453344324003621,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9648644799041224,
+      "pure_cublaslt_historical": 2.69672219,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 16384 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s131072",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150708-ea9eb2",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "0153e2c962e44781ce91dcfe78a356c1ba98c60236156e3a178321a6a91b6f77",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "2",
+        "effective_swizzle_size": "2",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 2
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.0066400170326233,
+          "p95_ms": 1.0135968446731567,
+          "pflops_per_rank": 2.184518018699761,
+          "half_drift": 0.006230587146360178,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 0.8675679862499237,
+          "p95_ms": 0.8919568091630936,
+          "pflops_per_rank": 2.5346984794325023,
+          "half_drift": 0.00461059901889855,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.6804800033569336,
+          "p95_ms": 0.6844511985778808,
+          "pflops_per_rank": null,
+          "half_drift": 0.0010345498118522567,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.6865919828414917,
+          "p95_ms": 0.6894847899675369,
+          "pflops_per_rank": null,
+          "half_drift": 0.0018642078175885586,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.866692323328463,
+      "pure_cublaslt_historical": 2.81003793,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 2 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s262144",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150723-60b5d5",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "837ce91bfd724b8ccad84151069821fb3879507f1b32219596922921342ce72e",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.8985759615898132,
+          "p95_ms": 1.9114479959011077,
+          "pflops_per_rank": 2.316497522396313,
+          "half_drift": 0.0016517847290062459,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.7429119944572449,
+          "p95_ms": 1.7613087832927703,
+          "pflops_per_rank": 2.5233898929438388,
+          "half_drift": 0.0013770291524519967,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.2627040147781372,
+          "p95_ms": 1.2680447936058044,
+          "pflops_per_rank": null,
+          "half_drift": 0.00020269385514743736,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.2724480032920837,
+          "p95_ms": 1.276464009284973,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001760341125817314,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9235009175998867,
+      "pure_cublaslt_historical": 2.72426067,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp4s524288",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150739-3b6eea",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "e769cc3f30b2001629f4f9c72b2b5992cd16959f02f8ed824c1efce4d0953d59",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.8112480640411377,
+          "p95_ms": 3.9471360087394713,
+          "pflops_per_rank": 2.3079298104992247,
+          "half_drift": 0.03251008271041072,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.429952025413513,
+          "p95_ms": 3.5050575733184814,
+          "pflops_per_rank": 2.5644944760262494,
+          "half_drift": 0.00023327811745949426,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.489344000816345,
+          "p95_ms": 2.493364727497101,
+          "pflops_per_rank": null,
+          "half_drift": 0.0005655553065920331,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.5099198818206787,
+          "p95_ms": 2.5167200207710265,
+          "pflops_per_rank": null,
+          "half_drift": 0.0005354615261346926,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.940193734267345,
+      "pure_cublaslt_historical": 2.69432669,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp8s131072",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150757-d97593",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "5ad2ffa1b730564fdbb1220cbba9b9046e84924007793f8c835d1d7cbcbd3f59",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 0.5194080173969269,
+          "p95_ms": 0.5221616238355636,
+          "pflops_per_rank": 2.1168553255807048,
+          "half_drift": 0.0004312491289381534,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 0.4285760074853897,
+          "p95_ms": 0.43196640759706495,
+          "pflops_per_rank": 2.565499721338187,
+          "half_drift": 0.0001492981059341338,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.37225599586963654,
+          "p95_ms": 0.3757536008954048,
+          "pflops_per_rank": null,
+          "half_drift": 0.0036104061388672988,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.3757279962301254,
+          "p95_ms": 0.37936960607767106,
+          "pflops_per_rank": null,
+          "half_drift": 0.0003406745729342817,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.6136636151561001,
+      "pure_cublaslt_historical": 2.61161691,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp8s262144",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150820-ee7d49",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "8a733cd6b58586d7c783ce0191f39c46ab0859f995a31a54b83e66117d19f4a4",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "2",
+        "effective_swizzle_size": "2",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 2
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.02292799949646,
+          "p95_ms": 1.0312736451625824,
+          "pflops_per_rank": 2.149734151997479,
+          "half_drift": 0.0010010555950617076,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 0.8938719928264618,
+          "p95_ms": 0.9092192232608796,
+          "pflops_per_rank": 2.460109806772884,
+          "half_drift": 0.0017183132523934375,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.732367992401123,
+          "p95_ms": 0.7379776149988174,
+          "pflops_per_rank": null,
+          "half_drift": 0.001966209102622784,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.7449280023574829,
+          "p95_ms": 0.7494927942752838,
+          "pflops_per_rank": null,
+          "half_drift": 0.00012890250122061308,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8724397871324594,
+      "pure_cublaslt_historical": 2.81003793,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 2 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h4096q64d128cp8s524288",
+      "models": [
+        "qwen3_235b"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 4096,
+      "k": 8192,
+      "run": "20260913-150843-1f515b",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "8c48d68e0d91ef55873e5be2259beb7aa72be19f2979576428465b2144edfb77",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.943120002746582,
+          "p95_ms": 1.9532832324504852,
+          "pflops_per_rank": 2.263394183008462,
+          "half_drift": 0.004973474963791571,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.7449439764022827,
+          "p95_ms": 1.7541967988014222,
+          "pflops_per_rank": 2.5204514131003055,
+          "half_drift": 0.0015954745744382072,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.3494239449501038,
+          "p95_ms": 1.3549936294555665,
+          "pflops_per_rank": null,
+          "half_drift": 0.0005691802457263225,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.3621439933776855,
+          "p95_ms": 1.3682512044906616,
+          "pflops_per_rank": null,
+          "half_drift": 0.0003993351590321859,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8775043546409897,
+      "pure_cublaslt_historical": 2.72426067,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 4096 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s131072",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-150911-94132a",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "83378ee4cc78442980b39dce6292324c42898512a26f7a5fa87d33e2382728d0",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.3757119178771973,
+          "p95_ms": 3.432464015483856,
+          "pflops_per_rank": 2.279987623846754,
+          "half_drift": 0.004881923998722487,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.2007360458374023,
+          "p95_ms": 3.24379677772522,
+          "pflops_per_rank": 2.404628586740697,
+          "half_drift": 0.013236935059285535,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.6236479878425598,
+          "p95_ms": 1.6296800076961517,
+          "pflops_per_rank": null,
+          "half_drift": 0.0006306833777448723,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.6379200220108032,
+          "p95_ms": 1.6418735921382903,
+          "pflops_per_rank": null,
+          "half_drift": 0.00017583864882554558,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9508169060509122,
+      "pure_cublaslt_historical": 2.67212724,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s262144",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-150927-ef3cd1",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "2c509cfafd0c1d8b7b7294b03baa4e8e62dd92f018dcc0502f28a3fd3afab252",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 6.897759914398193,
+          "p95_ms": 7.0281696081161495,
+          "pflops_per_rank": 2.2316176526719547,
+          "half_drift": 0.023808330506521966,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 6.586047887802124,
+          "p95_ms": 6.74630720615387,
+          "pflops_per_rank": 2.3372382119136037,
+          "half_drift": 0.016189321944446125,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 3.2140640020370483,
+          "p95_ms": 3.2241872429847716,
+          "pflops_per_rank": null,
+          "half_drift": 0.0010254613583958146,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 3.2321759462356567,
+          "p95_ms": 3.2396976590156554,
+          "pflops_per_rank": null,
+          "half_drift": 0.00028708991258473605,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9502198015455061,
+      "pure_cublaslt_historical": 2.67424411,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp4s524288",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-150945-c9770d",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "166fd30895397cd9d4ca7d3ec9fe387b795cc2f349b836c6de90ec7a523d7268",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 13.49129581451416,
+          "p95_ms": 13.575408315658569,
+          "pflops_per_rank": 2.2819398522570054,
+          "half_drift": 0.0058775756718075075,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 13.1877121925354,
+          "p95_ms": 13.298758172988892,
+          "pflops_per_rank": 2.334470538047827,
+          "half_drift": 0.001997061320217639,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 6.424975872039795,
+          "p95_ms": 6.437753582000733,
+          "pflops_per_rank": null,
+          "half_drift": 0.00036358506001602626,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 6.4399518966674805,
+          "p95_ms": 6.4530833005905155,
+          "pflops_per_rank": null,
+          "half_drift": 0.00023360752661978127,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9830334866387196,
+      "pure_cublaslt_historical": 2.67130733,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s131072",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-151008-d34895",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "069b38229703703f6f8cc3d7564afd41135f7e966ac526fde74d6e95c8747db8",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.7643199563026428,
+          "p95_ms": 1.7776368260383606,
+          "pflops_per_rank": 2.181175066046741,
+          "half_drift": 0.0070009919130421885,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.6148159503936768,
+          "p95_ms": 1.6397663593292235,
+          "pflops_per_rank": 2.3831141228681965,
+          "half_drift": 0.008204084169726721,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.9244320094585419,
+          "p95_ms": 0.9283423840999603,
+          "pflops_per_rank": null,
+          "half_drift": 0.0004154256044344217,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.9330720007419586,
+          "p95_ms": 0.9359232187271118,
+          "pflops_per_rank": null,
+          "half_drift": 0.00041157887706679366,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8241249621403157,
+      "pure_cublaslt_historical": 2.67150397,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s262144",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-151031-1cb6d8",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "3d0922cae3baf94c47d0c3e70670b711d906cf393b55d29dce2d1708de839a43",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.4024319648742676,
+          "p95_ms": 3.493577575683594,
+          "pflops_per_rank": 2.262082379277323,
+          "half_drift": 0.005342014348986191,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.2068800926208496,
+          "p95_ms": 3.2356175780296326,
+          "pflops_per_rank": 2.400021569918414,
+          "half_drift": 0.003781830293450939,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.8055520057678223,
+          "p95_ms": 1.8105216205120087,
+          "pflops_per_rank": null,
+          "half_drift": 0.00028357194751799607,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.818015992641449,
+          "p95_ms": 1.8212575972080232,
+          "pflops_per_rank": null,
+          "half_drift": 0.00008799640224545574,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.882187589111285,
+      "pure_cublaslt_historical": 2.67212724,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q128d128cp8s524288",
+      "models": [
+        "representative_large"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 7168,
+      "k": 16384,
+      "run": "20260913-151054-fe920f",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "575abf8ef9756ac74e6f20236885a83cbd725fa16fa9e6d0ee27acf07d112daa",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 6.9375998973846436,
+          "p95_ms": 7.135953450202942,
+          "pflops_per_rank": 2.218802325955257,
+          "half_drift": 0.015512054046402478,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 6.5478880405426025,
+          "p95_ms": 6.7167888402938845,
+          "pflops_per_rank": 2.350859192086677,
+          "half_drift": 0.023267327615923095,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 3.564624071121216,
+          "p95_ms": 3.5727744340896606,
+          "pflops_per_rank": null,
+          "half_drift": 0.00000896254105964123,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 3.5773119926452637,
+          "p95_ms": 3.5816256046295165,
+          "pflops_per_rank": null,
+          "half_drift": 0.00008944082423118547,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.87375258484144,
+      "pure_cublaslt_historical": 2.67424411,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 7168 --q-heads 128 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s131072",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151122-cfb560",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "f627e072c7005ba3714eb27613fa2077ba1fe8c61e4e549bb26b4616907f0cae",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "20",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "128",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 2.5731201171875,
+          "p95_ms": 2.579699158668518,
+          "pflops_per_rank": 2.243360505118374,
+          "half_drift": 0.0019648924877840503,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 2.3907999992370605,
+          "p95_ms": 2.4411887884140016,
+          "pflops_per_rank": 2.414437028469997,
+          "half_drift": 0.014482123692452399,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.0245440006256104,
+          "p95_ms": 1.028598415851593,
+          "pflops_per_rank": null,
+          "half_drift": 0.0013742512942582568,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.0377599596977234,
+          "p95_ms": 1.04367995262146,
+          "pflops_per_rank": null,
+          "half_drift": 0.001233377844217038,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.989123412979582,
+      "pure_cublaslt_historical": 2.74689555,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 20 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s262144",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151141-510509",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "669c7024cc65d72a1ddb7d3a09fd2bfe245671cc9ad55e70d2de8a7ac4e268d0",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 5.124671936035156,
+          "p95_ms": 5.183383989334106,
+          "pflops_per_rank": 2.2528021765584487,
+          "half_drift": 0.012032790631545881,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 4.80728006362915,
+          "p95_ms": 5.001275300979614,
+          "pflops_per_rank": 2.401539319290762,
+          "half_drift": 0.042209284898017646,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 3.150256037712097,
+          "p95_ms": 3.154587137699127,
+          "pflops_per_rank": null,
+          "half_drift": 0.00014220701580090989,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 3.1720160245895386,
+          "p95_ms": 3.1808591961860655,
+          "pflops_per_rank": null,
+          "half_drift": 0.0003934788638900989,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.932074540935971,
+      "pure_cublaslt_historical": 2.73420706,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp4s524288",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151159-0b09a3",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "3f192758227f22fbcafd18f4f85bd1b6832f36f6984713d3bd7a89c679b5e625",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 10.029520034790039,
+          "p95_ms": 10.285139465332032,
+          "pflops_per_rank": 2.30217837974331,
+          "half_drift": 0.007293723115414187,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 9.530704021453857,
+          "p95_ms": 9.707025480270385,
+          "pflops_per_rank": 2.422669315018114,
+          "half_drift": 0.011147058875032614,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 6.258064031600952,
+          "p95_ms": 6.26463041305542,
+          "pflops_per_rank": null,
+          "half_drift": 0.00011246475618559016,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 6.282959938049316,
+          "p95_ms": 6.290230369567871,
+          "pflops_per_rank": null,
+          "half_drift": 0.00026995393706984394,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9850903193749854,
+      "pure_cublaslt_historical": 2.71254981,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s131072",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151217-ff8d9b",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "ff5f8beb41f1199ab8f2fd9f705af57baceb4beaa8b2553a0da348f213959cf2",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "20",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "128",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.352512001991272,
+          "p95_ms": 1.3573103904724122,
+          "pflops_per_rank": 2.1339685109357167,
+          "half_drift": 0.0003076057143446416,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.1974080204963684,
+          "p95_ms": 1.2053056061267853,
+          "pflops_per_rank": 2.4103880828487854,
+          "half_drift": 0.022822641828013527,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.5771520137786865,
+          "p95_ms": 0.5814048171043396,
+          "pflops_per_rank": null,
+          "half_drift": 0.0008316633970201809,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.5856319963932037,
+          "p95_ms": 0.5937039941549301,
+          "pflops_per_rank": null,
+          "half_drift": 0.0017485516562412583,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8103128759143008,
+      "pure_cublaslt_historical": 2.75016208,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 20 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s262144",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151241-f99677",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "4863bf5ee49ed6411d229ea25ae139cbbd9d67cbb0f04800726734f165907abd",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 2.6101759672164917,
+          "p95_ms": 2.619286394119263,
+          "pflops_per_rank": 2.211512219223964,
+          "half_drift": 0.0007723875823716053,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 2.446592092514038,
+          "p95_ms": 2.468265640735626,
+          "pflops_per_rank": 2.3593781993680984,
+          "half_drift": 0.004028454792949079,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.7244639992713928,
+          "p95_ms": 1.7288832128047944,
+          "pflops_per_rank": null,
+          "half_drift": 0.00005564829310958341,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.7297759652137756,
+          "p95_ms": 1.7360768079757691,
+          "pflops_per_rank": null,
+          "half_drift": 0.00018497062023564113,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8782655226367069,
+      "pure_cublaslt_historical": 2.74689555,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    },
+    {
+      "id": "h7168q96d128cp8s524288",
+      "models": [
+        "kimi_k3_kda"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 7168,
+      "k": 12288,
+      "run": "20260913-151304-d76ce1",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "c49259c3904b5a2ae94da35e537944f634cefa06bf7844f85356f45ccd73fe80",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "12",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "4",
+        "effective_swizzle_size": "4",
+        "scheduled_compute_ctas": "136",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 4
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 5.336319923400879,
+          "p95_ms": 5.439636826515198,
+          "pflops_per_rank": 2.1634520151277514,
+          "half_drift": 0.03585393144572183,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 4.794255971908569,
+          "p95_ms": 4.914351987838745,
+          "pflops_per_rank": 2.408063348993868,
+          "half_drift": 0.043258378381711635,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 3.482319951057434,
+          "p95_ms": 3.488107216358185,
+          "pflops_per_rank": null,
+          "half_drift": 0.00010105499428536061,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 3.494144082069397,
+          "p95_ms": 3.4986655592918394,
+          "pflops_per_rank": null,
+          "half_drift": 0.0006869092342620118,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8850962571127587,
+      "pure_cublaslt_historical": 2.73420706,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 7168 --q-heads 96 --kv-heads 8 --head-dim 128 --comm-sm 12 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 4 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s131072",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 4,
+      "sequence": 131072,
+      "m": 32768,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151332-58234c",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "d9bff5eec48eb3b28b837f9344ec5cb16a11f58f22c4028f32140299a5bb2a7c",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "16",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "132",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.9060479998588562,
+          "p95_ms": 1.9188975512981414,
+          "pflops_per_rank": 2.3074164509129242,
+          "half_drift": 0.000973726490179444,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.7653279900550842,
+          "p95_ms": 1.8000847935676574,
+          "pflops_per_rank": 2.491348087086506,
+          "half_drift": 0.0024290541919619987,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.6546880006790161,
+          "p95_ms": 0.6587759971618652,
+          "pflops_per_rank": null,
+          "half_drift": 0.0008797468135466625,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.6622720062732697,
+          "p95_ms": 0.666308781504631,
+          "pflops_per_rank": null,
+          "half_drift": 0.0005315414643967345,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9566631417930676,
+      "pure_cublaslt_historical": 2.77685299,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 131072 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 16 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s262144",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 4,
+      "sequence": 262144,
+      "m": 65536,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151348-fb6921",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "7e357040c498108e7837592c7cbffc5af67eca4884f4e63936cc3b2646a861bd",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.7458399534225464,
+          "p95_ms": 3.9875774741172787,
+          "pflops_per_rank": 2.348229804685348,
+          "half_drift": 0.014163979861107288,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.4920159578323364,
+          "p95_ms": 3.5045231580734253,
+          "pflops_per_rank": 2.5189154712993242,
+          "half_drift": 0.0005589702139609211,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.3289599418640137,
+          "p95_ms": 2.3332080960273744,
+          "pflops_per_rank": null,
+          "half_drift": 0.00013738223977275216,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.333359956741333,
+          "p95_ms": 2.339369606971741,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001234312960255429,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9982183008993843,
+      "pure_cublaslt_historical": 2.72831671,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 262144 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp4s524288",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 4,
+      "sequence": 524288,
+      "m": 131072,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151404-56d1f5",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "f76d10b094e4807b6be3d6538ec1a9b4f4c544a0cd032706a0a6f9f9b9b85d55",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 7.639888048171997,
+          "p95_ms": 8.03116488456726,
+          "pflops_per_rank": 2.3026758943968164,
+          "half_drift": 0.007187551696474471,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 7.163919925689697,
+          "p95_ms": 7.4639586210250854,
+          "pflops_per_rank": 2.4556648073816008,
+          "half_drift": 0.028627921683613413,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 4.621664047241211,
+          "p95_ms": 4.630227279663086,
+          "pflops_per_rank": null,
+          "half_drift": 0.0001593011877843227,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 4.627983808517456,
+          "p95_ms": 4.6374959468841555,
+          "pflops_per_rank": null,
+          "half_drift": 0.00023501930924208538,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 2.0055334305555856,
+      "pure_cublaslt_historical": 2.71472286,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 4 --global-seq 524288 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s131072",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 8,
+      "sequence": 131072,
+      "m": 16384,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151422-a6717c",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "08fcaefa6a2836b40dad684940d8dcc75c9853db7d6ad92779291dbe30390f22",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "20",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "128",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.0381919741630554,
+          "p95_ms": 1.0423455834388733,
+          "pflops_per_rank": 2.118127774321079,
+          "half_drift": 0.006996796584401248,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 0.8952800035476685,
+          "p95_ms": 0.9006400108337402,
+          "pflops_per_rank": 2.456240781474033,
+          "half_drift": 0.02448392196537141,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 0.29635201394557953,
+          "p95_ms": 0.3014672040939331,
+          "pflops_per_rank": null,
+          "half_drift": 0.005182964249473561,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 0.30379199981689453,
+          "p95_ms": 0.308220799267292,
+          "pflops_per_rank": null,
+          "half_drift": 0.0014747534916135351,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.7945234002608843,
+      "pure_cublaslt_historical": 2.78882654,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 131072 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 20 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s262144",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 8,
+      "sequence": 262144,
+      "m": 32768,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151445-19950d",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "2892faf1c9af48393f185db0f5ab9a8f5b80c4777813b56b12e7139c1900c8c2",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 64,
+        "oproj_n_group_tiles": 16,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 1.9617120027542114,
+          "p95_ms": 1.9895855963230134,
+          "pflops_per_rank": 2.241943009437275,
+          "half_drift": 0.003996528203364687,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 1.7559840083122253,
+          "p95_ms": 1.7813279807567597,
+          "pflops_per_rank": 2.5046051047647118,
+          "half_drift": 0.0026788390688108287,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 1.2927520275115967,
+          "p95_ms": 1.2950639843940734,
+          "pflops_per_rank": null,
+          "half_drift": 0.0007674013937160135,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 1.2974079847335815,
+          "p95_ms": 1.3012175738811493,
+          "pflops_per_rank": null,
+          "half_drift": 0.00022198849316765177,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.8898316512016713,
+      "pure_cublaslt_historical": 2.77685299,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 262144 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 64 --oproj-n-group-tiles 16 --causal --calibrate"
+    },
+    {
+      "id": "h8192q64d128cp8s524288",
+      "models": [
+        "llama31_70b",
+        "qwen25_72b"
+      ],
+      "cp": 8,
+      "sequence": 524288,
+      "m": 65536,
+      "n": 8192,
+      "k": 8192,
+      "run": "20260913-151509-535b8d",
+      "candidate": 1,
+      "source": "fa9d9a87a626c03416237e9cbf20c9fca84209973991d4ab33b93404e687d580",
+      "binary": "e59d6bd4f4ee33e7f2f6dd2c62ec6b23b5124d2f15b3714e63012a6ce69c5458",
+      "artifact": "a1d77c0d38e8a2e5723de1ad7ff2506abd15dbeb8716c61f0186745959d73ad5",
+      "environment": "db0411ef10686aaa965817b10f24707e0b15f67f09b9ae7e64d088e598848f69",
+      "configuration": {
+        "comm_sm": "8",
+        "tile": "m128n256",
+        "tile_m": "128",
+        "tile_n": "256",
+        "tile_k": "128",
+        "raster": "along_n",
+        "max_swizzle_size": "8",
+        "effective_swizzle_size": "8",
+        "scheduled_compute_ctas": "140",
+        "dynamic_smem": "220160",
+        "oproj_m_window_tiles": 0,
+        "oproj_n_group_tiles": 0,
+        "window_effective_swizzle_size_derived": 8
+      },
+      "weight_preparation": "all",
+      "epilogue_n": 32,
+      "metrics": {
+        "fused": {
+          "p50_ms": 3.8735839128494263,
+          "p95_ms": 4.048863887786865,
+          "pflops_per_rank": 2.2707893310455107,
+          "half_drift": 0.012193336629739105,
+          "validation": "both_payloads_and_postmeasurement_full_numeric_and_route"
+        },
+        "compute_reference": {
+          "p50_ms": 3.5787359476089478,
+          "p95_ms": 3.6803471326828,
+          "pflops_per_rank": 2.4578770691603866,
+          "half_drift": 0.002038732520218691,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        },
+        "copy_reference": {
+          "p50_ms": 2.538383960723877,
+          "p95_ms": 2.542854392528534,
+          "pflops_per_rank": null,
+          "half_drift": 0.00023950961955164927,
+          "validation": "both_payloads_and_postmeasurement_full_route"
+        },
+        "producer_reference": {
+          "p50_ms": 2.5439040660858154,
+          "p95_ms": 2.550231945514679,
+          "pflops_per_rank": null,
+          "half_drift": 0.00017610275328547848,
+          "validation": "both_payloads_and_postmeasurement_full_numeric"
+        }
+      },
+      "v21_historical_pflops": 1.9022889373005296,
+      "pure_cublaslt_historical": 2.72831671,
+      "replay": "python3 scripts/l20d.py run fused-smoke --node 09 --workspace /home/work/workspace_wct --mpi --mxfp8 --fused-launch graph --fused-direction oproj --input-generator gpu_philox --world 8 --global-seq 524288 --hidden 8192 --q-heads 64 --kv-heads 8 --head-dim 128 --comm-sm 8 --qkv-policy-list m128n256 --oproj-policy-list m128n256 --oproj-raster along_n --max-swizzle-size 8 --mxfp8-epilogue-n 32 --mxfp8-weight-preparation all --oproj-m-window-tiles 0 --oproj-n-group-tiles 0 --causal --calibrate"
+    }
+  ]
+}

@@ -5,7 +5,21 @@ optional, disabled experimental extension, not part of these benchmarks.
 Targets are measured separately: forward QKV/OProj each2.2 PFLOPS/GPU;
 corresponding complete backward each2.0 PFLOPS/GPU. OProj forward is independently
 confirmed at2.256462P across all36 physical points with explicit offline plans.
-The other three targets remain unachieved; this is not a new Auto or release.
+The other three targets remain unachieved. The OProj forward milestone is
+published separately in [v23.0](../../results/sm103/v23.0/README.md); this is
+not a new Auto policy or completion of the remaining development goal.
+
+## Backward component checkpoint
+
+OProj backward Qwen3 CP8/128K, fixed C16/E32/sw8/AlongN: actual complete
+five-kernel Graph is1.999480ms/1.099798P. Separate B (W transpose quant,
+dA and inverse A2A) is0.648888ms; W (dY/A transpose quant and dW) is1.372248ms.
+Both payloads and all pre/post numerical and route checks pass Graph10+50;
+run20260913-184756-a0df65, source0deb948f. The W phase dominates this point,
+but these measurements do not isolate quantization from the dW GEMM itself.
+Independent phase times are not added to replace the actual complete timing.
+`--calibrate` selects this diagnostic; it preserves native B epochs across
+component Graphs, while ordinary dW launches use a separate software counter.
 
 ## Baselines and scope
 

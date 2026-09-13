@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v22.0
+        default: v23.0
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v22.0");
+              : (process.env.REQUESTED_TAG || "v23.0");
 
             const releases = {
+              "v23.0": {
+                name: "v23.0 — SM103 MXFP8 OProj forward 2.2P milestone",
+                body: [
+                  "OProj A2A→GEMM 纯双融合：36/36 大尺寸长序列物理点，CP4/8×128K/256K/512K，固定配置 Graph10+50、双非零 Philox、完整数值/路由及测后校验通过。几何平均2.256462 PFLOPS/卡，达到2.2P平均目标；7个单点仍低于2.2P。",
+                  "相对v21历史发布吞吐+17.85%，为历史满设备纯cuBLASLt的83.1%；是历史对照，不是同场配对A/B。完整边界含BF16权重量化、A/SFA通信、GEMM及同步；上游激活量化不包含。",
+                  "核心优化：计算CTA在启动阶段协助权重量化，通信立即搬运激活；均衡scale交货；容量适配搬运槽；离线选择与GEMM消费顺序匹配的通信窗口和CTA预算。不放宽ready/fence协议，不宣称新Auto。",
+                  "保存当前开发进展：OProj MXFP8 B+dW已有6个CP8/128K物理点初始基线，GM1.355P，尚未达到2P；QKV前向和两个反向目标仍继续开发，QKV MXFP8反向尚未实现。norm/RoPE仍默认关闭、实验性且不计入主表；不宣称完整模型训练验证。",
+                  "最终表、逐点配置、复现和证据：results/sm103/v23.0。不打包调参过程、profile、原始大日志或依赖。",
+                ].join("\n\n"),
+              },
               "v22.0": {
                 name: "v22.0 — Experimental SM103 MXFP8 norm/RoPE forward fusion",
                 body: [

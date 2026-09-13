@@ -1,5 +1,16 @@
 # 版本演进手册
 
+## v23.0：MXFP8 OProj 前向 2.2P 里程碑
+
+- 计算 CTA 协助启动权重量化，激活搬运立即开始；scale 工作均衡分配，
+  搬运槽按容量匹配，通信窗口与预算跟随 GEMM 消费轨迹。
+- 36/36 固定点，Graph10+50 双 payload 全量校验，几何平均2.256462P/卡。
+  相对 v21 历史结果+17.85%，保留历史满 SM cuBLASLt 吞吐83.1%。
+- 显式离线配置；不把部分单点低于2.2P隐藏，也不宣称新 Auto 或全 goal 达成。
+- 保存 OProj MXFP8 B+dW 初始基线及分阶段测量；QKV 前向和两个反向仍在开发。
+  原 norm/RoPE 实验功能保持默认关闭，与本次主表分开。
+  [最终结果与复现](results/sm103/v23.0/README.md)。
+
 ## v22.0：实验性 MXFP8 norm/RoPE 前向融合
 
 - 可选 Q/K head RMSNorm＋RoPE、RoPE-only、OProj 后残差＋完整 hidden RMSNorm；
