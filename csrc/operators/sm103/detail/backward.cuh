@@ -420,6 +420,7 @@ struct QkvBackwardPushCommT {
 // concatenation, is the K-ready unit: [all Q][all K][all V] must match W rows.
 // Read-side packing also saves ORIGINAL BF16 masters for the later dW K-axis.
 // Share O's first-use scheduler and asynchronous, warp-owned input transport.
+template <bool Prepared = false>
 struct Mxfp8QkvBackwardPullComm {
   using ScaleLayout = decltype(Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
       cute::make_shape(int{}, int{}, int{}, 1)));
@@ -445,6 +446,7 @@ struct Mxfp8QkvBackwardPullComm {
   }
   static Params to_underlying_arguments(const Arguments& a) { return a; }
   CUTLASS_DEVICE static void initialize_grid(const Params& a) {
+    if constexpr (Prepared) return;  // Diagnostic preserves completed B's ready flags.
     const auto& p=a.params;
     const int64_t count=int64_t{p.local_tokens/128}*(p.q_heads+2*p.kv_heads);
     for(int64_t i=int64_t{blockIdx.x}*blockDim.x+threadIdx.x;i<count;
@@ -453,6 +455,7 @@ struct Mxfp8QkvBackwardPullComm {
     cooperative_groups::this_grid().sync();
   }
   CUTLASS_DEVICE void operator()(const Params& a, char* storage, int comm_id, int comm_ctas) {
+    if constexpr (Prepared) return;  // Same GEMM budget/layout, no input transport.
     const auto& p=a.params;
     const int heads=p.q_heads+2*p.kv_heads, width=heads*128;
     const int lane=threadIdx.x%32, warp=threadIdx.x/32;

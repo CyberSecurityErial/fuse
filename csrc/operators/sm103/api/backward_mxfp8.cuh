@@ -315,7 +315,7 @@ cudaError_t validate_mxfp8_qkv_backward_data(const Mxfp8QkvBackwardDataParams& p
   return cudaSuccess;
 }
 
-template <int EpilogueN>
+template <int EpilogueN, bool Prepare = true>
 cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
   auto status=validate_mxfp8_qkv_backward_data(p);
   if(status!=cudaSuccess)return status;
@@ -337,7 +337,7 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
       ,true>;
   using Gemm=cutlass::gemm::kernel::GemmUniversal<ProblemShape,Mainloop,
       typename Types::Epilogue,detail::MonolithicPersistentScheduler>;
-  using Comm=Mxfp8QkvBackwardPullComm;
+  using Comm=Mxfp8QkvBackwardPullComm<!Prepare>;
   using Base=detail::MonolithicGemm<Gemm,Comm>;
   using Kernel=detail::InputProductionKernel<Base,Comm>;
   typename Kernel::Arguments args{};
@@ -361,8 +361,9 @@ cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cud
   comm.input_order.ready_group_m_tiles=std::max(1,d.num_comm_ctas*8);
   args.num_comm_ctas=d.num_comm_ctas;
   if(!Kernel::can_implement(args) || Kernel::get_workspace_size(args))return cudaErrorNotSupported;
-  status=prepare_mxfp8_transpose(d.weight,w.rhs.b,w.rhs.sfb,g.n,g.k,g.n,
-      main.layout_SFB,info,stream);
+  if constexpr (Prepare)
+    status=prepare_mxfp8_transpose(d.weight,w.rhs.b,w.rhs.sfb,g.n,g.k,g.n,
+        main.layout_SFB,info,stream);
   return status==cudaSuccess?launch_monolithic<Kernel>(args,info,stream):status;
 }
 
@@ -376,6 +377,11 @@ cudaError_t qkv_backward_mxfp8_data_workspace_size(const QkvBackwardDataParams& 
 cudaError_t launch_qkv_backward_mxfp8_data(const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
   return p.projection.gemm_tuning.epilogue_n==64
       ?qkv_backward_mxfp8_data_impl<64>(p,stream):qkv_backward_mxfp8_data_impl<32>(p,stream);
+}
+cudaError_t launch_qkv_backward_mxfp8_data_compute_reference(
+    const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
+  return p.projection.gemm_tuning.epilogue_n==64?qkv_backward_mxfp8_data_impl<64,false>(p,stream):
+      qkv_backward_mxfp8_data_impl<32,false>(p,stream);
 }
 
 cudaError_t qkv_backward_mxfp8_weight_workspace_size(const QkvBackwardWeightParams& p, size_t* bytes) {

@@ -1,4 +1,4 @@
-"""Read-only audit of complete MXFP8 OProj B+W Graph measurements.
+"""Read-only audit of complete MXFP8 projection B+W Graph measurements.
 
 Reuses archived source/build/environment verification, not forward performance
 parsing. Every rank's own stream, both payloads, full checks, warmup convergence
@@ -90,7 +90,7 @@ def audit_run(directory,component='full'):
     sf.require(request.get('mxfp8') and request.get('backward') and request.get('mpi') and
                request.get('fused_direction') in ('oproj','qkv') and request.get('fused_launch')=='graph' and
                not request.get('profile') and not request.get('quick'),'Not complete MXFP8 backward Graph')
-    sf.require(component in ('full','data','weight','weight_compute') and
+    sf.require(component in ('full','data','weight','weight_compute','data_compute') and
                (component=='full' or request.get('calibrate')),'Backward component requires calibration')
     old_workspace,old_audit=str(l20d.WORKSPACE),sf.audit_mpi_receipts
     try:
@@ -108,6 +108,9 @@ def audit_run(directory,component='full'):
     configs=selected('backward_config');sf.require(len(configs)==1,'Missing/duplicate backward configuration')
     c=configs[0];shape=l20d.fused_geometry(job)
     qkv=job['fused_direction']=='qkv'
+    if component=='data_compute':
+        sf.require(qkv and c.get('data_compute_reference')=='1',
+                   'Missing exact prepared dX diagnostic boundary')
     raster=job[job['fused_direction']+'_raster']
     width=shape['projection_width'] if qkv else shape['q_width']
     sf.require(c.get('op')==job['fused_direction']+'_mxfp8','Wrong backward operator')
@@ -210,11 +213,12 @@ def audit_run(directory,component='full'):
                   'W_quant_dA_inverse_A2A_two_kernels'),
                   'weight':('dQKV_quant_saved_X_quant_dW_three_kernels' if qkv else
                             'dY_quant_saved_A_quant_dW_three_kernels'),
-                  'weight_compute':'prepared_dW_GEMM_one_kernel_no_quantization'}[component],payloads=payloads,
+                  'weight_compute':'prepared_dW_GEMM_one_kernel_no_quantization',
+                  'data_compute':'prepared_dX_same_budget_acquire_adapter_no_quantization_or_transport'}[component],payloads=payloads,
         p50_ms=p50,pflops=flops/(p50*1e12),verification='full_two_payload_pre_post_numeric_and_route')
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('runs',nargs='+',type=Path)
-    parser.add_argument('--component',choices=('full','data','weight','weight_compute'),default='full')
+    parser.add_argument('--component',choices=('full','data','weight','weight_compute','data_compute'),default='full')
     args=parser.parse_args();print(json.dumps([audit_run(run,args.component) for run in args.runs],indent=2))

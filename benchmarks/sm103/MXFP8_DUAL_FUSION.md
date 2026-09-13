@@ -629,3 +629,21 @@ this finite budget comparison does not establish global optimality.
 Kimi QKV-only CP8/128K C64 (204725-206968) passes complete validation at
 1.151694P, not a full-matrix result or a measured improvement versus its old
 transport. Further data-gradient compute/communication diagnosis is required.
+
+Prepared dX reference keeps the SAME GEMM, acquire/TMA adapter, raster/swizzle
+and compute budget, but preserves completed B's packed inputs/ready flags and
+omits W preparation and communication. It must run after B and BEFORE W reuses
+scratch. Its single cooperative Graph is not a full B performance claim.
+Sourcea94c7e9a passes bounded CP4 causal test205353-167d7b and all five
+independent large-component audits:
+
+| CP8/128K | C | Full ms | B ms | Prepared dX ms | Prepared dX P |
+|---|---:|---:|---:|---:|---:|
+| Llama70/Qwen72 (205429-e21320) | 32 | 3.674536 | 2.349040 | 2.081272 | 1.320721 |
+| Llama70/Qwen72 (205508-6b7ff3) | 64 | 4.381728 | 3.060480 | 2.741368 | 1.002703 |
+| Kimi QKV-only (205547-3311f0) | 32 | 12.591144 | 8.226440 | 7.514200 | 1.152305 |
+
+Already-ready dX remains most of B time. This rules out blaming most remaining
+time on waiting for delivery; it does not separate arithmetic from the head-wise
+acquire/load adapter. B minus prepared dX includes preparation, transport and
+concurrent/cache effects, not a measured sum of semaphore wait intervals.

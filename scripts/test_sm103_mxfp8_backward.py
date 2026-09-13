@@ -202,6 +202,19 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertIn('(flops/2)/(value.p50*1e12)',text)
         self.assertIn('r.validate(o,generation,"post");results.push_back(result)',text)
 
+    def test_prepared_dx_preserves_ready_budget_and_weight_workspace_lease(self):
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        harness=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
+        route=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
+        header=(ROOT/'include/fuse/operators/ulysses/qkv_backward.h').read_text()
+        self.assertIn('using Comm=Mxfp8QkvBackwardPullComm<!Prepare>',api)
+        self.assertIn('qkv_backward_mxfp8_data_impl<32,false>',api)
+        self.assertIn('if constexpr (Prepared) return',route)
+        self.assertIn('compute-CTA budget',header)
+        self.assertIn('Do not run W on this scratch',header)
+        self.assertIn('components.insert(components.begin()+1,Component::kDataCompute)',harness)
+        self.assertIn('std::vector<L>{L::kCooperativeDynamic}',harness)
+
     def test_qkv_formal_reference_reads_original_peer_planes(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_mpi_bench.cu').read_text()
         ref=(ROOT/'benchmarks/sm103/backward/mxfp8_reference.cuh').read_text()

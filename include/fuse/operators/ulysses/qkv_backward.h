@@ -255,6 +255,13 @@ cudaError_t qkv_backward_mxfp8_weight_workspace_size(
     const QkvBackwardWeightParams& params, size_t* bytes);
 cudaError_t launch_qkv_backward_mxfp8_data(
     const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
+// Diagnostic only: first complete B with identical parameters, then preserve
+// its packed MXFP8 operands/SF and ready flags. Do not run W on this scratch
+// between B and this call. Keeps the exact dX GEMM, acquire/TMA adapter and
+// compute-CTA budget; skips W preparation, communication and ready reset.
+// This is a compute diagnostic with already-ready inputs, NOT a B boundary.
+cudaError_t launch_qkv_backward_mxfp8_data_compute_reference(
+    const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
 cudaError_t launch_qkv_backward_mxfp8_weight(
     const Mxfp8QkvBackwardWeightParams& params, cudaStream_t stream);
 // Diagnostic only, same prepared-scratch lease as the OProj compute reference:
