@@ -23,6 +23,22 @@ The pure cuBLASLt ceiling requires its own two-timed-payload validation,
 separate from the native operator comparisons below. Historical records that
 timed only payload0 must not be described as two-payload timing results.
 
+Formal MXFP8 forward MPI runs now declare `timed_payload_generations=2`:
+each regenerated activation/master-weight payload independently converges,
+runs10+50 and passes its own full pre/post checks. Allocations remain reused.
+F/C/R/Q boundaries remain separate; profiling, quick and legacy BF16 timing
+are unchanged. Reports retain both sets of50 real samples and accepted rounds;
+latency is the equal-weight mean of payload p50s, and reported p95 is the mean
+of payload p95s (not a pooled percentile). Drift is the maximum per-payload
+half-drift; warmup_calls is the per-payload minimum. Old reports without this
+field explicitly mean one timed payload plus two validated payloads, including
+the earlier O forward milestone and Q forward finite-candidate table. They are
+not silently relabelled; new fixed-matrix replay is a separate confirmation.
+This contract passed ordinary QKV/OProj CP4/8 small causal full/component checks
+and QKV Dense CP8/128K plus Qwen3 CP4/128K full-boundary checks, all with two
+actually timed payloads. Source010ba02f/build20260914-074915-b9042c; no production
+kernel algorithm changed. Experimental norm/RoPE was disabled in these checks.
+
 The backward harness uses a payload-scoped independent-reference
 cache: keep the original K32 decoder, pedantic chunk accumulation, tolerance
 and full pre/post comparison for every component. Only repeated reference

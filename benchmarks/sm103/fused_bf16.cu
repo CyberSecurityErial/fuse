@@ -3905,6 +3905,12 @@ int main(int argc, char** argv) {
     ::alarm(60);
     fused_mpi::initialize(argc, argv);
     const Options options = parse_options(argc, argv);
+    const int timed_payload_generations =
+#if FUSE_BENCH_MXFP8
+        !options.profile && !options.quick ? 2 : 1;
+#else
+        1;
+#endif
     ::alarm(options.timeout_seconds);
     auto candidates = make_candidates(options);
     std::ostringstream contract;
@@ -3967,6 +3973,7 @@ int main(int argc, char** argv) {
               << ",seed=" << options.seed << ",warmup=" << (options.quick ? 1 : kWarmup)
               << ",samples=" << (options.quick ? 5 : kSamples)
               << ",sampling_mode=" << (options.quick ? "quick_1_5" : "formal_10_50")
+              << ",timed_payload_generations=" << timed_payload_generations
               << ",input_generator=" << options.input_generator
               << ",host_launch=" << options.host_launch
               << ",max_swizzle_size=" << options.max_swizzle_size
@@ -4032,6 +4039,9 @@ int main(int argc, char** argv) {
     // A candidate is not accepted until BOTH payload generations pass.
     for (uint32_t generation = 0; generation < 2; ++generation) {
       const std::string payload_context = ",generation=" + std::to_string(generation);
+      // Reuse the same allocations, but independently converge/sample both
+      // MXFP8 production payloads. Profile/quick and BF16 protocols stay put.
+      const bool time_payload = generation < timed_payload_generations;
       {
         StageTimer timer{"input", payload_context + (options.input_generator == "gpu_philox"
             ? ",includes=gpu_activation_rng_statistics_publish"
@@ -4075,11 +4085,11 @@ int main(int argc, char** argv) {
           validation_self_test(runtimes, candidate_options, candidate.direction, context);
           self_tested[direction_index] = true;
         }
-        if (generation == 0 && !options.validation_self_test) {
+        if (time_payload && !options.validation_self_test) {
           StageTimer timer{"benchmark", context + ",includes=convergence_sampling_logging"};
           benchmark(runtimes, candidate_options, candidate.direction, epoch, context);
         }
-        if (options.launch == "graph" && generation == 0 && !options.validation_self_test) {
+        if (options.launch == "graph" && time_payload && !options.validation_self_test) {
           StageTimer timer{"validate", context + ",validation_phase=post,includes=last_graph_sample_full_checks"};
           validate(runtimes, candidate_options, candidate.direction, context + ",validation_phase=post");
 #if FUSE_BENCH_MXFP8
@@ -4121,7 +4131,7 @@ int main(int argc, char** argv) {
               run_epoch(runtimes, reference_options, candidate.direction, ++reference_epoch);
               validate(runtimes, reference_options, candidate.direction, reference_context + ",validation_phase=pre");
             }
-            if (generation == 0) {
+            if (time_payload) {
               {
                 StageTimer timer{"benchmark", reference_context + ",includes=convergence_sampling_logging"};
                 benchmark(runtimes, reference_options, candidate.direction, reference_epoch, reference_context);

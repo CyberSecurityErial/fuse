@@ -613,7 +613,8 @@ def bf16_round(value):
     return struct.unpack('<f', struct.pack('<I', rounded))[0]
 
 
-def audit_graph_preparation(records, timing, checks, domains, world, *, repeat_launches=0):
+def audit_graph_preparation(records, timing, checks, domains, world, *, repeat_launches=0,
+                            payload_timings=None):
     """One prepare/one actual launch; capture/update is host work, not an epoch."""
     rows = [row for row in records if row['kind'] == 'graph_prepare']
     require(Counter((count(row, 'generation'), count(row, 'rank')) for row in rows) ==
@@ -626,20 +627,22 @@ def audit_graph_preparation(records, timing, checks, domains, world, *, repeat_l
                 'Graph preparation schema/untimed contract mismatch')
         number(row, 'wall_s', 0)
         generation, rank = count(row, 'generation'), count(row, 'rank')
+        current_timing = (payload_timings.get(generation) if payload_timings is not None
+                          else timing if generation == 0 else None)
         first, last, calls = (count(row, key, 1) for key in ('first_epoch', 'last_epoch', 'calls'))
         require(last < 2**32 and last - first + 1 == calls, 'Graph preparation epoch/count mismatch')
-        expected_calls = repeat_launches + (1 if generation == 1 or timing is None else (
-            1 + timing['warmup_calls'] + sum(len(value['maxrank_ms']) for value in timing['rounds'])))
+        expected_calls = repeat_launches + (1 if current_timing is None else (
+            1 + current_timing['warmup_calls'] + sum(len(value['maxrank_ms']) for value in current_timing['rounds'])))
         require(calls == expected_calls, 'Graph preparations differ from actual launch count')
-        if generation == 0 and timing is not None:
-            require(first == timing['rounds'][0]['epoch_first'] - timing['warmup_calls'] - 1 - repeat_launches and
-                    last == timing['rounds'][-1]['epoch_last'], 'Graph preparation/sample epochs disagree')
+        if current_timing is not None:
+            require(first == current_timing['rounds'][0]['epoch_first'] - current_timing['warmup_calls'] - 1 - repeat_launches and
+                    last == current_timing['rounds'][-1]['epoch_last'], 'Graph preparation/sample epochs disagree')
         require(checks['candidate', generation, 'pre', rank]['line'] < row['line'],
                 'Graph preparation precedes native candidate binding')
         # Validations are root-owned; rank-concatenated logs are not a global
         # clock. Only rank 0's preparation can be compared with these lines.
         if rank == 0:
-            phase = 'post' if generation == 0 and timing is not None else 'pre'
+            phase = 'post' if current_timing is not None else 'pre'
             require(all(checks[kind, generation, phase, peer]['line'] < row['line']
                         for kind in domains for peer in range(world)),
                     'Graph preparation report precedes full final validation')

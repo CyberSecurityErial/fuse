@@ -692,7 +692,7 @@ int main() {
 class Mxfp8ComponentSummaryContracts(unittest.TestCase):
     """Synthetic log audits reuse the real 10+50 parser; no GPU measurements."""
 
-    def fixture(self):
+    def fixture(self, timed_generations=1):
         import summarize_sm103_mxfp8_fused as report
         from test_sm103_fused_summary import FusedSummaryTests, line
         job = dict(run_id='synthetic', experiment='unit', workspace='/home/work/workspace_wct',
@@ -712,6 +712,8 @@ class Mxfp8ComponentSummaryContracts(unittest.TestCase):
                         calibrate=1, cpu_oracle=0, candidates=1, max_swizzle_size=1, qkv_raster='heuristic',
                         oproj_raster='heuristic', qkv_effective_raster='along_m', oproj_effective_raster='along_n')]
         helpers = FusedSummaryTests()
+        if timed_generations == 2:
+            records[1] += ',timed_payload_generations=2'
         for rank in range(4):
             records += [line('device', rank=rank, runtime_cc='10.3', sms=148),
                         helpers.input_row('QKV-weight', 1024 * 2048, 20260917, .02, rank=rank)]
@@ -754,15 +756,29 @@ class Mxfp8ComponentSummaryContracts(unittest.TestCase):
                                 checked=256 * 2048, nonfinite=0,
                                 **(numeric if kind == 'correctness' else dict(bitwise_mismatches=0))))
                 checks('pre')
-                if generation == 0:
+                if generation < timed_generations:
                     for text in helpers.timing_rows('GEMM_A2A', scoped):
+                        if generation == 1:
+                            # Slower second payload and continuing production
+                            # epochs prove neither timing nor Graph checks are
+                            # accidentally still bound only to generation zero.
+                            fields=text.split(',')
+                            for i,field in enumerate(fields):
+                                if '=' not in field: continue
+                                key,value=field.split('=',1)
+                                if key=='epoch' and component=='fused':
+                                    fields[i]=key+'='+str(int(value)+101)
+                                if key.endswith('_ms') and (key.startswith(('rank','maxrank','warmup_p','p50','p95','accumulated'))):
+                                    fields[i]=key+'='+str(float(value)*2)
+                                if key=='ms_per_call':fields[i]=key+'='+str(float(value)*2)
+                            text=','.join(fields)
                         text = text.replace('per_epoch_rank_events_v2', 'mpi_graph_rank_events_v1').replace(
                             'single_process_eager_maxrank_cudaevent', 'mpi_graph_maxrank_cudaevent')
                         if text.startswith('summary,'):
                             text += ',launch=graph,graph_epoch_mode=recapture_update_v1'
                         records.append(text)
                     checks('post')
-                first, calls = (102 if component == 'fused' and generation == 1 else 1), (101 if generation == 0 else 1)
+                first, calls = (102 if component == 'fused' and generation == 1 else 1), (101 if generation < timed_generations else 1)
                 for rank in range(4):
                     records.append(line('graph_prepare', 'GEMM_A2A', **scoped, rank=rank, launch='graph',
                         graph_epoch_mode='recapture_update_v1', calls=calls, first_epoch=first,
@@ -776,9 +792,9 @@ class Mxfp8ComponentSummaryContracts(unittest.TestCase):
         records.append('PASS: selected BF16 boundaries, complete routes, changed payloads')
         return job, '\n'.join(records)
 
-    def audit(self, component, change=lambda text: text):
+    def audit(self, component, change=lambda text: text, timed_generations=1):
         import summarize_sm103_mxfp8_fused as report
-        job, log = self.fixture()
+        job, log = self.fixture() if timed_generations==1 else self.fixture(timed_generations)
         receipts = {'status.json': {'attempt': 1}, 'fused-build.json': {'binary_sha256': 'c' * 64},
                     'environment.json': {'fingerprint': 'd' * 64}, 'gpu-before.json': {}}
         data = {'attempt1.log': change(log).encode(), 'gpu-telemetry.csv': b''}
@@ -791,6 +807,34 @@ class Mxfp8ComponentSummaryContracts(unittest.TestCase):
             with mock.patch.object(report.sf, 'read_receipts', return_value=(job, receipts, data, evidence)), \
                  mock.patch.object(report.sf, 'audit_telemetry', return_value={}):
                 return report.audit_run(folder, component=component)
+
+    def test_two_payloads_are_independently_timed_and_equal_weighted(self):
+        for component in ('fused','compute_reference','copy_reference','quantize_reference'):
+            r=self.audit(component,timed_generations=2)
+            self.assertEqual(r['timed_payload_generations'],2)
+            self.assertEqual(len(r['raw_maxrank_ms']),100)
+            a,b=r['payloads']
+            self.assertAlmostEqual(b['p50_ms']/a['p50_ms'],2)
+            self.assertAlmostEqual(r['p50_ms'],(a['p50_ms']+b['p50_ms'])/2)
+            self.assertEqual([p['calls'] for p in r['graph_preparation']],[101,101])
+
+    def test_second_payload_missing_samples_checks_or_epochs_is_rejected(self):
+        for mutation in ('sample','post','epoch','count'):
+            def change(text):
+                rows=text.splitlines(); out=[]; changed=False
+                for row in rows:
+                    target='component=fused,' in row and 'generation=1,' in row
+                    if target and mutation=='sample' and row.startswith('sample,') and 'phase=measurement,' in row and not changed:
+                        changed=True;continue
+                    if target and mutation=='post' and row.startswith('correctness,') and 'validation_phase=post,' in row and not changed:
+                        changed=True;continue
+                    if target and row.startswith('graph_prepare,'):
+                        if mutation=='epoch':row=row.replace('last_epoch=202,','last_epoch=203,')
+                        if mutation=='count':row=row.replace('calls=101,','calls=1,')
+                    out.append(row)
+                return '\n'.join(out)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                self.audit('fused',change,timed_generations=2)
 
     def test_fused_compute_copy_quantize_are_separate_verified_boundaries(self):
         results = {component: self.audit(component) for component in (

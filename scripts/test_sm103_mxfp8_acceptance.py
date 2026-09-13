@@ -44,6 +44,23 @@ def history(sequence=131072, confirmed=True):
 
 
 class AcceptanceSummaryTests(unittest.TestCase):
+    def test_confirmation_keeps_both_timed_payloads_without_selecting_faster(self):
+        row=history()['rows'][0]; entry=row['confirmation']
+        payloads=[dict(generation=g,p50_ms=t,p95_ms=t,half_drift=0.,warmup_calls=10,
+                       rounds=[dict(maxrank_ms=[t]*50)]) for g,t in enumerate((.25,.5))]
+        entry.update(timed_payload_generations=2,timing_aggregation='equal_weight_payload_percentiles_v1',
+                     payloads=payloads,raw_maxrank_ms=[.25]*50+[.5]*50,p50_ms=.375,p95_ms=.375,
+                     pflops_per_rank=2*entry['m']*entry['n']*entry['k']/.375/1e12)
+        report._check_confirmation(row,entry)
+        for mutation in ('faster','missing','raw','generation'):
+            changed=deepcopy(entry)
+            if mutation=='faster':changed['p50_ms']=.25
+            if mutation=='missing':changed['payloads'].pop()
+            if mutation=='raw':changed['raw_maxrank_ms'].pop()
+            if mutation=='generation':changed['payloads'][1]['generation']=0
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                report._check_confirmation(row,changed)
+
     def test_user_gate_is_strict_per_point_and_requires_complete_same_gemm(self):
         def table(ratios):
             return dict(rows=[dict(paired_manual={'evidence': True}, same_historical_gemm=True,

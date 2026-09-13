@@ -140,7 +140,20 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
     expected_comm, expected_tile = expected[candidate_id - 1]
     sf.require(all(int(r['comm_sm']) == expected_comm and r['tile'] == expected_tile for r in selected),
                'Candidate differs from requested budget/tile')
-    timing = sf.audit_timing(candidate, world, mpi=True, launch='graph')
+    timed_count = int(config.get('timed_payload_generations', 1))
+    sf.require(timed_count in (1, 2), 'Unsupported timed payload count')
+    timed_generations = tuple(range(timed_count))
+    payload_timings = {g: sf.audit_timing([r for r in candidate if r.get('generation') == str(g)],
+                                        world, mpi=True, launch='graph') for g in timed_generations}
+    timing = dict(payload_timings[0])
+    # Equal-weight payload latencies, never select the faster random input.
+    # p95 is the mean of per-payload p95s, not a fabricated pooled percentile.
+    timing.update(p50_ms=sum(t['p50_ms'] for t in payload_timings.values()) / timed_count,
+                  p95_ms=sum(t['p95_ms'] for t in payload_timings.values()) / timed_count,
+                  half_drift=max(t['half_drift'] for t in payload_timings.values()),
+                  warmup_calls=min(t['warmup_calls'] for t in payload_timings.values()),
+                  selected_round=timing['selected_round'] if timed_count == 1 else None,
+                  payloads=[dict(generation=g, **t) for g,t in payload_timings.items()])
     domains = ('correctness', 'route') if component in ('fused', 'producer_reference') else (
         ('route',) if component == 'copy_reference' else ('correctness',))
     checked = [r for r in candidate if r['kind'] in ('correctness', 'route')]
@@ -151,7 +164,7 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
         checks[key] = row
     expected = {('candidate', g, 'pre', rank) for g in (0, 1) for rank in range(world)}
     expected.update((kind, g, phase, rank) for kind in domains for g in (0, 1)
-                    for phase in (('pre', 'post') if g == 0 else ('pre',)) for rank in range(world))
+                    for phase in (('pre', 'post') if g in timed_generations else ('pre',)) for rank in range(world))
     sf.require(set(checks) == expected, 'Missing before/after-measurement and changed-payload checks')
     for row in checked:
         width = (shape['hidden'] if row['kind'] == 'correctness' else shape['q_width']) if oproj else shape['projection_width']
@@ -163,19 +176,23 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
             sf.audit_validation(dict(row, kind='correctness'), shape['seq_local'] * width)
         else:
             sf.audit_validation(row, shape['seq_local'] * width)
-    first_warmup = min(r['line'] for r in candidate if r['kind'] == 'warmup')
+    first_warmups = {g: min(r['line'] for r in candidate if r['kind'] == 'warmup'
+                           and r.get('generation') == str(g)) for g in timed_generations}
     for kind in domains:
         for rank in range(world):
-            sf.require(checks[kind, 0, 'pre', rank]['line'] < first_warmup
-                       and checks[kind, 0, 'post', rank]['line'] > timing['summary_line']
-                       and checks[kind, 1, 'pre', rank]['line'] > timing['summary_line'],
+            for g,t in payload_timings.items():
+                sf.require(checks[kind, g, 'pre', rank]['line'] < first_warmups[g]
+                           and checks[kind, g, 'post', rank]['line'] > t['summary_line'],
+                           'Checks do not bracket this payload measurement')
+            sf.require(checks[kind, 1, 'pre', rank]['line'] > payload_timings[0]['summary_line'],
                        'Checks do not bracket measurement or changed payload precedes measurement')
     quant_checks = [r for r in candidate if r['kind'] in ('quant_validation', 'producer_validation')]
     if component in ('quantize_reference', 'producer_reference'):
         sf.require(all(r['kind'] == ('producer_validation' if component == 'producer_reference' else 'quant_validation')
                        for r in quant_checks), 'Wrong operand validation boundary')
         sf.require(Counter((int(r['generation']), r.get('validation_phase', 'pre')) for r in quant_checks)
-                   == Counter(((0, 'pre'), (0, 'post'), (1, 'pre'))),
+                   == Counter((g,phase) for g in (0,1)
+                              for phase in (('pre','post') if g in timed_generations else ('pre',))),
                    'Missing quantization represented-operand validation')
         for row in quant_checks:
             sf.require(row.get('method') == 'represented_operands_gemm' and row.get('prepare_repeated') == '0'
@@ -184,11 +201,16 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
             generation, phase = int(row['generation']), row.get('validation_phase', 'pre')
             sf.require(all(row['line'] < checks['correctness', generation, phase, rank]['line']
                            for rank in range(world)), 'Quantization validation follows its numerical checks')
-            sf.require(row['line'] < first_warmup if (generation, phase) == (0, 'pre')
-                       else row['line'] > timing['summary_line'], 'Quantization validation enters measurement')
+            if generation in payload_timings:
+                sf.require(row['line'] < first_warmups[generation] if phase == 'pre'
+                           else row['line'] > payload_timings[generation]['summary_line'],
+                           'Quantization validation enters measurement')
+            else:
+                sf.require(row['line'] > payload_timings[0]['summary_line'],
+                           'Changed-payload validation precedes measurement')
     else:
         sf.require(not quant_checks, 'Quantization validation attached to another boundary')
-    sf.require(all(r.get('generation') == '0' for r in candidate
+    sf.require(all(r.get('generation') in tuple(map(str,timed_generations)) for r in candidate
                    if r['kind'] in ('warmup', 'sample', 'summary')), 'Unexpected timed payload generation')
     verified = [r for r in candidate if r['kind'] == 'candidate_verified']
     acceptance = dict(payload_generations='2', full_numeric=str(int('correctness' in domains)),
@@ -198,7 +220,7 @@ def audit_component(rows, job, config, shape, candidate_id, component, epilogue_
                'Missing final component acceptance')
     sf.require(verified[0]['line'] > max(r['line'] for r in checked), 'Acceptance precedes checks')
     preparation = sf.audit_graph_preparation(candidate, timing, checks, domains, world,
-                                             repeat_launches=repeat_launches)
+                                             repeat_launches=repeat_launches, payload_timings=payload_timings)
     if component != 'fused':
         sf.require(all(r['first_epoch'] == 1 for r in preparation), 'Reference epoch was not reset')
 
@@ -335,6 +357,8 @@ def audit_run(directory, candidate_id=1, component='fused'):
     configs = [r for r in rows if r['kind'] == 'config']
     sf.require(len(configs) == 1, 'Missing/duplicate config')
     config, shape = configs[0], l20d.fused_geometry(job)
+    timed_count = int(config.get('timed_payload_generations', 1))
+    sf.require(timed_count in (1,2), 'Unsupported timed payload count')
     world = int(job['world'])
     for field in ('world','global_seq','seq_local','hidden','q_heads','kv_heads','head_dim'):
         sf.require(int(config[field]) == shape[field], 'Geometry mismatch: '+field)
@@ -394,14 +418,14 @@ def audit_run(directory, candidate_id=1, component='fused'):
                 if key[0] == candidate_id: repeat_checks.append(r)
             expected_repeats = {(c,g,'pre',i,r) for c in range(1,len(comm)*len(policies)+1)
                                 for g in (0,1) for i in range(3) for r in range(world)}
-            expected_repeats |= {(c,0,'post',0,r) for c in range(1,len(comm)*len(policies)+1)
-                                 for r in range(world)}
+            expected_repeats |= {(c,g,'post',0,r) for c in range(1,len(comm)*len(policies)+1)
+                                 for g in range(timed_count) for r in range(world)}
             sf.require(seen == expected_repeats, 'Incomplete postnorm repeatability coverage')
         for rank in range(world):
             text = data[f'mpi-attempt{attempt}-rank-{rank}.stdout.log'].decode()
             checks = [dict(field.split('=', 1) for field in line.split(',')[1:])
                       for line in text.splitlines() if line.startswith('postnorm_residual,')]
-            sf.require(len(checks) == 3 * len(comm) * len(policies),
+            sf.require(len(checks) == (2 + timed_count) * len(comm) * len(policies),
                        'Missing residual-output pre/post-measurement or changed-payload checks')
             for check in checks:
                 sf.require(int(check['rank']) == rank and int(check['mismatches']) == 0 and
@@ -482,7 +506,9 @@ def audit_run(directory, candidate_id=1, component='fused'):
         p50_ms=timing['p50_ms'],p95_ms=timing['p95_ms'],
         pflops_per_rank=executed_flops/timing['p50_ms']/1e12 if executed_flops else None,
         half_drift=timing['half_drift'],selected_round=timing['selected_round'],warmup_calls=timing['warmup_calls'],
-        raw_maxrank_ms=timing['rounds'][-1]['maxrank_ms'],configuration=configuration,
+        raw_maxrank_ms=[v for t in timing['payloads'] for v in t['rounds'][-1]['maxrank_ms']],
+        timed_payload_generations=len(timing['payloads']), timing_aggregation='equal_weight_payload_percentiles_v1',
+        payloads=timing['payloads'], configuration=configuration,
         communication_selection=automatic.get(candidate_id, dict(mode='explicit')),
         component_resources=resources,graph_preparation=preparation,
         source_id=job['source_id'],quantization_sha256=job['files']['csrc/operators/sm103/detail/quantization.cuh'],
@@ -619,14 +645,29 @@ def _check_confirmation(row, entry):
                and entry.get('precision') == 'MXFP8_E4M3_UE8M0_accFP32_BF16out'
                and entry.get('validation') == 'both_payloads_and_postmeasurement_full_numeric_and_route',
                'Historical confirmation boundary/validation mismatch')
-    samples = entry.get('raw_maxrank_ms')
-    sf.require(isinstance(samples, list) and len(samples) == 50 and entry.get('warmup_calls', 0) >= 10,
-               'Historical confirmation lacks 10+50 evidence')
-    samples = [sf.finite(v, 'historical raw sample', 0) for v in samples]
-    sf.require(all(v > 0 for v in samples), 'Nonpositive historical sample')
-    sf.close(entry['p50_ms'], sf.percentile(samples, .5), 'historical p50')
-    sf.close(entry['p95_ms'], sf.percentile(samples, .95), 'historical p95')
-    sf.close(entry['half_drift'], sf.drift(samples), 'historical drift')
+    timed_count=entry.get('timed_payload_generations',1)
+    sf.require(timed_count in (1,2),'Unsupported historical timed payload count')
+    if timed_count==2:
+        payloads=entry.get('payloads',[])
+        sf.require(len(payloads)==2 and [p['generation'] for p in payloads]==[0,1] and
+                   entry.get('timing_aggregation')=='equal_weight_payload_percentiles_v1',
+                   'Historical two-payload aggregation mismatch')
+        groups=[p['rounds'][-1]['maxrank_ms'] for p in payloads]
+        sf.require(entry.get('raw_maxrank_ms')==groups[0]+groups[1],
+                   'Historical raw payload samples differ from retained rounds')
+    else:
+        payloads=[entry];groups=[entry.get('raw_maxrank_ms')]
+    for payload,samples in zip(payloads,groups):
+        sf.require(isinstance(samples,list) and len(samples)==50 and payload.get('warmup_calls',0)>=10,
+                   'Historical confirmation lacks per-payload10+50 evidence')
+        samples=[sf.finite(v,'historical raw sample',0) for v in samples]
+        sf.require(all(v>0 for v in samples),'Nonpositive historical sample')
+        sf.close(payload['p50_ms'],sf.percentile(samples,.5),'historical payload p50')
+        sf.close(payload['p95_ms'],sf.percentile(samples,.95),'historical payload p95')
+        sf.close(payload['half_drift'],sf.drift(samples),'historical payload drift')
+    sf.close(entry['p50_ms'],sum(p['p50_ms'] for p in payloads)/timed_count,'historical p50')
+    sf.close(entry['p95_ms'],sum(p['p95_ms'] for p in payloads)/timed_count,'historical mean payload p95')
+    sf.close(entry['half_drift'],max(p['half_drift'] for p in payloads),'historical maximum payload drift')
     sf.close(entry['pflops_per_rank'], 2 * row['m'] * row['n'] * row['k'] / entry['p50_ms'] / 1e12,
              'historical PFLOPS')
     for field in ('binary_sha256', 'environment_fingerprint', 'artifact_sha256', 'source_id'):
