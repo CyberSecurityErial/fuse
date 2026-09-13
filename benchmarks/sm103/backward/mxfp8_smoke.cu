@@ -2,6 +2,7 @@
 // Small full-element CPU-oracle bring-up. Not a formal throughput benchmark:
 // no large-shape coverage or timing claim is inferred from these checks.
 #include "fuse/operators/ulysses/oproj_backward.h"
+#include "fuse/operators/ulysses/qkv_backward.h"
 #include "fuse/operators/primitives/gemm_a2a_mxfp8.h"
 #include "../fused_graph.cuh"
 #include "mxfp8_reference.cuh"
@@ -276,6 +277,238 @@ void run(int world, int m, int h) {
   std::cout<<"backward_validation deferred=pass beta1=pass mode=cpu_oracle_bringup_only performance=not_measured\n";
 }
 
+// QKV W is separately checked with its real packed-head width, not by
+// relabeling the OProj case. B/A2A is deliberately NOT claimed by this test.
+void run_qkv_weight(int m, int h) {
+  Rank r;
+  CUDA_CHECK(cudaSetDevice(0));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream,cudaStreamNonBlocking));
+  for (int q_heads : {8,16}) {
+    constexpr int kv_heads=8, dim=128;
+    const int packed=(q_heads+2*kv_heads)*dim;
+    auto* gradient=r.alloc<Bf16>(size_t(m)*packed);
+    auto* input=r.alloc<Bf16>(size_t(m)*h);
+    auto* output=r.alloc<Bf16>(size_t(packed)*h);
+    fuse::Mxfp8QkvBackwardWeightParams p{};
+    p.projection={gradient,input,output,m,h,q_heads,kv_heads,dim,.75f,0.f};
+    CUDA_CHECK(fuse::qkv_backward_mxfp8_weight_workspace_size(p.projection,&p.workspace_bytes));
+    p.workspace=r.alloc<unsigned char>(p.workspace_bytes);
+    auto invalid=p;
+    invalid.workspace_bytes--;
+    if(fuse::launch_qkv_backward_mxfp8_weight(invalid,r.stream)!=cudaErrorInvalidValue)
+      throw std::runtime_error("QKV W undersized scratch accepted");
+    invalid=p;invalid.projection.kv_heads=0;
+    if(fuse::launch_qkv_backward_mxfp8_weight(invalid,r.stream)!=cudaErrorInvalidValue)
+      throw std::runtime_error("QKV W invalid packed heads accepted");
+    for(int generation=0;generation<2;++generation) {
+      random_input<<<64,256,0,r.stream>>>(gradient,m*packed,packed,2345+100*generation);
+      random_input<<<64,256,0,r.stream>>>(input,m*h,h,6789+100*generation);
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaStreamSynchronize(r.stream));
+      const auto g=represented(download(r,gradient,size_t(m)*packed),packed,m,true);
+      const auto x=represented(download(r,input,size_t(m)*h),h,m,true);
+      std::vector<double> product(size_t(packed)*h);
+      for(int row=0;row<packed;++row)for(int col=0;col<h;++col) {
+        double sum=0;
+        for(int k=0;k<m;++k)sum+=double(g[size_t(row)*m+k])*x[size_t(col)*m+k];
+        product[size_t(row)*h+col]=sum;
+      }
+      for(bool graph:{false,true})for(int epilogue:{32,64}) {
+        p.gemm_tuning={epilogue,epilogue==32?1:8,epilogue==64};
+        std::vector<Bf16> previous(product.size(),Bf16(.125f)),expected(product.size());
+        for(float beta:{0.f,1.f}) {
+          p.projection.beta=beta;
+          using L=fused_graph::Launch;
+          std::unique_ptr<fused_graph::Operation> operation;
+          if(graph)operation.reset(new fused_graph::Operation(0,r.stream,0,
+              {L::kOrdinaryStatic,L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+          for(int replay=1;replay<=(graph?2:1);++replay) {
+            if(graph)operation->prepare(replay,[&](uint32_t,cudaStream_t s){
+              return fuse::launch_qkv_backward_mxfp8_weight(p,s);
+            });
+            // beta=0 must overwrite poison; beta=1 must read the original C.
+            if(beta==0)CUDA_CHECK(cudaMemsetAsync(output,0xff,product.size()*sizeof(Bf16),r.stream));
+            else CUDA_CHECK(cudaMemcpyAsync(output,previous.data(),product.size()*sizeof(Bf16),
+                cudaMemcpyHostToDevice,r.stream));
+            if(graph)operation->launch();
+            else CUDA_CHECK(fuse::launch_qkv_backward_mxfp8_weight(p,r.stream));
+            CUDA_CHECK(cudaStreamSynchronize(r.stream));
+            for(size_t i=0;i<product.size();++i)
+              expected[i]=Bf16(float(.75*product[i]+beta*float(previous[i])));
+            expect(download(r,output,product.size()),expected,"QKV W CPU FP64 numeric");
+          }
+          if(graph)operation->reset(2);
+        }
+      }
+      std::cout<<"backward_weight_validation op=qkv_mxfp8 M="<<m<<" H="<<h
+          <<" Q="<<q_heads<<" KV="<<kv_heads<<" generation="<<generation
+          <<" CPU_FP64=pass alpha_beta=pass eager_graph=pass performance=not_measured\n"<<std::flush;
+    }
+  }
+}
+
+struct QkvRank : Rank {
+  fuse::Mxfp8QkvBackwardParams qkv{};
+  Bf16* gradients[3]{};
+  fuse::Mxfp8Activation quantized[3]{};
+  std::vector<Bf16> host_gradients[3];
+};
+
+void run_qkv(int world,int m,int h) {
+  constexpr int q=16,kv=8,dim=128,packed=(q+2*kv)*dim;
+  std::vector<QkvRank> ranks(world);
+  auto sync=[&]{for(auto& r:ranks){CUDA_CHECK(cudaSetDevice(r.device));
+      CUDA_CHECK(cudaStreamSynchronize(r.stream));}};
+  for(int rank=0;rank<world;++rank) {
+    auto& r=ranks[rank];r.device=rank;
+    CUDA_CHECK(cudaSetDevice(rank));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&r.stream,cudaStreamNonBlocking));
+    r.weight=r.alloc<Bf16>(size_t(packed)*h);r.attention=r.alloc<Bf16>(size_t(m)*h);
+    r.da=r.alloc<Bf16>(size_t(m)*h);r.dw=r.alloc<Bf16>(size_t(packed)*h);
+    r.routed=r.alloc<Bf16>(size_t(m)*packed);
+    for(int kind=0;kind<3;++kind) {
+      const int width=(kind==0?q:kv)/world*dim;
+      const fuse::GemmProblem shape{m*world,h,width,1};
+      r.gradients[kind]=r.alloc<Bf16>(size_t(m)*world*width);
+      size_t data=0,scales=0;
+      CUDA_CHECK(fuse::gemm_a2a_mxfp8_activation_size(shape,&data,&scales));
+      r.quantized[kind]={r.alloc<fuse::Fp8E4m3>(data),r.alloc<uint8_t>(scales),data,scales};
+    }
+    auto& d=r.qkv.data.projection;
+    d.local_tokens=m;d.hidden=h;d.q_heads=q;d.kv_heads=kv;d.head_dim=dim;
+    d.world_size=world;d.rank=rank;d.num_comm_ctas=4;d.epoch=1;
+    d.weight=r.weight;d.grad_input=r.da;d.peer_dqkv_staging[rank]=r.routed;
+    d.peer_ready[rank]=r.alloc<uint32_t>(fuse::qkv_backward_ready_elements(d));
+    d.gemm_policy=fuse::BackwardGemmPolicy::kM128N256;
+    r.qkv.weight.projection={r.routed,r.attention,r.dw,m,h,q,kv,dim,1.f,0.f};
+    size_t b=0,w=0;
+    CUDA_CHECK(fuse::qkv_backward_mxfp8_data_workspace_size(d,&b));
+    CUDA_CHECK(fuse::qkv_backward_mxfp8_weight_workspace_size(r.qkv.weight.projection,&w));
+    auto* scratch=r.alloc<unsigned char>(std::max(b,w));
+    r.qkv.data.workspace=r.qkv.weight.workspace=scratch;
+    r.qkv.data.workspace_bytes=r.qkv.weight.workspace_bytes=std::max(b,w);
+  }
+  // P2P visibility was established by the preceding O bring-up. No host cat
+  // feeds production; the host gather below is solely an independent oracle.
+  for(auto& r:ranks)for(int peer=0;peer<world;++peer) {
+    const auto& source=ranks[peer];
+    r.qkv.data.peer_input[peer]={source.quantized[0],source.quantized[1],source.quantized[2],
+        source.gradients[0],source.gradients[1],source.gradients[2]};
+  }
+  for(int generation=0;generation<2;++generation) {
+    for(auto& r:ranks) {
+      CUDA_CHECK(cudaSetDevice(r.device));
+      for(int kind=0;kind<3;++kind) {
+        const int width=(kind==0?q:kv)/world*dim;
+        random_input<<<64,256,0,r.stream>>>(r.gradients[kind],m*world*width,width,
+            12340+1000*generation+100*kind+r.device);
+        CUDA_CHECK(fuse::quantize_gemm_a2a_mxfp8_activation({m*world,h,width,1},
+            r.gradients[kind],r.quantized[kind],r.stream));
+      }
+      random_input<<<64,256,0,r.stream>>>(r.weight,packed*h,h,23450+generation*1000);
+      random_input<<<64,256,0,r.stream>>>(r.attention,m*h,h,34560+generation*1000+r.device);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    sync();
+    for(auto& r:ranks) {
+      for(int kind=0;kind<3;++kind)r.host_gradients[kind]=download(r,r.gradients[kind],
+          size_t(m)*(kind==0?q:kv)*dim);
+      r.hw=download(r,r.weight,size_t(packed)*h);r.ha=download(r,r.attention,size_t(m)*h);
+    }
+    for(bool causal:{false,true}) {
+      if(causal && m%256)continue;
+      for(auto& r:ranks) {
+        r.hdy.resize(size_t(m)*packed);
+        for(int row=0;row<m;++row) {
+          const int global=causal?(row<m/2?r.device*m/2+row:
+              (2*world-r.device-1)*m/2+row-m/2):r.device*m+row;
+          for(int head=0;head<q+2*kv;++head) {
+            const int kind=head<q?0:(head<q+kv?1:2);
+            const int within=head-(kind==0?0:(kind==1?q:q+kv));
+            const int local=(kind==0?q:kv)/world,peer=within/local,own=within%local;
+            for(int c=0;c<dim;++c)r.hdy[size_t(row)*packed+head*dim+c]=
+                ranks[peer].host_gradients[kind][size_t(global)*local*dim+own*dim+c];
+          }
+        }
+        r.expected_da=multiply(represented(r.hdy,m,packed,false),represented(r.hw,h,packed,true),m,h,packed);
+        r.expected_dw=multiply(represented(r.hdy,packed,m,true),represented(r.ha,h,m,true),packed,h,m);
+      }
+      for(bool graph:{false,true})for(int epilogue:{32,64}) {
+        std::vector<std::unique_ptr<fused_graph::Operation>> graphs;
+        for(auto& r:ranks) {
+          CUDA_CHECK(cudaSetDevice(r.device));
+          r.qkv.data.projection.causal_load_balanced=causal;
+          r.qkv.data.projection.gemm_tuning={epilogue,epilogue==32?1:8,epilogue==64};
+          r.qkv.weight.gemm_tuning=r.qkv.data.projection.gemm_tuning;
+          using L=fused_graph::Launch;
+          if(graph)graphs.emplace_back(new fused_graph::Operation(r.device,r.stream,0,
+              {L::kOrdinaryStatic,L::kCooperativeDynamic,L::kOrdinaryStatic,
+               L::kOrdinaryStatic,L::kOrdinaryDynamic}));
+        }
+        for(int replay=1;replay<=(graph?2:1);++replay) {
+          for(auto& r:ranks) {
+            CUDA_CHECK(cudaSetDevice(r.device));
+            if(graph)graphs[r.device]->prepare(replay,[&](uint32_t e,cudaStream_t s){
+              r.qkv.data.projection.epoch=e;return fuse::launch_qkv_backward_mxfp8(r.qkv,s);
+            });
+            CUDA_CHECK(cudaMemsetAsync(r.da,0xff,size_t(m)*h*sizeof(Bf16),r.stream));
+            CUDA_CHECK(cudaMemsetAsync(r.dw,0xff,size_t(packed)*h*sizeof(Bf16),r.stream));
+            CUDA_CHECK(cudaMemsetAsync(r.routed,0xff,size_t(m)*packed*sizeof(Bf16),r.stream));
+          }
+          sync();
+          for(auto& r:ranks) {
+            CUDA_CHECK(cudaSetDevice(r.device));
+            if(graph)graphs[r.device]->launch();
+            else CUDA_CHECK(fuse::launch_qkv_backward_mxfp8(r.qkv,r.stream));
+          }
+          sync();
+          for(auto& r:ranks) {
+            expect(download(r,r.da,size_t(m)*h),r.expected_da,"QKV dX CPU FP64");
+            expect(download(r,r.dw,size_t(packed)*h),r.expected_dw,"QKV dW CPU FP64");
+            const auto master=download(r,r.routed,size_t(m)*packed);
+            for(size_t i=0;i<master.size();++i)if(master[i].raw()!=r.hdy[i].raw())
+              throw std::runtime_error("QKV ORIGINAL BF16 route bytes");
+          }
+        }
+        for(auto& r:ranks)if(graph){CUDA_CHECK(cudaSetDevice(r.device));graphs[r.device]->reset(2);}
+        std::cout<<"backward_validation op=qkv_mxfp8 world="<<world<<" M="<<m
+            <<" H="<<h<<" generation="<<generation<<" causal="<<causal<<" epilogue="<<epilogue
+            <<" launch="<<(graph?"graph":"eager")
+            <<" B=pass W=pass original_route_bytes=pass performance=not_measured\n"<<std::flush;
+      }
+    }
+  }
+  std::vector<std::vector<Bf16>> previous;
+  for(auto& r:ranks) {
+    previous.push_back(download(r,r.dw,size_t(packed)*h));
+    CUDA_CHECK(cudaSetDevice(r.device));
+    r.qkv.weight_mode=fuse::WeightGradientMode::kDeferred;
+    CUDA_CHECK(cudaMemsetAsync(r.da,0xff,size_t(m)*h*sizeof(Bf16),r.stream));
+    CUDA_CHECK(cudaMemsetAsync(r.routed,0xff,size_t(m)*packed*sizeof(Bf16),r.stream));
+    CUDA_CHECK(fuse::launch_qkv_backward_mxfp8(r.qkv,r.stream));
+  }
+  sync();
+  for(auto& r:ranks) {
+    const auto dw=download(r,r.dw,size_t(packed)*h);
+    for(size_t i=0;i<dw.size();++i)if(dw[i].raw()!=previous[r.device][i].raw())
+      throw std::runtime_error("QKV deferred B modified dW");
+    expect(download(r,r.da,size_t(m)*h),r.expected_da,"QKV deferred dX");
+    const auto master=download(r,r.routed,size_t(m)*packed);
+    for(size_t i=0;i<master.size();++i)if(master[i].raw()!=r.hdy[i].raw())
+      throw std::runtime_error("QKV deferred W lease is not original BF16");
+    CUDA_CHECK(cudaSetDevice(r.device));r.qkv.weight.projection.beta=1;
+    CUDA_CHECK(fuse::launch_qkv_backward_mxfp8_weight(r.qkv.weight,r.stream));
+  }
+  sync();
+  for(auto& r:ranks) {
+    auto expected=r.expected_dw;
+    for(size_t i=0;i<expected.size();++i)
+      expected[i]=Bf16(float(expected[i])+float(previous[r.device][i]));
+    expect(download(r,r.dw,size_t(packed)*h),expected,"QKV deferred W beta1");
+  }
+  std::cout<<"backward_validation op=qkv_mxfp8 deferred=pass beta1=pass performance=not_measured\n";
+}
+
 int main(int argc,char** argv){
   try{
     if(argc!=7 || std::string(argv[1])!="--world" || std::string(argv[3])!="--m" ||
@@ -284,6 +517,6 @@ int main(int argc,char** argv){
     CUDA_CHECK(cudaGetDeviceCount(&count));
     if((world!=4&&world!=8)||count<world||(m!=128&&m!=256)||(h!=128&&h!=256))
       throw std::runtime_error("requires CP4/8, CPU-oracle bounded M/H128|256");
-    run(world,m,h);return 0;
+    run(world,m,h);run_qkv_weight(m,h);run_qkv(world,m,h);return 0;
   }catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}
 }

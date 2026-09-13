@@ -176,37 +176,45 @@ cudaError_t oproj_backward_mxfp8_data_impl(const Mxfp8OprojBackwardDataParams& p
   return status == cudaSuccess ? launch_monolithic<Kernel>(args, info, stream) : status;
 }
 
+// Both projection gradients are the same physical operation G^T * X. Resolve
+// semantic dimensions at the entry, then share preparation and CUTLASS without
+// inventing a different model's head count or copying the three-kernel path.
+struct Mxfp8WeightGradientOperands {
+  GemmProblem gemm{};
+  const Bf16* gradient = nullptr;  // Original [K,M], quantized along reduction K.
+  const Bf16* input = nullptr;     // Original [K,N], independently quantized.
+  Bf16* output = nullptr;          // [M,N].
+  float alpha = 1.f, beta = 0.f;
+};
+
 template <int EpilogueN, bool Prepare = true>
-cudaError_t oproj_backward_mxfp8_weight_impl(const Mxfp8OprojBackwardWeightParams& p,
-                                          cudaStream_t stream) {
-  auto status = validate_mxfp8_backward_weight(p);
-  if (status != cudaSuccess) return status;
+cudaError_t backward_mxfp8_weight_impl(const Mxfp8WeightGradientOperands& d,
+                                     void* workspace, cudaStream_t stream) {
   DeviceInfo info{};
-  status = device_info(&info);
+  auto status = device_info(&info);
   if (status != cudaSuccess) return status;
-  const auto& d = p.projection;
-  const auto g = mxfp8_backward_weight_problem(d, p.gemm_tuning);
-  const auto w = Mxfp8BackwardWeightWorkspace::make(g, p.workspace);
+  const auto& g = d.gemm;
+  const auto w = Mxfp8BackwardWeightWorkspace::make(g, workspace);
   using Gemm = typename Mxfp8GemmFamily<256, 128, EpilogueN, 0, Bf16>::PureGemm;
   using Adapter = cutlass::gemm::device::GemmUniversalAdapter<Gemm>;
-  auto args = gemm_arguments<Gemm>(g, w.lhs, w.rhs.b, d.grad_weight,
+  auto args = gemm_arguments<Gemm>(g, w.lhs, w.rhs.b, d.output,
       d.alpha, 0, info, GemmRaster::kAlongN);
   args.mainloop.ptr_SFA = w.sfa;
   args.mainloop.ptr_SFB = w.rhs.sfb;
   args.mainloop.layout_SFA = Mxfp8ScaleConfig::tile_atom_to_shape_SFA(args.problem_shape);
   args.mainloop.layout_SFB = Mxfp8ScaleConfig::tile_atom_to_shape_SFB(args.problem_shape);
   args.epilogue.thread.beta = d.beta;
-  args.epilogue.ptr_C = d.grad_weight;
+  args.epilogue.ptr_C = d.output;
   if (Adapter::can_implement(args) != cutlass::Status::kSuccess || Adapter::get_workspace_size(args))
     return cudaErrorNotSupported;
   Adapter op;
   if (op.initialize(args, nullptr, stream) != cutlass::Status::kSuccess)
     return cudaErrorInitializationError;
   if constexpr (Prepare) {
-    status = prepare_mxfp8_transpose(d.grad_output, w.lhs, w.sfa, g.m, g.k, g.m,
+    status = prepare_mxfp8_transpose(d.gradient, w.lhs, w.sfa, g.m, g.k, g.m,
         args.mainloop.layout_SFA, info, stream);
     if (status != cudaSuccess) return status;
-    status = prepare_mxfp8_transpose(d.saved_attention, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n,
+    status = prepare_mxfp8_transpose(d.input, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n,
         args.mainloop.layout_SFB, info, stream);
     if (status != cudaSuccess) return status;
   }
@@ -214,7 +222,188 @@ cudaError_t oproj_backward_mxfp8_weight_impl(const Mxfp8OprojBackwardWeightParam
   return cudaGetLastError();
 }
 
+template <int EpilogueN, bool Prepare = true>
+cudaError_t oproj_backward_mxfp8_weight_impl(const Mxfp8OprojBackwardWeightParams& p,
+                                          cudaStream_t stream) {
+  auto status = validate_mxfp8_backward_weight(p);
+  if (status != cudaSuccess) return status;
+  const auto& d = p.projection;
+  return backward_mxfp8_weight_impl<EpilogueN, Prepare>(
+      {mxfp8_backward_weight_problem(d, p.gemm_tuning), d.grad_output,
+       d.saved_attention, d.grad_weight, d.alpha, d.beta}, p.workspace, stream);
+}
+
+bool mxfp8_qkv_backward_weight_dimensions(const QkvBackwardWeightParams& p) {
+  const int64_t heads = int64_t{p.q_heads} + 2LL * p.kv_heads;
+  return p.local_tokens > 0 && p.local_tokens % 128 == 0 &&
+      p.hidden > 0 && p.hidden % 128 == 0 && p.head_dim == 128 &&
+      p.q_heads > 0 && p.kv_heads > 0 && p.q_heads % p.kv_heads == 0 &&
+      heads * p.head_dim <= INT32_MAX - 127;
+}
+
+GemmProblem mxfp8_qkv_backward_weight_problem(const QkvBackwardWeightParams& p,
+                                             const BackwardGemmTuning& t = {}) {
+  GemmProblem g{(p.q_heads + 2 * p.kv_heads) * p.head_dim,
+                p.hidden, p.local_tokens, 1};
+  g.max_swizzle_size = t.max_swizzle_size;
+  g.raster = t.along_m ? GemmRaster::kAlongM : GemmRaster::kAlongN;
+  return g;
+}
+
+cudaError_t validate_mxfp8_qkv_backward_weight(const Mxfp8QkvBackwardWeightParams& p) {
+  const auto& d = p.projection;
+  if (!mxfp8_qkv_backward_weight_dimensions(d) || !mxfp8_backward_tuning(p.gemm_tuning) ||
+      !std::isfinite(d.alpha) || !std::isfinite(d.beta) ||
+      !mxfp8_aligned(d.dqkv_staging, 16) || !mxfp8_aligned(d.saved_input, 16) ||
+      !mxfp8_aligned(d.grad_weight, 16) || !mxfp8_aligned(p.workspace))
+    return cudaErrorInvalidValue;
+  const auto g = mxfp8_qkv_backward_weight_problem(d, p.gemm_tuning);
+  if (p.workspace_bytes < Mxfp8BackwardWeightWorkspace::make(g, nullptr).bytes)
+    return cudaErrorInvalidValue;
+  return cudaSuccess;
+}
+
+template <int EpilogueN>
+cudaError_t qkv_backward_mxfp8_weight_impl(const Mxfp8QkvBackwardWeightParams& p,
+                                        cudaStream_t stream) {
+  auto status=validate_mxfp8_qkv_backward_weight(p);
+  if(status!=cudaSuccess)return status;
+  const auto& d=p.projection;
+  const auto g=mxfp8_qkv_backward_weight_problem(d,p.gemm_tuning);
+  return backward_mxfp8_weight_impl<EpilogueN>(
+      {g, d.dqkv_staging, d.saved_input, d.grad_weight, d.alpha, d.beta}, p.workspace, stream);
+}
+
+bool mxfp8_qkv_backward_data_dimensions(const QkvBackwardDataParams& p) {
+  auto basic=p;
+  basic.gemm_tuning.epilogue_n=0;
+  basic.epoch=1;  // A workspace-size query does not consume a launch epoch.
+  return backward_shape_supported(basic) && mxfp8_backward_tuning(p.gemm_tuning) &&
+      (p.gemm_policy==BackwardGemmPolicy::kAuto || p.gemm_policy==BackwardGemmPolicy::kM128N256) &&
+      p.hidden%128==0 && p.head_dim==128 && p.kv_heads>0 &&
+      p.q_heads%p.kv_heads==0 && p.kv_heads%p.world_size==0 &&
+      (int64_t{p.q_heads}+2LL*p.kv_heads)*128<=INT32_MAX-127 &&
+      (p.local_tokens/p.batch)%(p.causal_load_balanced?256:128)==0;
+}
+
+GemmProblem mxfp8_qkv_backward_data_problem(const QkvBackwardDataParams& p) {
+  GemmProblem g{p.local_tokens,p.hidden,(p.q_heads+2*p.kv_heads)*128,1};
+  g.max_swizzle_size=p.gemm_tuning.max_swizzle_size;
+  g.raster=p.gemm_tuning.along_m?GemmRaster::kAlongM:GemmRaster::kAlongN;
+  return g;
+}
+
+cudaError_t validate_mxfp8_qkv_backward_data(const Mxfp8QkvBackwardDataParams& p) {
+  const auto& d=p.projection;
+  if(!mxfp8_qkv_backward_data_dimensions(d) || d.num_comm_ctas<=0 || d.epoch==0 ||
+      !mxfp8_aligned(d.weight,16) || !mxfp8_aligned(d.grad_input,16) ||
+      !mxfp8_aligned(d.peer_dqkv_staging[d.rank],16) ||
+      !mxfp8_aligned(d.peer_ready[d.rank],4) || !mxfp8_aligned(p.workspace))
+    return cudaErrorInvalidValue;
+  const auto g=mxfp8_qkv_backward_data_problem(d);
+  if(p.workspace_bytes<Mxfp8BackwardWeightWorkspace::make(g,nullptr).bytes)
+    return cudaErrorInvalidValue;
+  for(int peer=0;peer<d.world_size;++peer) {
+    const auto& a=p.peer_input[peer];
+    const GemmProblem q{d.local_tokens*d.world_size,d.hidden,d.q_heads/d.world_size*128,1};
+    const GemmProblem kv{q.m,q.n,d.kv_heads/d.world_size*128,1};
+    if(!valid_mxfp8_activation(q,a.grad_q) || !valid_mxfp8_activation(kv,a.grad_k) ||
+        !valid_mxfp8_activation(kv,a.grad_v) || !mxfp8_aligned(a.master_q,16) ||
+        !mxfp8_aligned(a.master_k,16) || !mxfp8_aligned(a.master_v,16))
+      return cudaErrorInvalidValue;
+  }
+  return cudaSuccess;
+}
+
+template <int EpilogueN>
+cudaError_t qkv_backward_mxfp8_data_impl(const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
+  auto status=validate_mxfp8_qkv_backward_data(p);
+  if(status!=cudaSuccess)return status;
+  DeviceInfo info{};
+  status=device_info(&info);
+  if(status!=cudaSuccess)return status;
+  const auto& d=p.projection;
+  if(d.num_comm_ctas>=info.sm_count)return cudaErrorInvalidValue;
+  const auto g=mxfp8_qkv_backward_data_problem(d);
+  const auto w=Mxfp8BackwardWeightWorkspace::make(g,p.workspace);
+  using Types=Mxfp8GemmFamily<256,128,EpilogueN>;
+  // Logical K heads, not physical CP peers. Keep the existing backward
+  // system-scope full-head protocol and its producer-warp async-proxy fence.
+  using Mainloop=detail::A2ALhsReadyMainloop<
+      detail::WeightReadyMainloop<typename Types::Mainloop>,typename Types::TileShape
+#if FUSE_ENABLE_PROFILING
+      ,false
+#endif
+      ,true>;
+  using Gemm=cutlass::gemm::kernel::GemmUniversal<ProblemShape,Mainloop,
+      typename Types::Epilogue,detail::MonolithicPersistentScheduler>;
+  using Comm=Mxfp8QkvBackwardPullComm;
+  using Base=detail::MonolithicGemm<Gemm,Comm>;
+  using Kernel=detail::InputProductionKernel<Base,Comm>;
+  typename Kernel::Arguments args{};
+  args.gemm=gemm_arguments<Gemm>(g,w.lhs,w.rhs.b,d.grad_input,d.alpha,
+      d.num_comm_ctas,info,GemmRaster::kAlongN);
+  auto& main=args.gemm.mainloop;
+  main.ptr_SFA=w.sfa;main.ptr_SFB=w.rhs.sfb;
+  main.layout_SFA=Mxfp8ScaleConfig::tile_atom_to_shape_SFA(args.gemm.problem_shape);
+  main.layout_SFB=Mxfp8ScaleConfig::tile_atom_to_shape_SFB(args.gemm.problem_shape);
+  main.weight_ready=nullptr;  // Whole transposed W is prepared on this stream.
+  main.ready=d.peer_ready[d.rank];main.world_size=d.q_heads+2*d.kv_heads;
+  main.m_tiles=d.local_tokens/128;main.arrivals_per_peer=1;main.k_tiles_per_peer=1;main.epoch=1;
+  auto& comm=args.comm;
+  comm.params=d;comm.route=backward_route(d,true);comm.route.kv_heads=d.kv_heads;
+  for(int peer=0;peer<d.world_size;++peer)comm.peer_input[peer]=p.peer_input[peer];
+  comm.activation=w.lhs;comm.scales=w.sfa;comm.destination_scales=main.layout_SFA;
+  for(int kind=0;kind<2;++kind)comm.source_scales[kind]=Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(d.local_tokens*d.world_size,d.hidden,
+          (kind?d.kv_heads:d.q_heads)/d.world_size*128,1));
+  comm.input_order=a2a_input_order<Gemm>(args.gemm);
+  comm.input_order.ready_group_m_tiles=std::max(1,d.num_comm_ctas*8);
+  args.num_comm_ctas=d.num_comm_ctas;
+  if(!Kernel::can_implement(args) || Kernel::get_workspace_size(args))return cudaErrorNotSupported;
+  status=prepare_mxfp8_transpose(d.weight,w.rhs.b,w.rhs.sfb,g.n,g.k,g.n,
+      main.layout_SFB,info,stream);
+  return status==cudaSuccess?launch_monolithic<Kernel>(args,info,stream):status;
+}
+
 }  // namespace
+
+cudaError_t qkv_backward_mxfp8_data_workspace_size(const QkvBackwardDataParams& p,size_t* bytes) {
+  if(!bytes || !mxfp8_qkv_backward_data_dimensions(p))return cudaErrorInvalidValue;
+  *bytes=Mxfp8BackwardWeightWorkspace::make(mxfp8_qkv_backward_data_problem(p),nullptr).bytes;
+  return cudaSuccess;
+}
+cudaError_t launch_qkv_backward_mxfp8_data(const Mxfp8QkvBackwardDataParams& p,cudaStream_t stream) {
+  return p.projection.gemm_tuning.epilogue_n==64
+      ?qkv_backward_mxfp8_data_impl<64>(p,stream):qkv_backward_mxfp8_data_impl<32>(p,stream);
+}
+
+cudaError_t qkv_backward_mxfp8_weight_workspace_size(const QkvBackwardWeightParams& p, size_t* bytes) {
+  if (!bytes || !mxfp8_qkv_backward_weight_dimensions(p)) return cudaErrorInvalidValue;
+  *bytes = Mxfp8BackwardWeightWorkspace::make(mxfp8_qkv_backward_weight_problem(p), nullptr).bytes;
+  return cudaSuccess;
+}
+cudaError_t launch_qkv_backward_mxfp8_weight(const Mxfp8QkvBackwardWeightParams& p, cudaStream_t stream) {
+  return p.gemm_tuning.epilogue_n == 64
+      ? qkv_backward_mxfp8_weight_impl<64>(p, stream) : qkv_backward_mxfp8_weight_impl<32>(p, stream);
+}
+cudaError_t launch_qkv_backward_mxfp8(const Mxfp8QkvBackwardParams& p,cudaStream_t stream) {
+  if(p.weight_mode!=WeightGradientMode::kImmediate && p.weight_mode!=WeightGradientMode::kDeferred)
+    return cudaErrorInvalidValue;
+  auto status=validate_mxfp8_qkv_backward_data(p.data);
+  if(status!=cudaSuccess)return status;
+  if(p.weight_mode==WeightGradientMode::kImmediate) {
+    const auto& d=p.data.projection;const auto& w=p.weight.projection;
+    if(d.local_tokens!=w.local_tokens || d.hidden!=w.hidden || d.q_heads!=w.q_heads ||
+        d.kv_heads!=w.kv_heads || d.head_dim!=w.head_dim ||
+        d.peer_dqkv_staging[d.rank]!=w.dqkv_staging)return cudaErrorInvalidValue;
+    status=validate_mxfp8_qkv_backward_weight(p.weight);
+    if(status!=cudaSuccess)return status;
+  }
+  status=launch_qkv_backward_mxfp8_data(p.data,stream);
+  return status==cudaSuccess && p.weight_mode==WeightGradientMode::kImmediate
+      ?launch_qkv_backward_mxfp8_weight(p.weight,stream):status;
+}
 
 cudaError_t oproj_backward_mxfp8_data_workspace_size(const OprojBackwardDataParams& p, size_t* bytes) {
   if (!bytes || !mxfp8_backward_dimensions(p)) return cudaErrorInvalidValue;

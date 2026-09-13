@@ -184,7 +184,9 @@ int main(int argc, char** argv) {
                                 seen.add(m)
                         for world, chunks, slots in ((4, 1, 4), (4, 11, 32),
                                                       (4, 11, 64), (4, 16, 64),
-                                                      (8, 6, 8), (8, 22, 16)):
+                                                      (8, 6, 8), (8, 22, 16),
+                                                      (24, 1, 32), (32, 1, 128),
+                                                      (144, 1, 128)):
                             with self.subTest(mt=mt, nt=nt, swizzle=swizzle,
                                               along_n=along_n, compute=compute,
                                               world=world, chunks=chunks, slots=slots):

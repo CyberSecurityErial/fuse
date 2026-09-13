@@ -553,3 +553,54 @@ artifacts referenced by run/source/binary hashes. Profile only selected
 diagnostic cases using the repository protocol; use ordinary uninstrumented
 launches for performance decisions. Existing BF16/SM90 behavior and the
 experimental norm/RoPE contract must not be silently changed.
+
+### v24 backward register-owned quantization checkpoint
+
+The transpose preparation now loads a BF16 K32 x 256-row tile with aligned
+16-byte vectors; each thread owns one entire K32 group and reduces locally.
+The scale rule, native padding, original BF16 source and whole-ready contract
+are unchanged. This is a preparation optimization, not omission of preparation
+from the complete B+W boundary. Six CP8/128K points independently pass all four
+full/B/W/prepared-dW audits (two payloads, original numerical/route checks,
+Graph10+50). Source-run `20260913-193535-9fe821`, native `98a9e47`:
+
+| Physical geometry | Complete B+W PFLOPS/card | Run suffix |
+|---|---:|---|
+| Qwen3 235B | 1.856606 | 193622-4ef864 |
+| BLOOM 176B | 2.000852 | 193826-d64471 |
+| Llama 3.1 405B | 2.007219 | 193915-9b24ee |
+| representative_large | 1.964440 | 194009-bc8d39 |
+| Kimi K3 KDA projection geometry | 1.953442 | 194047-3830e8 |
+| Llama70B / Qwen72B shared geometry | 1.943575 | 194120-ce2c59 |
+
+Six-point geometric mean **1.953717P**. W raster/swizzle is independently
+selected from the finite pure-dW search; B remains C16/E32/AlongN/swizzle8.
+The subsequent remaining30 CP4/8 x 128/256/512K points used this frozen source,
+without another search. All **36/36** now pass the independent full-boundary
+audit with one source/binary, no missing/OOM points; geometric mean
+**1.961974P**, still below the 2P backward goal. The full table is
+`fuse_midfile/mxfp8-v23/oproj-backward-current.md`, with configurations and
+raw references in `current.json.oproj_backward_register_full`.
+The v23.0 O-forward release/table stays unchanged.
+
+QKV MXFP8 backward development is isolated from that frozen GPU queue. It
+receives prequantized planar Q/K/V gradients for dX and saves their ORIGINAL
+BF16 values during inverse routing for dW. Head ownership is reconstructed in
+the real packed `[all Q][all K][all V]` order; W uses the same shared transposed
+K32 preparation as O. The first-use M queue is derived from the actual GEMM
+layout/budget, and each ready unit covers a complete M128/head including SFA.
+Upstream quantization/visibility and the all-rank input lease are caller-owned;
+the complete local immediate boundary includes W preparation, inverse route,
+dX, both dW preparations and dW. No replicated-KV or special KDA routing is
+claimed. The independent CPU-oracle harness passed CP4 M/H128
+(`201027-2f1b8f`, 8 complete B+W cases) and CP8 M/H256 (`201121-19fce7`,
+16 cases including causal/noncausal routing). Both use two nonzero Philox
+payloads, Eager/Graph, epilogue32/64, full dX/dW numerical checks and byte-exact
+original BF16 staging checks. Standalone QKV W also passed alpha=.75 and
+beta=0/1 across two packed Q/K/V widths. Receipt/source/binary hashes and
+the complete validation records were independently re-audited.
+`201349-52c151` additionally verifies that deferred B leaves dW byte-identical,
+retains the original BF16 staging lease, and the later W applies beta=1.
+This establishes bounded correctness, not large-matrix throughput, full-model
+training or the 2P goal. QKV MPI performance coverage remains to be implemented;
+these new entries are not part of the published v23.0 release.

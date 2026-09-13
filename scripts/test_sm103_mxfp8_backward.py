@@ -67,14 +67,25 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
         header=(ROOT/'include/fuse/operators/ulysses/oproj_backward.h').read_text()
         self.assertIn('prepare_mxfp8_transpose(d.weight, w.b, w.sfb, g.n, g.k, g.n',api)
-        self.assertIn('prepare_mxfp8_transpose(d.grad_output, w.lhs, w.sfa, g.m, g.k, g.m',api)
-        self.assertIn('prepare_mxfp8_transpose(d.saved_attention, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n',api)
+        self.assertIn('prepare_mxfp8_transpose(d.gradient, w.lhs, w.sfa, g.m, g.k, g.m',api)
+        self.assertIn('prepare_mxfp8_transpose(d.input, w.rhs.b, w.rhs.sfb, g.n, g.k, g.n',api)
+        self.assertIn('d.saved_attention, d.grad_weight, d.alpha, d.beta',api)
         self.assertIn('Mxfp8GemmFamily<256, 128, EpilogueN, 0, Bf16>::PureGemm',api)
         self.assertIn('args.epilogue.thread.beta = d.beta',api)
         self.assertIn('launch_oproj_backward_mxfp8_weight(p.weight, stream)',api)
         self.assertIn('Cross-CP dWo reduction is caller-owned',header)
         self.assertIn('straight-through',header)
         self.assertIn('upstream dY quantization is not',header)
+
+    def test_qkv_weight_shares_preparation_without_relabeling_heads(self):
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        header=(ROOT/'include/fuse/operators/ulysses/qkv_backward.h').read_text()
+        self.assertIn('(p.q_heads + 2 * p.kv_heads) * p.head_dim',api)
+        self.assertIn('p.hidden, p.local_tokens, 1',api)
+        self.assertIn('d.dqkv_staging, d.saved_input, d.grad_weight, d.alpha, d.beta',api)
+        self.assertIn('backward_mxfp8_weight_impl<EpilogueN>',api)
+        self.assertIn('cross-CP dW summation remains caller-owned',header)
+        self.assertIn('This W entry alone does not represent a complete QKV backward',header)
 
     def test_existing_input_type_and_ready_protocol_are_not_faked(self):
         api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
@@ -84,6 +95,49 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         self.assertNotIn('reinterpret_cast<Bf16*>',api)
         self.assertNotIn('cudaMalloc',api)
         self.assertNotIn('cudaDeviceSynchronize',api)
+
+    def test_qkv_inverse_route_packs_heads_without_changing_k32_groups(self):
+        for world,q,kv in ((4,8,8),(8,16,8),(4,64,8),(8,128,8)):
+            for batch in (1,2):
+                for causal in (False,True):
+                    seq=256
+                    for rank in range(world):
+                        destinations=Counter()
+                        for row in range(batch*seq):
+                            b,local=divmod(row,seq)
+                            if causal:
+                                c=rank if local<seq//2 else 2*world-rank-1
+                                source=b*seq*world+c*(seq//2)+local%(seq//2)
+                            else:
+                                source=b*seq*world+rank*seq+local
+                            for head in range(q+2*kv):
+                                kind=0 if head<q else (1 if head<q+kv else 2)
+                                group=head-(0 if kind==0 else (q if kind==1 else q+kv))
+                                count=(q if kind==0 else kv)//world
+                                peer,own=divmod(group,count)
+                                self.assertLess(peer,world)
+                                # A ready task cannot cross a causal row jump
+                                # or change a native aligned M128/K128 SF atom.
+                                self.assertEqual(source%128,row%128)
+                                destinations[row,head]+=1
+                                self.assertEqual(peer*count+own,group)
+                        self.assertEqual(len(destinations),batch*seq*(q+2*kv))
+                        self.assertEqual(set(destinations.values()),{1})
+
+    def test_qkv_backward_keeps_bf16_w_lease_and_complete_ready(self):
+        api=(ROOT/'csrc/operators/sm103/api/backward_mxfp8.cuh').read_text()
+        route=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
+        header=(ROOT/'include/fuse/operators/ulysses/qkv_backward.h').read_text()
+        self.assertIn('main.k_tiles_per_peer=1;main.epoch=1',api)
+        self.assertIn('d.peer_dqkv_staging[d.rank]!=w.dqkv_staging',api)
+        self.assertIn('detail::InputProductionKernel<Base,Comm>',api)
+        self.assertIn('Mxfp8QkvBackwardPullComm',route)
+        self.assertIn('source.master_q',route)
+        self.assertIn('cooperative_groups::this_grid().sync()',route)
+        self.assertIn('ALL ranks finish B',header)
+        self.assertIn('No KV replication/reduction',header)
+        self.assertGreater(header.index('struct Mxfp8QkvBackwardInput'),
+                           header.index('using Bf16QkvBackwardDataParams'))
 
     def test_smoke_cannot_be_mistaken_for_full_performance(self):
         text=(ROOT/'benchmarks/sm103/backward/mxfp8_smoke.cu').read_text()

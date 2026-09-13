@@ -192,4 +192,73 @@ cudaError_t launch_qkv_backward_fp8(
     const Fp8QkvBackwardParams& params,
     cudaStream_t stream);
 
+#if FUSE_ARCH_SM103
+// One source rank's planar attention gradients, all global sequence rows and
+// its local Q/K/V heads. Each MXFP8 view uses native SFA with its OWN planar
+// width. BF16 masters are retained for the independently quantized W phase.
+struct Mxfp8QkvBackwardInput {
+  Mxfp8Activation grad_q{}, grad_k{}, grad_v{};
+  const Bf16* master_q = nullptr;
+  const Bf16* master_k = nullptr;
+  const Bf16* master_v = nullptr;
+};
+
+// B: inverse QKV route -> dX = dQKV * W. The BF16 forward master W[QKV,H]
+// is transposed/quantized inside this boundary. Communication reads upstream
+// prequantized planar gradients AND retains their original BF16 values in
+// projection.peer_dqkv_staging[rank] for W. No framework-side cat is hidden.
+// The ready allocation uses qkv_backward_ready_elements(projection).
+// Only the local staging/ready pointers are used; peer_input supplies reads.
+//
+// Before launch the caller establishes visibility of all peer inputs; they
+// remain immutable until ALL ranks finish B (not merely the local stream).
+// Reuse native CUDA IPC/P2P mappings. Private workspace and local ready may be
+// reused on ordered Graph replays; concurrent invocations need disjoint slots.
+// No KV replication/reduction, KDA-special route or norm/RoPE backward here.
+struct Mxfp8QkvBackwardDataParams {
+  QkvBackwardDataParams projection{};
+  Mxfp8QkvBackwardInput peer_input[kMaxWorldSize]{};
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
+};
+
+// W phase of MXFP8 QKV backward, using the same straight-through, per-GEMM
+// K32 quantization contract as MXFP8 OProj backward:
+//
+//   ORIGINAL BF16 dQKV[M,QKV] -> transpose/quantize along M -> lhs[QKV,M]
+//   saved BF16 X[M,H]        -> transpose/quantize along M -> rhs[H,M]
+//   dW[QKV,H] = alpha * lhs * rhs^T + beta * dW
+//
+// dqkv_staging is the sequence-local, full-head [all Q, all K, all V] gradient,
+// not the head-sharded attention output. The B phase must preserve the ORIGINAL
+// BF16 gradient for this lease, not dequantize the representation used for dX.
+// This entry includes both preparations and GEMM. The inverse A2A that produces
+// staging is a separate B boundary; cross-CP dW summation remains caller-owned.
+// This W entry alone does not represent a complete QKV backward operator.
+// Scratch is private, 256-byte aligned and may be reused after B on one stream.
+struct Mxfp8QkvBackwardWeightParams {
+  QkvBackwardWeightParams projection{};
+  BackwardGemmTuning gemm_tuning{};
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
+};
+
+struct Mxfp8QkvBackwardParams {
+  Mxfp8QkvBackwardDataParams data{};
+  Mxfp8QkvBackwardWeightParams weight{};
+  WeightGradientMode weight_mode = WeightGradientMode::kImmediate;
+};
+
+cudaError_t qkv_backward_mxfp8_data_workspace_size(
+    const QkvBackwardDataParams& params, size_t* bytes);
+cudaError_t qkv_backward_mxfp8_weight_workspace_size(
+    const QkvBackwardWeightParams& params, size_t* bytes);
+cudaError_t launch_qkv_backward_mxfp8_data(
+    const Mxfp8QkvBackwardDataParams& params, cudaStream_t stream);
+cudaError_t launch_qkv_backward_mxfp8_weight(
+    const Mxfp8QkvBackwardWeightParams& params, cudaStream_t stream);
+cudaError_t launch_qkv_backward_mxfp8(
+    const Mxfp8QkvBackwardParams& params, cudaStream_t stream);
+#endif
+
 }  // namespace fuse

@@ -416,5 +416,98 @@ struct QkvBackwardPushCommT {
 #endif
 };
 
+// MXFP8 reverse QKV route. A full logical head, rather than one rank's QKV
+// concatenation, is the K-ready unit: [all Q][all K][all V] must match W rows.
+// Read-side packing also saves ORIGINAL BF16 masters for the later dW K-axis.
+// This initial path deliberately shares the same first-use scheduler as O;
+// vector loads/stores establish a simple baseline before transport tuning.
+struct Mxfp8QkvBackwardPullComm {
+  using ScaleLayout = decltype(Mxfp8ScaleConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(int{}, int{}, int{}, 1)));
+  static constexpr int kMinThreads = 256;
+  static constexpr size_t SharedStorageBytes = 0;
+  static constexpr bool kNeedsGridFinalize = false;
+  struct Arguments {
+    QkvBackwardDataParams params{};
+    UlyssesRoute route{};
+    Mxfp8QkvBackwardInput peer_input[kMaxWorldSize]{};
+    Fp8E4m3* activation = nullptr;
+    cutlass::float_ue8m0_t* scales = nullptr;
+    ScaleLayout source_scales[2]{}, destination_scales{};
+    detail::A2AInputTileOrder input_order{};
+  };
+  using Params = Arguments;
+  static bool can_implement(const Arguments& a) {
+    return a.activation && a.scales && a.params.num_comm_ctas > 0 &&
+        a.params.peer_dqkv_staging[a.params.rank] && a.params.peer_ready[a.params.rank] &&
+        a.input_order.compute_ctas > 0;
+  }
+  static Params to_underlying_arguments(const Arguments& a) { return a; }
+  CUTLASS_DEVICE static void initialize_grid(const Params& a) {
+    const auto& p=a.params;
+    const int64_t count=int64_t{p.local_tokens/128}*(p.q_heads+2*p.kv_heads);
+    for(int64_t i=int64_t{blockIdx.x}*blockDim.x+threadIdx.x;i<count;
+        i+=int64_t{gridDim.x}*blockDim.x)
+      p.peer_ready[p.rank][i*kReadyFlagStride]=0;
+    cooperative_groups::this_grid().sync();
+  }
+  CUTLASS_DEVICE void operator()(const Params& a, char*, int comm_id, int comm_ctas) {
+    const auto& p=a.params;
+    const int heads=p.q_heads+2*p.kv_heads, width=heads*128;
+    const int lane=threadIdx.x%32, warp=threadIdx.x/32;
+    const int64_t tasks=int64_t{p.local_tokens/128}*heads;
+    // GEMM(M,N) consumes logical heads in K order. Each task owns ALL 128 rows
+    // of one head and its 512 scale bytes; no partial-head ready is introduced.
+    //
+    //    peer dQ/dK/dV MXFP8 -> packed A + SFA --+
+    //    same BF16 masters  -> packed dQKV ----+-> whole (M128,head) release
+    //                                            | dX consumes MXFP8 now
+    //                                            + dW requantizes BF16 later
+    //
+    // First-use M windows reflect the actual GEMM raster/swizzle/SM budget.
+    // Workers finish independently; there is no cross-task completion order.
+    for(int64_t task=int64_t{warp}*comm_ctas+comm_id;task<tasks;
+        task+=int64_t{8}*comm_ctas) {
+      const auto t=a.input_order.decode(task,heads,1);
+      const int kind=t.peer<p.q_heads?0:(t.peer<p.q_heads+p.kv_heads?1:2);
+      const int head=t.peer-(kind==0?0:(kind==1?p.q_heads:p.q_heads+p.kv_heads));
+      const int local_heads=(kind==0?p.q_heads:p.kv_heads)/p.world_size;
+      const int peer=head/local_heads, local_head=head%local_heads;
+      const auto& source=a.peer_input[peer];
+      const auto& quantized=kind==0?source.grad_q:(kind==1?source.grad_k:source.grad_v);
+      const Bf16* master=kind==0?source.master_q:(kind==1?source.master_k:source.master_v);
+      const int row=t.m*128, batch=row/a.route.seq_local;
+      const int source_row=batch*a.route.global_seq+
+          QkvBackwardPushCommT<128>::global_sequence_row(a.route,p.rank,row%a.route.seq_local);
+      const int source_width=local_heads*128;
+      for(int i=lane;i<128*128/16;i+=32) {
+        const int r=i/8, col=(i%8)*16;
+        const auto value=*reinterpret_cast<const uint4*>(quantized.data+
+            int64_t{source_row+r}*source_width+local_head*128+col);
+        *reinterpret_cast<uint4*>(a.activation+int64_t{row+r}*width+t.peer*128+col)=value;
+      }
+      for(int i=lane;i<128*128/8;i+=32) {
+        const int r=i/16, col=(i%16)*8;
+        const auto value=*reinterpret_cast<const uint4*>(master+
+            int64_t{source_row+r}*source_width+local_head*128+col);
+        *reinterpret_cast<uint4*>(p.peer_dqkv_staging[p.rank]+
+            int64_t{row+r}*width+t.peer*128+col)=value;
+      }
+      const auto src=a.source_scales[kind!=0](cute::make_coord(source_row,local_head*128,0));
+      const auto dst=a.destination_scales(cute::make_coord(row,t.peer*128,0));
+      // An aligned M128/K128 scale atom is exactly 512 contiguous bytes.
+      const auto value=reinterpret_cast<const uint4*>(quantized.scales+src)[lane];
+      reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(a.scales)+dst)[lane]=value;
+      __syncwarp();
+      // Reuse the existing head-granular SYSTEM acquire adapter, including its
+      // async-proxy fence before TMA. This is a matched strong baseline, not a
+      // claim that local publication fundamentally requires system scope.
+      if(lane==0)detail::store_release_system(
+          p.peer_ready[p.rank]+(int64_t{t.m}*heads+t.peer)*kReadyFlagStride,1);
+      __syncwarp();
+    }
+  }
+};
+
 }  // namespace
 }  // namespace fuse
