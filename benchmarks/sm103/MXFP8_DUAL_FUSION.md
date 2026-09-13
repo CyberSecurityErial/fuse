@@ -683,3 +683,11 @@ large CP8/128K five-component audits pass. Llama214201-188884 full is3.449656ms
 original same-config controls, full throughput improves6.52% and7.46%; static
 register/stack/local resource counts are unchanged. This is retained indexing
 specialization, not a change in ready granularity or a full-matrix claim.
+
+Removing QKV backward's unused WeightReadyMainloop wrapper (W is fully prepared
+by the preceding stream operation) gives another controlled improvement at
+source de5bc712: Llama214757-c21339 full3.373160ms/1.629795P, prepared dX
+1.703264ms; Kimi214852-04d8de full11.470896ms/1.509674P, prepared dX6.078216ms.
+All five component audits pass. Input head acquire/proxy fence and communication
+are unchanged. Relative to the original controls these two complete boundaries
+are8.93% and9.77% faster; this still does not meet the2P full-matrix target.

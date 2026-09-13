@@ -129,6 +129,9 @@ class Mxfp8BackwardContracts(unittest.TestCase):
         route=(ROOT/'csrc/operators/sm103/detail/backward.cuh').read_text()
         header=(ROOT/'include/fuse/operators/ulysses/qkv_backward.h').read_text()
         self.assertIn('main.k_tiles_per_peer=1;main.epoch=1',api)
+        qkv=api[api.index('cudaError_t qkv_backward_mxfp8_data_impl'):]
+        self.assertNotIn('WeightReadyMainloop',qkv)
+        self.assertNotIn('main.weight_ready',qkv)
         self.assertIn('d.peer_dqkv_staging[d.rank]!=w.dqkv_staging',api)
         self.assertIn('detail::InputProductionKernel<Base,Comm>',api)
         self.assertIn('Mxfp8QkvBackwardPullComm',route)
