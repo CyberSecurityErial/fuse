@@ -391,7 +391,7 @@ def export_cpp(document):
         lines.append('  {' + ', '.join(values) + '},')
     lines.extend(['};', '', '}  // namespace fuse::detail', ''])
     # The BF16 generator owns only its primitive table. Preserve the separate
-    # MXFP8 calibration section verbatim; regenerating BF16 must never delete it
+    # MXFP8 calibration sections verbatim; regenerating BF16 must never delete them
     # or fold its evidence into the BF16 version hash.
     template = (Path(__file__).resolve().parents[1] /
                 'csrc/operators/sm103/detail/model_calibration.cuh').read_text()
@@ -400,7 +400,12 @@ def export_cpp(document):
             'Expected one independent MXFP8 calibration section')
     start, stop = template.index(begin), template.index(end)
     require(start < stop, 'Malformed MXFP8 calibration section')
-    return '\n'.join(lines) + '\n' + template[start:stop + len(end)] + '\n'
+    # OProj calibration follows QKV and is owned by its own exporter as well.
+    o_begin, o_end = '// BEGIN MXFP8 OPROJ CALIBRATION', '// END MXFP8 OPROJ CALIBRATION'
+    require(template.count(o_begin) == 1 and template.count(o_end) == 1 and
+            stop < template.index(o_begin) < template.index(o_end),
+            'Expected an independent MXFP8 OProj calibration section')
+    return '\n'.join(lines) + '\n' + template[start:]
 
 
 def main(argv=None):
