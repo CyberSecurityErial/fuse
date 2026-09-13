@@ -3,7 +3,9 @@
 Mainline boundaries remain QKV GEMM+A2A and OProj A2A+GEMM. Norm/RoPE is an
 optional, disabled experimental extension, not part of these benchmarks.
 Targets are measured separately: forward QKV/OProj each2.2 PFLOPS/GPU;
-corresponding complete backward each2.0 PFLOPS/GPU. None is claimed achieved.
+corresponding complete backward each2.0 PFLOPS/GPU. OProj forward is independently
+confirmed at2.256462P across all36 physical points with explicit offline plans.
+The other three targets remain unachieved; this is not a new Auto or release.
 
 ## Baselines and scope
 
@@ -124,7 +126,7 @@ reducing its count. Balanced contiguous SFA slices now distribute a complete
 M128-peer shard over its existing A chunks, without changing the ready unit.
 Independent confirmation of all36 frozen configurations on the alignment-hardened
 implementation gives2.084644P (previous compute-assisted2.026349P, +2.8769%).
-This is the current accepted finite-candidate baseline, not Auto or the2.2P target.
+This is the earlier confirmed finite-candidate checkpoint, not Auto or the2.2P target.
 
 An unaccepted W-to-A handoff experiment uses six32-KiB or eight24-KiB private
 slots in the same192KiB allocation. Copy alone accelerates, but three of four
@@ -191,11 +193,21 @@ runtime selector is enabled from this diagnostic.
 The completed layout/budget search covers all36 physical points and yields a
 finite-candidate geometric mean of2.259959P (+6.5783% versus the same-source P4
 search). Seven individual points remain below2.2P. All original F/C/R/P and
-two-payload checks pass, with no missing or OOM points. Each winner is now
+two-payload checks pass, with no missing or OOM points. Each winner was
 frozen for an independent confirmation; the search mean is not the acceptance
 result. Existing same-configuration repeats are deduplicated by first valid run,
 not by choosing the fastest repeat. The unique current table retains the full
 configuration and source/run/artifact provenance.
+
+Independent Graph10+50 confirmation of the frozen36 plans gives2.256462P:
+-0.1547% versus search, +8.2421% versus the earlier2.084644P fixed checkpoint.
+Every original numerical/routing/F/C/R/P audit passes. Relative to published
+v21 OProj history, improvement is17.8498% (current/history minus one).
+Current throughput retains83.0603% of the historical full-device cuBLASLt
+geometric mean. These historical comparisons are not paired new measurements.
+No point is replaced by its faster search observation. The six physical-family
+means are2.2172--2.3006P; seven individual points remain below2.2P. The forward
+OProj geometric-mean target is met, not a guarantee that each point exceeds it.
 
 ## Backward implementation boundary
 
