@@ -430,7 +430,7 @@ def export(run, output):
         protocol='PROFILE_PROTOCOL.md: GEMM -> A2A', run_id=job['run_id'], source_id=job['source_id'],
         artifact_sha256=receipt['artifact_sha256'], node=job['node'],
         config={k:job.get(k) for k in ['world','global_seq','hidden','q_heads','kv_heads','head_dim',
-                'comm_sm','qkv_policy_list','max_swizzle_size','qkv_raster','host_launch','input_generator',
+                'comm_sm','qkv_policy','qkv_policy_list','max_swizzle_size','qkv_raster','host_launch','input_generator',
                 'mxfp8_weight_preparation']},
         route_warps=route_warps, weight_schedule=weight_schedule,
         clock='per-GPU globaltimer ns converted to trace microseconds; independent rank origins',
@@ -459,7 +459,11 @@ def export(run, output):
     route_workers = comm * route_warps
     previous = [[0] * route_workers for _ in range(world)]
     emitted = len(events)
-    tile = re.fullmatch(r'm(\d+)n(\d+).*', job['qkv_policy_list'])
+    # Both explicit CLI forms describe the same single diagnostic candidate.
+    # Do not require a one-element list or mutate its recorded job to export it.
+    policy = job.get('qkv_policy_list') or job.get('qkv_policy') or ''
+    assert ',' not in policy, 'Detailed export requires one GEMM tile'
+    tile = re.fullmatch(r'm(\d+)n(\d+).*', policy)
     assert tile, 'Detailed export requires an explicit GEMM tile'
     tile_m, tile_n = map(int, tile.groups())
     created = False

@@ -24,6 +24,46 @@ same-session A/B. Formal timing stays Graph10+50 with two nonzero payloads and
 full numerical/routing validation. Primary comparison remains full-device
 cuBLASLt; a reduced-SM GEMM is diagnostic, not a lowered acceptance ceiling.
 
+## QKV startup controls after the OProj confirmation
+
+On the same frozen native source as the OProj confirmation, six128K QKV
+representatives passed36 candidates and an independent90-boundary F/C/R/Q
+audit (Graph10+50, original two-payload validation). The existing explicit
+`all` mode quantizes the whole weight with all CTAs, then joins the grid;
+it is not the OProj compute-assisted schedule. Its best tested throughput
+versus ordinary `comm` was:
+
+| Projection geometry | comm P | all P |
+|---|---:|---:|
+| QwenDense, CP8 |1.1681|1.1916|
+| Qwen3 235B, CP4 |1.8102|1.9929|
+| Qwen72/Llama70, CP8 |1.8698|2.0506|
+| Llama405, CP8 |1.9123|2.1986|
+| Kimi QKV-only, CP8 |1.8874|2.0411|
+| BLOOM, CP8 |1.9732|2.2127|
+
+These are finite candidate controls, not the full33-point result or Auto.
+C/R/Q are measured only in `comm` mode; the `all` controls measure F only.
+QwenDense's independent R at20/72 CTAs is226/218us, already close to its
+fused duration. R includes cross-rank completion, so it does not establish
+raw TMA latency or link bandwidth. Inspect local route service and finalize
+separately before changing the transport. No QKV device changes are accepted
+from this comparison alone.
+
+The same-source Dense service probes subsequently measured GPU0 local R
+(before cross-rank finalize) at181.152us with20 CTAs and178.080us with72.
+Prepared compute moved from114.976us to181.056us as its budget shrank.
+These are individual diagnostic captures, not independent repeated timings.
+The complete `all`,20-CTA trace ended compute at145.472us and route at219.456us
+on GPU0, with kernel completion at236.864us. Every rank showed route ending
+later than compute. Thus extra communication CTAs alone have little measured
+benefit here; inspect per-copy transport/control before consuming more SMs.
+This does not identify physical NVLink saturation. The service probe cannot
+excite a noninitial W panel for this geometry (all16 panels are in the first
+compute wave); unavailable delay services remain explicitly unavailable.
+Raw probes: `20260913-154439-92fbdb` and `20260913-154739-2faf80`;
+full trace: `20260913-154529-279069`. All original numerical/route checks passed.
+
 ## Reusable historical work
 
 | Commit | Applicable work |

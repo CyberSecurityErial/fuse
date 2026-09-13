@@ -301,6 +301,27 @@ class QkvPerfettoTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             export(self.run, self.output)
 
+    def test_single_policy_cli_exports_without_rewriting_evidence(self):
+        path = self.log.parent / 'job.json'
+        job = json.loads(path.read_text())
+        job.update(qkv_policy=job['qkv_policy_list'], qkv_policy_list=None)
+        path.write_text(json.dumps(job))
+        evidence = path.read_bytes()
+        self.render()
+        trace = json.loads(self.output.read_text())
+        self.assertEqual(trace['metadata']['config']['qkv_policy'], 'm128n256k64e32')
+        self.assertIsNone(trace['metadata']['config']['qkv_policy_list'])
+        self.assertEqual(path.read_bytes(), evidence)
+
+    def test_multiple_policy_cli_rejected(self):
+        path = self.log.parent / 'job.json'
+        job = json.loads(path.read_text())
+        job['qkv_policy_list'] = 'm128n256,m128n128'
+        path.write_text(json.dumps(job))
+        with self.assertRaisesRegex(AssertionError, 'one GEMM tile'):
+            self.render()
+        self.assertFalse(self.output.exists())
+
     def comm_warp_fixture(self, handoff=False):
         job_path = self.log.parent / 'job.json'
         job = json.loads(job_path.read_text())
