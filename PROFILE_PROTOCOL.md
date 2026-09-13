@@ -601,3 +601,14 @@ Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终
 - profile kernel 多写 global-memory 时间戳，数值会受观测开销影响；正式延迟仍以 profiling 关闭后的 10+50 benchmark 为准。
 - Perfetto 先看同一 rank 内的通信完成、peer 发布顺序、首包等待和 CTA 长尾，再用正式 benchmark 判断这些现象是否影响端到端时间。
 - TE Userbuffers 对照使用正式 winner 配置和 CUDA Event 阶段时间线。TE 是多 stream 边界，不能用单个 Graph 外框代替计算、通信和 unpack 三段。
+
+## 编译后二进制检查（非时间线）
+
+`l20d.py run fused-build --cuda-resource-info --cuda-sass-filter <符号子串>`
+只检查本工作区的已编译程序，不启动 GPU 工作。过滤器为有长度限制的字面符号
+子串，先从资源报告解析出 1–16 个实际函数，再按精确名字导出 SASS，最大16 MiB。
+`control/cuda-resource-info.json` 记录二进制、资源报告、SASS 的哈希和选中函数；
+指令文本在同目录的 `cuda-sass.txt`，不展开到终端。
+
+它用于核对实际指令、寄存器和编译安排，不提供运行时延迟、带宽或 stall 比例，
+也不替代上面的宏打点协议及完整无 profiling 的性能对照。

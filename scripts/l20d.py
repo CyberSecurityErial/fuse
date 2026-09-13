@@ -352,6 +352,11 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
 
 
 def validate_job(job, hostname=None):
+    sass_filter=job.get('cuda_sass_filter')
+    if sass_filter is not None and (not isinstance(sass_filter,str) or
+            not re.fullmatch(r'[A-Za-z0-9_]{1,128}',sass_filter) or
+            not job.get('cuda_resource_info')):
+        raise ValueError('SASS requires resource inspection and a bounded literal symbol filter')
     if job.get('cuda_resource_info') and not (job['stage']=='fused-build' or
             (job['stage']=='build' and job.get('mxfp8_gemm_search'))):
         raise ValueError('CUDA resource inspection is an opt-in build-only diagnostic')
@@ -1421,7 +1426,7 @@ def fused_build_receipt(job, env_id):
     return recorded
 
 
-def collect_cuda_resources(binary, folder):
+def collect_cuda_resources(binary, folder, sass_filter=None):
     binary=Path(binary).resolve()
     if not binary.is_relative_to(REMOTE.resolve()) or not binary.is_file():
         raise ValueError('CUDA resource target must be this workspace executable')
@@ -1429,10 +1434,29 @@ def collect_cuda_resources(binary, folder):
     raw=read_command([tool,'--dump-resource-usage',str(binary)])
     report=folder/'cuda-resource-info.txt'
     report.write_text(raw+'\n')
-    write_json(folder/'cuda-resource-info.json',dict(
+    info=dict(
         schema='cuda_static_resource_info_v1',binary=str(binary),binary_sha256=sha(binary),
         tool=tool,version=read_command([tool,'--version']),report_sha256=sha(report),
-        diagnostic_only=True,gpu_work_launched=False))
+        diagnostic_only=True,gpu_work_launched=False)
+    if sass_filter is not None:
+        if not re.fullmatch(r'[A-Za-z0-9_]{1,128}',sass_filter):
+            raise ValueError('SASS symbol filter must be a bounded literal name')
+        # Resolve actual symbols from this binary; do not pass a shell pattern
+        # or silently dump the whole executable. cuobjdump --function accepts
+        # exact names, which also bind the evidence to the resource report.
+        names=sorted({name for name in re.findall(r'^\s*Function\s+(\S+):\s*$',raw,re.M)
+                      if sass_filter in name})
+        if not 1<=len(names)<=16:
+            raise ValueError('SASS filter must resolve between one and sixteen device functions')
+        sass=read_command([tool,'--dump-sass','--function',','.join(names),str(binary)])
+        if len(sass.encode())>16*1024*1024 or any(
+                not re.search(r'\bFunction\s*:\s*'+re.escape(name)+r'\b',sass) for name in names):
+            raise ValueError('SASS output exceeds the bound or omits selected functions')
+        assembly=folder/'cuda-sass.txt'
+        assembly.write_text(sass+'\n')
+        info.update(sass_file=assembly.name,sass_sha256=sha(assembly),
+                    sass_filter=sass_filter,sass_functions=names)
+    write_json(folder/'cuda-resource-info.json',info)
 
 
 def check_fused_build(job, env_id, folder):
@@ -2179,12 +2203,14 @@ def remote(job_path):
             receipt = mxfp8_search_receipt(job, env_id)
             write_json(REMOTE / 'build/sm103-mxfp8-search/.l20d-build.json', receipt)
             write_json(folder / 'mxfp8-search-build.json', receipt)
-            if job.get('cuda_resource_info'): collect_cuda_resources(receipt['binary'],folder)
+            if job.get('cuda_resource_info'):
+                collect_cuda_resources(receipt['binary'],folder,job.get('cuda_sass_filter'))
         elif stage == 'fused-build':
             build_receipt = fused_build_receipt(job, env_id)
             write_json(fused_build_dir(job) / '.l20d-build.json', build_receipt)
             write_json(folder / 'fused-build.json', build_receipt)
-            if job.get('cuda_resource_info'): collect_cuda_resources(build_receipt['binary'],folder)
+            if job.get('cuda_resource_info'):
+                collect_cuda_resources(build_receipt['binary'],folder,job.get('cuda_sass_filter'))
         elif stage == 'gemm-cutlass-build':
             build_receipt = cutlass_probe_build_receipt(job, env_id)
             write_json(cutlass_probe_library().parent / '.l20d-build.json', build_receipt)
@@ -2251,6 +2277,8 @@ def main():
     run.add_argument('--source-run', help='Reuse the verified local source snapshot of this run, not current Mac edits')
     run.add_argument('--cuda-resource-info', action='store_true',
                      help='build-only: archive cuobjdump register/local/shared usage; launches no GPU work')
+    run.add_argument('--cuda-sass-filter',
+                     help='with --cuda-resource-info: archive SASS for 1–16 matching mangled symbols, max16MiB')
     run.add_argument('--profile', action='store_true', help='fused stages: separate instrumented build/run')
     run.add_argument('--mpi', action='store_true', help='fused stages: optional one-process-per-GPU MPI target')
     run.add_argument('--backward', action='store_true', help='reuse BF16 reverse-route harness, separate build directory')

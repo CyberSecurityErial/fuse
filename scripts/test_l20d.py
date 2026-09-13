@@ -1883,6 +1883,33 @@ int main() {
         with self.assertRaises(ValueError):
             l20d.validate_job(self.fused_job(cuda_resource_info=True))
 
+    def test_sass_inspection_resolves_exact_symbols_without_gpu_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);folder=root/'report';folder.mkdir()
+            binary=root/'kernel';binary.write_bytes(b'private executable')
+            raw=' Function _ZExactKernel0:\n REG:112\n Function _ZOther:\n REG:99\n'
+            sass='Function : _ZExactKernel0\n /*0000*/ EXIT;\n'
+            with mock.patch.object(l20d,'REMOTE',root),mock.patch.object(
+                    l20d,'read_command',side_effect=[raw,'CUDA13',sass]) as inspect:
+                l20d.collect_cuda_resources(binary,folder,'ExactKernel')
+                self.assertEqual(inspect.call_args_list[-1].args[0][1:],
+                    ['--dump-sass','--function','_ZExactKernel0',str(binary.resolve())])
+                info=json.loads((folder/'cuda-resource-info.json').read_text())
+                self.assertFalse(info['gpu_work_launched'])
+                self.assertEqual(info['sass_functions'],['_ZExactKernel0'])
+                self.assertEqual(info['sass_sha256'],l20d.sha(folder/'cuda-sass.txt'))
+            for filter_,resource,assembly in (
+                    ('missing',raw,sass),('ExactKernel',raw,'no selected function'),
+                    ('ExactKernel',''.join(' Function _ZExactKernel%d:\n'%i for i in range(17)),sass)):
+                with mock.patch.object(l20d,'REMOTE',root),mock.patch.object(
+                        l20d,'read_command',side_effect=[resource,'CUDA13',assembly]):
+                    with self.assertRaises(ValueError):l20d.collect_cuda_resources(binary,folder,filter_)
+        for value in ('','*','../kernel','a,b','a;echo','x'*129,12):
+            with self.assertRaises(ValueError):
+                l20d.validate_job(self.fused_job(stage='fused-build',cuda_resource_info=True,cuda_sass_filter=value))
+        with self.assertRaises(ValueError):
+            l20d.validate_job(self.fused_job(stage='fused-build',cuda_sass_filter='ExactKernel'))
+
     def test_fused_build_receipt_ignores_controller_docs_but_rejects_stale_binary(self):
         job = self.fused_job(files={'CMakeLists.txt': 'cmake', 'include/fuse/kernel.h': 'header',
                                   'csrc/operators/sm103/entry.cu': 'entry', 'scripts/l20d.py': 'old'})
@@ -1891,6 +1918,8 @@ int main() {
         self.assertEqual(l20d.fused_build_inputs(job), l20d.fused_build_inputs(same_build))
         self.assertEqual(l20d.fused_build_inputs(job),
                          l20d.fused_build_inputs(job|dict(cuda_resource_info=True)))
+        self.assertEqual(l20d.fused_build_inputs(job),l20d.fused_build_inputs(
+            job|dict(cuda_resource_info=True,cuda_sass_filter='ExactKernel')))
         validation_header = 'benchmarks/sm103/fused_validation.cuh'
         with_validation = job | {'files': job['files'] | {validation_header: 'gpu-validation-v1'}}
         changed_validation = job | {'files': job['files'] | {validation_header: 'gpu-validation-v2'}}
