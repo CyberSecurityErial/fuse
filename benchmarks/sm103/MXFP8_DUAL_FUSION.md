@@ -713,3 +713,14 @@ for that table. Complete matched O-matrix replay remains required.
 CP8 M/H256 contract220127-05f105 independently verifies both operators,
 two payloads, E32/E64, eager/Graph, ordinary/causal routes, original BF16 masters,
 prepared W, deferred beta1, and CPU FP64 alpha=.75/beta0,1 weight references.
+
+Matched OProj backward full replay v24-beta-zero-oproj-full-01..36 completes
+all36 physical points at source4945f245/binarydc64b589. Each configuration,
+including causal routing and B/W layouts, is checked against the previous
+row. Graph10+50/two-payload/full pre-post audits all pass; GM1.961974→2.038881P
+(+3.92%),36 improvements and no missing points. The aggregate2P target is met,
+not an assertion that every point exceeds2P. The unique current table is
+fuse_midfile/mxfp8-v23/oproj-backward-current.md; raw provenance is in current.json.
+Core CUDA consolidation: both reverse operators share the transpose quantizer,
+operand/workspace handling and dW kernel/dispatch; only route-specific B adapters
+remain separate. No new core or public header is needed for these optimizations.
