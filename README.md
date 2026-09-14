@@ -1,5 +1,28 @@
 # Ulysses GEMM + All-to-All Fusion
 
+## v24.0 — SM103 MXFP8 双算子前向与完整反向
+
+固定全量几何平均（PFLOPS/卡）：
+
+| 算子 | 前向 | 完整反向 B+dW |
+|---|---:|---:|
+| OProj（各36点） | 2.250 | 2.122 |
+| QKVProj（各33点） | 2.047 | 1.870 |
+
+补全 QKVProj MXFP8 反向，并收录 OProj/QKVProj 两类前向、完整 B+dW 反向的
+大尺寸长序列结果。前向与反向分别统计；上游激活/梯度量化、调用方的跨 CP dW
+归约边界明确保留，不把纯 GEMM 或分段时间相加冒充融合吞吐。
+
+关键优化：寄存器内 K32 量化、合并写回与下一组输入预取，QKV 反向异步搬运和
+完整 head 并行 acquire，以及与通信解耦的 dW GEMM 布局。保留完整 ready/fence
+协议、独立数值/路由校验；两份非零 Philox 输入分别正式 Graph10+50。
+
+按用户接受的当前性能发布，不宣称四类均达到原性能目标，也不宣称新增 Auto。
+norm/RoPE 仍默认关闭、实验性；SM90 实现不改。
+[全量最终表、配置、收益与复现证据](results/sm103/v24.0/README.md) ·
+[关键优化与数值合同](benchmarks/sm103/MXFP8_DUAL_FUSION.md) ·
+[SM103 模块职责](csrc/operators/sm103/README.md)
+
 ## v23.0 — SM103 MXFP8 OProj 前向达到 2.2P
 
 纯 A2A→GEMM 双融合，36/36 大尺寸长序列物理点，CP4/8×128K/256K/512K：
