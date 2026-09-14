@@ -5,12 +5,22 @@ including both complete MXFP8 backward paths. Norm/RoPE remains separate,
 default-off and experimental. All predefined legal long-sequence points are
 retained; aliases count once.
 
-| Operator | Physical points | Geometric mean PFLOPS/GPU | Original target | Status |
+## 典型泛化场景 / Representative generalization scenarios
+
+| Operator | Headline physical points | Geometric mean PFLOPS/GPU | Target | Status in this cohort |
 |---|---:|---:|---:|---|
 | OProj forward | 36 | 2.249637 | 2.2 | Met |
 | OProj complete backward | 36 | 2.122491 | 2.0 | Met |
-| QKVProj forward | 33 | 2.047223 | 2.2 | Below target; user accepted current result |
-| QKVProj complete backward | 33 | 1.870026 | 2.0 | Below target; user accepted current result |
+| QKVProj forward | 27 | 2.200574 | 2.2 | Met in revised cohort |
+| QKVProj complete backward | 27 | 2.081297 | 2.0 | Met in revised cohort |
+
+QwenDense remains a supplementary scenario: all six points per QKV direction
+remain in the detailed tables but do not contribute to the headline summary.
+The original all-measured QKV means remain 2.047223P forward and 1.870026P
+backward (33 points each), below the original full-matrix targets. OProj is
+unchanged. This user-requested post-release cohort revision changes no code,
+measurement or per-point configuration, and does not prove universal
+generalization. results.json preserves both summary cohorts.
 
 CP4/8 × 128K/256K/512K, fixed configurations, two actual nonzero Philox payloads,
 each independently warmed and sampled with Graph10+50. No OOM/missing/numerical
@@ -43,6 +53,10 @@ below their operator's aggregate target.
   profiling in include/fuse/profiling. Two outdated development logs were
   condensed from 2,122 to 258 lines of module ownership, contracts and useful
   optimization conclusions. No new core/public file was introduced.
+
+The following prefetch comparison retains ALL measured points, including
+supplementary QwenDense. On the headline 27-point QKV cohort the corresponding
+change is 2.057202P → 2.081297P (+1.17%).
 
 The final prefetch confirmation keeps the same per-point GEMM/communication
 configuration as its immediate predecessor:
