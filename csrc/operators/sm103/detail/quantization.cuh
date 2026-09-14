@@ -5,6 +5,7 @@
 #include "fuse/layout/gemm.h"
 #include "producer_consumer.cuh"
 #include <cooperative_groups.h>
+#include <cute/arch/copy_sm80.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/float_subbyte.h>
@@ -307,6 +308,31 @@ __global__ void quantize_mxfp8_operand(const Bf16* input, Fp8E4m3* output,
 inline constexpr int kMxfp8TransposeRows = 256;
 inline constexpr int kMxfp8TransposeGroups = 4;
 inline constexpr int kMxfp8TransposeStoreGroups = 2;
+CUTLASS_DEVICE void load_mxfp8_transpose_input(const Bf16* input,
+    Bf16 (*tile)[kMxfp8TransposeRows + 8], int rows, int row_base,
+    int k_base, int64_t source_stride) {
+  using InputVector = cutlass::AlignedArray<Bf16, 8, 16>;
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int first_row = row_base + lane * 8;
+  #pragma unroll
+  for (int i = warp; i < 32; i += 8) {
+    const Bf16* source = input + int64_t{k_base + i} * source_stride;
+    if (first_row + 7 < rows && reinterpret_cast<uintptr_t>(source + first_row) % 16 == 0) {
+      cute::SM80_CP_ASYNC_CACHEGLOBAL<uint4>::copy(
+          *reinterpret_cast<const uint4*>(source + first_row),
+          *reinterpret_cast<uint4*>(&tile[i][lane * 8]));
+    } else {
+      InputVector values;
+      values.clear();
+      #pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (first_row + j < rows) values[j] = source[first_row + j];
+      *reinterpret_cast<InputVector*>(&tile[i][lane * 8]) = values;
+    }
+  }
+  cute::cp_async_fence();
+}
+
 template <class ScaleLayout>
 __global__ void quantize_mxfp8_transposed_operand(const Bf16* input,
     Fp8E4m3* output, cutlass::float_ue8m0_t* scales, int rows, int k,
@@ -327,34 +353,38 @@ __global__ void quantize_mxfp8_transposed_operand(const Bf16* input,
   for (int64_t t = blockIdx.x; t < row_tiles * k_tiles; t += gridDim.x) {
     const int row_base = int(t / k_tiles) * kMxfp8TransposeRows;
     const int k_base = int(t % k_tiles) * (32 * kGroups);
+    load_mxfp8_transpose_input(input, tile, rows, row_base, k_base, source_stride);
     uint32_t scale_word = 0;
     #pragma unroll
     for (int group = 0; group < kGroups; ++group) {
-      using InputVector = cutlass::AlignedArray<Bf16, 8, 16>;
-      #pragma unroll
-      for (int i = warp; i < 32; i += 8) {
-        InputVector values;
-        values.clear();
-        const int first_row = row_base + lane * 8;
-        const Bf16* source = input + int64_t{k_base + group * 32 + i} * source_stride;
-        if (first_row + 7 < rows && reinterpret_cast<uintptr_t>(source + first_row) % 16 == 0)
-          values = *reinterpret_cast<const InputVector*>(source + first_row);
-        else {
-          #pragma unroll
-          for (int j = 0; j < 8; ++j)
-            if (first_row + j < rows) values[j] = source[first_row + j];
-        }
-        *reinterpret_cast<InputVector*>(&tile[i][lane * 8]) = values;
-      }
+      cute::cp_async_wait<0>();
       __syncthreads();
       cutlass::Array<float, 32> values;
-      cutlass::Array<float, 4> maxima;
-      maxima.clear();
       #pragma unroll
       for (int i = 0; i < 32; ++i) {
         values[i] = float(tile[i][threadIdx.x]);
-        maxima[i % 4] = fmaxf(maxima[i % 4], fabsf(values[i]));
       }
+      // Every current K32 value is now register-owned. After all readers
+      // join, reuse the SAME input tile for the next group while this group
+      // computes its scale and converts/writes FP8. Output staging is separate.
+      //
+      //   input SMEM: [K32 g] --all readers join--> [async load g+1]
+      //   registers:          [scale / convert g / writeback]      -> wait g+1
+      //
+      // No extra shared stage. Register/occupancy effects still need measured
+      // resource checks. The join before reuse and
+      // next iteration's async wait + CTA join are both required; neither
+      // quantization grouping nor the stream-ordered GEMM boundary changes.
+      if (group + 1 < kGroups) {
+        __syncthreads();
+        load_mxfp8_transpose_input(input, tile, rows, row_base,
+            k_base + (group + 1) * 32, source_stride);
+      }
+      cutlass::Array<float, 4> maxima;
+      maxima.clear();
+      #pragma unroll
+      for (int i = 0; i < 32; ++i)
+        maxima[i % 4] = fmaxf(maxima[i % 4], fabsf(values[i]));
       const float amax = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
       const int exponent = mxfp8_scale_exponent(amax);
       #pragma unroll

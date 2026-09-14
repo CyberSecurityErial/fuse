@@ -120,6 +120,70 @@ int main(){for(int prefix:{0,3,4})for(bool rotate:{false,true}){
         self.assertEqual(set(stores.values()), {1})
         self.assertEqual(groups, Counter(range(256)))
 
+    def test_transpose_async_input_preserves_tail_and_stride(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('host C++ compiler required')
+        text = (ROOT/'csrc/operators/sm103/detail/quantization.cuh').read_text()
+        begin = text.index('CUTLASS_DEVICE void load_mxfp8_transpose_input(')
+        helper = text[begin:text.index('\ntemplate <class ScaleLayout>', begin)]
+        program = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#define CUTLASS_DEVICE
+using Bf16 = uint16_t;
+struct alignas(16) uint4 { uint32_t x,y,z,w; };
+struct {int x=0;} threadIdx;
+constexpr int kMxfp8TransposeRows=256;
+int commits=0, async_copies=0;
+namespace cutlass {
+template<class T,int N,int A> struct alignas(A) AlignedArray {
+  T v[N]; void clear(){for(auto& x:v)x=0;} T& operator[](int i){return v[i];}
+};
+}
+namespace cute {
+template<class T> struct SM80_CP_ASYNC_CACHEGLOBAL {
+  static void copy(const T& src,T& dst){std::memcpy(&dst,&src,sizeof(T));++async_copies;}
+};
+void cp_async_fence(){++commits;}
+}
+''' + helper + r'''
+int main() {
+  for(int rows:{1,33,128,129,256,257,384})for(int padding:{0,1,2,3}) {
+    int stride=rows+padding;
+    std::vector<uint4> storage((128*stride+7)/8);
+    auto* input=reinterpret_cast<Bf16*>(storage.data());
+    for(int k=0;k<128;++k)for(int r=0;r<stride;++r)input[k*stride+r]=(k*13+r)%60000+1;
+    alignas(16) Bf16 tile[32][264];
+    for(int rb=0;rb<rows;rb+=256)for(int kb=0;kb<128;kb+=32) {
+      for(auto& line:tile)for(auto& v:line)v=65535;
+      int before=commits;
+      for(int thread=0;thread<256;++thread) {
+        threadIdx.x=thread;load_mxfp8_transpose_input(input,tile,rows,rb,kb,stride);
+      }
+      assert(commits-before==256);
+      for(int k=0;k<32;++k)for(int r=0;r<264;++r)
+        assert(tile[k][r]==(r>=256?65535:rb+r<rows?input[(kb+k)*stride+rb+r]:0));
+    }
+  }
+  assert(async_copies>0);
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'async_input.cpp';binary=Path(directory)/'async_input'
+            source.write_text(program)
+            subprocess.run([compiler,'-std=c++17','-O2',str(source),'-o',str(binary)],
+                           check=True,capture_output=True,text=True)
+            subprocess.run([str(binary)],check=True,capture_output=True,text=True)
+        kernel = text[text.index('__global__ void quantize_mxfp8_transposed_operand'):]
+        self.assertLess(kernel.index('cute::cp_async_wait<0>();'),
+                        kernel.index('values[i] = float(tile[i][threadIdx.x]);'))
+        prefetch = kernel[kernel.index('if (group + 1 < kGroups) {'):]
+        self.assertLess(prefetch.index('__syncthreads();'),
+                        prefetch.index('load_mxfp8_transpose_input('))
+
     def test_backward_log_parser_rejects_unowned_or_ambiguous_records(self):
         rows=backward_summary.parse(b'device,rank=3,sm=148,compute=10.3\n')
         self.assertEqual(rows,[dict(kind='backward_device',rank='3',sm='148',compute='10.3')])
