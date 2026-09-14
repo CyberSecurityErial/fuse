@@ -572,9 +572,20 @@ cudaError_t prepare_gemm_a2a_mxfp8(const Mxfp8GemmA2AParams& p, cudaStream_t str
   auto status = validate_mxfp8(p, &w);
   if (status != cudaSuccess) return status;
   const auto& g = p.projection.gemm;
-  quantize_mxfp8_operand<<<256, 256, 0, stream>>>(p.projection.rhs_nt, w.b, w.sfb,
-      g.n, g.k, b_row_stride(g),
-      Mxfp8ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(g.m, g.n, g.k, 1)));
+  auto layout = Mxfp8ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(g.m, g.n, g.k, 1));
+  auto kernel = quantize_mxfp8_operand<decltype(layout), true>;
+  int blocks_per_sm = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, 256, 0);
+  if (status != cudaSuccess) return status;
+  DeviceInfo info{};
+  status = device_info(&info);
+  if (status != cudaSuccess) return status;
+  const int64_t chunks = int64_t{ceil_div(g.n, 128) * 128} * g.k / 1024;
+  const int blocks = static_cast<int>(std::min<int64_t>((chunks + 7) / 8,
+      int64_t{info.sm_count} * blocks_per_sm));
+  if (blocks <= 0) return cudaErrorNotSupported;
+  quantize_mxfp8_operand<decltype(layout), true><<<blocks, 256, 0, stream>>>(p.projection.rhs_nt, w.b, w.sfb,
+      g.n, g.k, b_row_stride(g), layout);
   return cudaGetLastError();
 }
 
@@ -660,6 +671,11 @@ cudaError_t launch_gemm_a2a_mxfp8_role_telemetry(
     const Mxfp8GemmA2AParams& params, A2AGemmCtaTimeline* timeline,
     int32_t capacity, cudaStream_t stream, Mxfp8ProfileView probe,
     QkvRouteTimeline* routes, int32_t route_capacity) {
+  // TODO: export all-mode's post-grid-join publication as its own event.
+  // The incremental chunk-arrival exporter cannot represent this protocol;
+  // reject that detailed trace rather than fabricate release timestamps.
+  if (params.weight_preparation == Mxfp8WeightPreparation::kAllCtas && probe.quant)
+    return cudaErrorNotSupported;
   return params.epilogue_n == 32
       ? launch_mxfp8<true, 32>(params, stream, true, timeline, capacity, probe, routes, route_capacity)
       : launch_mxfp8<true, 64>(params, stream, true, timeline, capacity, probe, routes, route_capacity);

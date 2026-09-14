@@ -25,6 +25,12 @@ struct Mxfp8GemmA2AParams {
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
   Mxfp8Activation activation{};
+  // NOTE: In the measured QKV workloads, moving W quantization OUT of the
+  // fused kernel is the preferred performance choice because of parallel
+  // configuration limits. kAllCtas still inherits the GEMM/route kernel's
+  // register/SMEM budget and cannot overlap preparation with those roles.
+  // This is not a universal guarantee: compare the full timed boundary
+  // with per-call prepare_gemm_a2a_mxfp8 + the prequantized launch, not cached W.
   Mxfp8WeightPreparation weight_preparation = Mxfp8WeightPreparation::kCommunicationCtas;
   // CUTLASS epilogue subtile N; independent of the full N256 ready panel.
   // Raster/swizzle remain explicit in projection.gemm. 64 preserves the baseline.
@@ -64,6 +70,8 @@ cudaError_t launch_gemm_a2a_mxfp8_postprocess_reference(
 
 // Diagnostic control: prepare W separately, then measure GEMM+A2A alone.
 // Re-prepare after W changes; this is not the dynamic-weight fused boundary.
+// For a dynamic-weight standalone comparison, time BOTH calls on every epoch
+// in the same stream/Graph, including prepare; never reuse cached quantized W.
 // Both diagnostic calls require a positive communication budget. To compare
 // against auto production, query its budget above and pass it explicitly here.
 cudaError_t prepare_gemm_a2a_mxfp8(

@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v24.0
+        default: v24.1
 
 permissions:
   contents: write
@@ -27,9 +27,19 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v24.0");
+              : (process.env.REQUESTED_TAG || "v24.1");
 
             const releases = {
+              "v24.1": {
+                name: "v24.1 — QKV MXFP8 quantization maintenance",
+                body: [
+                  "QKV前向典型泛化场景27点几何平均2.227942 PFLOPS/卡，比v24.0历史结果+1.24%；包括补充QwenDense的全33点2.077387P（+1.47%）。固定配置、两份实际非零Philox各Graph10+50、完整数值和路由校验。历史对照不是同轮全量A/B，不挑旧新较快值。",
+                  "保留有效优化：all模式量化后经原grid join一次发布完整panel，消除冗余贡献计数；连续物理chunk寻址。K32数值和消费端ready/异步内存序不变。",
+                  "all选择处新增并行配置限制说明：独立量化可选择自己的执行资源，实测中更有利；显式separate对照在同一个Graph内计时量化及GEMM+A2A，不是缓存权重的纯GEMM。默认选择不改，发布33点仍是all。",
+                  "OProj与两个反向沿用v24.0，不保留无整体收益的试验。新版all详细量化发布Perfetto尚未适配，显式返回不支持；不伪造旧发布协议trace。",
+                  "最终表、逐点参数和证据：results/sm103/v24.1；不附调优流水账、profile、大日志或依赖。",
+                ].join("\n\n"),
+              },
               "v24.0": {
                 name: "v24.0 — SM103 MXFP8 forward and complete backward baselines",
                 body: [

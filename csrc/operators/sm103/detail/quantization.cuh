@@ -278,11 +278,25 @@ CUTLASS_DEVICE void quantize_mxfp8_chunk(const Bf16* input, Fp8E4m3* output,
   reinterpret_cast<uint8_t*>(scales)[offset] = static_cast<uint8_t>(exponent + 127);
 }
 
-template <class ScaleLayout>
+template <class ScaleLayout, bool RegisterChunks = false>
 __global__ void quantize_mxfp8_operand(const Bf16* input, Fp8E4m3* output,
     cutlass::float_ue8m0_t* scales, int rows, int k, int64_t row_stride,
     ScaleLayout scale_layout) {
   const int64_t groups = ((int64_t{rows} + 127) / 128 * 128) * (k / 32);
+  if constexpr (RegisterChunks) {
+    // Standalone W preparation: reuse the production register-owned K32
+    // quantizer, but distribute independent 1024-value chunks over the grid.
+    // No panel counters/fences are needed here: same-stream kernel completion
+    // orders all FP8/scales before the following GEMM+A2A kernel. Its output
+    // routing still uses the original ready/epoch protocol.
+    for (int64_t chunk = (int64_t{blockIdx.x} * blockDim.x + threadIdx.x) / 32;
+         chunk < groups / 32; chunk += int64_t{gridDim.x} * blockDim.x / 32) {
+      const int64_t offset = chunk * 1024;
+      quantize_mxfp8_chunk(input, output, scales, rows, k, row_stride,
+          scale_layout, static_cast<int>(offset / k), static_cast<int>(offset % k));
+    }
+    return;
+  }
   for (int64_t group = (int64_t{blockIdx.x} * blockDim.x + threadIdx.x) / 32;
        group < groups; group += int64_t{gridDim.x} * blockDim.x / 32) {
     quantize_mxfp8_group(input, output, scales, rows, k, row_stride, scale_layout, group);
@@ -502,10 +516,24 @@ struct Mxfp8WeightProducer {
     // There are no host memset nodes and no reliance on zero-filled scratch.
     cooperative_groups::this_grid().sync();
     if (p.weights.all_ctas) {
+      // Performance caveat: "all" means all resident CTAs, not an independent
+      // quantization grid. This prologue inherits the GEMM/route kernel's
+      // resource limits and cannot overlap W preparation with those roles.
+      // NOTE: Separate W quantization is preferable in the measured QKV
+      // workloads: it can choose its own parallel configuration and has no
+      // intermediate panel publication. Keep quantization INSIDE the timed
+      // quantize+GEMM+A2A boundary when comparing, never reuse cached weights.
       Mxfp8WeightProducer work(p.weights, p.producer_order, p.n_band_swizzle,
           index / 32, gridDim.x * blockDim.x / 32);
-      work.drain();
+      // QKV all-CTA startup already joins ALL writers before any GEMM begins.
+      // Per-warp panel arrival RMWs add no readiness information in this mode.
+      // Quantize every physical chunk, then publish each complete panel once
+      // AFTER the grid join. Normal communication-side
+      // production (including OProj's overlapping startup) retains arrivals.
+      work.drain<false>();
       cooperative_groups::this_grid().sync();
+      for (int n = index; n < p.weights.workspace.panels; n += gridDim.x * blockDim.x)
+        detail::store_release_gpu(p.weights.workspace.ready + n * kReadyFlagStride, p.weights.epoch);
     }
   }
 
@@ -523,21 +551,45 @@ struct Mxfp8WeightProducer {
         : schedule.divmod_batch_.divisor / schedule.divmod_cluster_blk_major_.divisor);
   }
 
+  template <bool PublishPanels = true>
   CUTLASS_DEVICE bool progress() {
     if (!args.source) return false; // Explicit prequantized diagnostic.
     const int64_t panel_groups = int64_t{kPanelN} * (args.k / 32);
     const int64_t steps = (panel_groups + kGroupsPerStep - 1) / kGroupsPerStep;
-    if (next >= int64_t{order.extent} * steps) return false;
-    const int panel = order.forward(static_cast<int>(next / steps));
-    const int64_t step = next % steps;
-    next += stride;
-    if (panel >= args.workspace.panels) return true;
     const int padded_n = ceil_div(args.n, 128) * 128;
-    const int remaining_rows = padded_n - panel * kPanelN;
-    const int rows = remaining_rows < kPanelN ? remaining_rows : kPanelN;
-    const int64_t groups = int64_t{rows} * (args.k / 32);
-    const int64_t begin = step * kGroupsPerStep;
-    if (begin >= groups) return true;
+    int panel = 0, row = 0, column = 0;
+    int64_t step = 0, groups = 0;
+    if constexpr (PublishPanels) {
+      if (next >= int64_t{order.extent} * steps) return false;
+      panel = order.forward(static_cast<int>(next / steps));
+      step = next % steps;
+      next += stride;
+      if (panel >= args.workspace.panels) return true;
+      const int remaining_rows = padded_n - panel * kPanelN;
+      const int rows = remaining_rows < kPanelN ? remaining_rows : kPanelN;
+      groups = int64_t{rows} * (args.k / 32);
+      const int64_t begin = step * kGroupsPerStep;
+      if (begin >= groups) return true;
+      const int groups_per_row = args.k / 32;
+      row = panel * kPanelN + static_cast<int>(begin / groups_per_row);
+      column = static_cast<int>(begin % groups_per_row) * 32;
+    } else {
+      // All-CTA startup finishes the ENTIRE weight before GEMM starts:
+      //   physical chunk -> divmod(chunk * 1024, K) -> (row, column).
+      // No panel/step decode or GEMM-order rotation is needed on this path.
+      // Physical FP8/SF addresses and K32 math stay unchanged. With rotation
+      // disabled this also preserves each warp's original chunk sequence.
+      // Incremental communication-side production retains its panel queue.
+      if (next >= int64_t{padded_n} * args.k / 1024) return false;
+      const int64_t offset = next * 1024;
+      next += stride;
+      row = static_cast<int>(offset / args.k);
+      column = static_cast<int>(offset % args.k);
+#if FUSE_ENABLE_PROFILING
+      panel = row / kPanelN;
+      step = (offset - int64_t{panel} * kPanelN * args.k) / 1024;
+#endif
+    }
 #if FUSE_ENABLE_PROFILING
     Mxfp8QuantRecord* record = nullptr;
     const int64_t record_index = int64_t{panel} * steps + step;
@@ -559,9 +611,6 @@ struct Mxfp8WeightProducer {
     //
     // The lane's 32 values remain adjacent. Removing repeated group divmod
     // changes neither K32 scales nor the chunk/panel publication boundaries.
-    const int groups_per_row = args.k / 32;
-    const int row = panel * kPanelN + static_cast<int>(begin / groups_per_row);
-    const int column = static_cast<int>(begin % groups_per_row) * 32;
     static_assert(kGroupsPerStep == 32);
     quantize_mxfp8_chunk(args.source, args.workspace.b, args.workspace.sfb,
         args.n, args.k, args.row_stride, args.scales, row, column);
@@ -574,39 +623,41 @@ struct Mxfp8WeightProducer {
     uint64_t warp_join_done = 0, arrival_done = 0;
     uint32_t arrival_chunks = 0;
 #endif
-    const uint32_t expected = (groups + kGroupsPerStep - 1) / kGroupsPerStep;
-    ++pending_chunks;
-    if (step + stride >= expected) {
-      const uint32_t delta = pending_chunks;
-      pending_chunks = 0;
-      __syncwarp();
-#if FUSE_ENABLE_PROFILING
-      if (record) {
-        asm volatile("" ::: "memory");
-        warp_join_done = detail::read_global_timer();
-        asm volatile("" ::: "memory");
-      }
-      arrival_chunks = delta;
-#endif
-      if (threadIdx.x % 32 == 0) {
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_device> count(
-            args.workspace.arrivals[panel * kReadyFlagStride]);
-        const uint32_t arrived = count.fetch_add(delta, cuda::memory_order_acq_rel) + delta;
+    if constexpr (PublishPanels) {
+      const uint32_t expected = (groups + kGroupsPerStep - 1) / kGroupsPerStep;
+      ++pending_chunks;
+      if (step + stride >= expected) {
+        const uint32_t delta = pending_chunks;
+        pending_chunks = 0;
+        __syncwarp();
 #if FUSE_ENABLE_PROFILING
         if (record) {
           asm volatile("" ::: "memory");
-          arrival_done = detail::read_global_timer();
+          warp_join_done = detail::read_global_timer();
           asm volatile("" ::: "memory");
         }
+        arrival_chunks = delta;
 #endif
-        if (arrived == expected) {
-          detail::store_release_gpu(args.workspace.ready + panel * kReadyFlagStride, args.epoch);
+        if (threadIdx.x % 32 == 0) {
+          cuda::atomic_ref<uint32_t, cuda::thread_scope_device> count(
+              args.workspace.arrivals[panel * kReadyFlagStride]);
+          const uint32_t arrived = count.fetch_add(delta, cuda::memory_order_acq_rel) + delta;
 #if FUSE_ENABLE_PROFILING
-          if (record) record->release = detail::read_global_timer();
+          if (record) {
+            asm volatile("" ::: "memory");
+            arrival_done = detail::read_global_timer();
+            asm volatile("" ::: "memory");
+          }
 #endif
+          if (arrived == expected) {
+            detail::store_release_gpu(args.workspace.ready + panel * kReadyFlagStride, args.epoch);
+#if FUSE_ENABLE_PROFILING
+            if (record) record->release = detail::read_global_timer();
+#endif
+          }
         }
+        __syncwarp();
       }
-      __syncwarp();
     }
 #if FUSE_ENABLE_PROFILING
     if (record) {
@@ -618,7 +669,8 @@ struct Mxfp8WeightProducer {
 #endif
     return true;
   }
-  CUTLASS_DEVICE void drain() { while (progress()) {} }
+  template <bool PublishPanels = true>
+  CUTLASS_DEVICE void drain() { while (progress<PublishPanels>()) {} }
 };
 
 }  // namespace

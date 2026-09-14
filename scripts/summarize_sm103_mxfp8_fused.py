@@ -391,7 +391,8 @@ def audit_run(directory, candidate_id=1, component='fused'):
     epilogue_n = int(fields_precision.get('epilogue_n',64))
     sf.require(epilogue_n == (job.get('mxfp8_epilogue_n') or 64), 'Epilogue metadata mismatch')
     sf.require(fields_precision['includes_weight_quantization'] == '1', 'Not dynamic weight boundary')
-    if job.get('oproj_postnorm_separate') or job.get('qkv_postprocess_separate'):
+    if (job.get('oproj_postnorm_separate') or job.get('qkv_postprocess_separate') or
+            job.get('mxfp8_weight_preparation') == 'separate'):
         sf.require(fields_precision.get('kernel_nodes') == '2', 'Separate boundary must contain two kernels')
     sf.require(fields_precision.get('weight_preparation') == (job.get('mxfp8_weight_preparation') or 'comm'),
                'Weight preparation job/config mismatch')
@@ -485,7 +486,9 @@ def audit_run(directory, candidate_id=1, component='fused'):
     flops = 2*shape['seq_local']*n*k
     executed_flops = flops if component in ('fused', 'compute_reference') else 0
     return dict(run_id=job['run_id'],candidate_id=candidate_id,component=component,
-        measurement_role=('separate_postprocess_reference' if job.get('oproj_postnorm_separate') or
+        measurement_role=('separate_weight_quantization_reference' if
+                          job.get('mxfp8_weight_preparation') == 'separate' else
+                          'separate_postprocess_reference' if job.get('oproj_postnorm_separate') or
                           job.get('qkv_postprocess_separate') else
                           'production' if component == 'fused' else 'calibration'),
         epilogue_n=epilogue_n,experiment=job['experiment'],world=world,global_seq=shape['global_seq'],
@@ -496,7 +499,9 @@ def audit_run(directory, candidate_id=1, component='fused'):
                    'producer_reference': 'MXFP8_A_and_SFA_copy_plus_BF16_W_quantization',
                    'quantize_reference': 'BF16_to_MXFP8_E4M3_UE8M0'}.get(
             component, 'MXFP8_E4M3_UE8M0_accFP32_BF16out'),
-        boundary=(OPROJ_BOUNDARIES if oproj else BOUNDARIES)[component] + (
+        boundary=('standalone_BF16_W_quantization_then_MXFP8_GEMM_and_BF16_A2A' if
+                  job.get('mxfp8_weight_preparation') == 'separate' else
+                  (OPROJ_BOUNDARIES if oproj else BOUNDARIES)[component]) + (
             '+BF16_residual_add+full_hidden_RMSNorm' if job.get('oproj_postnorm') else
             '+' + postprocess['qkv'] if postprocess['qkv'] != 'none' else ''),
         postprocess=postprocess,

@@ -491,8 +491,13 @@ def validate_job(job, hostname=None):
             raise ValueError('MXFP8 baseline hidden dimension must be divisible by 128')
         if job.get('fused_direction') != 'oproj' and job.get('head_dim', 128) != 128:
             raise ValueError('MXFP8 communication-side quantization requires the head_dim=128 TMA route')
-        if job.get('mxfp8_weight_preparation') not in (None, 'comm', 'all', 'comm_warp'):
-            raise ValueError('MXFP8 weight preparation requires comm, all, or comm_warp')
+        if job.get('mxfp8_weight_preparation') not in (None, 'comm', 'all', 'comm_warp', 'separate'):
+            raise ValueError('MXFP8 weight preparation requires comm, all, comm_warp, or separate')
+        if job.get('mxfp8_weight_preparation') == 'separate' and (
+                job.get('fused_direction') != 'qkv' or job.get('profile') or job.get('calibrate') or
+                job.get('mxfp8_prequantized') or job.get('auto_mxfp8_comm') or
+                job.get('qkv_postprocess', 'none') not in (None, 'none')):
+            raise ValueError('Separate W quantization requires plain QKV with explicit budget and complete timed boundary')
     if job.get('backward_gemm_sweep') and not (job.get('backward') and job.get('profile') and job.get('mpi')):
         raise ValueError('Backward GEMM sweep requires isolated backward profile MPI build')
     if job.get('backward_matrix') or job.get('backward_matrix_payload'):
@@ -2299,7 +2304,7 @@ def main():
     run.add_argument('--rope-policy', choices=('qwen3', 'llama31'), help='Upstream RoPE table policy for validation fixture')
     run.add_argument('--mxfp8-epilogue-n', type=int, choices=(32, 64),
                      help='MXFP8 CUTLASS epilogue subtile; default 64 preserves baseline')
-    run.add_argument('--mxfp8-weight-preparation', choices=('comm', 'all', 'comm_warp'), help='Weight quantization by communication CTAs (default), all CTAs at startup, or comm_warp: warps 0..3 route immediately; warps 4..7 quantize then join routing (warp_then_route_v1)')
+    run.add_argument('--mxfp8-weight-preparation', choices=('comm', 'all', 'comm_warp', 'separate'), help='Weight quantization by communication CTAs (default), all CTAs at startup, comm_warp specialization, or separate: time standalone W quantization then GEMM+A2A together')
     run.add_argument('--backward-gemm-sweep', action='store_true', help='isolated pure NN GEMM candidate sweep; production overlap unchanged')
     run.add_argument('--backward-weight-epilogue-n', type=int, choices=(32,64),
                      help='MXFP8 backward: independent dW epilogue, default inherits dA')

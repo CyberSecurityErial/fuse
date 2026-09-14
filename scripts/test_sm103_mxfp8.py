@@ -16,6 +16,70 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Mxfp8QuantizationContracts(unittest.TestCase):
+    def test_profile_dispatch_does_not_also_launch_production(self):
+        compiler = shlex.split(os.environ.get('CXX', 'c++'))
+        if not compiler or not shutil.which(compiler[0]):
+            self.skipTest('host C++ compiler required')
+        source = (ROOT/'benchmarks/sm103/fused_bf16.cu').read_text()
+        begin = source.index('#if FUSE_ENABLE_PROFILING\n    if (job.qkv_epilogue_probe)')
+        block = source[begin:source.index('\n#else\n#if FUSE_ENABLE_PROFILING', begin)]
+        program = r'''
+#include <stdexcept>
+#define CUDA_CHECK(x) (x)
+int calls=0, prepares=0;
+namespace fuse {
+template<class... T> int prepare_gemm_a2a_mxfp8(T...) { ++prepares; return 0; }
+template<class... T> int launch_gemm_a2a_mxfp8_role_telemetry(T...) { ++calls; return 0; }
+template<class... T> int launch_gemm_a2a_mxfp8_postprocess_reference(T...) { ++calls; return 0; }
+template<class... T> int launch_gemm_a2a_mxfp8_prequantized(T...) { ++calls; return 0; }
+template<class... T> int launch_gemm_a2a_mxfp8_cutlass(T...) { ++calls; return 0; }
+namespace detail {
+template<class... T> int launch_qkv_epilogue_telemetry(T...) { ++calls; return 0; }
+}}
+int main() {
+  for(int mode=0;mode<4;++mode) {
+    struct { bool qkv_epilogue_probe,profile; } job{mode==0,mode==1};
+    struct {
+      int timeline=0,sm_count=0,qkv_epilogue=0,stream=0,mxfp8_probe=0,
+          qkv_route_timeline=0,qkv_route_capacity=0,qkv_global_postprocess=0;
+      bool mxfp8_separate_weight=false,qkv_postprocess_separate=false,mxfp8_prequantized=false;
+    } runtime;
+    runtime.mxfp8_separate_weight=mode==3;
+    int params=0;
+    calls=prepares=0;
+''' + block + r'''
+    if(calls!=1 || prepares!=(mode==3)) throw std::runtime_error("duplicate or missing launch");
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'dispatch.cpp'
+            path.write_text(program)
+            for enabled in (0, 1):
+                exe = Path(folder)/('dispatch'+str(enabled))
+                subprocess.run([*compiler,'-std=c++17',f'-DFUSE_ENABLE_PROFILING={enabled}',
+                                str(path),'-o',str(exe)],check=True,capture_output=True)
+                subprocess.run([str(exe)],check=True,capture_output=True)
+        api = (ROOT/'csrc/operators/sm103/api/forward_mxfp8.cuh').read_text()
+        telemetry = api[api.index('cudaError_t launch_gemm_a2a_mxfp8_role_telemetry('):]
+        self.assertIn('Mxfp8WeightPreparation::kAllCtas && probe.quant', telemetry)
+
+    def test_separate_weight_quantization_remains_inside_graph(self):
+        harness = (ROOT/'benchmarks/sm103/fused_bf16.cu').read_text()
+        operation = harness[harness.index('void enqueue_operation('):harness.index('\nvoid ', harness.index('void enqueue_operation(')+5)]
+        self.assertIn('if (runtime.mxfp8_separate_weight)', operation)
+        self.assertLess(operation.index('fuse::prepare_gemm_a2a_mxfp8('),
+                        operation.index('fuse::launch_gemm_a2a_mxfp8_prequantized('))
+        graph = harness[harness.index('void bind_graph('):harness.index('void report_graph_preparation(')]
+        self.assertIn('options.mxfp8_weight_preparation == "separate"', graph)
+        self.assertIn('fused_graph::Launch::kOrdinaryStatic', graph)
+        self.assertIn('fused_graph::Launch::kCooperativeDynamic', graph)
+        api = (ROOT/'csrc/operators/sm103/api/forward_mxfp8.cuh').read_text()
+        preparation = api[api.index('cudaError_t prepare_gemm_a2a_mxfp8('):api.index('cudaError_t launch_gemm_a2a_mxfp8_prequantized(')]
+        self.assertIn('quantize_mxfp8_operand<decltype(layout), true>', preparation)
+        self.assertIn('cudaOccupancyMaxActiveBlocksPerMultiprocessor', preparation)
+        self.assertNotIn('cudaMemset', preparation)
+
     def test_joint_fused_search_starts_from_registered_gemm(self):
         import tune_sm103_mxfp8_fused as search
         seed = search.gemm_config({'id':'example','winner':{'config':'m128n256k128e32s0sw8M'}})
@@ -197,7 +261,7 @@ int main() {
         begin = text.index('CUTLASS_HOST_DEVICE int mxfp8_scale_exponent(')
         math = text[begin:text.index('// One warp owns', begin)]
         begin = text.index('template <class ScaleLayout>\nCUTLASS_DEVICE void quantize_mxfp8_chunk')
-        helper = text[begin:text.index('\ntemplate <class ScaleLayout>', begin + 1)]
+        helper = text[begin:text.index('\ntemplate <class ScaleLayout, bool RegisterChunks', begin + 1)]
         program = r'''
 #include <algorithm>
 #include <cmath>
@@ -414,7 +478,8 @@ int main() {
         self.assertIn('params.projection.lhs = nullptr', harness)
         self.assertIn('includes_activation_quantization=0', harness)
         self.assertTrue('kernel_nodes="' in harness)
-        self.assertTrue('options.oproj_postnorm_separate || options.qkv_postprocess_separate ? 2 : 1' in harness)
+        self.assertIn('options.oproj_postnorm_separate || options.qkv_postprocess_separate ||', harness)
+        self.assertIn('options.mxfp8_weight_preparation == "separate" ? 2 : 1', harness)
 
     def test_communication_warp_specialization_keeps_independent_queues(self):
         comm = (ROOT / 'csrc/operators/sm103/detail/gemm_a2a.cuh').read_text()
@@ -460,6 +525,18 @@ int main() {
         self.assertLess(consumer.index('wait_acquire_gpu_single_lane('), consumer.index('__syncwarp();'))
         self.assertLess(consumer.index('__syncwarp();'), consumer.index('fence_proxy_async_global();'))
         self.assertLess(consumer.index('fence_proxy_async_global();'), consumer.index('return Base::load('))
+
+    def test_all_weight_publication_follows_complete_grid_join(self):
+        source = (ROOT / 'csrc/operators/sm103/detail/quantization.cuh').read_text()
+        producer = source[source.index('struct Mxfp8WeightProducer'):]
+        startup = producer[producer.index('static void initialize_grid'):producer.index('template <class Schedule>')]
+        self.assertEqual(startup.count('cooperative_groups::this_grid().sync();'), 2)
+        all_startup = startup[startup.index('if (p.weights.all_ctas)'):]
+        self.assertLess(all_startup.index('work.drain<false>();'), all_startup.index('this_grid().sync();'))
+        self.assertLess(all_startup.index('this_grid().sync();'), all_startup.index('store_release_gpu('))
+        self.assertIn('n += gridDim.x * blockDim.x', all_startup)
+        self.assertIn('template <bool PublishPanels = true>', producer)
+        self.assertIn('if constexpr (PublishPanels)', producer)
 
     def test_actual_weight_queue_covers_groups_once_and_publishes_only_complete_panels(self):
         # Execute production queue/counter code with CPU memory-operation stubs.
@@ -606,6 +683,23 @@ int main() {
       Mxfp8WeightProducer no_work(prequantized,s,order,0,workers);
       if(no_work.progress() || atomic_calls!=previous_calls || seen!=previous_seen)
         throw std::runtime_error("empty worker changed output or published");
+      // Run the actual all-mode flat path too, including padded rows,
+      // non-power-of-two K, both GEMM rasters and nonzero panel rotation.
+      // The final physical groups must agree, without intermediate publication.
+      std::fill(seen.begin(),seen.end(),0);
+      const auto previous_ready=ready;
+      for(int i=0;i<workers;++i) {
+        current_worker=i;
+        Mxfp8WeightProducer flat(a,s,order,i,workers);
+        int64_t expected_chunk=i;
+        while(flat.progress<false>()) {
+          if(last_chunk_panel!=int(expected_chunk*1024/(256*k)))
+            throw std::runtime_error("flat physical chunk order");
+          expected_chunk+=workers;
+        }
+      }
+      if(seen!=previous_seen || atomic_calls!=previous_calls || ready!=previous_ready)
+        throw std::runtime_error("flat queue changed coverage or published early");
     }
   }
 }

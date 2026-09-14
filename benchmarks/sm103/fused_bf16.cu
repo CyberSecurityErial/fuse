@@ -482,8 +482,8 @@ Options parse_options(int argc, char** argv) {
       if (++index == argc) throw std::runtime_error("missing MXFP8 weight preparation");
       options.mxfp8_weight_preparation = argv[index];
       if (options.mxfp8_weight_preparation != "comm" && options.mxfp8_weight_preparation != "all" &&
-          options.mxfp8_weight_preparation != "comm_warp")
-        throw std::runtime_error("--mxfp8-weight-preparation requires comm, all, or comm_warp");
+          options.mxfp8_weight_preparation != "comm_warp" && options.mxfp8_weight_preparation != "separate")
+        throw std::runtime_error("--mxfp8-weight-preparation requires comm, all, comm_warp, or separate");
 #endif
     } else if (argument == "--profile") {
       options.profile = true;
@@ -538,7 +538,7 @@ Options parse_options(int argc, char** argv) {
                    "[--cpu-oracle] [--validation-self-test] [--calibrate]\n"
 #if FUSE_BENCH_MXFP8
                    "--oproj-m-window-tiles H --oproj-n-group-tiles P: explicit MXFP8 OProj tile windows; 0/0 disables.\n"
-                   "--mxfp8-weight-preparation comm|all|comm_warp: comm_warp uses warp_then_route_v1; "
+                   "--mxfp8-weight-preparation comm|all|comm_warp|separate: separate times W quantization then GEMM+A2A; comm_warp uses warp_then_route_v1; "
                    "warps 0..3 route immediately, warps 4..7 quantize their weights then join routing.\n"
 #endif
                    "--auto-oproj-comm: runtime CTA selection; Graph OProj causal rows, explicit N256/e32 and sw4/8 only; excludes --comm-sm/list.\n"
@@ -778,6 +778,10 @@ Options parse_options(int argc, char** argv) {
       (options.mxfp8_weight_preparation != "comm" &&
        !(options.run_oproj() && options.mxfp8_weight_preparation == "all"))))
     throw std::runtime_error("MXFP8 C/Q/R calibration requires dynamic-weight ordinary communication warps");
+  if (options.mxfp8_weight_preparation == "separate" &&
+      (options.fused_direction != "qkv" || options.profile || options.calibrate ||
+       options.mxfp8_prequantized || options.auto_mxfp8_comm || options.qkv_postprocess != "none"))
+    throw std::runtime_error("Separate W quantization requires plain QKV with explicit budget and complete timed boundary");
   if (options.qkv_policy_list.empty()) options.qkv_policy_list = {"m128n256"};
   if (options.qkv_policy_list != std::vector<std::string>{"m128n256"} || options.hidden % 128 ||
       (options.run_qkv() && options.head_dim != 128))
@@ -815,6 +819,7 @@ struct RankRuntime {
   Bf16* mxfp8_reference_a = nullptr;
   Bf16* mxfp8_reference_b = nullptr;
   bool mxfp8_prequantized = false;
+  bool mxfp8_separate_weight = false;
 #if FUSE_ENABLE_PROFILING
   fuse::Mxfp8ProfileView mxfp8_probe{};
   fuse::Mxfp8ServiceView mxfp8_service{};
@@ -1020,7 +1025,16 @@ void bind_graph(std::vector<RankRuntime>& runtimes, const Options& options, uint
     auto& runtime = runtimes[rank];
     CUDA_CHECK(cudaSetDevice(runtime.device));
     if (runtime.graph) runtime.graph->reset(committed_epoch);
-    else runtime.graph = std::make_unique<fused_graph::Operation>(
+    else
+#if FUSE_BENCH_MXFP8
+    if (options.mxfp8_weight_preparation == "separate")
+      runtime.graph = std::make_unique<fused_graph::Operation>(
+          runtime.device, runtime.stream, committed_epoch,
+          std::vector<fused_graph::Launch>{fused_graph::Launch::kOrdinaryStatic,
+                                         fused_graph::Launch::kCooperativeDynamic});
+    else
+#endif
+    runtime.graph = std::make_unique<fused_graph::Operation>(
         runtime.device, runtime.stream, committed_epoch
 #if FUSE_BENCH_MXFP8
         , options.oproj_postnorm_separate || options.qkv_postprocess_separate,
@@ -1217,6 +1231,7 @@ std::vector<RankRuntime> create_runtimes(const Options& options) {
       runtime.qkv_reference = allocate<Bf16>(runtime, checked_product(m, options.projection_width()));
 #if FUSE_BENCH_MXFP8
       runtime.mxfp8_prequantized = options.mxfp8_prequantized;
+      runtime.mxfp8_separate_weight = options.mxfp8_weight_preparation == "separate";
       runtime.mxfp8_epilogue_n = options.mxfp8_epilogue_n;
       if (options.qkv_postprocess_separate &&
           (options.qkv_postprocess == "none" || options.profile || options.mxfp8_prequantized))
@@ -1896,11 +1911,17 @@ void enqueue_operation(const RankLaunch& job, int rank) {
         runtime.mxfp8_probe, runtime.qkv_route_timeline, runtime.qkv_route_capacity));
     else
 #endif
-    CUDA_CHECK(runtime.qkv_postprocess_separate
-        ? fuse::launch_gemm_a2a_mxfp8_postprocess_reference(params,runtime.qkv_global_postprocess,runtime.stream)
-        : runtime.mxfp8_prequantized
-        ? fuse::launch_gemm_a2a_mxfp8_prequantized(params, runtime.stream)
-        : fuse::launch_gemm_a2a_mxfp8_cutlass(params, runtime.stream));
+    {
+      // Capture BOTH launches on every epoch. The standalone quantizer is not
+      // upstream input preparation and must never be moved outside the events.
+      if (runtime.mxfp8_separate_weight)
+        CUDA_CHECK(fuse::prepare_gemm_a2a_mxfp8(params, runtime.stream));
+      CUDA_CHECK(runtime.qkv_postprocess_separate
+          ? fuse::launch_gemm_a2a_mxfp8_postprocess_reference(params,runtime.qkv_global_postprocess,runtime.stream)
+          : (runtime.mxfp8_prequantized || runtime.mxfp8_separate_weight)
+          ? fuse::launch_gemm_a2a_mxfp8_prequantized(params, runtime.stream)
+          : fuse::launch_gemm_a2a_mxfp8_cutlass(params, runtime.stream));
+    }
 #else
 #if FUSE_ENABLE_PROFILING
     if (job.qkv_epilogue_probe) CUDA_CHECK(fuse::detail::launch_qkv_epilogue_telemetry(
@@ -3945,8 +3966,13 @@ int main(int argc, char** argv) {
         << ",epilogue_n=" << options.mxfp8_epilogue_n;
     if (options.mxfp8_weight_preparation == "comm_warp")
       fused_mpi::root_output() << ",weight_schedule=warp_then_route_v1";
-    fused_mpi::root_output() << ",publication_protocol=warp_panel_acq_rel_v3,kernel_nodes="
-                             << (options.oproj_postnorm_separate || options.qkv_postprocess_separate ? 2 : 1) << '\n';
+    const char* publication_protocol = options.mxfp8_weight_preparation == "separate"
+        ? "same_stream_kernel_completion_v1"
+        : options.run_qkv() && options.mxfp8_weight_preparation == "all"
+        ? "grid_join_panel_release_v1" : "warp_panel_acq_rel_v3";
+    fused_mpi::root_output() << ",publication_protocol=" << publication_protocol << ",kernel_nodes="
+                             << (options.oproj_postnorm_separate || options.qkv_postprocess_separate ||
+                                 options.mxfp8_weight_preparation == "separate" ? 2 : 1) << '\n';
 #endif
     // One communication layout for every candidate/payload; never mutate the
     // ready arrival geometry while reusing this run's cumulative epochs.

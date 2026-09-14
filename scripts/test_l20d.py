@@ -137,6 +137,21 @@ class WorkflowContracts(unittest.TestCase):
                 l20d.validate_job(self.fused_job(mxfp8=True, fused_direction='qkv',
                     qkv_policy='auto', mxfp8_weight_preparation='comm_warp') | changes)
 
+    def test_separate_weight_quantization_has_complete_explicit_boundary(self):
+        job = self.fused_job(mxfp8=True, mpi=True, fused_direction='qkv',
+            qkv_policy='auto', mxfp8_weight_preparation='separate')
+        # Validation/argv only. Never submit a test job to a real cluster.
+        with mock.patch.object(l20d, 'command', side_effect=AssertionError('external action')):
+            l20d.validate_job(job)
+            argv = l20d.fused_argv(job)
+            self.assertEqual(argv[argv.index('--mxfp8-weight-preparation') + 1], 'separate')
+            self.assertNotIn('--mxfp8-prequantized', argv)
+            for change in ({'mxfp8_prequantized': True}, {'profile': True},
+                           {'calibrate': True}, {'fused_direction': 'oproj'},
+                           {'qkv_postprocess': 'rope'}, {'auto_mxfp8_comm': True}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    l20d.validate_job(job | change)
+
     def test_mxfp8_backward_is_explicit_bringup_not_forward_or_formal(self):
         for world in (4, 8):
             job = self.fused_job(mxfp8=True, backward=True, mpi=False,
