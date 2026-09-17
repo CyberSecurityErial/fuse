@@ -1,4 +1,15 @@
-# Ulysses GEMM + All-to-All Fusion
+# fuse — GEMM + Communication Fusion
+
+## v25.0 — BF16 Dispatch＋Grouped GEMM
+
+新增独立的 SM103 MoE Dispatch→专家 FC1 融合：动态专家 token 数、CTASP、
+完整 K 交付与单 ready，默认全量 buffer，显存紧张时可显式使用有限 buffer。
+最新实现 EP4 的128个有效点几何平均 **0.904P/卡**，为满SM强纯GEMM的 **68.6%**，
+相对历史融合基线提升 **38.6%**。EP8保留前一次完整快照，明确区分于最新代码复测。
+按用户接受的基线发布，不宣称每点达到原目标或已有通用CTA/GEMM Auto。
+Combine/swapAB开发路径不列入本次验收，Projection与SM90算法不改。
+[全表、配置、覆盖和限制](results/sm103/v25.0/README.md) ·
+[接口与模块划分](benchmarks/sm103/GROUPED_GEMM_STUDY.md)。
 
 ## v24.1 — QKV 权重量化小版本
 

@@ -9,7 +9,7 @@ on:
       tag:
         description: Annotated tag to publish
         required: true
-        default: v24.1
+        default: v25.0
 
 permissions:
   contents: write
@@ -27,9 +27,20 @@ jobs:
           script: |
             const tag = context.ref.startsWith("refs/tags/")
               ? context.ref.slice("refs/tags/".length)
-              : (process.env.REQUESTED_TAG || "v24.1");
+              : (process.env.REQUESTED_TAG || "v25.0");
 
             const releases = {
+              "v25.0": {
+                name: "v25.0 — SM103 BF16 Dispatch + Grouped GEMM",
+                body: [
+                  "新增独立的BF16 Dispatch→专家FC1通算融合：动态专家token数、持久化CTASP、FP32累加/BF16输出，支持Graph replay。router/激活/top-k归并不在边界内。",
+                  "有效优化：8个warp发起者、24KiB完整行bulk搬运槽、按实际工作量分批、协作预取路由地址、尾块负载均衡。默认全量buffer；有限buffer仅用于显存紧张，可能显著降速。保持完整K交付、单ready和原同步协议。",
+                  "最新代码等价EP4实测128/136点，几何平均0.904028 PFLOPS/卡，满148SM强纯GEMM保留率68.5577%，相对历史融合+38.6095%。两份非零随机输入分别Graph10+50，完整数值/路由校验；不是同轮全量A/B。",
+                  "EP8保留前一次完整搬运快照134/136点，与最新代码复测明确分开；2个有效点缺参照。强参考只留CUTLASS/DeepGEMM中有效较快者，不含通信，不宣称穷举全局最优。",
+                  "按用户接受的当前基线发布，原每点15%提升/60%保留率目标未全部达到。没有新增生产CTA/GEMM Auto；Combine/swapAB仍开发路径，不列为v25验收成果。Projection/SM90算法不变。",
+                  "最终表、逐点参数和证据：results/sm103/v25.0。删除未采用搬运分支；4个融合kernel清理前后SASS指令/编码一致。不附调优流水账、profile、大日志或依赖。",
+                ].join("\n\n"),
+              },
               "v24.1": {
                 name: "v24.1 — QKV MXFP8 quantization maintenance",
                 body: [

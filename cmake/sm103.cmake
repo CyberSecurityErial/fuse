@@ -9,12 +9,13 @@ set(CUTLASS_ROOT "" CACHE PATH "Local CUTLASS source root with SM100 BF16 collec
 option(FUSE_ENABLE_PROFILING "Build diagnostic role telemetry kernels" OFF)
 option(FUSE_SM103_QKV_RANK_SWIZZLE "Experiment: rank-dependent QKV producer/consumer N-band rotation" OFF)
 option(FUSE_BUILD_KERNELS "Build the SM103 BF16 fused operators" ON)
+option(FUSE_BUILD_GROUPED_KERNELS "Build independent SM103 BF16 grouped operators" OFF)
 option(FUSE_BUILD_BASELINES "Build the independent SM103 cuBLASLt benchmarks" ON)
 option(FUSE_BUILD_MPI_BENCH "Build the same full-validation harness with MPI Eager execution" OFF)
 if(FUSE_SM103_QKV_RANK_SWIZZLE AND FUSE_ENABLE_PROFILING)
   message(FATAL_ERROR "Rank-rotated profiling ownership is not implemented; disable rank swizzle or profiling")
 endif()
-if(FUSE_BUILD_KERNELS AND NOT EXISTS
+if((FUSE_BUILD_KERNELS OR FUSE_BUILD_GROUPED_KERNELS) AND NOT EXISTS
     "${CUTLASS_ROOT}/include/cutlass/gemm/collective/sm100_mma_warpspecialized.hpp")
   message(FATAL_ERROR "Set CUTLASS_ROOT to a local Blackwell-capable CUTLASS checkout")
 endif()
@@ -85,6 +86,35 @@ if(FUSE_BUILD_KERNELS)
       fuse_kernels CUDA::cublas CUDA::cudart Threads::Threads MPI::MPI_CXX)
     target_compile_options(fused_bf16_mpi PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+  endif()
+endif()
+
+if(FUSE_BUILD_GROUPED_KERNELS)
+  set(DEEPGEMM_ROOT "" CACHE PATH "Optional pinned DeepGEMM source for benchmark-only native reference")
+  add_library(fuse_grouped_kernels STATIC csrc/operators/sm103/grouped_entry.cu)
+  target_include_directories(fuse_grouped_kernels PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUTLASS_ROOT}/include ${CUTLASS_ROOT}/tools/util/include)
+  target_compile_definitions(fuse_grouped_kernels PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+  target_compile_definitions(fuse_grouped_kernels PUBLIC FUSE_ENABLE_PROFILING=$<BOOL:${FUSE_ENABLE_PROFILING}>)
+  target_link_libraries(fuse_grouped_kernels PUBLIC CUDA::cudart CUDA::cuda_driver)
+  target_compile_options(fuse_grouped_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+  set_target_properties(fuse_grouped_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+  add_executable(grouped_bf16 benchmarks/sm103/grouped_bf16.cu
+    csrc/baselines/sm103/cublaslt_training.cu)
+  target_link_libraries(grouped_bf16 PRIVATE fuse_grouped_kernels CUDA::cublas CUDA::cublasLt)
+  target_compile_options(grouped_bf16 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+  if(DEEPGEMM_ROOT)
+    add_library(grouped_deepgemm STATIC csrc/baselines/sm103/deepgemm_grouped.cu)
+    target_include_directories(grouped_deepgemm PRIVATE ${DEEPGEMM_ROOT}/deep_gemm/include
+      ${DEEPGEMM_ROOT}/third-party/cutlass/include)
+    target_link_libraries(grouped_deepgemm PUBLIC CUDA::cudart CUDA::cuda_driver)
+    target_compile_options(grouped_deepgemm PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-relaxed-constexpr;--expt-extended-lambda;-lineinfo>)
+    set_target_properties(grouped_deepgemm PROPERTIES CUDA_STANDARD 20)
+    target_compile_definitions(grouped_bf16 PRIVATE FUSE_GROUPED_EXTERNAL=1)
+    target_link_libraries(grouped_bf16 PRIVATE grouped_deepgemm)
   endif()
 endif()
 

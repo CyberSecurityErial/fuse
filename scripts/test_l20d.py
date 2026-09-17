@@ -21,6 +21,148 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_fixed_compute_requires_transport_comparison(self):
+        with self.assertRaisesRegex(ValueError,'compute comparison requires'):
+            l20d.validate_job(dict(stage='grouped-ep',grouped_compute_compare=True))
+
+    def test_transport_comparison_rejects_changed_boundary(self):
+        base=dict(stage='grouped-ep',world=4,grouped_measure=True,grouped_fused_only=True,
+            grouped_transport_compare=True,grouped_direction='dispatch')
+        for change in (dict(grouped_fused_only=False),dict(grouped_direction='combine'),
+                       dict(grouped_buffer_rows=128),dict(grouped_cases='4096,1408,128,8,256@256,64,1,4,20,128@combine')):
+            with self.assertRaisesRegex(ValueError,'transport comparison'):
+                l20d.validate_job(base|change)
+
+    def test_grouped_light_ready_batch(self):
+        job=dict(stage='grouped-ep',world=8,grouped_profile=True,grouped_ready_summary=True,
+            grouped_direction='dispatch',grouped_cases='4096,1408,128,8,2048@256,64,1,4,20,128@dispatch')
+        cases=l20d.grouped_batch_cases(job)
+        self.assertEqual(len(cases),1)
+        self.assertEqual(cases[0]['geometry']['target_rows'],2048)
+        detailed=l20d.grouped_case_geometry(job|dict(grouped_case=cases[0]['case'],grouped_cases=None,grouped_ready_summary=False))
+        self.assertGreaterEqual(detailed['minimum_free_bytes'],cases[0]['geometry']['minimum_free_bytes'])
+        tail=job|dict(grouped_cases=job['grouped_cases']+'@0@1')
+        self.assertTrue(l20d.grouped_batch_cases(tail)[0]['tail_balance'])
+        l20d.validate_job(tail)
+        with self.assertRaises(ValueError):
+            l20d.validate_job(tail|dict(grouped_cases=job['grouped_cases']+'@128@1'))
+        # Execute only the pure argv-construction fragment, never submission.
+        # Native parsing peels ready-summary, tail, trace, direction in reverse.
+        import textwrap
+        source=Path(l20d.__file__).read_text()
+        start=source.index("                        fields=[str(case['geometry']['minimum_free_bytes'])")
+        end=source.index("                        lines.append(' '.join(fields))",start)
+        fragment=textwrap.dedent(source[start:end])
+        scope=dict(job=tail,case=l20d.grouped_batch_cases(tail)[0],folder=Path('/unused'))
+        exec(fragment,scope)
+        fields=scope['fields']
+        self.assertLess(fields.index('--trace-out'),fields.index('--tail-balance'))
+        self.assertLess(fields.index('--tail-balance'),fields.index('--ready-summary'))
+        for change in (dict(grouped_ready_summary=False),dict(grouped_cases=job['grouped_cases'].replace('@dispatch','@combine'))):
+            with self.assertRaises(ValueError): l20d.grouped_batch_cases(job|change)
+
+    def test_grouped_tail_batch_options(self):
+        base=dict(stage='grouped-ep',world=4,grouped_measure=True,
+                  grouped_fused_only=True,grouped_hot_half=True,grouped_direction='dispatch')
+        entries=';'.join('4096,2048,288,8,256@256,64,1,4,20,128@dispatch@0@'+flag
+                         for flag in ('0','1'))
+        cases=l20d.grouped_batch_cases(base|dict(grouped_cases=entries))
+        self.assertEqual([c['tail_balance'] for c in cases],[False,True])
+        self.assertEqual([c['geometry']['expert_row_capacity'] for c in cases],[512,512])
+        with self.assertRaisesRegex(ValueError,'sized workload'):
+            l20d.validate_job(base)
+        with self.assertRaisesRegex(ValueError,'explicit grouped policy'):
+            l20d.validate_job(dict(stage='grouped-ep',grouped_direction='dispatch',grouped_tail_balance=True))
+
+    def test_grouped_buffer_rejects_unsupported_modes_before_submission(self):
+        base=dict(stage='grouped-ep',grouped_direction='dispatch',grouped_buffer_rows=128)
+        for change in (dict(grouped_buffer_rows=-128),dict(grouped_buffer_rows=129),
+                       dict(grouped_direction='combine'),dict(grouped_profile=True),
+                       dict(grouped_measure=True),dict(grouped_external=True),
+                       dict(grouped_gemm_search=True),dict(stage='grouped-build')):
+            with self.assertRaisesRegex(ValueError,'bounded buffer'):
+                l20d.validate_job(base|change)
+
+    def test_grouped_batch_geometry_and_directions(self):
+        job=dict(stage='grouped-ep', world=8, grouped_measure=True,
+                 grouped_cases='4096,1536,128,8,1;4096,1408,128,8,129@256,64,1,4,40,108@dispatch')
+        cases=l20d.grouped_batch_cases(job)
+        self.assertEqual(len(cases),2)
+        self.assertEqual(cases[0]['direction'],'both')
+        self.assertEqual(cases[1]['direction'],'dispatch')
+        self.assertEqual(cases[1]['geometry']['target_rows'],129)
+        for bad in ('bad', '4096,1536,128,8,1@128,64,0,1,148,1',
+                    '4096,1536,128,8,1@128,64,0,1,20,128@invalid'):
+            with self.assertRaises(ValueError): l20d.grouped_batch_cases(job|dict(grouped_cases=bad))
+        with self.assertRaises(ValueError): l20d.grouped_batch_cases(job|dict(grouped_measure=False))
+        with self.assertRaises(ValueError): l20d.grouped_batch_cases(job|dict(grouped_case='4096,1536,128,8,1'))
+        with self.assertRaises(ValueError):
+            l20d.grouped_batch_cases(job|dict(grouped_cases=';'.join(['4096,1536,128,8,1']*65)))
+
+    def test_grouped_explicit_policy_validation(self):
+        job = dict(stage='grouped-ep', grouped_policy='256,128,1,4,32,116')
+        self.assertEqual(l20d.grouped_policy(job), dict(tile_n=256,tile_k=128,
+            along_n=1,swizzle=4,comm=32,compute=116))
+        for value in ('128,64', '64,64,0,1,20,128', '128,32,0,1,20,128',
+                      '128,64,2,1,20,128', '128,64,0,3,20,128',
+                      '128,64,0,1,0,128', '128,64,0,1,32,128'):
+            with self.assertRaises(ValueError):
+                l20d.grouped_policy(job | dict(grouped_policy=value))
+        with self.assertRaises(ValueError):
+            l20d.grouped_policy(job | dict(stage='fused-smoke'))
+
+    def test_grouped_sized_geometry_and_memory(self):
+        job = dict(stage='grouped-ep', world=8, grouped_case='2048,1536,64,4,129')
+        value = l20d.grouped_case_geometry(job)
+        self.assertEqual(value['tokens_per_rank'], 258)
+        self.assertEqual(value['expert_row_capacity'], 129)
+        self.assertGreaterEqual(value['minimum_free_bytes'], 2 << 30)
+        fused_job=job|dict(grouped_direction='dispatch',grouped_measure=True,
+                          grouped_fused_only=True,grouped_transport_compare=True)
+        fused=l20d.grouped_case_geometry(fused_job)
+        self.assertGreater(fused['minimum_free_bytes'],512 << 20)
+        self.assertLess(fused['minimum_free_bytes'],2 << 30)
+        # Matched own GEMM aliases the existing d/oracle_a buffers, not another
+        # model-sized result. Numerical validation buffers are still counted.
+        self.assertEqual(fused,l20d.grouped_case_geometry(
+            fused_job|dict(grouped_compute_compare=True)))
+        for field in ('h','f','experts','topk','target_rows','tokens_per_rank','expert_row_capacity'):
+            self.assertEqual(fused[field],value[field])
+        self.assertGreaterEqual(l20d.grouped_case_geometry(
+            fused_job|dict(grouped_direction='combine'))['minimum_free_bytes'],2 << 30)
+        large=job|dict(grouped_direction='dispatch',grouped_case='4096,2048,288,8,8192')
+        self.assertLess(l20d.grouped_case_geometry(large|dict(grouped_buffer_rows=512))['minimum_free_bytes'],
+                        l20d.grouped_case_geometry(large)['minimum_free_bytes'])
+        for bad in ('1,2', '2048,1536,65,4,128', '2048,1536,64,65,128',
+                    '2048,1536,64,4,0', '2049,1536,64,4,128'):
+            with self.assertRaises(ValueError):
+                l20d.grouped_case_geometry(job | dict(grouped_case=bad))
+        with self.assertRaises(ValueError):
+            l20d.grouped_case_geometry(job | dict(stage='grouped-smoke'))
+        with self.assertRaises(ValueError):
+            l20d.grouped_case_geometry(job | dict(grouped_gemm_search=True))
+        self.assertIsNotNone(l20d.grouped_case_geometry(job | dict(grouped_gemm_search=True,
+                                                                 grouped_measure=True)))
+
+    def test_grouped_build_fingerprint_covers_native_inputs(self):
+        native = {
+            'include/fuse/types.h': 'types',
+            'csrc/operators/sm103/detail/grouped/gemm.cuh': 'gemm',
+            'csrc/operators/sm103/detail/grouped/a2a_gemm.cuh': 'comm',
+            'csrc/operators/sm103/detail/grouped/producer_consumer.cuh': 'order',
+            'csrc/operators/sm103/detail/persistent_gemm.cuh': 'wrapper',
+            'benchmarks/sm103/grouped_bf16.cu': 'harness',
+            'csrc/baselines/sm103/cublaslt_training.cu': 'lt-reference',
+            'CMakeLists.txt': 'cmake-root',
+            'cmake/sm103.cmake': 'cmake-sm103',
+        }
+        files = native | {'benchmarks/sm103/GROUPED_GEMM_STUDY.md': 'docs',
+                          'results/sm103/old.json': 'results',
+                          'scripts/test_sm103_grouped.py': 'host-test'}
+        self.assertEqual(l20d.grouped_build_inputs({'files': files}), native)
+        self.assertIn('grouped-build', l20d.STAGES)
+        self.assertIn('grouped-smoke', l20d.STAGES)
+
     def test_frozen_source_uses_exact_archive_and_rejects_tampering(self):
         import hashlib
         with tempfile.TemporaryDirectory() as folder:
@@ -2019,7 +2161,8 @@ int main() {
                 self.assertEqual(receipt['memory_estimate'], memory)
 
     def test_gpu_guard_retains_failure_snapshot_and_never_kills(self):
-        for utilization, free, error in ((25, 4096, 'is computing'), (0, 1000, '2 GiB')):
+        for utilization, free, error in ((25, 4096, 'is computing'),
+                                        (0, 1000, 'estimated requirement 2048.0 MiB')):
             with self.subTest(utilization=utilization, free=free), \
                     mock.patch.object(l20d, 'read_command', return_value=self.gpu_csv(
                         ['0', '1', '2', '3'], utilization=utilization, free=free)), \
@@ -2082,7 +2225,8 @@ int main() {
         self.assertIn('artifact_sha256', state)
 
     def test_watch_short_job_completion_latency_preserves_sweep_cadence(self):
-        for stage in ('fused-build', 'fused-smoke', 'baseline-replay'):
+        for stage in ('fused-build', 'fused-smoke', 'baseline-replay',
+                      'grouped-build', 'grouped-smoke', 'grouped-ep'):
             self.assertEqual([l20d.watch_interval(stage, t)
                               for t in (0, 14.9, 15, 119.9, 120, 3600)],
                              [2, 2, 5, 5, 15, 15])

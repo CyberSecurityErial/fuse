@@ -43,11 +43,12 @@ class DriverCallBuildContracts(unittest.TestCase):
         commands = re.findall(r"target_compile_definitions\s*\(([^)]*)\)", source)
         direct = [command.split() for command in commands
                   if "CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL" in command]
-        self.assertEqual(direct, [["fuse_kernels", "PRIVATE",
-                                  "CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1"]])
+        self.assertEqual(direct, [[target, "PRIVATE", "CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1"]
+                                  for target in ("fuse_kernels", "fuse_grouped_kernels")])
         links = re.findall(r"target_link_libraries\s*\(([^)]*)\)", source)
         self.assertEqual([command.split() for command in links if "CUDA::cuda_driver" in command],
-                         [["fuse_kernels", "PUBLIC", "CUDA::cudart", "CUDA::cuda_driver"]])
+                         [[target, "PUBLIC", "CUDA::cudart", "CUDA::cuda_driver"]
+                          for target in ("fuse_kernels", "fuse_grouped_kernels", "grouped_deepgemm")])
         library = source.index("add_library(fuse_kernels STATIC")
         definition = source.index("target_compile_definitions(fuse_kernels PRIVATE")
         self.assertLess(library, definition)

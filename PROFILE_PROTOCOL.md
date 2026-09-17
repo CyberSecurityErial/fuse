@@ -602,6 +602,52 @@ Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终
 - Perfetto 先看同一 rank 内的通信完成、peer 发布顺序、首包等待和 CTA 长尾，再用正式 benchmark 判断这些现象是否影响端到端时间。
 - TE Userbuffers 对照使用正式 winner 配置和 CUDA Event 阶段时间线。TE 是多 stream 边界，不能用单个 Graph 外框代替计算、通信和 unpack 三段。
 
+## BF16 grouped Dispatch → GEMM handoff
+
+使用 `l20d.py run grouped-build --grouped-profile` 独立构建到
+`build/sm103-grouped-profile`，不覆盖正式 grouped 二进制。随后用同一 source-run
+执行单个 sized Dispatch `grouped-ep --grouped-profile`，不得同时开启正式计时。
+记录类型位于 `include/fuse/profiling/grouped.cuh`，关闭宏时参数和热路径不含记录。
+
+沿用 `%globaltimer` 纳秒时钟，每 GPU 独立原点，不相减跨 GPU 时间。
+两套随机 payload 完整数值/路由/尾部检查后，诊断 Graph 预热10次；epoch 单调
+递增到13，清空记录后采一次，输出再次通过完整检查。每 GPU 一个 host 线程
+并发提交，但 host 提交偏差仍可能影响跨 rank finalize，不据此报告正式性能。
+
+- 生产者记录完整 `(expert,M)` panel 的 gather 起点及 ready store 前后边界；
+  原 CTA join、ready 粒度及原子协议不变。当前导出仅接受单生产者 panel，
+  不将共享 panel 的最后一个 chunk 冒充全部通信时长。
+- 消费者记录每个 `(expert,M,N)` 首次 load 的 ready 检查起点、acquire 观察点、
+  原 warp join/proxy fence 后的 Base::load 起止；同 panel 的 ready 缓存命中显式标记。
+  Base::load 包含流水线等待和提交，不代表整 tile GEMM 或 TMA 到达时间。
+- CTA 角色结束的诊断 join 用于覆盖全部 warp；它有观测开销，不是正式路径新增屏障。
+- 真正轮询跨度为 `observed - wait_begin`；`first acquire - release_begin`
+  还包含尚未轮到该 panel 的排队时间。发布前后的等待拆分只以 store 边界为参照，
+  不声称测到了 flag 传播延迟。各 CTA 等待可能彼此重叠，也可能与此前 MMA 重叠。
+
+`scripts/summarize_sm103_grouped.py --handoff-profile <run-directory>` 验证 fetched
+归档、源/二进制凭据、全部 rank、panel/tile 唯一覆盖、静态 CTA ownership、时间
+顺序和原校验完成标记后输出 Perfetto JSON。每份显示本地角色完成包络最长的 rank，
+其他 rank 的统计放在 metadata；细节紧邻其 CTA role，避免铺满八卡重复轨道。
+“等待时存在其他已 ready 尚未访问的 tile”仅为调度机会，不证明该 tile 的资源
+已经可用，也不等于可回收的端到端时间。单次 trace 不写入正式 benchmark 表。
+
+全矩阵筛查使用 `--grouped-ready-summary`（同时指定 `--grouped-profile`、
+`--grouped-direction dispatch`），支持现有 `--grouped-cases` 常驻批处理。
+只记录每 CTA 的角色边界，以及 load warp 原 ready 检查的次数、总时长、
+最大值、首次时长、至少1us的次数；每卡148×64字节，不分配逐tile记录。
+计数在寄存器中累计，角色结束写一次，无新增轮询、原子或热路径同步。
+采集前的默认stream清零必须完成，再启动各rank的nonblocking Graph。
+汇总重放原静态tile遍历核对检查次数；所有rank及数值/路由/尾部校验仍保留。
+报告区分首等和持续等待，等待占角色时间≥50%标高、20–50%标中、<20%标低；
+这只是筛查阈值，不是Tensor Core空闲率或E2E损失率。原始JSON只落文件，
+终端仅显示进度与摘要。详细阶段因果分析继续使用上面的完整handoff profile。
+
+轻量ready汇总允许沿用生产的尾块均衡（batch项末尾 `@0@1`）；它不依赖每个
+panel唯一通信CTA的条带假设。汇总结果必须保留 `tail_balance`，不可和关闭均衡
+的旧profile混为同一配置。详细panel条带仍不支持多生产者，有限buffer仍不在
+此profile入口支持范围。诊断和正式吞吐分别构建、分别报告。
+
 ## 编译后二进制检查（非时间线）
 
 `l20d.py run fused-build --cuda-resource-info --cuda-sass-filter <符号子串>`

@@ -45,7 +45,7 @@ QKV_POLICIES = ('auto', 'm128n64', 'm128n128', 'm128n160', 'm128n192', 'm128n256
 OPROJ_POLICIES = ('auto', 'm128n128', 'm128n256') + BLACKWELL_TILE_VARIANTS
 FUSED_STAGES = ('fused-build', 'fused-smoke')
 DONE = {'succeeded', 'failed'}
-STAGES = ('doctor', 'build', 'te-build', 'ub-check', 'batch-check', 'matrix-check', 'cache-check', 'smoke', 'sweep', 'refine', 'formal', 'summary', 'overhead', 'baseline-replay', 'gemm-probe', 'gemm-cutlass-build', 'transport-probe', *FUSED_STAGES)
+STAGES = ('doctor', 'build', 'te-build', 'ub-check', 'batch-check', 'matrix-check', 'cache-check', 'smoke', 'sweep', 'refine', 'formal', 'summary', 'overhead', 'baseline-replay', 'gemm-probe', 'gemm-cutlass-build', 'grouped-build', 'grouped-smoke', 'grouped-ep', 'transport-probe', *FUSED_STAGES)
 BASELINE_CASE_FIELDS = ('direction', 'model', 'seq', 'cp', 'hidden', 'q_heads', 'kv_heads',
                         'head_dim', 'm', 'n', 'k')
 CUTLASS_COUNTER_RANGE = 'fuse_cutlass_1sm_counters'
@@ -126,7 +126,8 @@ def relay_progress(path, stop):
                                     'warmup,', 'sample,',
                                     'summary,', 'precision,', 'counter_epoch,', 'warning,', 'profile_resources,', 'profile_host,',
                                     'profile_dispatch,', 'PASS:', 'fused_bf16:', 'bf16 ',
-                                    'BACKWARD ', 'backward_validation ', 'B: p50=', 'W: p50=')):
+                                    'BACKWARD ', 'backward_validation ', 'B: p50=', 'W: p50=',
+                                    'CHECK grouped-', 'PASSED grouped-', 'RESULT grouped', 'CASE grouped', 'ERROR:')):
                     print(line.rstrip(), flush=True)
             elif stop.is_set():
                 return
@@ -351,13 +352,186 @@ def fused_scheduler_geometry(m, n, tile_n, max_swizzle_size):
     return effective, padded_m, padded_n, (m_tiles != padded_m or n_tiles != padded_n)
 
 
+def grouped_case_geometry(job):
+    """Sized correctness input, not a tuned performance result."""
+    value = job.get('grouped_case')
+    if job.get('grouped_cases'):
+        if value:
+            raise ValueError('--grouped-case and --grouped-cases are mutually exclusive')
+        return None
+    if job.get('grouped_gemm_search') and (not value or not job.get('grouped_measure')):
+        raise ValueError('grouped GEMM search requires --grouped-case and --grouped-measure')
+    if value is None:
+        if job.get('grouped_measure') and not job.get('grouped_fused_only'):
+            raise ValueError('--grouped-measure requires --grouped-case')
+        return None
+    if job.get('stage') != 'grouped-ep':
+        raise ValueError('--grouped-case requires grouped-ep')
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){4}', value):
+        raise ValueError('grouped case must be H,F,E,TOPK,ROWS')
+    h, f, experts, topk, target = map(int, value.split(','))
+    world = job.get('world', 8)
+    if (world not in (4, 8) or min(h, f, experts, topk, target) <= 0 or
+            max(h, 2*f, experts, target) > 2147483647 or h % 8 or f % 8 or
+            experts % world or topk > experts):
+        raise ValueError('invalid grouped dimensions, top-k or EP split')
+    tokens = (experts*target + world*topk - 1) // (world*topk)
+    local_experts = experts // world
+    capacity = (tokens*topk*(2 if job.get('grouped_hot_half') else 1) + local_experts-1) // local_experts
+    if max(tokens, capacity) > 2147483647:
+        raise ValueError('grouped token count exceeds index range')
+    estimates = []
+    direction = job.get('grouped_direction') or 'both'
+    dispatch_fused_only = direction == 'dispatch' and job.get('grouped_fused_only', False)
+    for kind, n, k in (('dispatch', 2*f, h), ('combine', h, f)):
+        if direction not in ('both', kind):
+            continue
+        values = (tokens*k + 2*local_experts*capacity*k + local_experts*n*k +
+                  2*local_experts*capacity*n + tokens*topk*n)
+        if kind=='dispatch' and job.get('grouped_buffer_rows',0)>0:
+            # Only production staging shrinks; the independent full oracle
+            # and full outputs remain live in the correctness harness.
+            values -= local_experts*(capacity-min(capacity,job['grouped_buffer_rows']))*k
+        ready = local_experts*((capacity+127)//128)*((n+127)//128)*32*4
+        if job.get('grouped_measure'):
+            if not dispatch_fused_only:
+                values += local_experts*capacity*n  # serialized library modes share one output
+            if job.get('grouped_external'):
+                values += local_experts*((capacity+255)//256*256)*(k+n)
+            if not job.get('grouped_gemm_search'):
+                ready *= 2  # isolated transport diagnostic owns separate ready flags
+        profile_bytes = 0
+        if job.get('grouped_profile'):
+            panels = local_experts*((capacity+127)//128)
+            profile_bytes = (148*64 if job.get('grouped_ready_summary') else
+                             panels*(40 + ((n+127)//128)*56) + 148*24)
+        estimates.append(values*2 + ready + tokens*topk*12 + profile_bytes)
+        allocated = max(estimates)
+    # Fused-only Dispatch never constructs the library timing references or
+    # their extra model-sized output. Its optional fixed-budget own GEMM reuses
+    # d, and transport reuses a. Count the actual live tensors plus the SAME
+    # >=512MiB/10% safety allowance; the native per-case check happens after
+    # CUDA context creation. A blanket 2GiB floor otherwise rejects small cases
+    # that fit, even though no such 2GiB allocation exists in this path.
+    minimum = allocated + max(512 << 20, allocated//10)
+    if not dispatch_fused_only:
+        minimum = max(2 << 30, minimum)
+    return dict(h=h, f=f, experts=experts, topk=topk, target_rows=target,
+                tokens_per_rank=tokens, expert_row_capacity=capacity,
+                minimum_free_bytes=minimum,
+                note='Sized dual-payload allocation; optional native-reference exploratory timing')
+
+
+def grouped_policy(job):
+    value = job.get('grouped_policy')
+    if value is None:
+        return None
+    if job.get('stage') != 'grouped-ep' or not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){5}', value):
+        raise ValueError('grouped policy requires grouped-ep and N,K,AlongN,swizzle,comm,compute')
+    n, k, along, swizzle, comm, compute = map(int, value.split(','))
+    if n not in (128, 256) or k not in (64, 128) or along not in (0, 1) or swizzle not in (1, 2, 4, 8) or min(comm, compute) < 1 or comm + compute > 148:
+        raise ValueError('invalid grouped tile, raster, swizzle or CTA budget')
+    return dict(tile_n=n, tile_k=k, along_n=along, swizzle=swizzle, comm=comm, compute=compute)
+
+
+def grouped_batch_cases(job):
+    value = job.get('grouped_cases')
+    if not value:
+        return None
+    if job.get('stage') != 'grouped-ep' or not (job.get('grouped_measure') or job.get('grouped_ready_summary')) or job.get('grouped_case'):
+        raise ValueError('grouped batch requires grouped-ep, --grouped-measure and no --grouped-case')
+    if not isinstance(value, str) or len(value) > 16384:
+        raise ValueError('invalid grouped batch list')
+    entries = value.split(';')
+    if not 1 <= len(entries) <= 64:
+        raise ValueError('grouped batch must contain 1..64 entries')
+    cases = []
+    for index, entry in enumerate(entries):
+        fields = entry.split('@')
+        if len(fields) > 5:
+            raise ValueError('batch entry requires H,F,E,top,M[@policy[@direction[@buffer_rows[@tail_balance]]]]')
+        case = job | dict(grouped_cases=None, grouped_case=fields[0])
+        if len(fields) >= 2:
+            case['grouped_policy'] = fields[1]
+        if len(fields) >= 3:
+            case['grouped_direction'] = fields[2]
+        if len(fields)>=4:
+            if not fields[3].isdigit() or int(fields[3])%128 or not (
+                    job.get('grouped_fused_only') or (job.get('grouped_ready_summary') and fields[3]=='0')):
+                raise ValueError('buffer batch requires fused-only and a multiple of 128 rows')
+            case['grouped_buffer_rows']=int(fields[3])
+        if len(fields)==5:
+            if fields[4] not in ('0','1') or not (job.get('grouped_fused_only') or job.get('grouped_ready_summary')):
+                raise ValueError('tail batch requires fused-only and 0/1')
+            case['grouped_tail_balance']=fields[4]=='1'
+        direction = case.get('grouped_direction') or 'both'
+        if direction not in ('both', 'dispatch', 'combine'):
+            raise ValueError('invalid grouped direction')
+        if job.get('grouped_ready_summary') and direction!='dispatch':
+            raise ValueError('ready summaries only support Dispatch')
+        if any(case.get(k) for k in ('grouped_buffer_rows','grouped_tail_balance','grouped_hot_half')) and direction!='dispatch':
+            raise ValueError('buffer/tail/skew probes only apply to Dispatch')
+        cases.append(dict(index=index, case=fields[0], policy=case.get('grouped_policy'),
+                          direction=direction, buffer_rows=case.get('grouped_buffer_rows',0),
+                          tail_balance=bool(case.get('grouped_tail_balance')),geometry=grouped_case_geometry(case)))
+        grouped_policy(case)
+    return cases
+
+
 def validate_job(job, hostname=None):
+    if job.get('grouped_compute_compare') and not job.get('grouped_transport_compare'):
+        raise ValueError('compute comparison requires transport comparison')
+    if job.get('grouped_transport_compare') and (not job.get('grouped_fused_only') or
+            job.get('grouped_direction')!='dispatch' or job.get('grouped_buffer_rows') or
+            any(c.get('buffer_rows') or c['direction']!='dispatch' for c in (grouped_batch_cases(job) or []))):
+        raise ValueError('transport comparison requires full-buffer fused-only Dispatch')
+    if job.get('grouped_ready_summary') and (not job.get('grouped_profile') or
+            job.get('stage') not in ('grouped-build','grouped-ep') or
+            job.get('grouped_gemm_search')):
+        raise ValueError('ready summary requires grouped profiling')
+    buffer_rows=job.get('grouped_buffer_rows',0)
+    buffered=bool(buffer_rows or any(c.get('buffer_rows') for c in (grouped_batch_cases(job) or [])))
+    if buffered and (not isinstance(buffer_rows,int) or buffer_rows<0 or buffer_rows%128 or
+            job.get('stage')!='grouped-ep' or job.get('grouped_direction')!='dispatch' or
+            any(job.get(k) for k in ('grouped_external','grouped_gemm_search','grouped_profile')) or
+            (job.get('grouped_measure') and not job.get('grouped_fused_only'))):
+        raise ValueError('bounded buffer requires Dispatch validation or fused-only timing and a multiple of 128 rows')
+    if any(job.get(k) for k in ('grouped_tail_balance','grouped_hot_half')) and (
+            job.get('stage')!='grouped-ep' or job.get('grouped_direction')!='dispatch' or
+            any(job.get(k) for k in ('grouped_external','grouped_gemm_search')) or
+            (job.get('grouped_profile') and not job.get('grouped_ready_summary')) or
+            (job.get('grouped_measure') and not job.get('grouped_fused_only'))):
+        raise ValueError('tail/skew requires Dispatch validation or fused-only timing')
+    if job.get('grouped_hot_half') and not (job.get('grouped_case') or job.get('grouped_cases')):
+        raise ValueError('hot-half requires a sized workload')
+    if job.get('grouped_tail_balance') and not any(job.get(k) for k in
+            ('grouped_case','grouped_cases','grouped_policy')):
+        raise ValueError('tail boundary validation requires an explicit grouped policy')
+    if job.get('grouped_fused_only') and (job.get('stage')!='grouped-ep' or not job.get('grouped_measure') or
+            any(job.get(k) for k in ('grouped_external','grouped_gemm_search','grouped_profile'))):
+        raise ValueError('fused-only requires measured grouped-ep without external/search/profile')
+    if job.get('grouped_profile') and (job.get('stage') not in ('grouped-build','grouped-ep') or
+            job.get('grouped_measure') or job.get('grouped_external') or
+            (job.get('grouped_cases') and not job.get('grouped_ready_summary')) or
+            (job['stage']=='grouped-ep' and (not (job.get('grouped_case') or job.get('grouped_cases')) or
+             job.get('grouped_direction')!='dispatch'))):
+        raise ValueError('grouped profile requires isolated build or one untimed Dispatch case')
+    if job.get('grouped_external') and (job.get('stage') not in ('grouped-build','grouped-ep') or
+            (job['stage']=='grouped-ep' and (not job.get('grouped_measure') or
+             job.get('grouped_direction')!='dispatch' or job.get('grouped_gemm_search')))):
+        raise ValueError('external grouped references require grouped-build or measured Dispatch grouped-ep')
+    grouped_case_geometry(job)
+    grouped_policy(job)
+    grouped_batch_cases(job)
+    if job.get('grouped_direction') and (job.get('stage') != 'grouped-ep' or
+            job['grouped_direction'] not in ('both','dispatch','combine')):
+        raise ValueError('grouped direction requires grouped-ep')
     sass_filter=job.get('cuda_sass_filter')
     if sass_filter is not None and (not isinstance(sass_filter,str) or
             not re.fullmatch(r'[A-Za-z0-9_]{1,128}',sass_filter) or
             not job.get('cuda_resource_info')):
         raise ValueError('SASS requires resource inspection and a bounded literal symbol filter')
-    if job.get('cuda_resource_info') and not (job['stage']=='fused-build' or
+    if job.get('cuda_resource_info') and not (job['stage'] in ('fused-build','grouped-build') or
             (job['stage']=='build' and job.get('mxfp8_gemm_search'))):
         raise ValueError('CUDA resource inspection is an opt-in build-only diagnostic')
     weight_tuning = {'backward_weight_epilogue_n': (32,64),
@@ -1067,7 +1241,8 @@ def watch_interval(stage, elapsed):
         return 2
     # A terminal receipt is uploaded immediately, independently of the 30 s
     # running heartbeat. Avoid a 30 s completion-discovery gap on short jobs.
-    if stage in ('fused-build', 'fused-smoke', 'baseline-replay'):
+    if stage in ('fused-build', 'fused-smoke', 'baseline-replay',
+                 'grouped-build', 'grouped-smoke', 'grouped-ep'):
         return 5 if elapsed < 120 else 15
     return 30  # Preserve the long sweep's existing observation cadence.
 
@@ -1759,6 +1934,31 @@ def collect_cutlass_counters(folder, env):
     # production sample and aggregate tensor activity is not effective FLOPs.
 
 
+def grouped_build_inputs(job):
+    return {name: digest for name, digest in job['files'].items()
+            if (name.startswith(('include/fuse/', 'csrc/operators/sm103/')) and
+                Path(name).suffix in ('.h', '.cuh', '.cu')) or
+            name in ('benchmarks/sm103/grouped_bf16.cu', 'benchmarks/sm103/grouped_validation.cuh',
+                     'csrc/baselines/sm103/deepgemm_grouped.cu',
+                     'csrc/baselines/sm103/cublaslt_training.cu',
+                     'benchmarks/sm103/grouped_measurement.cuh',
+                     'benchmarks/sm103/fused_inputs.cuh', 'CMakeLists.txt', 'cmake/sm103.cmake')}
+
+
+def grouped_build_dir(job):
+    return REMOTE / ('build/sm103-grouped-profile' if job.get('grouped_profile') else 'build/sm103-grouped')
+
+
+def grouped_external_identity():
+    root = REMOTE.parent / 'deps/DeepGEMM-78b6900'
+    paths = sorted(p for sub in ('deep_gemm/include','third-party/cutlass/include')
+                   for p in (root/sub).rglob('*') if p.is_file())
+    if len(paths)<100:
+        raise RuntimeError('Pinned DeepGEMM/CUTLASS headers missing')
+    return dict(root=str(root), upstream='78b69000794d0937b47ae3387eff7663410264d1',
+                files={str(p.relative_to(root)):sha(p) for p in paths})
+
+
 def cutlass_probe_library():
     return REMOTE / 'build/sm103-cutlass/libfuse_sm103_cutlass_bf16.so'
 
@@ -1802,7 +2002,7 @@ def mxfp8_search_receipt(job, env_id):
                 library_sha256=sha(binary.parent / 'libfuse_sm103_cublaslt.so'))
 
 
-def check_fused_devices(job, folder, devices=None, memory=None):
+def check_fused_devices(job, folder, devices=None, memory=None, maximum_utilization=5):
     devices = fused_devices(job) if devices is None else devices
     memory = fused_device_memory(job) if memory is None else memory
     fields = ('index', 'uuid', 'utilization.gpu', 'memory.free', 'memory.used',
@@ -1831,12 +2031,12 @@ def check_fused_devices(job, folder, devices=None, memory=None):
             utilization, free = float(row['utilization.gpu']), float(row['memory.free'])
             if not math.isfinite(utilization) or not math.isfinite(free):
                 raise RuntimeError(f'GPU {device} returned invalid utilization/memory telemetry')
-            if utilization > 5:
+            if utilization > maximum_utilization:
                 busy.append((device, utilization))
             if free * (1 << 20) < memory['minimum_free_bytes']:
                 required_mib = memory['minimum_free_bytes'] / (1 << 20)
                 raise RuntimeError(f'GPU {device} has {free:g} MiB free; estimated requirement '
-                                   f'{required_mib:.1f} MiB (minimum 2 GiB); no processes were stopped')
+                                   f'{required_mib:.1f} MiB; no processes were stopped')
             if not row.get('uuid', '').startswith('GPU-'):
                 raise RuntimeError(f'GPU {device} did not return a valid UUID')
         if busy:
@@ -1937,7 +2137,7 @@ def remote(job_path):
                 if actual != value:
                     raise RuntimeError(f'Source changed since this run: {name}; submit a new run')
         receipt = environment_receipt(require_te=job['stage'] not in
-            (*FUSED_STAGES, 'build', 'gemm-probe', 'gemm-cutlass-build', 'transport-probe'))
+            (*FUSED_STAGES, 'build', 'gemm-probe', 'gemm-cutlass-build', 'grouped-build', 'grouped-smoke', 'grouped-ep', 'transport-probe'))
         if job.get('mpi'):
             receipt['mpi_toolchain'] = mpi_toolchain_receipt()
         env_id = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
@@ -1970,6 +2170,125 @@ def remote(job_path):
                 argv = ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_argv)]
         elif stage == 'gemm-cutlass-build':
             argv = cutlass_probe_build_argv()
+        elif stage == 'grouped-build':
+            build = grouped_build_dir(job)
+            build.mkdir(parents=True, exist_ok=True)
+            configure = ['cmake', '-S', str(REMOTE), '-B', str(build), '-G', 'Ninja',
+                         '-DCMAKE_BUILD_TYPE=Release', '-DFUSE_ARCH=sm103',
+                         '-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc',
+                         '-DCUTLASS_ROOT=' + CUTLASS, '-DFUSE_BUILD_KERNELS=OFF',
+                         '-DFUSE_BUILD_BASELINES=OFF', '-DFUSE_BUILD_GROUPED_KERNELS=ON']
+            configure += ['-DFUSE_ENABLE_PROFILING=' + ('ON' if job.get('grouped_profile') else 'OFF')]
+            configure += ['-DDEEPGEMM_ROOT=' + (grouped_external_identity()['root']
+                           if job.get('grouped_external') else '')]
+            compile_argv = ['cmake', '--build', str(build), '--target', 'grouped_bf16', '--parallel', '2']
+            argv = ['bash', '-c', shlex.join(configure) + ' && exec ' + shlex.join(compile_argv)]
+        elif stage in ('grouped-smoke', 'grouped-ep'):
+            build = grouped_build_dir(job)
+            recorded = json.loads((build / '.l20d-build.json').read_text())
+            if bool(recorded.get('profiling')) != bool(job.get('grouped_profile')):
+                raise RuntimeError('Grouped profiling build mismatch')
+            if job.get('grouped_external') and recorded.get('external') != grouped_external_identity():
+                raise RuntimeError('External grouped dependency identity changed; rebuild required')
+            inputs = grouped_build_inputs(job)
+            if (recorded['inputs'] != inputs or recorded['environment_fingerprint'] != env_id or
+                    recorded['binary_sha256'] != sha(build / 'grouped_bf16')):
+                raise RuntimeError('Grouped native inputs/environment changed; run grouped-build first')
+            is_ep = stage == 'grouped-ep'
+            devices = fused_devices(job) if is_ep else fused_devices(job)[:1]
+            grouped_case = grouped_case_geometry(job)
+            grouped_cases = grouped_batch_cases(job)
+            batch_memory = dict(minimum_free_bytes=min(c['geometry']['minimum_free_bytes'] for c in grouped_cases),
+                                note='Batch starts at smallest case; per-case CUDA memory check skips larger OOM cases') if grouped_cases else None
+            env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, devices,
+                grouped_case or batch_memory or dict(minimum_free_bytes=2 << 30, note='Grouped correctness; not a performance benchmark'),
+                maximum_utilization=0)
+            write_json(folder / 'grouped-contract.json', dict(
+                boundary='CTASP dispatch/combine with real peer transport' if is_ep else
+                         'local GEMM with pre-delivered input; transport not tested',
+                performance_measured=bool(job.get('grouped_measure')),
+                measurement_boundary='complete fusion, matched transport and fixed-budget own GEMM' if job.get('grouped_compute_compare') else 'complete fusion and matched transport body' if job.get('grouped_transport_compare') else 'complete fusion only' if job.get('grouped_fused_only') else 'stock CUTLASS/native DeepGEMM pure GEMM and same-round fusion' if job.get('grouped_external') else 'pure CUTLASS grouped GEMM' if job.get('grouped_gemm_search')
+                    else 'complete fusion and pure GEMM references',
+                references={} if job.get('grouped_fused_only') else dict(cublas_grouped_default=dict(tuned=False),
+                    cublaslt_sequence=dict(tuned=bool(job.get('grouped_measure') and not job.get('grouped_gemm_search') and not job.get('grouped_external')), candidates=32,
+                        workspace_mib=32, warmup=10, samples=50, full_sm_budget=True)),
+                graph_replays=None if job.get('grouped_measure') else (4 if grouped_case else (12 if is_ep else 54)),
+                samples=50 if job.get('grouped_measure') else 0,
+                geometry=grouped_case, policy=grouped_policy(job),
+                cases=grouped_cases,
+                gemm_search=bool(job.get('grouped_gemm_search')), physical_devices=devices,
+                external_search=bool(job.get('grouped_external')),
+                profiling=bool(job.get('grouped_profile')),
+                build=recorded))
+            # Keep a process-local deadline even if the jump-host disconnects
+            # and the interactive runner receives SIGHUP. Only this test's
+            # process group is owned by timeout, never other GPU workloads.
+            argv = ['timeout', '--signal=TERM', '--kill-after=10s',
+                    str(job['job_timeout']), str(build / 'grouped_bf16')]
+            if is_ep:
+                if grouped_cases:
+                    lines=[]
+                    for case in grouped_cases:
+                        fields=[str(case['geometry']['minimum_free_bytes']), '--case', str(job['world']),
+                                *case['case'].split(',')]
+                        if job.get('grouped_measure'):
+                            fields += [str(folder / f'grouped-case-{case["index"]:04d}.csv')]
+                        if job.get('grouped_gemm_search'):
+                            fields += ['--gemm-search']
+                        if job.get('grouped_external'):
+                            fields += ['--external-search']
+                        if case.get('policy'):
+                            fields += ['--policy', case['policy']]
+                        fields += ['--direction', case['direction']]
+                        if job.get('grouped_ready_summary'):
+                            fields += ['--trace-out',str(folder / f'grouped-ready-{case["index"]:04d}')]
+                        if case.get('buffer_rows'):
+                            fields += ['--dispatch-buffer-rows', str(case['buffer_rows'])]
+                        if case.get('tail_balance'):
+                            fields += ['--tail-balance']
+                        if job.get('grouped_hot_half'):
+                            fields += ['--hot-half']
+                        if job.get('grouped_fused_only'):
+                            fields += ['--fused-only']
+                        if job.get('grouped_ready_summary'):
+                            fields += ['--ready-summary']
+                        if job.get('grouped_transport_compare'):
+                            fields += ['--transport-compare']
+                        if job.get('grouped_compute_compare'):
+                            fields += ['--compute-compare']
+                        lines.append(' '.join(fields))
+                    (folder / 'grouped-cases.txt').write_text('\n'.join(lines)+'\n')
+                    argv += ['--batch', str(folder / 'grouped-cases.txt')]
+                elif grouped_case:
+                    argv += ['--case', str(job['world']), *job['grouped_case'].split(',')]
+                    if job.get('grouped_measure'):
+                        argv += [str(folder / 'grouped-samples.csv')]
+                else:
+                    argv += ['--ep', str(job['world'])]
+                if job.get('grouped_gemm_search') and not grouped_cases:
+                    argv += ['--gemm-search']
+                if job.get('grouped_external') and not grouped_cases:
+                    argv += ['--external-search']
+                if job.get('grouped_policy') and not grouped_cases:
+                    argv += ['--policy', job['grouped_policy']]
+                if job.get('grouped_direction') and not grouped_cases:
+                    argv += ['--direction', job['grouped_direction']]
+                if job.get('grouped_profile') and not grouped_cases:
+                    argv += ['--trace-out', str(folder / 'grouped-handoff')]
+                if job.get('grouped_buffer_rows') and not grouped_cases:
+                    argv += ['--dispatch-buffer-rows', str(job['grouped_buffer_rows'])]
+                if job.get('grouped_tail_balance') and not grouped_cases:
+                    argv += ['--tail-balance']
+                if job.get('grouped_hot_half') and not grouped_cases:
+                    argv += ['--hot-half']
+                if job.get('grouped_fused_only') and not grouped_cases:
+                    argv += ['--fused-only']
+                if job.get('grouped_ready_summary') and not grouped_cases:
+                    argv += ['--ready-summary']
+                if job.get('grouped_transport_compare') and not grouped_cases:
+                    argv += ['--transport-compare']
+                if job.get('grouped_compute_compare') and not grouped_cases:
+                    argv += ['--compute-compare']
         elif stage == 'transport-probe':
             devices = fused_devices(job)[:2]
             env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, devices,
@@ -2161,7 +2480,7 @@ def remote(job_path):
         argv = ['bash', '-c', source_environment() + ' && exec "$@"', 'l20d', *argv]
         publish(phase=stage)
         with log_path.open('w') as log, contextlib.ExitStack() as monitors:
-            if stage == 'fused-smoke':
+            if stage == 'fused-smoke' or (stage == 'grouped-ep' and (job.get('grouped_measure') or job.get('grouped_profile'))):
                 monitors.enter_context(fused_telemetry(job, folder))
             elif stage in ('gemm-probe', 'transport-probe'):
                 monitors.enter_context(baseline_executor(REMOTE).telemetry(
@@ -2220,6 +2539,18 @@ def remote(job_path):
             build_receipt = cutlass_probe_build_receipt(job, env_id)
             write_json(cutlass_probe_library().parent / '.l20d-build.json', build_receipt)
             write_json(folder / 'cutlass-probe-build.json', build_receipt)
+        elif stage == 'grouped-build':
+            binary = grouped_build_dir(job) / 'grouped_bf16'
+            build_receipt = dict(
+                source_id=job['source_id'], environment_fingerprint=env_id,
+                binary_sha256=sha(binary), inputs=grouped_build_inputs(job), validation='compile_only',
+                profiling=bool(job.get('grouped_profile')))
+            if job.get('grouped_external'):
+                build_receipt['external'] = grouped_external_identity()
+            write_json(folder / 'grouped-build.json', build_receipt)
+            write_json(binary.parent / '.l20d-build.json', build_receipt)
+            if job.get('cuda_resource_info'):
+                collect_cuda_resources(str(binary),folder,job.get('cuda_sass_filter'))
         elif stage == 'gemm-probe' and (job.get('cutlass_counters') or job.get('cublaslt_counters')):
             collect_cutlass_counters(folder, env)
         elif stage == 'fused-smoke' and job.get('fused_counters'):
@@ -2326,6 +2657,23 @@ def main():
     run.add_argument('--qkv-rank-swizzle', action='store_true',
                      help='experimental QKV rank-dependent N-band rotation; separate non-profile build')
     run.add_argument('--world', type=int, choices=(4, 8), default=8, help='fused smoke rank count')
+    run.add_argument('--grouped-case', help='grouped-ep sized correctness: H,F,E,TOPK,ROWS')
+    run.add_argument('--grouped-gemm-search', action='store_true', help='32 pure CUTLASS candidates in one process')
+    run.add_argument('--grouped-external', action='store_true', help='benchmark-only stock CUTLASS and pinned native DeepGEMM, full SM budget')
+    run.add_argument('--grouped-profile', action='store_true', help='isolated globaltimer Dispatch handoff diagnostics; never formal timings')
+    run.add_argument('--grouped-ready-summary',action='store_true',help='lightweight per-CTA ready-wait totals; supports untimed Dispatch batches')
+    run.add_argument('--grouped-transport-compare',action='store_true',help='add matched transport-body timing to fused-only Dispatch; no GEMM retuning')
+    run.add_argument('--grouped-compute-compare',action='store_true',help='with transport comparison: measure fixed-budget own GEMM, no library search')
+    run.add_argument('--grouped-fused-only',action='store_true',help='Graph 10+50 fusion timing, no pure-GEMM retuning')
+    run.add_argument('--grouped-buffer-rows',type=int,default=0,
+                     help='Dispatch receive rows/expert; 0=full (default). Reduced buffers may be much slower: memory-pressure fallback only')
+    run.add_argument('--grouped-tail-balance',action='store_true',help='experimental incomplete communication batch sharing')
+    run.add_argument('--grouped-hot-half',action='store_true',help='route the same token/branch count to half the experts')
+    run.add_argument('--grouped-cases', help='semicolon-separated H,F,E,top,M[@policy[@direction[@0[@tail_balance]]]] entries; one process')
+    run.add_argument('--grouped-direction', choices=('both','dispatch','combine'), help='restrict grouped forward direction')
+    run.add_argument('--grouped-policy', help='N,K,AlongN,swizzle,comm,compute for explicit grouped tuning')
+    run.add_argument('--grouped-measure', action='store_true',
+                     help='grouped-case exploratory 10+50 timing against untuned native grouped cuBLAS')
     sequence = run.add_mutually_exclusive_group()
     sequence.add_argument('--seq-local', type=int, help='fused smoke rows per rank (default 256)')
     sequence.add_argument('--global-seq', type=int, help='fused smoke global rows, divisible by world')

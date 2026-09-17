@@ -9,6 +9,13 @@ A declaration, host test or successful build alone does not prove GPU support.
 
 ## Module ownership
 
+v25 adds a separately compiled BF16 Dispatch + Grouped GEMM backend:
+`grouped_entry.cu`, `api/grouped.cuh` and private `detail/grouped/` modules.
+It does not route MoE workloads through Projection hot paths. See the
+[Grouped contract](../../../benchmarks/sm103/GROUPED_GEMM_STUDY.md) and
+[v25 results](../../../results/sm103/v25.0/README.md). Existing Combine/swapAB
+development paths are not included in this release's acceptance claims.
+
 SM90 and SM103 keep the same architecture-level organization. Precision is
 explicit in parameter/entry names, not a collection of IsFp8/IsMxfp8 switches.
 There are no empty files for unimplemented architecture features.

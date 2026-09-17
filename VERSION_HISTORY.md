@@ -1,5 +1,15 @@
 # 版本演进手册
 
+## v25.0：BF16 Dispatch＋Grouped GEMM 基线
+
+- 新增独立Group CTASP路径，支持GPU侧动态专家token数、Graph replay与尾块。
+- 全K/128行单ready；8个warp发起者使用24KiB槽，批次按实际行数适配，预取路由地址。
+- 保留尾块均衡；默认全量buffer，有限buffer只作为可能明显降速的显存回退。
+- 最新实现EP4有效128点，GM0.904028P/卡，满SM纯GEMM保留率68.5577%，历史提升38.6095%。
+- EP8历史完整快照与最新代码覆盖分开标注；显存/参考缺口不填造数据。
+- 用户接受当前基线，原逐点目标并未全部达成；不宣称生产Auto、Combine或swapAB验收。
+  [最终结果与配置](results/sm103/v25.0/README.md)。
+
 ## v24.1：QKV 量化发布与寻址优化
 
 - all 模式量化完全部 W 后，经原 grid join 一次发布完整 panel；去掉冗余贡献计数。
