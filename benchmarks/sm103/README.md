@@ -1,11 +1,12 @@
 # SM103 Ulysses forward baseline bench
 
-v25.0 BF16 MoE [Dispatch + Grouped GEMM](GROUPED_GEMM_STUDY.md): independent
+v25.1 BF16 MoE [Dispatch + Grouped GEMM](GROUPED_GEMM_STUDY.md): independent
 CTASP implementation, variable expert row counts, full-buffer default and
-memory-pressure bounded fallback. [Results/configurations](../../results/sm103/v25.0/README.md)
+memory-pressure bounded fallback. [Results/configurations](../../results/sm103/v25.1/README.md)
 compare against the stronger valid CUTLASS/DeepGEMM pure-GEMM reference.
-Latest-code EP4 and historical EP8 coverage are explicitly separated.
-Combine and swapAB remain development code, not v25 acceptance claims;
+Small-token rows omitted from v25.0 are restored in the complete bench; latest-code
+EP4, historical EP8 and restored small-token cohorts are explicitly separated.
+Combine and swapAB remain development code, not v25.1 acceptance claims;
 communication WASP and production CTA/GEMM Auto are deferred.
 
 ## MXFP8 OProj forward — v21.0 manual SOTA
