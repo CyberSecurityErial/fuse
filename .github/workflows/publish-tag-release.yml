@@ -30,6 +30,17 @@ jobs:
               : (process.env.REQUESTED_TAG || "v25.0");
 
             const releases = {
+              "v25.1": {
+                name: "v25.1 — SM103 BF16 Dispatch + Grouped GEMM complete bench",
+                body: [
+                  "补齐BF16 Dispatch→专家FC1完整bench发布表：v25.0漏掉的M<192小token行已从此前external-reference矩阵恢复到results/sm103/v25.1。",
+                  "完整矩阵覆盖EP4/8、17个物理模型几何和M=1/8/16/32/64/96/128/192/256/384/512/1024/2048/4096/8192，共510行；500行valid，10行insufficient_memory。",
+                  "强参考仍为满148SM的CUTLASS/DeepGEMM grouped GEMM有效较快者，不含通信；只保留winner/configuration，不宣称穷举全局最优。",
+                  "M<192行是恢复已有证据，不是最新代码重新复测；EP4 M>=192、EP8 M>=192和小token恢复cohort在README/table/results中明确分开。",
+                  "本版为benchmark完整性修正，不新增生产CTA/GEMM Auto，不改变Combine/swapAB验收边界，也不修改Projection/SM90算法。",
+                  "最终表、逐点参数和证据：results/sm103/v25.1。不附调优流水账、profile、大日志或依赖。",
+                ].join("\n\n"),
+              },
               "v25.0": {
                 name: "v25.0 — SM103 BF16 Dispatch + Grouped GEMM",
                 body: [
