@@ -21,6 +21,85 @@ import l20d
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_grouped_property_seed_is_untimed_dispatch_only(self):
+        base=dict(stage='grouped-ep',world=4,grouped_direction='dispatch',grouped_property_seed=0)
+        l20d.validate_job(base)
+        l20d.validate_job(base|dict(grouped_property_seed=0xffffffff))
+        l20d.validate_job(base|dict(grouped_property_dynamic=True))
+        with self.assertRaisesRegex(ValueError,'requires a property seed'):
+            l20d.validate_job(base|dict(grouped_property_seed=None,grouped_property_dynamic=True))
+        for change in (dict(grouped_property_seed=-1),dict(grouped_property_seed=1<<32),
+                       dict(grouped_property_seed=True),dict(grouped_property_seed=1.0),
+                       dict(grouped_property_seed='1'),dict(grouped_direction='combine'),
+                       dict(grouped_direction='both'),dict(grouped_direction=None),
+                       dict(stage='grouped-build'),dict(grouped_measure=True),
+                       dict(grouped_case='64,192,16,2,128'),dict(grouped_profile=True),
+                       dict(grouped_cases='64,192,16,2,128'),dict(grouped_gemm_search=True),
+                       dict(grouped_external=True),dict(grouped_fused_only=True)):
+            with self.assertRaisesRegex(ValueError,'property seed requires'):
+                l20d.validate_job(base|change)
+
+    def test_grouped_validation_coverage_counts_selected_directions_and_policies(self):
+        base = dict(stage='grouped-ep', world=4)
+        policy = dict(grouped_policy='128,64,1,4,20,128')
+        sized = dict(grouped_case='64,192,16,2,128')
+        for direction, count in (('both', 2), ('dispatch', 1), ('combine', 1)):
+            for options, policies, replays in (({}, 2, 3), (policy, 1, 3), (sized, 1, 2)):
+                job = base | options | dict(grouped_direction=direction)
+                l20d.validate_job(job)
+                coverage = l20d.grouped_validation_coverage(job)
+                self.assertEqual(len(coverage['directions']), count)
+                if count == 1:
+                    self.assertEqual(coverage['directions'], [direction])
+                self.assertEqual(coverage['validation_configurations'], count * policies)
+                self.assertEqual(coverage['graph_replays_per_configuration'], replays)
+                self.assertEqual(coverage['graph_replays'], count * policies * replays)
+                self.assertIsNone(coverage['property_replays'])
+        for seed in (0, 0xffffffff):
+            for options, total in (({}, 32), (policy, 16)):
+                job = base | options | dict(grouped_direction='dispatch', grouped_property_seed=seed)
+                l20d.validate_job(job)
+                coverage = l20d.grouped_validation_coverage(job)
+                self.assertEqual(coverage['directions'], ['dispatch'])
+                self.assertEqual(coverage['graph_replays_per_configuration'], 16)
+                self.assertEqual(coverage['graph_replays'], total)
+                self.assertEqual(coverage['property_replays'], total)
+        self.assertEqual(l20d.grouped_validation_coverage(dict(stage='grouped-smoke'))['graph_replays'], 54)
+        for option in ('grouped_measure', 'grouped_profile'):
+            self.assertIsNone(l20d.grouped_validation_coverage(base | sized | {option: True})['graph_replays'])
+        batch = base | dict(grouped_measure=True, grouped_cases='64,192,16,2,128@128,64,1,4,20,128@dispatch')
+        coverage = l20d.grouped_validation_coverage(batch)
+        self.assertEqual(coverage['directions'], ['dispatch'])
+        self.assertIsNone(coverage['graph_replays'])
+        self.assertIsNone(coverage['validation_configurations'])
+
+    def test_native_grouped_success_reports_only_selected_coverage(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('host C++ compiler unavailable')
+        source = (l20d.REPO / 'benchmarks/sm103/grouped_bf16.cu').read_text()
+        begin = source.index('void report_grouped_validation(')
+        report = source[begin:source.index('int run_grouped(', begin)]
+        unit = self.root / 'grouped_validation_report.cpp'
+        unit.write_text('#include <cstdio>\n#include <string>\n' + report + '''
+int main() {
+ report_grouped_validation("ep", "dispatch", 2, 16, "property");
+ report_grouped_validation("ep", "dispatch", 1, 16, "property");
+ report_grouped_validation("ep", "both", 2, 3, "boundaries");
+ report_grouped_validation("case", "combine", 1, 2, "sized");
+}
+''')
+        executable = self.root / 'grouped_validation_report'
+        subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                        str(unit), '-o', str(executable)], check=True, capture_output=True)
+        output = subprocess.run([str(executable)], check=True, capture_output=True, text=True).stdout.splitlines()
+        self.assertEqual(output, [
+            'PASSED grouped-ep: directions=dispatch policies=2 validation_graph_replays_per_rank=32 replays_per_configuration=16; property',
+            'PASSED grouped-ep: directions=dispatch policies=1 validation_graph_replays_per_rank=16 replays_per_configuration=16; property',
+            'PASSED grouped-ep: directions=dispatch,combine policies=2 validation_graph_replays_per_rank=12 replays_per_configuration=3; boundaries',
+            'PASSED grouped-case: directions=combine policies=1 validation_graph_replays_per_rank=2 replays_per_configuration=2; sized',
+        ])
+
     def test_fixed_compute_requires_transport_comparison(self):
         with self.assertRaisesRegex(ValueError,'compute comparison requires'):
             l20d.validate_job(dict(stage='grouped-ep',grouped_compute_compare=True))
@@ -100,9 +179,40 @@ class WorkflowContracts(unittest.TestCase):
             l20d.grouped_batch_cases(job|dict(grouped_cases=';'.join(['4096,1536,128,8,1']*65)))
 
     def test_grouped_explicit_policy_validation(self):
+        swapped=dict(stage='grouped-ep',grouped_direction='dispatch',
+                     grouped_policy='128,64,1,4,20,128,1')
+        self.assertTrue(l20d.grouped_policy(swapped)['swap_ab'])
+        untrimmed=swapped|dict(grouped_policy='128,64,1,4,20,128,1,0')
+        self.assertFalse(l20d.grouped_policy(untrimmed)['trim_swap_tokens'])
+        self.assertNotIn('trim_swap_tokens',l20d.grouped_policy(swapped))
+        for value in ('128,64,1,4,20,128,0,0','128,64,1,4,20,128,1,2'):
+            with self.assertRaises(ValueError):
+                l20d.grouped_policy(swapped|dict(grouped_policy=value))
+        for changed in (dict(grouped_direction='combine'),
+                        dict(grouped_policy='256,64,1,4,20,128,1'),
+                        dict(grouped_policy='128,64,1,4,20,128,2'),
+                        dict(grouped_measure=True)):
+            with self.assertRaises(ValueError): l20d.grouped_policy(swapped|changed)
         job = dict(stage='grouped-ep', grouped_policy='256,128,1,4,32,116')
         self.assertEqual(l20d.grouped_policy(job), dict(tile_n=256,tile_k=128,
             along_n=1,swizzle=4,comm=32,compute=116))
+        two_sm=job|dict(grouped_direction='dispatch',
+            grouped_policy='256,64,0,4,8,140,0,1,2')
+        self.assertEqual(l20d.grouped_policy(two_sm)['mma_sm_count'],2)
+        selectable_copy=job|dict(grouped_direction='dispatch',
+            grouped_policy='256,128,1,4,32,116,0,1,1,1')
+        self.assertEqual(l20d.grouped_policy(selectable_copy)['dispatch_copy'],'tma')
+        cp_async=selectable_copy|dict(grouped_policy='256,128,1,4,32,116,0,1,1,0')
+        self.assertNotIn('dispatch_copy',l20d.grouped_policy(cp_async))
+        with self.assertRaises(ValueError):
+            l20d.grouped_policy(selectable_copy|dict(grouped_direction='combine'))
+        with self.assertRaises(ValueError):
+            l20d.grouped_policy(selectable_copy|dict(
+                grouped_policy='256,128,1,4,32,116,0,1,1,2'))
+        for value in ('256,64,0,4,7,141,0,1,2',
+                      '256,64,0,4,8,138,0,1,2'):
+            with self.assertRaises(ValueError):
+                l20d.grouped_policy(two_sm|dict(grouped_policy=value))
         for value in ('128,64', '64,64,0,1,20,128', '128,32,0,1,20,128',
                       '128,64,2,1,20,128', '128,64,0,3,20,128',
                       '128,64,0,1,0,128', '128,64,0,1,32,128'):
@@ -2300,13 +2410,14 @@ int main() {
     def test_progress_relay_drains_without_waiting_for_heartbeat(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'progress.log'
-            path.write_text('verbose payload\nRUN 1/2 shape\nDONE 1/2 shape p50=0.1ms\n')
+            concise = 'RUN 1/2 shape\nPROPERTY grouped seed=0 replay=0 rows=0,1,\nDONE 1/2 shape p50=0.1ms\n'
+            path.write_text('verbose payload\n' + concise)
             stop = threading.Event()
             stop.set()
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 l20d.relay_progress(path, stop)
-            self.assertEqual(output.getvalue(), 'RUN 1/2 shape\nDONE 1/2 shape p50=0.1ms\n')
+            self.assertEqual(output.getvalue(), concise)
 
     def test_fused_progress_is_live_but_raw_profile_stays_in_log(self):
         path = self.root / 'fused-progress.log'

@@ -2,11 +2,52 @@
 #pragma once
 
 #include "fuse/operators/primitives/grouped_gemm.h"
+#include <algorithm>
+#include <random>
+#include <stdexcept>
+#include <vector>
 
 // Benchmark-only scalar oracles. No production tile order, ready indexing or
 // communication helper is reused here. All elements, including unused capacity
 // and unselected branch slots, are checked; only summaries return to the CPU.
 namespace grouped_validation {
+
+// Host-only generated routes for correctness, never the performance workload.
+// Each pair has identical branches, inputs and weights; the odd replay reverses
+// rows within every expert. The independent oracle must follow that permutation.
+// Across pairs, the SAME captured graph sees dense, skewed, empty and sparse
+// counts. Full-capacity receive storage bounds even the most concentrated route.
+inline std::vector<std::vector<fuse::GroupedTokenSource>> property_routes(
+    int world, int experts, int tokens, int topk, uint32_t seed, int replay) {
+  const int total = world * experts;
+  if (world <= 0 || experts <= 0 || tokens <= 0 || topk <= 0 || topk > total || replay < 0)
+    throw std::invalid_argument("invalid grouped property workload");
+  std::mt19937 rng(seed + uint32_t(replay / 2) * 0x9e3779b9u);
+  std::vector<std::vector<fuse::GroupedTokenSource>> rows(total);
+  std::vector<int> destinations(total), sources(world * tokens);
+  for (int e = 0; e < total; ++e) destinations[e] = e;
+  for (int t = 0; t < world * tokens; ++t) sources[t] = t;
+  std::shuffle(destinations.begin(), destinations.end(), rng);
+  std::shuffle(sources.begin(), sources.end(), rng);
+  const int mode = (replay / 2) % 4;
+  const int boundaries[] = {1,7,8,9,15,16,17,63,64,65,127,128,129,191,192,193,255,256,257};
+  int active = world * tokens;
+  if (mode == 1) active = std::min(active, boundaries[rng() % 19]);
+  if (mode == 2) active = 0;
+  if (mode == 3) active = int(rng() % (uint32_t(active) + 1));
+  for (int i = 0; i < active; ++i) {
+    // Sampling without replacement keeps expert choices distinct per token.
+    // In skew mode the first topk experts receive every selected token.
+    if (mode != 1) std::shuffle(destinations.begin(), destinations.end(), rng);
+    for (int slot = 0; slot < topk; ++slot)
+      rows[destinations[slot]].push_back({sources[i] / tokens, sources[i] % tokens, slot});
+  }
+  for (auto& expert : rows) {
+    std::shuffle(expert.begin(), expert.end(), rng);
+    if (replay % 2) std::reverse(expert.begin(), expert.end());
+  }
+  return rows;
+}
 
 struct Peers { const fuse::Bf16* data[fuse::kMaxWorldSize]{}; };
 struct BranchOwner { int rank = -1, expert = -1, row = -1; };

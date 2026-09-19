@@ -4,6 +4,7 @@
 // Neither mode is a tuned performance benchmark.
 #include "../../csrc/operators/sm103/detail/grouped/a2a_gemm.cuh"
 #include "../../csrc/operators/sm103/detail/grouped/gemm_a2a.cuh"
+#include "../../csrc/operators/sm103/api/grouped.cuh"
 #include <cutlass/device_kernel.h>
 #include <cutlass/util/packed_stride.hpp>
 #include <cublas_v2.h>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <sstream>
 #include <limits>
+#include <set>
 #include <thread>
 
 // Reuse the published pure-GEMM tuning ABI, not Projection operator internals.
@@ -188,9 +190,11 @@ struct GroupedLtReference {
 // Same CUTLASS collectives/scheduler as the fused kernels, with pre-delivered
 // input and no ready adapters or communication CTAs. Physical device metadata
 // stays full-size; only the persistent worker grid uses the requested budget.
-template <int TileN=128, int TileK=64, bool Stock=false>
+template <int TileN=128, int TileK=64, bool Stock=false, bool SwapAB=false,
+    bool TrimTokens=true, int SmMode=1>
 struct GroupedCutlassReference {
-  using Collectives=fuse::detail::Bf16GroupedGemmTypes<TileN,TileK>;
+  using Collectives=fuse::detail::Bf16GroupedGemmTypes<
+      TileN,TileK,SwapAB,TrimTokens,SmMode>;
   using StockProblem=cutlass::gemm::GroupProblemShape<cute::Shape<int32_t,int32_t,int32_t>>;
   using Kernel=std::conditional_t<Stock,
       cutlass::gemm::kernel::GemmUniversal<StockProblem,typename Collectives::Mainloop,typename Collectives::Epi>,
@@ -199,6 +203,7 @@ struct GroupedCutlassReference {
   using SA=typename Kernel::InternalStrideA;
   using SB=typename Kernel::InternalStrideB;
   using SD=typename Kernel::InternalStrideD;
+  static constexpr int ClusterSize=cute::size(typename Kernel::ClusterShape{});
   Buffer<const fuse::Bf16*> a,b;
   Buffer<fuse::Bf16*> d;
   Buffer<Shape> shapes;
@@ -221,12 +226,15 @@ struct GroupedCutlassReference {
     std::vector<SA> va; std::vector<SB> vb; std::vector<SD> vd;
     for(int e=0;e<experts;++e) {
       const int m=rows[e+1]-rows[e];
-      pa.push_back(inputs+size_t(e)*capacity*k); pb.push_back(weights+size_t(e)*n*k);
+      const auto* input=inputs+size_t(e)*capacity*k;
+      const auto* weight=weights+size_t(e)*n*k;
+      pa.push_back(SwapAB?weight:input); pb.push_back(SwapAB?input:weight);
       pd.push_back(output.ptr+size_t(e)*capacity*n);
-      ps.push_back(cute::make_shape(m,n,k)); pt.push_back(pt.back()+(int64_t(m)+127)/128);
-      va.push_back(cutlass::make_cute_packed_stride(SA{},cute::make_shape(capacity,k,1)));
-      vb.push_back(cutlass::make_cute_packed_stride(SB{},cute::make_shape(n,k,1)));
-      vd.push_back(cutlass::make_cute_packed_stride(SD{},cute::make_shape(capacity,n,1)));
+      ps.push_back(cute::make_shape(SwapAB?n:m,SwapAB?m:n,k));
+      pt.push_back(pt.back()+(int64_t(m)+128*SmMode-1)/(128*SmMode));
+      va.push_back(cutlass::make_cute_packed_stride(SA{},cute::make_shape(SwapAB?n:capacity,k,1)));
+      vb.push_back(cutlass::make_cute_packed_stride(SB{},cute::make_shape(SwapAB?capacity:n,k,1)));
+      vd.push_back(cutlass::make_cute_packed_stride(SD{},cute::make_shape(SwapAB?n:capacity,SwapAB?capacity:n,1)));
     }
     a.copy(pa); b.copy(pb); d.copy(pd); shapes.copy(ps); tiles.copy(pt);
     sa.copy(va); sb.copy(vb); sd.copy(vd);
@@ -240,12 +248,16 @@ struct GroupedCutlassReference {
     args.epilogue.ptr_D=d.ptr; args.epilogue.dD=sd.ptr;
     args.epilogue.thread.alpha=1.f; args.epilogue.thread.beta=0.f;
     cudaDeviceProp prop{}; check(cudaGetDeviceProperties(&prop,device));
-    args.hw_info.device_id=device; args.hw_info.sm_count=prop.multiProcessorCount;
+    args.hw_info.device_id=device;
+    // The stock scheduler may be used as a same-budget pure-GEMM diagnostic.
+    // Our fused scheduler must retain the physical count because its block
+    // offset participates in CUTLASS's pointer-array workspace indexing.
+    args.hw_info.sm_count=Stock?workers:prop.multiProcessorCount;
     if constexpr(!Stock) {
       args.scheduler.row_tile_offsets=tiles.ptr; args.scheduler.n=n;
       args.scheduler.compute_ctas=workers; args.scheduler.block_offset=0;
-    } else if(workers!=prop.multiProcessorCount) {
-      throw std::runtime_error("stock CUTLASS reference requires full SM budget");
+    } else if(workers%ClusterSize) {
+      throw std::runtime_error("stock CUTLASS budget must contain whole clusters");
     }
     args.scheduler.max_swizzle_size=swizzle;
     using Raster=typename Kernel::TileScheduler::RasterOrderOptions;
@@ -261,8 +273,22 @@ struct GroupedCutlassReference {
         cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
     check(cudaStreamSynchronize(stream));
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-    cutlass::device_kernel<Kernel><<<Kernel::get_grid_shape(params),
-        Kernel::get_block_shape(),smem,stream>>>(params);
+    if constexpr(ClusterSize==1) {
+      cutlass::device_kernel<Kernel><<<Kernel::get_grid_shape(params),
+          Kernel::get_block_shape(),smem,stream>>>(params);
+    } else {
+      cudaLaunchAttribute attribute{};
+      attribute.id=cudaLaunchAttributeClusterDimension;
+      attribute.val.clusterDim={ClusterSize,1,1};
+      cudaLaunchConfig_t config{};
+      config.gridDim=Kernel::get_grid_shape(params);
+      config.blockDim=Kernel::get_block_shape();
+      config.dynamicSmemBytes=smem;
+      config.stream=stream;
+      config.attrs=&attribute;
+      config.numAttrs=1;
+      check(cudaLaunchKernelEx(&config,cutlass::device_kernel<Kernel>,params));
+    }
     check(cudaGetLastError());
     check(cudaStreamEndCapture(stream,&graph));
   }
@@ -405,6 +431,41 @@ struct GroupedWorkload {
   int buffer_rows = 0;
   bool balance_tail = false, hot_half = false;
   bool ready_summary = false;
+  bool swap_ab = false;
+  bool trim_swap_tokens = true;
+  int mma_sm_count = 1;
+  fuse::GroupedDispatchCopy dispatch_copy = fuse::GroupedDispatchCopy::CpAsync;
+  int64_t property_seed = -1;  // Validation only; never changes formal samples.
+  bool property_dynamic = false;  // Validation-only device policy probe.
+};
+
+// This selector is intentionally a validation probe, not the production
+// performance model. It makes several legal decisions from the current
+// device-resident route counts so Graph replay tests exercise the dynamic
+// parameter path. Production thresholds must come from physical calibration.
+struct GroupedPropertySelector {
+  fuse::detail::GroupedInvocationPolicy* selected = nullptr;
+
+  CUTLASS_DEVICE fuse::detail::GroupedInvocationPolicy operator()(
+      const fuse::detail::GroupedPrepareParams& p,
+      fuse::detail::GroupedInvocationPolicy initial) const {
+    int64_t panels = p.row_tile_offsets[p.experts];
+    int64_t max_rows = 0;
+    int active = 0;
+    for (int e = 0; e < p.experts; ++e) {
+      const int64_t rows = p.row_offsets[e + 1] - p.row_offsets[e];
+      max_rows = rows > max_rows ? rows : max_rows;
+      active += rows != 0;
+    }
+    auto chosen = initial;
+    if (panels == 0) chosen = {8, 140, 1, false};
+    else if (max_rows < 128) chosen = {40, 108, 4, true};
+    else if (max_rows < 192 && active > 1) chosen = {64, 84, 8, true};
+    else chosen = {20, 128, 4, true};
+    chosen.borrow_idle_compute_ctas = panels > 0;
+    if (selected) *selected = chosen;
+    return chosen;
+  }
 };
 
 template <bool IsCombine>
@@ -415,6 +476,9 @@ struct GroupedRank {
       fuse::moe::DispatchForwardSpec>;
   const int E, T, Top, N, K;
   int rank, world, capacity, buffer_rows;
+  bool property_dynamic;
+  int mma_sm_count;
+  fuse::GroupedDispatchCopy dispatch_copy;
   Buffer<Bf16> input, a, b, d, output, ref, oracle_a;
   Buffer<const Bf16*> bp;
   Buffer<Bf16*> dp, stage_ap;
@@ -424,6 +488,7 @@ struct GroupedRank {
   Buffer<fused_inputs::Scratch> random_scratch;
   Buffer<grouped_validation::Result> validation;
   Buffer<grouped_validation::BranchOwner> branch_owners;
+  Buffer<fuse::detail::GroupedInvocationPolicy> selected_policy;
   fuse::Bf16GroupedGemmPlan* plan = nullptr;
   cudaStream_t stream{};
   cudaGraph_t graph{};
@@ -438,6 +503,7 @@ struct GroupedRank {
   std::unique_ptr<Buffer<fuse::GroupedTileTimeline>> profile_tiles;
   std::unique_ptr<Buffer<fuse::GroupedRoleTimeline>> profile_roles;
   std::unique_ptr<Buffer<fuse::GroupedReadySummary>> profile_ready;
+  std::unique_ptr<Buffer<fuse::GroupedCommSummary>> profile_comm;
 #endif
 
   GroupedRank(int r, int w, const GroupedWorkload& q)
@@ -446,11 +512,12 @@ struct GroupedRank {
         rank(r), world(w),
         capacity(q.boundary_checks ? w*T : int((int64_t(T)*Top*(q.hot_half?2:1)+E-1)/E)),
         buffer_rows(!IsCombine && q.buffer_rows && q.buffer_rows<capacity ? q.buffer_rows : capacity),
+      property_dynamic(q.property_dynamic),mma_sm_count(q.mma_sm_count),dispatch_copy(q.dispatch_copy),
       input(size_t(T)*K), a(size_t(E)*buffer_rows*K), b(size_t(E)*N*K), d(size_t(E)*capacity*N),
       output(size_t(T)*Top*N), ref(size_t(E)*capacity*N), oracle_a(size_t(E)*capacity*K),
       bp(E),dp(E),stage_ap(E),offsets(E+1),routes(size_t(E)*capacity),
       started(w*fuse::kReadyFlagStride),done(w*fuse::kReadyFlagStride),
-      random_scratch(1),validation(1),branch_owners(size_t(T)*Top) {
+      random_scratch(1),validation(1),branch_owners(size_t(T)*Top),selected_policy(1) {
     try {
 #if FUSE_ENABLE_PROFILING
     if (q.trace_out) {
@@ -460,6 +527,7 @@ struct GroupedRank {
       else {
         profile_panels=std::make_unique<Buffer<fuse::GroupedPanelTimeline>>(panels);
         profile_tiles=std::make_unique<Buffer<fuse::GroupedTileTimeline>>(panels*nt);
+        profile_comm=std::make_unique<Buffer<fuse::GroupedCommSummary>>(148*8);
       }
       profile_roles=std::make_unique<Buffer<fuse::GroupedRoleTimeline>>(148);
       clear_profile();
@@ -528,7 +596,8 @@ struct GroupedRank {
   }
 
   void capture(const std::vector<std::unique_ptr<GroupedRank>>& ranks, bool along_n, int sw,
-      int comm, int compute, int tile_n, int tile_k, bool balance_tail=false) {
+      int comm, int compute, int tile_n, int tile_k, bool balance_tail=false, bool swap_ab=false,
+      bool trim_swap_tokens=true) {
     check(cudaSetDevice(rank));
     fuse::Bf16GroupedGemmParams p{};
     p.lhs = stage_ap.ptr; p.weight_nt = bp.ptr; p.output = dp.ptr;
@@ -537,11 +606,19 @@ struct GroupedRank {
     p.rank = rank; p.world_size = world; p.topk = Top;
     p.policy = {comm, compute, sw, along_n, tile_n, tile_k};
     p.policy.balance_dispatch_tail=balance_tail;
+    p.policy.swap_ab=swap_ab;
+    p.policy.trim_swap_tokens=trim_swap_tokens;
+    p.policy.mma_sm_count=mma_sm_count;
+    p.policy.dispatch_copy=dispatch_copy;
     p.dispatch_buffer_rows=buffer_rows<capacity ? buffer_rows : 0;
 #if FUSE_ENABLE_PROFILING
     if (profile_panels)
       p.profile={profile_panels->ptr,profile_tiles->ptr,profile_roles->ptr,
           int64_t(profile_panels->size),(N+tile_n-1)/tile_n};
+    if (profile_comm) {
+      p.profile.comm_summary=profile_comm->ptr;
+      p.profile.comm_summary_capacity=int32_t(profile_comm->size);
+    }
     if (profile_ready) {
       p.profile.roles=profile_roles->ptr;
       p.profile.ready_summary=profile_ready->ptr;
@@ -553,7 +630,16 @@ struct GroupedRank {
       p.peer_started[r] = ranks[r]->started.ptr;
       p.peer_done[r] = ranks[r]->done.ptr;
     }
-    check(Spec::create(p, &plan));
+    if constexpr (!IsCombine) {
+      if (property_dynamic) {
+        GroupedPropertySelector selector{selected_policy.ptr};
+        check(fuse::detail::create_grouped_plan<false>(p, &plan, selector));
+      } else check(Spec::create(p, &plan));
+    } else {
+      if (property_dynamic)
+        throw std::runtime_error("dynamic property policy only supports Dispatch");
+      check(Spec::create(p, &plan));
+    }
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
     check(Spec::launch(plan, stream));
     check(cudaStreamEndCapture(stream,&graph));
@@ -565,6 +651,7 @@ struct GroupedRank {
     if (profile_tiles) check(cudaMemset(profile_tiles->ptr,0,profile_tiles->size*sizeof(fuse::GroupedTileTimeline)));
     check(cudaMemset(profile_roles->ptr,0,profile_roles->size*sizeof(fuse::GroupedRoleTimeline)));
     if (profile_ready) check(cudaMemset(profile_ready->ptr,0,profile_ready->size*sizeof(fuse::GroupedReadySummary)));
+    if (profile_comm) check(cudaMemset(profile_comm->ptr,0,profile_comm->size*sizeof(fuse::GroupedCommSummary)));
   }
   void dump_profile(const char* prefix,int comm,int compute,int tile_n,int tile_k,int sw,bool along) {
     if (profile_ready) {
@@ -591,9 +678,12 @@ struct GroupedRank {
     std::vector<fuse::GroupedPanelTimeline> panels(profile_panels->size);
     std::vector<fuse::GroupedTileTimeline> tiles(profile_tiles->size);
     std::vector<fuse::GroupedRoleTimeline> roles(profile_roles->size);
+    std::vector<fuse::GroupedCommSummary> comm_warps(profile_comm->size);
     check(cudaMemcpy(panels.data(),profile_panels->ptr,panels.size()*sizeof(panels[0]),cudaMemcpyDeviceToHost));
     check(cudaMemcpy(tiles.data(),profile_tiles->ptr,tiles.size()*sizeof(tiles[0]),cudaMemcpyDeviceToHost));
     check(cudaMemcpy(roles.data(),profile_roles->ptr,roles.size()*sizeof(roles[0]),cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(comm_warps.data(),profile_comm->ptr,
+        comm_warps.size()*sizeof(comm_warps[0]),cudaMemcpyDeviceToHost));
     int64_t actual=0;
     for(int e=0;e<E;++e) actual+=(host_offsets[e+1]-host_offsets[e]+127)/128;
     const int nt=(N+tile_n-1)/tile_n;
@@ -609,6 +699,10 @@ struct GroupedRank {
     for(int64_t i=0;i<actual;++i) {auto x=panels[i];out<<(i?",":"")<<"["<<x.begin<<","<<x.release_begin<<","<<x.release_end<<","<<x.cta<<","<<x.expert<<","<<x.m<<"]";}
     out<<"],\"tiles\":[";
     for(int64_t i=0;i<actual*nt;++i) {auto x=tiles[i];out<<(i?",":"")<<"["<<x.wait_begin<<","<<x.observed<<","<<x.load_begin<<","<<x.load_end<<","<<x.cta<<","<<x.expert<<","<<x.m<<","<<x.n<<","<<x.polled<<"]";}
+    out<<"],\"comm_warps\":[";
+    for(int c=0;c<comm*8;++c) {auto x=comm_warps[c];out<<(c?",":"")<<"["
+        <<x.panels<<","<<x.batches<<","<<x.bytes<<","<<x.address_ns<<","<<x.store_wait_ns
+        <<","<<x.g2s_ns<<","<<x.store_issue_ns<<","<<x.g2s_issue_ns<<","<<x.g2s_wait_ns<<"]";}
     out<<"]}\n";
     if(!out) throw std::runtime_error("cannot write grouped profile");
   }
@@ -634,11 +728,14 @@ template <bool IsCombine, int TileN, int TileK>
 struct GroupedTransportReference {
   Buffer<const fuse::Bf16*> inputs;
   Buffer<fuse::Bf16*> outputs;
+  Buffer<int32_t> first_wave{1};
+  Buffer<int32_t> effective_comm_storage{1};
   Buffer<uint32_t> ready, arrivals;
   cudaGraph_t graph{};
   int device;
   GroupedTransportReference(const std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& ranks,
-      int rank, const Buffer<int64_t>& tiles, int comm, bool along_n, int sw, bool balance_tail=false)
+      int rank, const Buffer<int64_t>& tiles, int comm, int compute,
+      bool along_n, int sw, bool balance_tail=false)
       : inputs(std::max(ranks.size(),size_t(ranks[rank]->E))),
         outputs(inputs.size), ready((tiles.size-1)*
             size_t((ranks[rank]->capacity+127)/128)*
@@ -662,11 +759,27 @@ struct GroupedTransportReference {
     auto& p=args.params;
     p.order={tiles.ptr,r.E,(r.N+TileN-1)/TileN,sw,along_n};
     p.balance_tail=balance_tail;
+    p.cp_async_g2s=r.dispatch_copy==fuse::GroupedDispatchCopy::CpAsync;
     p.row_offsets=r.offsets.ptr; p.source=r.routes.ptr;
     p.input=inputs.ptr; p.output=outputs.ptr; p.ready=ready.ptr;
-    if constexpr(!IsCombine) p.arrivals=arrivals.ptr;
+    int effective_comm=comm;
+    int64_t panels=0;
+    if constexpr(!IsCombine) {
+      p.arrivals=arrivals.ptr;
+      std::vector<int64_t> prefix(1,0);
+      for(int e=0;e<r.E;++e)
+        prefix.push_back(prefix.back()+(r.host_offsets[e+1]-r.host_offsets[e]+127)/128);
+      panels=prefix.back();
+      auto host_order=p.order; host_order.row_tile_offsets=prefix.data();
+      const int32_t first=fuse::detail::grouped_use_latency_cohort(
+          r.host_offsets.data(),r.E)
+          ? fuse::detail::grouped_first_wave_panels(host_order,compute) : -1;
+      first_wave.copy(std::vector<int32_t>{first}); p.first_wave_panels=first_wave.ptr;
+      effective_comm_storage.copy(std::vector<int32_t>{effective_comm});
+      p.effective_comm_ctas=effective_comm_storage.ptr;
+    }
     p.columns=IsCombine?r.N:r.K; p.topk=r.Top; p.rank=rank;
-    p.world_size=r.world; p.num_comm_ctas=comm; p.epoch=1;
+    p.world_size=r.world; p.num_comm_ctas=effective_comm; p.epoch=1;
     using Fused=std::conditional_t<IsCombine,fuse::detail::GroupedGemmA2A<TileN,TileK>,
         fuse::detail::A2AGroupedGemm<TileN,TileK>>;
     constexpr size_t smem=Fused::SharedStorageSize;
@@ -674,12 +787,12 @@ struct GroupedTransportReference {
         cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
     check(cudaStreamBeginCapture(r.stream,cudaStreamCaptureModeThreadLocal));
     if constexpr(!IsCombine) {
-      int64_t panels=0;
-      for(int e=0;e<r.E;++e) panels+=(r.host_offsets[e+1]-r.host_offsets[e]+127)/128;
-      if(balance_tail || fuse::detail::grouped_dispatch_splits(panels,comm)>1)
+      int32_t first=0; check(cudaMemcpy(&first,first_wave.ptr,sizeof(first),cudaMemcpyDeviceToHost));
+      if(balance_tail || fuse::detail::grouped_dispatch_splits(
+          panels,effective_comm,first,int64_t(128)*r.K*sizeof(fuse::Bf16))>1)
         check(cudaMemsetAsync(arrivals.ptr,0,arrivals.size*sizeof(uint32_t),r.stream));
     }
-    grouped_transport_only<IsCombine,TileN><<<comm,256,smem,r.stream>>>(args);
+    grouped_transport_only<IsCombine,TileN><<<effective_comm,256,smem,r.stream>>>(args);
     check(cudaGetLastError()); check(cudaStreamEndCapture(r.stream,&graph));
   }
   ~GroupedTransportReference() { cudaSetDevice(device); if(graph) cudaGraphDestroy(graph); }
@@ -715,7 +828,8 @@ void write_grouped_samples(std::ostream& raw,
            <<','<<p.num_comm_ctas<<','<<p.num_compute_ctas<<','<<p.swizzle<<','<<p.along_n
            <<','<<observed.warmup<<','<<observed.drift<<','<<round<<','<<accepted
            <<','<<p.tile_n<<','<<p.tile_k<<','<<ranks[rank]->buffer_rows
-           <<','<<q.balance_tail<<','<<q.hot_half<<'\n';
+           <<','<<q.balance_tail<<','<<q.hot_half<<','<<q.swap_ab<<','<<q.trim_swap_tokens
+           <<','<<int(q.dispatch_copy)<<'\n';
   }
   if(!raw) throw std::runtime_error("failed to write grouped sample CSV");
 }
@@ -723,16 +837,18 @@ void write_grouped_samples(std::ostream& raw,
 // Bounded compute-only grid: four tiles x two rasters x four swizzles. Reuse
 // payload, routes, reference and CUDA contexts; no Lt retuning or communication
 // timing per candidate. Both payloads independently validate the same grid.
-template <bool IsCombine,int TileN,int TileK,bool Stock=false>
+template <bool IsCombine,int TileN,int TileK,bool Stock=false,int SmMode=1>
 void search_grouped_tile(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& ranks,
     const GroupedWorkload& q,int replay,int compute,int& candidate,double& best) {
   for(bool along:{false,true}) for(int sw:{1,2,4,8}) {
-    std::vector<std::unique_ptr<GroupedCutlassReference<TileN,TileK,Stock>>> refs;
+    std::vector<std::unique_ptr<GroupedCutlassReference<
+        TileN,TileK,Stock,false,true,SmMode>>> refs;
     std::vector<grouped_measurement::Operation> ops;
     double flops=0;
     for(auto& r:ranks) {
       check(cudaSetDevice(r->rank));
-      refs.push_back(std::make_unique<GroupedCutlassReference<TileN,TileK,Stock>>(r->stream,
+      refs.push_back(std::make_unique<GroupedCutlassReference<
+          TileN,TileK,Stock,false,true,SmMode>>(r->stream,
           r->host_offsets,r->capacity,r->N,r->K,r->b.ptr,r->oracle_a.ptr,compute,along,sw));
       ops.push_back({r->rank,r->stream,refs.back()->graph});
       flops+=2.*r->host_offsets.back()*r->N*r->K;
@@ -744,7 +860,9 @@ void search_grouped_tile(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& r
     const auto result=grouped_measurement::measure(ops,!Stock || candidate==0);
     for(auto& r:ranks) validate_grouped_reference(*r,refs[r->rank]->output.ptr);
     std::ofstream raw(q.timing_csv,std::ios::app); raw<<std::setprecision(9);
-    write_grouped_samples(raw,ranks,q,replay,Stock?"cutlass_stock":"cutlass_search",result,{0,compute,sw,along,TileN,TileK});
+    const char* mode=!Stock?(SmMode==1?"cutlass_search":"cutlass_search_2sm"):
+        (SmMode==1?"cutlass_stock_1sm_budget":"cutlass_stock_2sm_budget");
+    write_grouped_samples(raw,ranks,q,replay,mode,result,{0,compute,sw,along,TileN,TileK});
     if(result.drift<=.05) best=std::min(best,result.p50);
     using Kernel=typename GroupedCutlassReference<TileN,TileK,Stock>::Kernel;
     cudaFuncAttributes resources{};
@@ -842,7 +960,7 @@ void measure_grouped_case(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& 
         r->host_offsets,r->capacity,r->N,r->K,r->b.ptr,r->oracle_a.ptr,compute,along_n,sw,scratch));
     cutlass_ops.push_back({r->rank,r->stream,cutlass.back()->graph});
     transport.push_back(std::make_unique<GroupedTransportReference<IsCombine,TileN,TileK>>(
-        ranks,r->rank,cutlass.back()->tiles,comm,along_n,sw));
+        ranks,r->rank,cutlass.back()->tiles,comm,compute,along_n,sw));
     transport_ops.push_back({r->rank,r->stream,transport.back()->graph});
     fused_ops.push_back({r->rank,r->stream,r->graph});
   }
@@ -899,7 +1017,7 @@ void measure_grouped_case(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& 
 // Fixed-budget transport experiment: reuse the production copy body, without
 // constructing/tuning unrelated GEMM libraries. Keep prefix buffers alive
 // through Graph destruction and retain the fused kernel's reserved SMEM.
-template<int TileN,int TileK>
+template<int TileN,int TileK,bool SwapAB=false,bool TrimTokens=true,int SmMode=1>
 void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>& ranks,
     const GroupedWorkload& q,int replay,bool along,int sw,int comm,int compute) {
   std::vector<std::unique_ptr<Buffer<int64_t>>> tiles;
@@ -913,7 +1031,7 @@ void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>
     tiles.push_back(std::make_unique<Buffer<int64_t>>(prefix.size()));
     tiles.back()->copy(prefix);
     refs.push_back(std::make_unique<GroupedTransportReference<false,TileN,TileK>>(
-        ranks,r->rank,*tiles.back(),comm,along,sw,q.balance_tail));
+        ranks,r->rank,*tiles.back(),comm,compute,along,sw,q.balance_tail));
     ops.push_back({r->rank,r->stream,refs.back()->graph});
   }
   const auto measured=grouped_measurement::measure(ops);
@@ -928,11 +1046,18 @@ void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>
     // independently gathered oracle; tile/raster/swizzle/worker budget match
     // fusion exactly. Serial modes reuse production D after fusion validation
     // to avoid allocating another model-sized output. No communication runs.
-    std::vector<std::unique_ptr<GroupedCutlassReference<TileN,TileK>>> pure;
+    // The production 2-SM path uses CUTLASS's stock grouped scheduler: its
+    // cluster-pair indexing is part of the kernel ABI. Keep this diagnostic
+    // bit-for-bit on that scheduler instead of silently timing the custom
+    // one-SM traversal generalized to SmMode=2.
+    constexpr bool StockScheduler = SmMode == 2;
+    std::vector<std::unique_ptr<GroupedCutlassReference<
+        TileN,TileK,StockScheduler,SwapAB,TrimTokens,SmMode>>> pure;
     std::vector<grouped_measurement::Operation> pure_ops;
     for(auto& r:ranks) {
       check(cudaSetDevice(r->rank));
-      pure.push_back(std::make_unique<GroupedCutlassReference<TileN,TileK>>(
+      pure.push_back(std::make_unique<GroupedCutlassReference<
+          TileN,TileK,StockScheduler,SwapAB,TrimTokens,SmMode>>(
           r->stream,r->host_offsets,r->capacity,r->N,r->K,r->b.ptr,r->oracle_a.ptr,
           compute,along,sw,r->d.ptr));
       // Finish default-stream metadata/output poisoning before replaying on
@@ -960,15 +1085,23 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
   const int N=IsCombine?q.h:2*q.f, K=IsCombine?q.f:q.h;
   std::vector<std::unique_ptr<R>> ranks;
   for(int r=0;r<world;++r) { check(cudaSetDevice(r)); ranks.push_back(std::make_unique<R>(r,world,q)); }
-  for(auto& r:ranks) r->capture(ranks,along_n,sw,comm,compute,q.tile_n,q.tile_k,q.balance_tail);
+  for(auto& r:ranks) r->capture(ranks,along_n,sw,comm,compute,q.tile_n,q.tile_k,q.balance_tail,q.swap_ab,q.trim_swap_tokens);
+  std::vector<std::vector<Bf16>> previous_branches;
+  std::vector<fuse::detail::GroupedInvocationPolicy> previous_policies(world);
+  std::set<int> observed_policies;
   // Equal-ish, deliberately skewed (other ranks empty), and all-empty. Change
   // payload and row order as well as M_e; no graph re-capture between replays.
-  for(int replay=0;replay<(q.boundary_checks?3:2);++replay) {
-    std::mt19937 rng(20260916+replay);
+  for(int replay=0;replay<(q.property_seed>=0?16:q.boundary_checks?3:2);++replay) {
+    std::mt19937 rng(q.property_seed>=0 ? uint32_t(q.property_seed)+replay/2 : 20260916+replay);
     std::uniform_real_distribution<float> random(-0.5f,0.5f);
     using Source=fuse::detail::GroupedTokenSource;
     std::vector<std::vector<Source>> by_expert(world*E);
-    if (q.boundary_checks) {
+    if (q.property_seed>=0) {
+      by_expert=grouped_validation::property_routes(world,E,T,Top,uint32_t(q.property_seed),replay);
+      printf("PROPERTY grouped seed=%llu replay=%d rows=",(unsigned long long)q.property_seed,replay);
+      for(const auto& rows:by_expert) printf("%zu,",rows.size());
+      puts(""); fflush(stdout); // Reproduction coordinates survive a GPU failure.
+    } else if (q.boundary_checks) {
       if(replay!=2) for(int r=0;r<world;++r) for(int t=0;t<T;++t) {
         const int total=replay==1?E:world*E;
         const int first=(t*17+r*5)%total;
@@ -988,7 +1121,7 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
         by_expert[permutation[branch%active_experts]].push_back({r,t,slot});
       }
     }
-    for(auto& rows:by_expert) std::shuffle(rows.begin(),rows.end(),rng);
+    if(q.property_seed<0) for(auto& rows:by_expert) std::shuffle(rows.begin(),rows.end(),rng);
     std::vector<std::vector<grouped_validation::BranchOwner>> owners(
         world,std::vector<grouped_validation::BranchOwner>(size_t(T)*Top));
     for (int e=0;e<world*E;++e) for (size_t row=0;row<by_expert[e].size();++row) {
@@ -1071,6 +1204,29 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
     }
     for(auto& r:ranks) { check(cudaSetDevice(r->rank)); check(cudaGraphLaunch(r->exec,r->stream)); }
     for(auto& r:ranks) { check(cudaSetDevice(r->rank)); check(cudaStreamSynchronize(r->stream)); }
+    if (q.property_dynamic) {
+      for (auto& r : ranks) {
+        fuse::detail::GroupedInvocationPolicy selected{};
+        check(cudaSetDevice(r->rank));
+        check(cudaMemcpy(&selected,r->selected_policy.ptr,sizeof(selected),cudaMemcpyDeviceToHost));
+        if (selected.num_comm_ctas <= 0 || selected.num_compute_ctas <= 0 ||
+            selected.num_comm_ctas + selected.num_compute_ctas != 148 ||
+            (selected.swizzle != 1 && selected.swizzle != 2 &&
+             selected.swizzle != 4 && selected.swizzle != 8))
+          throw std::runtime_error("property: invalid selected device policy");
+        const auto& previous=previous_policies[r->rank];
+        if (replay % 2 && (selected.num_comm_ctas != previous.num_comm_ctas ||
+            selected.num_compute_ctas != previous.num_compute_ctas ||
+            selected.swizzle != previous.swizzle || selected.along_n != previous.along_n))
+          throw std::runtime_error("property: row permutation changed device policy");
+        if (!(replay % 2)) previous_policies[r->rank]=selected;
+        observed_policies.insert(selected.num_comm_ctas*1000 + selected.swizzle*10 + selected.along_n);
+        printf("PROPERTY_POLICY rank=%d replay=%d comm=%d compute=%d swizzle=%d along_n=%d\n",
+            r->rank,replay,selected.num_comm_ctas,selected.num_compute_ctas,
+            selected.swizzle,int(selected.along_n));
+      }
+      fflush(stdout);
+    }
     double max_abs=0;
     for (auto& r:ranks) max_abs=std::max(max_abs,r->validate_gpu(ranks));
     // Full host oracle remains only for the bounded boundary suite, cross-checking
@@ -1109,6 +1265,17 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
       check(cudaMemcpy(received.data(),r->output.ptr,r->output.size*sizeof(Bf16),cudaMemcpyDeviceToHost));
       if(std::memcmp(received.data(),branch_expected[r->rank].data(),received.size()*sizeof(Bf16)))
         throw std::runtime_error("combine branch bytes/untouched capacity mismatch");
+    }
+    if(q.property_seed>=0) {
+      if(replay%2==0) previous_branches=branch_expected;
+      else for(int rank=0;rank<world;++rank) for(size_t i=0;i<branch_expected[rank].size();++i) {
+        const auto a=branch_expected[rank][i], b=previous_branches[rank][i];
+        if(a.raw()==0x7f7f || b.raw()==0x7f7f) {
+          if(a.raw()!=b.raw()) throw std::runtime_error("property: row permutation changed branch coverage");
+        } else if(!std::isfinite(float(a)) || !std::isfinite(float(b)) ||
+            std::abs(float(a)-float(b))>0.002f+0.008f*std::abs(float(b)))
+          throw std::runtime_error("property: row permutation changed branch GEMM result");
+      }
     }
     }
 #if FUSE_ENABLE_PROFILING
@@ -1170,6 +1337,21 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
       search_grouped_tile<IsCombine,128,128>(ranks,q,replay,compute,candidate,best);
       search_grouped_tile<IsCombine,256,64>(ranks,q,replay,compute,candidate,best);
       search_grouped_tile<IsCombine,256,128>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,128,64,false,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,128,128,false,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,64,false,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,128,false,2>(ranks,q,replay,compute,candidate,best);
+      // Diagnose whether the remaining gap is the custom grouped traversal or
+      // the one-SM MMA shape. These use the SAME persistent CTA budget as the
+      // fused GEMM; unlike the external strong reference they do not get 148.
+      search_grouped_tile<IsCombine,128,64,true,1>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,128,128,true,1>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,64,true,1>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,128,true,1>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,128,64,true,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,128,128,true,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,64,true,2>(ranks,q,replay,compute,candidate,best);
+      search_grouped_tile<IsCombine,256,128,true,2>(ranks,q,replay,compute,candidate,best);
     } else if(q.timing_csv && q.fused_only) {
       std::vector<grouped_measurement::Operation> ops;
       double flops=0;
@@ -1190,7 +1372,15 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
           replay,ranks[0]->buffer_rows,q.balance_tail,q.hot_half,measured.p50,measured.p95,
           flops/(world*measured.p50*1e12),int(measured.drift<=.05));fflush(stdout);
       if constexpr(!IsCombine) if(q.transport_compare) {
-        if(q.tile_n==128 && q.tile_k==64) measure_dispatch_transport<128,64>(ranks,q,replay,along_n,sw,comm,compute);
+        if(q.swap_ab && !q.trim_swap_tokens && q.tile_k==64) measure_dispatch_transport<128,64,true,false>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.swap_ab && !q.trim_swap_tokens && q.tile_k==128) measure_dispatch_transport<128,128,true,false>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.swap_ab && q.tile_k==64) measure_dispatch_transport<128,64,true>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.swap_ab && q.tile_k==128) measure_dispatch_transport<128,128,true>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2 && q.tile_n==128 && q.tile_k==64) measure_dispatch_transport<128,64,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2 && q.tile_n==128 && q.tile_k==128) measure_dispatch_transport<128,128,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2 && q.tile_n==256 && q.tile_k==64) measure_dispatch_transport<256,64,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2 && q.tile_n==256 && q.tile_k==128) measure_dispatch_transport<256,128,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.tile_n==128 && q.tile_k==64) measure_dispatch_transport<128,64>(ranks,q,replay,along_n,sw,comm,compute);
         else if(q.tile_n==128 && q.tile_k==128) measure_dispatch_transport<128,128>(ranks,q,replay,along_n,sw,comm,compute);
         else if(q.tile_n==256 && q.tile_k==64) measure_dispatch_transport<256,64>(ranks,q,replay,along_n,sw,comm,compute);
         else if(q.tile_n==256 && q.tile_k==128) measure_dispatch_transport<256,128>(ranks,q,replay,along_n,sw,comm,compute);
@@ -1205,10 +1395,31 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
     printf("CHECK grouped-ep direction=%s ep=%d experts=%d tokens=%d n=%d k=%d along_n=%d swizzle=%d comm=%d compute=%d replay=%d max_abs=%.6g passed\n",
         IsCombine?"combine":"dispatch",world,E,T,N,K,along_n,sw,comm,compute,replay,max_abs); fflush(stdout);
   }
+  if (q.property_dynamic && observed_policies.size() < 2)
+    throw std::runtime_error("property: dynamic selector did not exercise multiple policies");
+}
+
+void report_grouped_validation(const char* suite,const std::string& direction,
+    int policies,int replays,const char* detail) {
+  const bool both=direction=="both";
+  printf("PASSED grouped-%s: directions=%s policies=%d validation_graph_replays_per_rank=%d "
+      "replays_per_configuration=%d; %s\n",suite,both?"dispatch,combine":direction.c_str(),
+      policies,policies*(both?2:1)*replays,replays,detail);
 }
 
 int run_grouped(int argc,char** argv) {
   try {
+    int64_t property_seed=-1;
+    if(argc>=3 && std::string(argv[argc-2])=="--property-seed") {
+      size_t parsed=0; property_seed=std::stoll(argv[argc-1],&parsed);
+      if(parsed!=std::strlen(argv[argc-1]) || property_seed<0 || property_seed>UINT32_MAX)
+        throw std::runtime_error("property seed must be uint32");
+      argc-=2;
+    }
+    const bool property_dynamic=argc>=2 && std::string(argv[argc-1])=="--property-dynamic";
+    if(property_dynamic) --argc;
+    if(property_dynamic && property_seed<0)
+      throw std::runtime_error("dynamic property policy requires a property seed");
     const bool compute_compare=argc>=2 && std::string(argv[argc-1])=="--compute-compare";
     if(compute_compare) --argc;
     const bool transport_compare=argc>=2 && std::string(argv[argc-1])=="--transport-compare";
@@ -1254,18 +1465,37 @@ int run_grouped(int argc,char** argv) {
         if(parsed!=item.size()) throw std::runtime_error("invalid grouped policy integer");
         values.push_back(value);
       }
-      if(values.size()!=6 || (values[0]!=128 && values[0]!=256) ||
+      if((values.size()<6 || values.size()>10) || (values[0]!=128 && values[0]!=256) ||
           (values[1]!=64 && values[1]!=128) || (values[2]!=0 && values[2]!=1) ||
           (values[3]!=1 && values[3]!=2 && values[3]!=4 && values[3]!=8) ||
-          values[4]<=0 || values[5]<=0)
-        throw std::runtime_error("policy requires N,K,AlongN,swizzle,comm,compute");
+          values[4]<=0 || values[5]<=0 ||
+          (values.size()>=7 && (values[6]<0 || values[6]>1 || (values[6] && values[0]!=128))) ||
+          (values.size()>=8 && (values[7]<0 || values[7]>1 ||
+              (values.size()==8 && !values[6]) ||
+              (values.size()>=9 && !values[6] && values[7]!=1))) ||
+          (values.size()>=9 && (values[8]<1 || values[8]>2 ||
+              (values[8]==2 && (values[6] || values[4]%2 || values[5]%2)))))
+        throw std::runtime_error(
+            "policy requires N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy]]]]");
       policy={values[4],values[5],values[3],bool(values[2]),values[0],values[1]};
+      policy.swap_ab=values.size()>=7 && values[6];
+      policy.trim_swap_tokens=values.size()<8 || values[7];
+      policy.mma_sm_count=values.size()<9 ? 1 : values[8];
+      if(values.size()==10) {
+        if(values[9]<0 || values[9]>1 || direction!="dispatch")
+          throw std::runtime_error("invalid grouped copy method");
+        policy.dispatch_copy=values[9] ? fuse::GroupedDispatchCopy::Tma :
+            fuse::GroupedDispatchCopy::CpAsync;
+      }
       argc-=2;
     }
     const bool external_search=argc>=2 && std::string(argv[argc-1])=="--external-search";
     if(external_search) --argc;
     const bool gemm_search=argc>=2 && std::string(argv[argc-1])=="--gemm-search";
     if(gemm_search) --argc;
+    if(policy.swap_ab && (direction!="dispatch" || gemm_search || external_search ||
+        (argc==9 && !fused_only)))
+      throw std::runtime_error("swapAB timing requires fused-only Dispatch; use compute-compare for matched GEMM");
     if((gemm_search || external_search) && (argc!=9 || std::string(argv[1])!="--case"))
       throw std::runtime_error("GEMM search requires a sized case and sample CSV");
     cudaDeviceProp prop{}; check(cudaGetDeviceProperties(&prop,0));
@@ -1273,6 +1503,9 @@ int run_grouped(int argc,char** argv) {
     if(int64_t(policy.num_comm_ctas)+policy.num_compute_ctas>prop.multiProcessorCount)
       throw std::runtime_error("grouped CTA budget exceeds physical SMs");
     const bool sized_case = (argc==8 || argc==9) && std::string(argv[1])=="--case";
+    if(property_seed>=0 && (argc!=3 || std::string(argv[1])!="--ep" ||
+        direction!="dispatch" || trace_out || gemm_search || external_search || fused_only))
+      throw std::runtime_error("property generation requires untimed Dispatch --ep validation");
     if(trace_out && (!sized_case || argc!=8 || direction!="dispatch" || gemm_search || external_search))
       throw std::runtime_error("grouped trace requires one untimed sized Dispatch case");
     if(ready_summary && !trace_out) throw std::runtime_error("ready summary requires --trace-out");
@@ -1296,6 +1529,10 @@ int run_grouped(int argc,char** argv) {
         if (tokens>INT32_MAX) throw std::runtime_error("token count exceeds index range");
         GroupedWorkload q{experts/world,int(tokens),top,h,f,false,argc==9?argv[8]:nullptr};
         q.tile_n=policy.tile_n; q.tile_k=policy.tile_k;
+        q.swap_ab=policy.swap_ab;
+        q.trim_swap_tokens=policy.trim_swap_tokens;
+        q.mma_sm_count=policy.mma_sm_count;
+        q.dispatch_copy=policy.dispatch_copy;
         q.gemm_search=gemm_search;
         q.external_search=external_search;
         q.trace_out=trace_out;
@@ -1316,32 +1553,45 @@ int run_grouped(int argc,char** argv) {
         if(q.timing_csv) {
           std::ofstream out(q.timing_csv);
           if(!out) throw std::runtime_error("cannot create grouped sample CSV");
-          out<<"direction,h,f,total_experts,topk,tokens_per_rank,ep,payload,mode,sample,rank,rank_rows,ms,comm_ctas,compute_ctas,swizzle,along_n,warmup,drift,round,accepted,tile_n,tile_k,buffer_rows,tail_balance,hot_half\n";
+          out<<"direction,h,f,total_experts,topk,tokens_per_rank,ep,payload,mode,sample,rank,rank_rows,ms,comm_ctas,compute_ctas,swizzle,along_n,warmup,drift,round,accepted,tile_n,tile_k,buffer_rows,tail_balance,hot_half,swap_ab,trim_swap_tokens,dispatch_copy\n";
         }
         if(direction!="combine") verify_grouped_ep<false>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
         if(direction!="dispatch") verify_grouped_ep<true>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
-        puts(q.timing_csv?"PASSED grouped-case: correctness and exploratory native-reference timing; tuning incomplete":
-            "PASSED grouped-case: sized dual-payload API correctness; performance NOT measured");
+        report_grouped_validation("case",direction,1,2,q.timing_csv?
+            "correctness and exploratory native-reference timing; tuning incomplete":
+            "sized dual-payload API correctness; performance NOT measured");
         return 0;
       }
       if(explicit_policy) {
         GroupedWorkload q{}; q.tile_n=policy.tile_n; q.tile_k=policy.tile_k;
+        q.property_seed=property_seed;
+        q.property_dynamic=property_dynamic;
+        q.swap_ab=policy.swap_ab;
+        q.trim_swap_tokens=policy.trim_swap_tokens;
+        q.mma_sm_count=policy.mma_sm_count;
+        q.dispatch_copy=policy.dispatch_copy;
         q.balance_tail=balance_tail;
         q.buffer_rows=buffer_rows;
         if(buffer_rows && direction!="dispatch") throw std::runtime_error("buffer only applies to Dispatch");
         if(hot_half || (balance_tail && direction!="dispatch")) throw std::runtime_error("invalid tail/skew probe mode");
         if(direction!="combine") verify_grouped_ep<false>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
         if(direction!="dispatch") verify_grouped_ep<true>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
-        puts("PASSED grouped-ep: explicit tile policy, both directions, dynamic Graph boundaries");
+        report_grouped_validation("ep",direction,1,property_seed>=0?16:3,
+            property_dynamic ?
+            "device-selected invocation policy, dynamic Graph boundaries; performance NOT measured" :
+            "explicit tile policy, dynamic Graph boundaries; performance NOT measured");
         return 0;
       }
       for(bool along_n:{false,true}) {
         GroupedWorkload q{};q.buffer_rows=buffer_rows;
+        q.property_seed=property_seed;
+        q.property_dynamic=property_dynamic;
         if(buffer_rows && direction!="dispatch") throw std::runtime_error("buffer only applies to Dispatch");
         if(direction!="combine") verify_grouped_ep<false>(world,along_n,along_n?4:1,along_n?4:2,8,q);
         if(direction!="dispatch") verify_grouped_ep<true>(world,along_n,along_n?4:1,along_n?4:2,8);
       }
-      puts("PASSED grouped-ep: both CTASP fusions, routed bytes, numeric, tails, skew, GPU-variable Graph; performance NOT measured");
+      report_grouped_validation("ep",direction,2,property_seed>=0?16:3,
+          "routed bytes, numeric, dynamic Graph boundaries; performance NOT measured");
       return 0;
     }
     if(argc!=1) throw std::runtime_error("usage: grouped_bf16 [--ep 4|8 | --case EP H F EXPERTS TOPK ROWS]");

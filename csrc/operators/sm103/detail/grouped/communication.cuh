@@ -25,9 +25,12 @@ struct GroupedCommParams {
   Bf16* const* output = nullptr;             // dispatch: experts; combine: peers
   uint32_t* ready = nullptr;
   uint32_t* arrivals = nullptr;              // dispatch only, one counter/panel
+  const int32_t* first_wave_panels = nullptr;// dispatch production cohort
+  const int32_t* effective_comm_ctas = nullptr;// actual useful producer breadth
   uint32_t* consumed = nullptr;              // bounded Dispatch: N readers finished
   int32_t buffer_m = 0;                      // physical 128-row slots per expert
   bool balance_tail = false;
+  bool cp_async_g2s = true;
   uint32_t* peer_done[kMaxWorldSize]{};       // per receiver [source rank * stride]
   int32_t columns = 0, topk = 0, rank = 0, world_size = 0, num_comm_ctas = 0;
   uint32_t epoch = 0;
@@ -41,12 +44,85 @@ struct GroupedPrepareParams {
   uint32_t* epoch = nullptr;
   uint32_t* arrivals = nullptr;
   uint32_t* consumed = nullptr;
+  int32_t* first_wave_panels = nullptr;
+  int32_t* effective_comm_ctas = nullptr;
+  GroupedTileOrder order{};
   bool balance_tail = false;
-  int32_t num_comm_ctas = 0;
+  int32_t num_comm_ctas = 0, num_compute_ctas = 0;
   uint32_t* peer_started[kMaxWorldSize]{};
   int32_t experts = 0, n = 0, k = 0, rank = 0, world_size = 0;
   int64_t row_capacity = 0;
   int32_t expert_row_capacity = INT32_MAX;
+};
+
+struct GroupedInvocationPolicy {
+  int32_t num_comm_ctas = 0, num_compute_ctas = 0, swizzle = 1;
+  bool along_n = false;
+  bool borrow_idle_compute_ctas = false;
+};
+
+// No selection, storage or extra synchronization in the explicit-policy path.
+struct GroupedExplicitPreparePolicy {
+  CUTLASS_DEVICE void select(const GroupedPrepareParams&) const {}
+  CUTLASS_DEVICE int num_comm_ctas(const GroupedPrepareParams& p) const {
+    return p.num_comm_ctas;
+  }
+  CUTLASS_DEVICE int num_compute_ctas(const GroupedPrepareParams& p) const {
+    return p.num_compute_ctas;
+  }
+  CUTLASS_DEVICE int first_consumer_panels(const GroupedPrepareParams& p) const {
+    return grouped_use_latency_cohort(p.row_offsets,p.experts)
+        ? grouped_first_wave_panels(p.order,p.num_compute_ctas) : -1;
+  }
+  CUTLASS_DEVICE bool borrow_idle_compute_ctas(const GroupedPrepareParams&) const {
+    return false;  // A positive public communication budget is exact.
+  }
+};
+
+// Dispatch-only adapter for a calibrated, allocation-free device selector.
+// It reads actual row counts and the completed tile prefix, not shapes (other
+// threads finish those at the existing barrier). Tile/layout types stay fixed.
+template <class Params, class Selector>
+struct GroupedPreparePolicyPatch {
+  Params* invocation_params = nullptr;
+  Selector selector{};
+  GroupedInvocationPolicy initial{};
+  int32_t launch_ctas = 0;
+
+  CUTLASS_DEVICE void select(const GroupedPrepareParams& p) const {
+    const auto chosen = selector(p, initial);
+    assert(invocation_params && chosen.num_comm_ctas > 0 && chosen.num_compute_ctas > 0 &&
+        int64_t(chosen.num_comm_ctas) + chosen.num_compute_ctas <= launch_ctas &&
+        (chosen.swizzle == 1 || chosen.swizzle == 2 || chosen.swizzle == 4 || chosen.swizzle == 8));
+    auto& params = *invocation_params;
+    params.num_comm_ctas = chosen.num_comm_ctas;
+    params.compute_ctas = chosen.num_compute_ctas;
+    params.borrow_idle_compute_ctas = chosen.borrow_idle_compute_ctas;
+    auto& schedule = params.gemm.scheduler;
+    schedule.block_offset = chosen.num_comm_ctas;
+    schedule.compute_ctas = chosen.num_compute_ctas;
+    schedule.order.swizzle = chosen.swizzle;
+    schedule.order.along_n = chosen.along_n;
+    auto& comm = params.comm.params;
+    comm.num_comm_ctas = chosen.num_comm_ctas;
+    comm.order.swizzle = chosen.swizzle;
+    comm.order.along_n = chosen.along_n;
+  }
+
+  CUTLASS_DEVICE int num_comm_ctas(const GroupedPrepareParams&) const {
+    return invocation_params->num_comm_ctas;
+  }
+  CUTLASS_DEVICE int num_compute_ctas(const GroupedPrepareParams&) const {
+    return invocation_params->compute_ctas;
+  }
+  CUTLASS_DEVICE int first_consumer_panels(const GroupedPrepareParams& p) const {
+    const auto& params=*invocation_params;
+    return grouped_use_latency_cohort(p.row_offsets,p.experts)
+        ? grouped_first_wave_panels(params.comm.params.order,params.compute_ctas) : -1;
+  }
+  CUTLASS_DEVICE bool borrow_idle_compute_ctas(const GroupedPrepareParams&) const {
+    return invocation_params->borrow_idle_compute_ctas;
+  }
 };
 
 // Fixed-size Graph node, GPU-variable expert counts. No padded expert work or
@@ -57,12 +133,14 @@ struct GroupedPrepareParams {
 // Entry publication follows prior input writes on the calling stream; exit
 // publication follows all output writes. This also prevents a fast rank from
 // reusing input storage while another rank is still reading the prior call.
-template <int TileM = 128>
-__global__ void prepare_grouped_invocation(GroupedPrepareParams p) {
+template <int TileM = 128, bool SwapAB = false, class Policy = GroupedExplicitPreparePolicy>
+CUTLASS_DEVICE void prepare_grouped_invocation_body(
+    GroupedPrepareParams p, Policy policy = {}) {
   for (int e=threadIdx.x; e<p.experts; e+=blockDim.x) {
     const int64_t rows = p.row_offsets[e+1]-p.row_offsets[e];
     assert(rows >= 0 && rows <= p.expert_row_capacity);
-    p.shapes[e] = cute::make_shape(int32_t(rows),p.n,p.k);
+    p.shapes[e] = cute::make_shape(SwapAB ? p.n : int32_t(rows),
+        SwapAB ? int32_t(rows) : p.n,p.k);
   }
   if (threadIdx.x == 0) {
     assert(p.row_offsets[0] == 0 && p.row_offsets[p.experts] <= p.row_capacity);
@@ -72,19 +150,36 @@ __global__ void prepare_grouped_invocation(GroupedPrepareParams p) {
       tiles += (p.row_offsets[e+1]-p.row_offsets[e]+TileM-1)/TileM;
       p.row_tile_offsets[e+1] = tiles;
     }
+    policy.select(p);
+    if (p.first_wave_panels)
+      *p.first_wave_panels=policy.first_consumer_panels(p);
+    if (p.effective_comm_ctas) {
+      const int configured_comm_ctas=policy.num_comm_ctas(p);
+      const int configured_compute_ctas=policy.num_compute_ctas(p);
+      *p.effective_comm_ctas=p.arrivals && policy.borrow_idle_compute_ctas(p)
+          ? grouped_effective_dispatch_ctas(
+          tiles,p.order.n_tiles,configured_comm_ctas,configured_compute_ctas,
+          grouped_dispatch_producer_groups(p.row_offsets,p.experts))
+          : configured_comm_ctas;
+    }
     assert(*p.epoch != UINT32_MAX);
     ++*p.epoch;
   }
   __syncthreads();
+  const int num_comm_ctas = p.effective_comm_ctas
+      ? *p.effective_comm_ctas : policy.num_comm_ctas(p);
   if (p.consumed)
     for (int64_t panel=threadIdx.x; panel<p.row_tile_offsets[p.experts]; panel+=blockDim.x)
       p.consumed[panel]=0;
-  if (p.arrivals && grouped_dispatch_splits(p.row_tile_offsets[p.experts],p.num_comm_ctas)>1)
+  const int first_wave=p.first_wave_panels?*p.first_wave_panels:0;
+  if (p.arrivals && grouped_dispatch_splits(
+      p.row_tile_offsets[p.experts],num_comm_ctas,first_wave,
+      int64_t(128)*p.k*sizeof(Bf16))>1)
     for (int64_t panel=threadIdx.x; panel<p.row_tile_offsets[p.experts]; panel+=blockDim.x)
       p.arrivals[panel]=0;
   else if (p.arrivals && p.balance_tail) {
     const int64_t panels=p.row_tile_offsets[p.experts];
-    const int64_t begin=panels-panels%p.num_comm_ctas;
+    const int64_t begin=panels-panels%num_comm_ctas;
     if (begin) for(int64_t panel=begin+threadIdx.x;panel<panels;panel+=blockDim.x)
       p.arrivals[panel]=0;
   }
@@ -101,6 +196,14 @@ __global__ void prepare_grouped_invocation(GroupedPrepareParams p) {
     }
     __syncwarp();
   }
+}
+
+// Keep preparation as its own ordered Graph node. Folding this work into CTA0
+// of the persistent grid replaces one small launch with a grid-wide barrier;
+// that barrier regresses larger workloads even when it helps the shortest one.
+template <int TileM = 128, bool SwapAB = false, class Policy = GroupedExplicitPreparePolicy>
+__global__ void prepare_grouped_invocation(GroupedPrepareParams p, Policy policy = {}) {
+  prepare_grouped_invocation_body<TileM,SwapAB>(p,policy);
 }
 
 // Invocation state is private to Grouped; neither transport depends on Projection.

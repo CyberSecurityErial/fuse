@@ -11,6 +11,8 @@ struct GroupedTokenSource {
   int32_t rank = 0, token = 0, slot = 0;
 };
 
+enum class GroupedDispatchCopy : int32_t { CpAsync = 0, Tma = 1 };
+
 struct GroupedGemmPolicy {
   int32_t num_comm_ctas = 20;
   int32_t num_compute_ctas = 128;
@@ -19,10 +21,25 @@ struct GroupedGemmPolicy {
   // Explicit CUTLASS configuration; no shape-name heuristic or online search.
   // M is 128; N=128/256, K=64/128. Stage count follows the SMEM carveout.
   int32_t tile_n = 128, tile_k = 64;
+  // 1: ordinary one-CTA UMMA. 2: Blackwell two-CTA UMMA; Dispatch-only and
+  // explicit for now. Paired producer CTAs retire into the full-SM GEMM after
+  // their queues drain; use only when that measured rendezvous cost is repaid.
+  int32_t mma_sm_count = 1;
+  // Remote scattered rows favor full-warp cp.async at small transfer sizes;
+  // TMA remains available for large/continuous workloads. Selection is fixed
+  // at plan creation and branches outside the transport hot loop.
+  GroupedDispatchCopy dispatch_copy = GroupedDispatchCopy::CpAsync;
   // Share only the last incomplete communication batch across CTAs. Delivery
   // stays full-K/128 rows. Opt-in: small workloads benefit; large ones can be
   // flat. Detailed per-panel profiling currently requires this to be false.
   bool balance_dispatch_tail = false;
+  // Dispatch-only opt-in: compute D^T=W*A^T without transposing buffers.
+  // TileN must be 128. Along/swizzle remain in logical (token, feature)
+  // coordinates; full-K/128-row readiness is unchanged. Default stays off.
+  bool swap_ab = false;
+  // Diagnostic control: isolate the transposed layout from tail-MMA savings.
+  // Ignored without swap_ab; selected once on the host, not in the K loop.
+  bool trim_swap_tokens = true;
 };
 
 // Device arrays contain one matrix pointer per LOCAL expert. Matrices are

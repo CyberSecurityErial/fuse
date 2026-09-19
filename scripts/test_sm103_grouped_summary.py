@@ -8,10 +8,43 @@ import unittest
 from unittest.mock import patch
 
 from summarize_sm103_grouped import audit_samples, comparison_rows, catalog_rows, seed_fusion_plan, collect_plan, catalog_markdown, collect_external_plan, external_markdown, grouped_handoff_trace
-from summarize_sm103_grouped import grouped_ready_checks, grouped_ready_summary
+from summarize_sm103_grouped import (grouped_ready_checks, grouped_ready_summary,
+    component_headroom, component_headroom_markdown)
+import summarize_sm103_grouped
 
 
 class GroupedSummaryTests(unittest.TestCase):
+    def test_auditor_records_explicit_tma_copy_method(self):
+        source=Path(summarize_sm103_grouped.__file__).read_text()
+        self.assertIn("sample.get('dispatch_copy',0)",source)
+        self.assertIn("row['config']['dispatch_copy'] = 'tma'",source)
+
+    def test_component_headroom_keeps_same_run_components_and_latest_repeat(self):
+        config=dict(tile_n=128,tile_k=64,along_n=0,swizzle=1,comm=20,compute=128)
+        base=[]; records=[]
+        for ep in (4,8):
+            for m in (64,192):
+                route=f'r{ep}-{m}'
+                base.append(dict(models=['model'],ep=ep,h=64,f=96,experts=12,topk=2,
+                    target_rows=m,status='valid',routing_id=route,fused_ms=10.,
+                    reference=dict(ms=4.,pflops=2.,backend='cutlass_stock')))
+                rows=[dict(direction='dispatch',mode=mode,config=config,valid=True,ms=ms,pflops=1/ms)
+                      for mode,ms in [('fused',8.),('cutlass_matched',5.),('transport_body',4.)]]
+                records.append(dict(run_id=f'02-{ep}-{m}',case_index=0,source_id='s',
+                    environment_fingerprint='e',world=ep,fused_only=True,search=False,
+                    geometry=dict(h=64,f=96,experts=12,topk=2,target_rows=m),
+                    routing_ids={'dispatch':route},rows=rows))
+        # A slower older repeat cannot be cherry-picked over the latest run.
+        older=records[0] | dict(run_id='01-old',rows=[r | dict(ms=100.) for r in records[0]['rows']])
+        result=component_headroom(dict(schema='base',rows=base),[older]+records)
+        row=result['rows'][0]
+        self.assertEqual(row['fused_ms'],8.)
+        self.assertEqual(row['ideal_ms'],5.)
+        self.assertAlmostEqual(row['fused_improvement'],.25)
+        self.assertAlmostEqual(row['fusion_uplift_required'],.6)
+        self.assertAlmostEqual(row['gemm_uplift_required'],.25)
+        self.assertIn('Fusion uplift needed',component_headroom_markdown(result))
+
     def test_ready_summary_validates_schedule_and_separates_first_wait(self):
         r=dict(schema='grouped-ready-summary-v1',world=1,rank=0,n=256,k=128,
             tile_n=128,tile_k=64,swizzle=2,along_n=1,comm=1,compute=2,

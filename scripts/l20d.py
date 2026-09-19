@@ -127,7 +127,7 @@ def relay_progress(path, stop):
                                     'summary,', 'precision,', 'counter_epoch,', 'warning,', 'profile_resources,', 'profile_host,',
                                     'profile_dispatch,', 'PASS:', 'fused_bf16:', 'bf16 ',
                                     'BACKWARD ', 'backward_validation ', 'B: p50=', 'W: p50=',
-                                    'CHECK grouped-', 'PASSED grouped-', 'RESULT grouped', 'CASE grouped', 'ERROR:')):
+                                    'CHECK grouped-', 'PASSED grouped-', 'PROPERTY grouped', 'RESULT grouped', 'CASE grouped', 'ERROR:')):
                     print(line.rstrip(), flush=True)
             elif stop.is_set():
                 return
@@ -426,12 +426,34 @@ def grouped_policy(job):
     value = job.get('grouped_policy')
     if value is None:
         return None
-    if job.get('stage') != 'grouped-ep' or not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){5}', value):
-        raise ValueError('grouped policy requires grouped-ep and N,K,AlongN,swizzle,comm,compute')
-    n, k, along, swizzle, comm, compute = map(int, value.split(','))
+    if job.get('stage') != 'grouped-ep' or not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){5,9}', value):
+        raise ValueError('grouped policy requires grouped-ep and N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy]]]]')
+    values = list(map(int, value.split(',')))
+    n, k, along, swizzle, comm, compute = values[:6]
+    swap = values[6] if len(values)>=7 else 0
+    trim = values[7] if len(values)>=8 else 1
+    mma_sms = values[8] if len(values)>=9 else 1
+    copy = values[9] if len(values)==10 else 0
+    if trim not in (0,1) or (len(values)==8 and not swap) or (
+            len(values)>=9 and not swap and trim!=1):
+        raise ValueError('trimTokens requires swapAB and a boolean value')
+    if swap not in (0,1) or (swap and (n!=128 or job.get('grouped_direction')!='dispatch' or
+            job.get('grouped_gemm_search') or job.get('grouped_external') or
+            (job.get('grouped_measure') and not job.get('grouped_fused_only')))):
+        raise ValueError('swapAB requires N128 Dispatch; timing requires fused-only')
     if n not in (128, 256) or k not in (64, 128) or along not in (0, 1) or swizzle not in (1, 2, 4, 8) or min(comm, compute) < 1 or comm + compute > 148:
         raise ValueError('invalid grouped tile, raster, swizzle or CTA budget')
-    return dict(tile_n=n, tile_k=k, along_n=along, swizzle=swizzle, comm=comm, compute=compute)
+    if mma_sms not in (1,2) or (mma_sms==2 and
+            (swap or job.get('grouped_direction')!='dispatch' or comm%2 or compute%2 or comm+compute!=148)):
+        raise ValueError('2SM MMA requires unswapped Dispatch, even CTA budgets, and all 148 SMs')
+    if copy not in (0,1) or (len(values)==10 and job.get('grouped_direction')!='dispatch'):
+        raise ValueError('grouped copy method must be 0=cp.async or 1=TMA on Dispatch')
+    result = dict(tile_n=n, tile_k=k, along_n=along, swizzle=swizzle, comm=comm, compute=compute)
+    if swap: result['swap_ab'] = True
+    if swap and not trim: result['trim_swap_tokens'] = False
+    if mma_sms==2: result['mma_sm_count'] = 2
+    if copy: result['dispatch_copy'] = 'tma'
+    return result
 
 
 def grouped_batch_cases(job):
@@ -478,7 +500,35 @@ def grouped_batch_cases(job):
     return cases
 
 
+def grouped_validation_coverage(job):
+    """Count untimed validation replays per rank, across directions and policies."""
+    cases = grouped_batch_cases(job)
+    if job['stage'] == 'grouped-smoke':
+        directions, policies, replays = ['pure', 'dispatch', 'combine'], 6, 3
+    else:
+        selected = [case['direction'] for case in cases] if cases else [job.get('grouped_direction') or 'both']
+        directions = [d for d in ('dispatch', 'combine') if any(s in ('both', d) for s in selected)]
+        policies = None if cases else (1 if job.get('grouped_case') or job.get('grouped_policy') else 2)
+        replays = 16 if job.get('grouped_property_seed') is not None else (2 if job.get('grouped_case') or cases else 3)
+    configurations = None if policies is None else len(directions) * policies
+    # Timing/profiling add launches, while batches can skip cases for memory.
+    # Do not advertise a fixed executed total for either path.
+    total = None if (configurations is None or job.get('grouped_measure') or job.get('grouped_profile')) else configurations * replays
+    return dict(directions=directions, validation_configurations=configurations,
+                graph_replays=total, graph_replays_per_configuration=replays,
+                graph_replay_scope='validation_per_rank_across_selected_directions_and_policies',
+                property_replays=total if job.get('grouped_property_seed') is not None else None)
+
+
 def validate_job(job, hostname=None):
+    seed=job.get('grouped_property_seed')
+    if job.get('grouped_property_dynamic') and seed is None:
+        raise ValueError('dynamic property probe requires a property seed')
+    if seed is not None and (type(seed) is not int or not 0<=seed<=0xffffffff or
+            job.get('stage')!='grouped-ep' or job.get('grouped_direction')!='dispatch' or
+            any(job.get(k) for k in ('grouped_case','grouped_cases','grouped_measure',
+                'grouped_profile','grouped_gemm_search','grouped_external','grouped_fused_only'))):
+        raise ValueError('property seed requires untimed Dispatch grouped-ep validation')
     if job.get('grouped_compute_compare') and not job.get('grouped_transport_compare'):
         raise ValueError('compute comparison requires transport comparison')
     if job.get('grouped_transport_compare') and (not job.get('grouped_fused_only') or
@@ -2198,13 +2248,14 @@ def remote(job_path):
             devices = fused_devices(job) if is_ep else fused_devices(job)[:1]
             grouped_case = grouped_case_geometry(job)
             grouped_cases = grouped_batch_cases(job)
+            coverage = grouped_validation_coverage(job)
             batch_memory = dict(minimum_free_bytes=min(c['geometry']['minimum_free_bytes'] for c in grouped_cases),
                                 note='Batch starts at smallest case; per-case CUDA memory check skips larger OOM cases') if grouped_cases else None
             env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, devices,
                 grouped_case or batch_memory or dict(minimum_free_bytes=2 << 30, note='Grouped correctness; not a performance benchmark'),
                 maximum_utilization=0)
             write_json(folder / 'grouped-contract.json', dict(
-                boundary='CTASP dispatch/combine with real peer transport' if is_ep else
+                boundary='CTASP ' + '/'.join(coverage['directions']) + ' with real peer transport' if is_ep else
                          'local GEMM with pre-delivered input; transport not tested',
                 performance_measured=bool(job.get('grouped_measure')),
                 measurement_boundary='complete fusion, matched transport and fixed-budget own GEMM' if job.get('grouped_compute_compare') else 'complete fusion and matched transport body' if job.get('grouped_transport_compare') else 'complete fusion only' if job.get('grouped_fused_only') else 'stock CUTLASS/native DeepGEMM pure GEMM and same-round fusion' if job.get('grouped_external') else 'pure CUTLASS grouped GEMM' if job.get('grouped_gemm_search')
@@ -2212,13 +2263,15 @@ def remote(job_path):
                 references={} if job.get('grouped_fused_only') else dict(cublas_grouped_default=dict(tuned=False),
                     cublaslt_sequence=dict(tuned=bool(job.get('grouped_measure') and not job.get('grouped_gemm_search') and not job.get('grouped_external')), candidates=32,
                         workspace_mib=32, warmup=10, samples=50, full_sm_budget=True)),
-                graph_replays=None if job.get('grouped_measure') else (4 if grouped_case else (12 if is_ep else 54)),
+                **coverage,
                 samples=50 if job.get('grouped_measure') else 0,
                 geometry=grouped_case, policy=grouped_policy(job),
                 cases=grouped_cases,
                 gemm_search=bool(job.get('grouped_gemm_search')), physical_devices=devices,
                 external_search=bool(job.get('grouped_external')),
                 profiling=bool(job.get('grouped_profile')),
+                property_seed=job.get('grouped_property_seed'),
+                property_dynamic=bool(job.get('grouped_property_dynamic')),
                 build=recorded))
             # Keep a process-local deadline even if the jump-host disconnects
             # and the interactive runner receives SIGHUP. Only this test's
@@ -2289,6 +2342,10 @@ def remote(job_path):
                     argv += ['--transport-compare']
                 if job.get('grouped_compute_compare') and not grouped_cases:
                     argv += ['--compute-compare']
+                if job.get('grouped_property_dynamic'):
+                    argv += ['--property-dynamic']
+                if job.get('grouped_property_seed') is not None:
+                    argv += ['--property-seed', str(job['grouped_property_seed'])]
         elif stage == 'transport-probe':
             devices = fused_devices(job)[:2]
             env['CUDA_VISIBLE_DEVICES'] = check_fused_devices(job, folder, devices,
@@ -2658,6 +2715,10 @@ def main():
                      help='experimental QKV rank-dependent N-band rotation; separate non-profile build')
     run.add_argument('--world', type=int, choices=(4, 8), default=8, help='fused smoke rank count')
     run.add_argument('--grouped-case', help='grouped-ep sized correctness: H,F,E,TOPK,ROWS')
+    run.add_argument('--grouped-property-seed',type=int,
+                     help='untimed Dispatch: generated routes and row-permutation properties; 16 Graph replays per policy (32 without --grouped-policy)')
+    run.add_argument('--grouped-property-dynamic',action='store_true',
+                     help='with property-seed only: exercise device policy changes across Graph replays; not a production Auto strategy')
     run.add_argument('--grouped-gemm-search', action='store_true', help='32 pure CUTLASS candidates in one process')
     run.add_argument('--grouped-external', action='store_true', help='benchmark-only stock CUTLASS and pinned native DeepGEMM, full SM budget')
     run.add_argument('--grouped-profile', action='store_true', help='isolated globaltimer Dispatch handoff diagnostics; never formal timings')

@@ -1,11 +1,58 @@
-# SM103 BF16 Dispatch + Grouped GEMM — v25.0
+# SM103 BF16 Dispatch + Grouped GEMM — v25.1
 
-User-accepted baseline release. This version publishes **Dispatch -> expert FC1**
-only. The existing Combine baseline and swapAB experiments remain development
-code; neither is part of v25's feature/performance acceptance. Projection and
-SM90 kernels are unchanged.
+User-accepted complete benchmark release. This version publishes **Dispatch ->
+expert FC1** only and restores the small-token rows that were omitted from v25.0.
+The existing Combine baseline and swapAB experiments remain development code;
+neither is part of v25.1's feature/performance acceptance. Projection and SM90
+kernels are unchanged.
 
-[Release results, configurations and coverage](../../results/sm103/v25.0/README.md)
+[Release results, configurations and coverage](../../results/sm103/v25.1/README.md)
+
+## Current development: explainable Grouped Auto
+
+Keep the v25.1 results immutable. New comparisons report complete fusion, matched
+own GEMM and transport, and the full-SM external reference independently. The
+diagnostic ideal is `max(own GEMM, transport)`, not a guaranteed E2E bound.
+Fusion headroom is `fusion / ideal - 1`; compute headroom is `own GEMM / reference
+- 1`. Report signed model residuals as well as nonnegative required improvements.
+There is no fixed 50%/70% acceptance threshold in this development goal.
+
+Initially distinguish per-expert M<192 and M>=192; skewed counts cannot be
+classified using only the mean. Small loads jointly consider integer waves,
+measured tile time, startup and first-delivery latency. Larger loads prioritize
+GEMM then select sufficient communication capacity and its first-use schedule.
+Use device-resident actual counts, no model-name lookup or online timing search.
+Tile/service calibration and held-out validation are still required: the current
+explicit-policy API is NOT yet Grouped Auto. CTASP remains the default.
+
+Correctness work adds `--grouped-property-seed <uint32>` to untimed Dispatch
+`grouped-ep` validation. Sixteen replays of the same graph generate dense, skewed,
+empty and sparse routes; consecutive pairs reverse each expert's row order with
+identical input/weights. Besides the independent numeric/route/tail oracle, the
+results must agree after mapping back to source token/branch coordinates.
+The seed and replay are logged before launch. Existing formal workloads/timings
+are unaffected. Generated schedule/route properties also run on the host against
+the production C++ tile decoder. This initial coverage does not yet establish
+all geometry, buffer and Auto properties; failure shrinking and expanded GPU
+coverage remain work items before accepting tuning results.
+
+The first private model component, `grouped/performance_model.cuh`, scores the
+actual compact input-consumer order. With constant calibrated tile service `t`,
+`T` tasks and `C` compute workers, the compute endpoint is
+`max_panel(ready[panel] + ceil((T-first_consumer[panel])/C)*t)`.
+This is algebraically identical to walking each worker's complete dependency
+chain, but visits only input panels. Generated host properties compare both
+formulations, including out-of-order releases, empty experts and partial bands.
+It is not yet the public Auto selector: transport release estimates, budget-
+specific service calibration, variable swapAB service, and GPU selection costs
+still need validation. Do not interpret the score as measured Tensor Core time.
+
+The private plan now supports a compile-time optional device selector inside
+the existing preparation node. It patches communication count, compute stride/
+offset and both producer/consumer traversal fields together. Its fixed launch
+ceiling preserves cooperative completion even for idle CTAs and empty ranks.
+Explicit public plans keep the original path; no default Auto policy is enabled
+until calibration and dynamic-policy GPU properties have passed.
 
 ## Operator boundary
 
@@ -119,6 +166,74 @@ names or timing searches. Future selection must remain robust across token loads
 small loads emphasize latency, large loads protect compute throughput; use actual
 router counts, not allocation capacity. Communication WASP remains deferred.
 
+### Critical-path balance rule
+
+For the current full-K panel protocol, put production and consumption in the
+same coordinate system:
+
+```text
+panel p:       release R[p,C] ----> first use q[p,L] ----> last worker step
+producer:      C communication CTAs
+consumer:      P=launch_ctas-C compute CTAs, tile/layout L
+```
+
+For actual routed rows, `T` is the GEMM tile count and `tau(P)` is the offline
+measured worker-step service for the exact tile/K/layout and compute budget:
+
+```text
+G(P)       = ceil(T/P) * tau(P)
+remain[p]  = floor((T-1-q[p,L])/P) + 1
+F(C,P,L)   = max(G(P), max_p(R[p,C] + remain[p] * tau(P)))
+exposed(C) = F(C,P,L) - G(P)
+```
+
+`exposed(C)` is the producer delay extending this modeled dependency chain, not
+a measured or necessarily recoverable E2E loss. The planned base Auto selector
+compares discrete candidates by `F`; it does not try to make
+standalone transport and GEMM times numerically equal. More communication is
+useful only when reducing `exposed` saves more time than the corresponding
+increase in `G`. Measured whole-GEMM service is required because B300 GEMM may
+be wave-, operand-movement- or epilogue-limited rather than Tensor-Core-limited.
+
+Candidate generation and service models may explicitly branch on current
+device-resident expert rows, not on a model or fixed benchmark case:
+
+| Routed workload | Candidate priority | Required model terms |
+|---|---|---|
+| `max_e(M_e) < 192` | jointly minimize first-wave delivery, integer waves and later waits | first-wave panel set from Along/swizzle, panel release order, tile service, kernel entry/drain cost |
+| otherwise | preserve the best GEMM configuration, then spend the minimum communication budget whose exposed-wait reduction exceeds its compute penalty | whole-GEMM service by compute budget, steady release curve, later-ready critical endpoint |
+
+The provisional 192 boundary is applied to actual `row_offsets` on every Graph
+replay. It chooses the optimization priority, not an already-proven bottleneck:
+small per-expert M can still produce many waves when many experts are active.
+For example, `[191,191]` and `[0,382]` have the same mean but take different
+branches. Every expert still contributes its actual tiles, tail and ready
+dependencies in either branch; the maximum is not a substitute for that
+distribution. Validate both sides of the boundary and mixed routes.
+
+The recurrence is exact only for uniform worker service, fixed round-robin
+assignment and exogenous releases. It does not simulate prefetch, variable tail
+service, concurrent interference or entry/exit synchronization. Those costs and
+candidate rankings still require GPU validation; this scorer is not public Auto.
+
+Project constraints on the selector:
+
+| Offline evidence | Launch-time inputs | Forbidden dependencies |
+|---|---|---|
+| `tau` by tile/K/layout/compute budget; `R` by copy class/base `C`; profile validation of `q` and the critical panel | device `row_offsets`, active experts, tile count, geometry, EP/world size | online timing/profile, model name, benchmark row, CPU count readback, extra all-rank sync, Graph recapture |
+
+After base `C` is selected, idle-CTA lending is a separate layer:
+
+```text
+idle_compute = P - min(T,P)
+useful_gap   = max(0, independent_producer_groups - C)
+effective_C  = C + min(idle_compute, useful_gap)
+```
+
+This removes the GEMM-wave opportunity cost but can still perturb scheduling or
+caches, so it needs class-level held-out validation. Positive explicit `C`
+remains exact; only Auto or an explicit diagnostic switch may lend.
+
 ## Module ownership
 
 ```text
@@ -131,6 +246,7 @@ csrc/operators/sm103/detail/grouped/
   persistent_gemm.cuh                             grouped scheduling and CTA roles
   cutlass_pipeline.cuh                            acquire/publication adapters
   producer_consumer.cuh                           tile order and bounded windows
+  performance_model.cuh                           calibrated input-dependency scorer
   a2a_gemm.cuh                                    Dispatch gather and delivery
   gemm_a2a.cuh                                    experimental Combine baseline
   communication.cuh                              private peer epoch completion
@@ -142,6 +258,28 @@ module. CUTLASS and low-level architecture primitives are shared dependencies.
 No general transport framework or additional public precision-switch family.
 
 ## Build and measurement
+
+Dispatch has an explicit `policy.swap_ab` experiment (default false, tile N128
+only). It computes `Y^T=W*X^T` as a column-major view of the existing row-major
+output: no transpose allocation/kernel. Logical token/feature traversal, full-K
+128-row ready units and communication budgets are unchanged. Only MMA's last
+token extent is rounded to 16; TMA/epilogue capacities are not reduced. This can
+save tail arithmetic, but does not promise lower ready latency or faster E2E.
+The benchmark policy accepts optional `swapAB[,trimTokens]` fields after the
+original six. `trimTokens=0` selects a compile-time untrimmed MMA control;
+omitting it preserves tail trimming. This separates layout effects from tail
+arithmetic savings without adding a K-loop branch. Use fused-only Dispatch and
+compute-compare for same-budget pure GEMM diagnostics. Raw samples record the flag and the auditor
+checks it. Select only from verified measurements, not model-name rules.
+
+EP4 tuning includes equal N128 grids over K64/128, both rasters and swizzle
+1/2/4/8, followed by forward/reversed-order winner confirmation. SwapAB can
+improve the N128 path without beating a wider ordinary tile. Compare against
+both the same-tile control and the original configuration; do not infer an
+automatic token-count threshold from grid minima. A wider epilogue candidate
+did not show a stable advantage and is not retained. Keep swapAB explicit and
+off by default; the v25.1 published table keeps swapAB disabled. Detailed local
+evidence is maintained outside the repository in `grouped-bf16/swapab-study.json`.
 
 CUDA13, a Blackwell-capable CUTLASS checkout, SM103a and peer-accessible GPUs:
 

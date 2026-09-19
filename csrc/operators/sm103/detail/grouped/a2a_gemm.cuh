@@ -32,15 +32,20 @@ struct GroupedDispatchComm {
   static constexpr size_t SharedStorageBytes =
       kBulkSlots*(kStageBytes+sizeof(uint64_t))+kRowAddressBytes;
   static constexpr bool kNeedsGridFinalize = true;
+  static constexpr bool kReuseIdleComputeCtas = true;
   using Arguments = GroupedCommArguments;
   using Params = Arguments;
 
   static bool can_implement(const Arguments& a) {
-    return valid_grouped_transport(a.params);
+    return valid_grouped_transport(a.params) && a.params.first_wave_panels &&
+        a.params.effective_comm_ctas;
   }
   static Params to_underlying_arguments(const Arguments& a) { return a; }
 
   CUTLASS_DEVICE void operator()(const Params& args, char* smem, int comm, int comm_ctas) {
+#if FUSE_ENABLE_PROFILING
+    GroupedCommSummary summary{};
+#endif
     const int64_t panels=args.params.order.row_tiles();
     const int64_t tail=panels%comm_ctas;
     if (args.params.balance_tail && panels>=comm_ctas && tail) {
@@ -51,15 +56,50 @@ struct GroupedDispatchComm {
       // There is no grid barrier at this transition: each CTA advances after
       // its own prefix. The last contributing CTA releases the original
       // full-K/128-row ready flag; GEMM does not gain extra ready checks.
-      copy<false>(args,smem,comm,comm_ctas,1,0,panels-tail);
-      copy<true>(args,smem,comm,comm_ctas,TileM/(blockDim.x/32),panels-tail,panels);
+      copy_selected<false>(args,smem,comm,comm_ctas,1,0,panels-tail
+#if FUSE_ENABLE_PROFILING
+          ,summary
+#endif
+      );
+      copy_selected<true>(args,smem,comm,comm_ctas,TileM/(blockDim.x/32),panels-tail,panels
+#if FUSE_ENABLE_PROFILING
+          ,summary
+#endif
+      );
+#if FUSE_ENABLE_PROFILING
+      publish_summary(args.params,comm,summary);
+#endif
       return;
     }
+    const int first_wave=args.params.first_wave_panels?*args.params.first_wave_panels:0;
     const int splits = args.params.arrivals ? grouped_dispatch_splits(
-        panels,comm_ctas,TileM,blockDim.x/32) : 1;
-    if (splits>1) copy<true>(args,smem,comm,comm_ctas,splits,0,panels);
-    else copy<false>(args,smem,comm,comm_ctas,1,0,panels);
+        panels,comm_ctas,first_wave,int64_t(TileM)*args.params.columns*sizeof(Bf16),
+        TileM,blockDim.x/32) : 1;
+    if (splits>1) copy_selected<true>(args,smem,comm,comm_ctas,splits,0,panels
+#if FUSE_ENABLE_PROFILING
+        ,summary
+#endif
+    );
+    else copy_selected<false>(args,smem,comm,comm_ctas,1,0,panels
+#if FUSE_ENABLE_PROFILING
+        ,summary
+#endif
+    );
+#if FUSE_ENABLE_PROFILING
+    publish_summary(args.params,comm,summary);
+#endif
   }
+
+#if FUSE_ENABLE_PROFILING
+  CUTLASS_DEVICE void publish_summary(
+      const GroupedCommParams& p, int comm, const GroupedCommSummary& summary) {
+    const int warp=threadIdx.x/32;
+    const int index=comm*(blockDim.x/32)+warp;
+    if ((threadIdx.x&31)==0 && p.profile.comm_summary &&
+        index<p.profile.comm_summary_capacity)
+      p.profile.comm_summary[index]=summary;
+  }
+#endif
 
   // Each warp owns one stage. Different warps overlap their batches; a warp
   // completes its own S2G before reusing its stage. Gathered source rows stay
@@ -67,8 +107,13 @@ struct GroupedDispatchComm {
   //   warp0: G2S -> S2G -> wait -> G2S ...
   //   warp1:   G2S -> S2G -> wait -> G2S ...
   //   all destination writes complete -> CTA join -> ONE full-panel ready.
+  template <bool CpAsyncG2S>
   CUTLASS_DEVICE void copy_staged(const GroupedCommParams& p, char* smem,
-      int expert, int first_row, int valid_rows, int64_t source_begin) {
+      int expert, int first_row, int valid_rows, int64_t source_begin
+#if FUSE_ENABLE_PROFILING
+      ,GroupedCommSummary& summary
+#endif
+  ) {
     int batch_rows=1;
     while (batch_rows < TileM && int64_t(batch_rows)*2*p.columns*sizeof(Bf16) <= kStageBytes)
       batch_rows*=2;
@@ -95,6 +140,9 @@ struct GroupedDispatchComm {
     auto** row_sources=reinterpret_cast<const Bf16**>(smem+
         kBulkSlots*(kStageBytes+sizeof(uint64_t)));
     const int batch_shift=__ffs(batch_rows)-1;  // batch_rows is a power of two
+#if FUSE_ENABLE_PROFILING
+    const uint64_t address_begin=read_global_timer();
+#endif
     for(int owned=lane;;owned+=32) {
       const int row=(owned>>batch_shift)*kBulkSlots*batch_rows+
           warp*batch_rows+(owned&(batch_rows-1));
@@ -103,39 +151,114 @@ struct GroupedDispatchComm {
       row_sources[row]=p.input[route.rank]+int64_t(route.token)*p.columns;
     }
     __syncwarp();
-    if(lane!=0) return;
+#if FUSE_ENABLE_PROFILING
+    if(lane==0) {
+      ++summary.panels;
+      summary.address_ns+=read_global_timer()-address_begin;
+    }
+#endif
     auto* barrier=reinterpret_cast<uint64_t*>(smem+kStageBytes*kBulkSlots)+warp;
-    cute::initialize_barrier(*barrier,1);
-    cutlass::arch::fence_barrier_init();
-    fence_proxy_async_global();
+    if constexpr (!CpAsyncG2S) {
+      if(lane!=0) return;
+      cute::initialize_barrier(*barrier,1);
+      cutlass::arch::fence_barrier_init();
+      fence_proxy_async_global();
+    }
     int phase=0;
     for(int begin=warp*batch_rows;begin<valid_rows;begin+=kBulkSlots*batch_rows) {
       const int count=valid_rows-begin<batch_rows ? valid_rows-begin : batch_rows;
-      // Prior destination writes must finish before this stage is overwritten.
-      tma_store_wait_all();
-      auto* buffer=reinterpret_cast<Bf16*>(smem+warp*kStageBytes);
-      cute::set_barrier_transaction_bytes(*barrier,count*p.columns*sizeof(Bf16));
-      for(int r=0;r<count;++r) {
-        const Bf16* src=row_sources[begin+r];
-        SM100_BULK_COPY_G2S::copy(src,barrier,buffer+int64_t(r)*p.columns,p.columns*sizeof(Bf16));
+      // Reusing this SMEM stage only requires the async engine to finish
+      // reading its source. Destination-global visibility is stronger and is
+      // required only once, at the full-panel publication boundary below.
+      // Keeping the two waits distinct avoids serializing every batch on the
+      // previous batch's NVLink/global write completion.
+#if FUSE_ENABLE_PROFILING
+      uint64_t stamp=lane==0?read_global_timer():0;
+#endif
+      if(lane==0) cute::tma_store_wait<0>();
+      if constexpr (CpAsyncG2S) __syncwarp();
+#if FUSE_ENABLE_PROFILING
+      if(lane==0) {
+        summary.store_wait_ns+=read_global_timer()-stamp;
+        stamp=read_global_timer();
       }
-      cute::wait_barrier(*barrier,phase);
-      phase^=1;
-      cute::tma_store_fence();
-      const int logical_row=first_row+begin;
-      const int physical_row=p.buffer_m ? logical_row%(p.buffer_m*TileM) : logical_row;
-      SM100_BULK_COPY_S2G::copy(buffer,p.output[expert]+int64_t(physical_row)*p.columns,
-          count*p.columns*sizeof(Bf16));
-      cute::tma_store_arrive();
+#endif
+      auto* buffer=reinterpret_cast<Bf16*>(smem+warp*kStageBytes);
+#if FUSE_ENABLE_PROFILING
+      uint64_t g2s_issued=0;
+#endif
+      if constexpr (CpAsyncG2S) {
+        for(int r=0;r<count;++r) {
+          auto* src=reinterpret_cast<const uint4*>(row_sources[begin+r]);
+          auto* dst=reinterpret_cast<uint4*>(buffer+int64_t(r)*p.columns);
+          for(int i=lane;i<p.columns/8;i+=32)
+            cute::SM80_CP_ASYNC_CACHEGLOBAL<uint4>::copy(src[i],dst[i]);
+        }
+        cute::cp_async_fence();
+#if FUSE_ENABLE_PROFILING
+        if(lane==0) g2s_issued=read_global_timer();
+#endif
+        cute::cp_async_wait<0>();
+        __syncwarp();
+      } else {
+        cute::set_barrier_transaction_bytes(*barrier,count*p.columns*sizeof(Bf16));
+        for(int r=0;r<count;++r) {
+          const Bf16* src=row_sources[begin+r];
+          SM100_BULK_COPY_G2S::copy(src,barrier,buffer+int64_t(r)*p.columns,p.columns*sizeof(Bf16));
+        }
+#if FUSE_ENABLE_PROFILING
+        g2s_issued=read_global_timer();
+#endif
+      }
+#if FUSE_ENABLE_PROFILING
+      if(lane==0) summary.g2s_issue_ns+=g2s_issued-stamp;
+#endif
+      if constexpr (!CpAsyncG2S) cute::wait_barrier(*barrier,phase);
+#if FUSE_ENABLE_PROFILING
+      const uint64_t g2s_done=lane==0?read_global_timer():0;
+      if(lane==0) {
+        summary.g2s_wait_ns+=g2s_done-g2s_issued;
+        summary.g2s_ns+=g2s_done-stamp;
+        stamp=read_global_timer();
+      }
+#endif
+      if(lane==0) {
+        phase^=1;
+        cute::tma_store_fence();
+        const int logical_row=first_row+begin;
+        const int physical_row=p.buffer_m ? logical_row%(p.buffer_m*TileM) : logical_row;
+        SM100_BULK_COPY_S2G::copy(buffer,p.output[expert]+int64_t(physical_row)*p.columns,
+            count*p.columns*sizeof(Bf16));
+        cute::tma_store_arrive();
+      }
+#if FUSE_ENABLE_PROFILING
+      if(lane==0) {
+        summary.store_issue_ns+=read_global_timer()-stamp;
+        ++summary.batches;
+        summary.bytes+=uint64_t(count)*p.columns*sizeof(Bf16);
+      }
+#endif
     }
-    tma_store_wait_all();
-    const uint32_t address=cute::cast_smem_ptr_to_uint(barrier);
-    asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(address) : "memory");
+#if FUSE_ENABLE_PROFILING
+    const uint64_t final_wait=lane==0?read_global_timer():0;
+#endif
+    if(lane==0) tma_store_wait_all();
+#if FUSE_ENABLE_PROFILING
+    if(lane==0) summary.store_wait_ns+=read_global_timer()-final_wait;
+#endif
+    if constexpr (!CpAsyncG2S) {
+      const uint32_t address=cute::cast_smem_ptr_to_uint(barrier);
+      asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(address) : "memory");
+    }
   }
 
-  template <bool SharedPanels>
+  template <bool SharedPanels, bool CpAsyncG2S>
   CUTLASS_DEVICE void copy(const Params& args, char* smem, int comm, int comm_ctas, int splits,
-      int64_t begin, int64_t end) {
+      int64_t begin, int64_t end
+#if FUSE_ENABLE_PROFILING
+      ,GroupedCommSummary& summary
+#endif
+  ) {
     const auto& p = args.params;
     const uint32_t epoch = p.epoch_ptr ? *p.epoch_ptr : p.epoch;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -187,9 +310,17 @@ struct GroupedDispatchComm {
           // may belong to other CTAs. Never bulk-store across that gap.
           const int stop=tail<TileM?tail:TileM;
           for(int offset=stripe*warps;offset<stop;offset+=warps*producers)
-            copy_staged(p,smem,expert,m*TileM+offset,
-                stop-offset<warps?stop-offset:warps,start);
-        } else copy_staged(p,smem,expert,m*TileM,tail<TileM?tail:TileM,start);
+            copy_staged<CpAsyncG2S>(p,smem,expert,m*TileM+offset,
+                stop-offset<warps?stop-offset:warps,start
+#if FUSE_ENABLE_PROFILING
+                ,summary
+#endif
+            );
+        } else copy_staged<CpAsyncG2S>(p,smem,expert,m*TileM,tail<TileM?tail:TileM,start
+#if FUSE_ENABLE_PROFILING
+            ,summary
+#endif
+        );
       }
       else for (int row = m * TileM + stripe * warps + warp;
            row < (m + 1) * TileM && row < rows; row += warps * producers) {
@@ -233,6 +364,29 @@ struct GroupedDispatchComm {
     }
   }
 
+  // The copy-engine choice is invocation-static. Branch once before entering
+  // the panel loop so neither implementation pays a per-batch method check.
+  template <bool SharedPanels>
+  CUTLASS_DEVICE void copy_selected(const Params& args, char* smem, int comm,
+      int comm_ctas, int splits, int64_t begin, int64_t end
+#if FUSE_ENABLE_PROFILING
+      ,GroupedCommSummary& summary
+#endif
+  ) {
+    if (args.params.cp_async_g2s)
+      copy<SharedPanels,true>(args,smem,comm,comm_ctas,splits,begin,end
+#if FUSE_ENABLE_PROFILING
+          ,summary
+#endif
+      );
+    else
+      copy<SharedPanels,false>(args,smem,comm,comm_ctas,splits,begin,end
+#if FUSE_ENABLE_PROFILING
+          ,summary
+#endif
+      );
+  }
+
   CUTLASS_DEVICE void finalize(const Params& args) {
     finalize_grouped_transport(args.params);
   }
@@ -243,8 +397,18 @@ static_assert(GroupedDispatchComm<>::SharedStorageBytes <= sizeof(Bf16GroupedGem
 static_assert(GroupedDispatchComm<>::SharedStorageBytes <= sizeof(Bf16GroupedGemmTypes<256,64>::DispatchGemm::SharedStorage));
 static_assert(GroupedDispatchComm<>::SharedStorageBytes <= sizeof(Bf16GroupedGemmTypes<256,128>::DispatchGemm::SharedStorage));
 
-template <int TileN = 128, int TileK = 64>
+template <int TileN = 128, int TileK = 64, bool SwapAB = false, bool TrimTokens = true>
 using A2AGroupedGemm = GroupedMonolithicGemm<
-    typename Bf16GroupedGemmTypes<TileN, TileK>::DispatchGemm, GroupedDispatchComm<>>;
+    typename Bf16GroupedGemmTypes<TileN, TileK, SwapAB, TrimTokens>::DispatchGemm, GroupedDispatchComm<>>;
+
+template <int TileN = 128, int TileK = 64>
+using RetiringA2AGroupedGemm = GroupedMonolithicGemm<
+    typename Bf16GroupedRetiringGemmTypes<TileN,TileK>::DispatchGemm,
+    GroupedDispatchComm<256>,GroupedExplicitPreparePolicy,true>;
+
+static_assert(GroupedDispatchComm<256>::SharedStorageBytes <=
+    sizeof(Bf16GroupedRetiringGemmTypes<128,64>::DispatchGemm::SharedStorage));
+static_assert(GroupedDispatchComm<256>::SharedStorageBytes <=
+    sizeof(Bf16GroupedRetiringGemmTypes<256,64>::DispatchGemm::SharedStorage));
 
 }  // namespace fuse::detail

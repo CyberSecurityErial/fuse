@@ -42,7 +42,8 @@ struct GroupedSwapABMainloop : Base {
       const int tokens = cute::get<1>(shapes_[int(cute::get<3>(coord))]);
       const int remaining = tokens - int(cute::get<1>(coord)) * 128;
       const int valid = remaining < 128 ? remaining : 128;
-      // InstrDescriptor stores N/8; BF16 M128 requires N in multiples of16.
+      // InstrDescriptor stores N/8. Keep the validated 16-token rounding;
+      // this is conservative, not a single-CTA BF16 hardware requirement.
       cute::get<0>(narrowed).idesc_.n_dim_ = ((valid + 15) / 16 * 16) >> 3;
     }
     return Base::mma(pipelines,states,accum,narrowed,coord,k_count);
@@ -55,7 +56,7 @@ struct GroupedSwapABMainloop : Base {
 // been installed in the TMA descriptor. Retain that expert at descriptor update
 // instead of treating load's L=0 as expert zero. A full M panel is acquired once
 // across both load calls (prologue/remainder), not at every K tile.
-template <class Base, bool SwapAB = false>
+template <class Base, bool SwapAB = false, int SmMode = 1>
 struct GroupedInputReadyMainloop : Base {
   using Base::Base;
   struct Arguments : Base::Arguments {
@@ -114,10 +115,12 @@ struct GroupedInputReadyMainloop : Base {
   CUTLASS_DEVICE auto load(const Params& p, typename Base::MainloopPipeline pipeline,
       typename Base::MainloopPipelineState state, const Inputs& inputs,
       const Coord& coord, Iterator k, int count, bool changed) {
+    const int physical_m=int(cute::get<SwapAB ? 1 : 0>(coord));
+    const int logical_m=physical_m/SmMode;
 #if FUSE_ENABLE_PROFILING
     // One record per output tile's FIRST load() call. Prologue/remainder
     // reuse must not overwrite it. No new ready checks or synchronization.
-    const int64_t profile_row = p.profile.tiles ? p.row_tile_offsets[expert_] + int(cute::get<SwapAB ? 1 : 0>(coord)) : -1;
+    const int64_t profile_row = p.profile.tiles ? p.row_tile_offsets[expert_] + logical_m : -1;
     const int64_t profile_tile = profile_row * p.profile.n_tiles + int(cute::get<SwapAB ? 0 : 1>(coord));
     const bool record = p.profile.tiles && count > 0 && profile_tile != profiled_tile_;
     const bool leader = threadIdx.x % 32 == 0;
@@ -126,7 +129,7 @@ struct GroupedInputReadyMainloop : Base {
     bool polled = false;
 #endif
     if (p.ready && count > 0) {
-      const int64_t row = p.row_tile_offsets[expert_] + int(cute::get<SwapAB ? 1 : 0>(coord));
+      const int64_t row = p.row_tile_offsets[expert_] + logical_m;
       if (row != acquired_) {
         const uint32_t epoch = p.epoch_ptr ? *p.epoch_ptr : p.epoch;
         if (threadIdx.x % 32 == 0) {
@@ -165,7 +168,7 @@ struct GroupedInputReadyMainloop : Base {
     if (record) {
       if (leader && profile_row < p.profile.panel_capacity)
         p.profile.tiles[profile_tile] = {wait_begin, observed, load_begin, read_global_timer(),
-            int(blockIdx.x), expert_, int(cute::get<SwapAB ? 1 : 0>(coord)), int(cute::get<SwapAB ? 0 : 1>(coord)), int(polled)};
+            int(blockIdx.x), expert_, logical_m, int(cute::get<SwapAB ? 0 : 1>(coord)), int(polled)};
       profiled_tile_ = profile_tile;
     }
     return result;

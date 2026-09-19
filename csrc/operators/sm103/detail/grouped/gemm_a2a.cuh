@@ -16,6 +16,7 @@ struct GroupedCombineComm {
   static constexpr int kMinThreads = 256;
   static constexpr size_t SharedStorageBytes = 0;
   static constexpr bool kNeedsGridFinalize = true;
+  static constexpr bool kReuseIdleComputeCtas = false;
   using Arguments = GroupedCommArguments;
   using Params = Arguments;
 

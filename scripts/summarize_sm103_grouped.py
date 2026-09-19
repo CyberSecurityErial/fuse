@@ -255,6 +255,21 @@ def audit_run(directory, case_index=None):
             for column,key in (('tail_balance','grouped_tail_balance'),('hot_half','grouped_hot_half')):
                 require(int(r.get(column,0))==int(bool(job.get(key))), 'Measured tail/routing option mismatch')
     policy = grouped_policy(job) or dict(tile_n=128,tile_k=64,along_n=0,swizzle=1,comm=20,compute=128)
+    # Old archives predate the optional column and mean swapAB=off. Never
+    # compare a swapped candidate under an indistinguishable six-field key.
+    for sample in csv.DictReader(io.StringIO(data['grouped-samples.csv'].decode())):
+        require(int(sample.get('swap_ab',0))==int(policy.get('swap_ab',False)),
+                'Measured swapAB differs from request')
+        require(int(sample.get('trim_swap_tokens',1))==int(policy.get('trim_swap_tokens',True)),
+                'Measured swapAB tail trimming differs from request')
+        require(int(sample.get('dispatch_copy',0))==int(policy.get('dispatch_copy')=='tma'),
+                'Measured Dispatch copy method differs from request')
+    if policy.get('swap_ab'):
+        for row in rows: row['config']['swap_ab'] = True
+    if policy.get('trim_swap_tokens') is False:
+        for row in rows: row['config']['trim_swap_tokens'] = False
+    if policy.get('dispatch_copy') == 'tma':
+        for row in rows: row['config']['dispatch_copy'] = 'tma'
     for row in rows:
         if search == 'external':
             require(row['config']==policy if row['mode']=='fused' else
@@ -832,6 +847,8 @@ def grouped_ready_summary(ranks):
         sums={k:sum(a[k] for a in active) for k in ('role_ns','wait_ns','checks','first_wait_ns','long_checks')}
         summaries.append(dict(rank=r['rank'],active_compute_ctas=len(active),
             local_role_us=(max(a[1] for a in r['ctas'])-origin)/1000,
+            finalize_done_us=(max(a[2] for a in r['ctas'])-origin)/1000,
+            grid_finalize_us=(max(a[2] for a in r['ctas'])-max(a[1] for a in r['ctas']))/1000,
             comm_done_us=(max(a[1] for a in r['ctas'][:r['comm']])-origin)/1000,
             compute_done_us=(max(a['end_ns'] for a in active)-origin)/1000,
             critical_cta=critical['cta'],critical_role_us=critical['role_ns']/1000,
@@ -963,15 +980,15 @@ def ready_markdown(table):
         lines.append('| '+', '.join(models)+f' | {ep} | '+', '.join(str(r['target_rows']) for r in rows)+
                      f' | {min(waits):.1f}–{max(waits):.1f}% |')
     lines+=['','## 完整矩阵（含缺失点）','',
-        '| 模型 | EP | M | 策略 | 等待占比 | 全rank加权等待 | 首等 μs | 后续等 μs | 计算角色 μs | 通信完成 μs | 计算完成 μs | 状态 |',
-        '|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|']
+        '| 模型 | EP | M | 策略 | 等待占比 | 全rank加权等待 | 首等 μs | 后续等 μs | 计算角色 μs | 通信完成 μs | 计算完成 μs | Join/finalize μs | 状态 |',
+        '|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|']
     for r in table['rows']:
         cells=[', '.join(r['models']),str(r['ep']),str(r['target_rows']),r['policy']]
         if r['status']=='valid':
             cells += [f"{100*r['critical_wait_fraction']:.1f}%",f"{100*r['all_rank_wait_fraction']:.1f}%"]
-            cells += [f"{r[k]:.2f}" for k in ('critical_first_wait_us','critical_later_wait_us','critical_role_us','comm_done_us','compute_done_us')]
+            cells += [f"{r[k]:.2f}" for k in ('critical_first_wait_us','critical_later_wait_us','critical_role_us','comm_done_us','compute_done_us','grid_finalize_us')]
             cells += [r['wait_class']]
-        else: cells+=['—']*7+[r['status']]
+        else: cells+=['—']*8+[r['status']]
         lines.append('| '+' | '.join(cells)+' |')
     return '\n'.join(lines)+'\n'
 
@@ -1009,6 +1026,129 @@ def catalog_markdown(table):
     return '\n'.join(lines)
 
 
+def component_headroom(base, records):
+    """Refresh F/G/R diagnostics without changing the frozen strong reference.
+
+    Repeated measurements of the same workload use the latest complete run, not
+    the fastest run.  F, G and R therefore always come from one run, source,
+    route and explicit policy.  The strong full-SM library reference remains the
+    audited reference in ``base``; absent references stay absent.
+    """
+    require(base.get('schema') is not None and isinstance(base.get('rows'), list),
+            'Invalid base headroom table')
+    expected={tuple(r[k] for k in ('h','f','experts','topk','target_rows','ep')):r
+              for r in base['rows'] if r.get('status')=='valid'}
+    require(len(expected)==sum(r.get('status')=='valid' for r in base['rows']),
+            'Duplicate valid workload in base table')
+    measured={}
+    for record in records:
+        require(not record.get('skipped') and record.get('fused_only') and
+                not record.get('search'), 'Expected a completed component run')
+        g=record['geometry']
+        key=tuple(g[k] for k in ('h','f','experts','topk','target_rows'))+(record['world'],)
+        require(key in expected, 'Component workload outside base table')
+        stamp=(record['run_id'], record.get('case_index') or 0)
+        if key not in measured or stamp>measured[key][0]: measured[key]=(stamp,record)
+    require(set(measured)==set(expected), 'Incomplete component matrix')
+    identities={(r['source_id'],r['environment_fingerprint']) for _,r in measured.values()}
+    require(len(identities)==1, 'Mixed component source or environment')
+    rows=[]
+    for original in base['rows']:
+        row={k:original[k] for k in ('models','ep','h','f','experts','topk','target_rows')}
+        if original.get('status')!='valid':
+            row.update(status=original.get('status','not_measured'),missing=original.get('missing',[]))
+            rows.append(row); continue
+        key=tuple(original[k] for k in ('h','f','experts','topk','target_rows','ep'))
+        _,record=measured[key]
+        require(record['routing_ids']['dispatch']==original['routing_id'],
+                'Component routing differs from base reference')
+        modes={r['mode']:r for r in record['rows'] if r['direction']=='dispatch'}
+        require(set(modes)=={'fused','transport_body','cutlass_matched'} and
+                all(r['valid'] for r in modes.values()), 'Incomplete or unstable F/G/R')
+        require(len({tuple(sorted(r['config'].items())) for r in modes.values()})==1,
+                'F/G/R configuration mismatch')
+        fused,gemm,transport=(modes[m] for m in ('fused','cutlass_matched','transport_body'))
+        ideal=max(gemm['ms'],transport['ms'])
+        reference=original.get('reference')
+        row.update(status='valid' if reference else 'reference_missing',
+            config=fused['config'],routing_id=record['routing_ids']['dispatch'],
+            source_id=record['source_id'],environment_fingerprint=record['environment_fingerprint'],
+            measurement=[record['run_id'],record.get('case_index')],
+            old_fused_ms=original['fused_ms'],fused_ms=fused['ms'],fused_pflops=fused['pflops'],
+            fused_improvement=original['fused_ms']/fused['ms']-1,
+            gemm_ms=gemm['ms'],gemm_pflops=gemm['pflops'],
+            transport_ms=transport['ms'],ideal_ms=ideal,
+            fusion_uplift_raw=fused['ms']/ideal-1,
+            fusion_uplift_required=max(0.0,fused['ms']/ideal-1),
+            limiting_component='gemm' if gemm['ms']>=transport['ms'] else 'transport',
+            reference=reference)
+        if reference:
+            row.update(actual_retention=reference['ms']/fused['ms'],
+                ideal_retention=reference['ms']/ideal,
+                gemm_uplift_raw=gemm['ms']/reference['ms']-1,
+                gemm_uplift_required=max(0.0,gemm['ms']/reference['ms']-1))
+        else:
+            row.update(actual_retention=None,ideal_retention=None,
+                gemm_uplift_raw=None,gemm_uplift_required=None)
+        rows.append(row)
+
+    def geo(values):
+        values=list(values); require(values,'Empty summary cohort')
+        return math.exp(statistics.mean(math.log(v) for v in values))
+    summary=[]
+    for ep in (4,8):
+        for load in ('all','small','large'):
+            selected=[r for r in rows if r.get('fused_ms') and r['ep']==ep and
+                (load=='all' or (r['target_rows']<192)==(load=='small'))]
+            referenced=[r for r in selected if r['reference'] is not None]
+            summary.append(dict(ep=ep,load=load,measured=len(selected),referenced=len(referenced),
+                fused_improvement=geo(1+r['fused_improvement'] for r in selected)-1,
+                fusion_uplift_required=geo(1+r['fusion_uplift_required'] for r in selected)-1,
+                actual_retention=geo(r['actual_retention'] for r in referenced),
+                ideal_retention=geo(r['ideal_retention'] for r in referenced),
+                gemm_uplift_required=geo(1+r['gemm_uplift_required'] for r in referenced)-1,
+                gemm_limiting=sum(r['limiting_component']=='gemm' for r in selected)))
+    source_id,environment_fingerprint=next(iter(identities))
+    return dict(schema='grouped-bf16-component-headroom-v1',source_id=source_id,
+        environment_fingerprint=environment_fingerprint,
+        note=('F/G/R are same-run Graph 10+50 dual-payload max-rank measurements. '
+              'Ideal=max(G,R) is diagnostic, not a guaranteed attainable time. '
+              'The strong full-SM CUTLASS/DeepGEMM reference is preserved from the base table; '
+              'two memory-limited points have no strong reference. Repeated identical workloads '
+              'use the latest complete run, never the fastest repeat.'),summary=summary,rows=rows)
+
+
+def component_headroom_markdown(table):
+    require(table['schema']=='grouped-bf16-component-headroom-v1','Unexpected headroom schema')
+    lines=['# BF16 Dispatch + Grouped GEMM — component headroom','',table['note'],'',
+        '## Summary','',
+        '| EP | Load | Points | Old→new | Actual retention | Ideal retention | Fusion uplift needed | GEMM uplift needed | GEMM-limited |',
+        '|---:|---|---:|---:|---:|---:|---:|---:|---:|']
+    for s in table['summary']:
+        lines.append(f"| {s['ep']} | {s['load']} | {s['measured']} | {100*s['fused_improvement']:+.2f}% | "
+            f"{100*s['actual_retention']:.1f}% | {100*s['ideal_retention']:.1f}% | "
+            f"{100*s['fusion_uplift_required']:.1f}% | {100*s['gemm_uplift_required']:.1f}% | "
+            f"{s['gemm_limiting']}/{s['measured']} |")
+    lines += ['', '## Full matrix', '',
+        '| Models | EP | M | Old F ms | New F ms | Old→new | G ms | R ms | Strong ms | Actual | Ideal | Fusion need | GEMM need | Limit | Config | Status |',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|']
+    for r in table['rows']:
+        cells=[', '.join(r['models']),str(r['ep']),str(r['target_rows'])]
+        if r.get('fused_ms'):
+            ref=r['reference']; c=r['config']
+            cells += [f"{r['old_fused_ms']:.6f}",f"{r['fused_ms']:.6f}",
+                f"{100*r['fused_improvement']:+.2f}%",f"{r['gemm_ms']:.6f}",
+                f"{r['transport_ms']:.6f}",f"{ref['ms']:.6f}" if ref else '—',
+                f"{100*r['actual_retention']:.1f}%" if ref else '—',
+                f"{100*r['ideal_retention']:.1f}%" if ref else '—',
+                f"{100*r['fusion_uplift_required']:.1f}%",
+                f"{100*r['gemm_uplift_required']:.1f}%" if ref else '—',r['limiting_component'],
+                '/'.join(str(c[k]) for k in ('tile_n','tile_k','along_n','swizzle','comm','compute'))]
+        else: cells += ['—']*12
+        cells.append(r['status']); lines.append('| '+' | '.join(cells)+' |')
+    return '\n'.join(lines)+'\n'
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('runs', nargs='*')
@@ -1024,9 +1164,27 @@ if __name__ == '__main__':
     parser.add_argument('--ready-summary', action='store_true', help='audit lightweight ready-wait batches')
     parser.add_argument('--ready-plan',type=Path,help='summarize a frozen lightweight diagnostic matrix')
     parser.add_argument('--output',type=Path,help='ready-plan report stem, writes generated .json and .md')
+    parser.add_argument('--headroom-base',type=Path,
+                        help='refresh a frozen headroom table from component runs under --runs-root')
+    parser.add_argument('--component-prefix',default='grouped-cohort-components-final-',
+                        help='experiment prefix selected by --headroom-base')
     parser.add_argument('--comparison', action='store_true', help='compact fused/library comparison JSON')
     parser.add_argument('--catalog', action='store_true', help='full requested matrix, including missing points')
     args = parser.parse_args()
+    if args.headroom_base:
+        if not args.runs_root or not args.output or args.runs or args.plan or args.ready_plan:
+            parser.error('--headroom-base needs --runs-root and --output')
+        records=[]
+        for path in sorted(args.runs_root.glob('*/job.json')):
+            job=json.loads(path.read_text())
+            if job.get('experiment','').startswith(args.component_prefix) and (path.parent/'fetched.json').is_file():
+                records.extend(audit_cases(path.parent))
+        table=component_headroom(json.loads(args.headroom_base.read_text()),records)
+        args.output.with_suffix('.json').write_text(json.dumps(table,separators=(',',':'))+'\n')
+        args.output.with_suffix('.md').write_text(component_headroom_markdown(table))
+        print(f"Component headroom: {len([r for r in table['rows'] if r.get('fused_ms')])} measured; "
+              f"{args.output.with_suffix('.md')}")
+        sys.exit(0)
     if args.ready_plan:
         if not args.runs_root or not args.output or args.runs or args.plan:
             parser.error('--ready-plan needs --runs-root and --output')

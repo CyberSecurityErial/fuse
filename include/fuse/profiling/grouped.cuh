@@ -23,6 +23,14 @@ struct GroupedReadySummary {
   uint64_t checks = 0, wait_ns = 0, max_wait_ns = 0;
   uint64_t first_wait_ns = 0, waits_ge_1us = 0;
 };
+// Diagnostic-only accumulated serial time for one Dispatch communication
+// warp. Warps overlap each other, so consumers must compare per-warp maxima;
+// summing these fields does not produce kernel wall time.
+struct GroupedCommSummary {
+  uint64_t panels = 0, batches = 0, bytes = 0;
+  uint64_t address_ns = 0, store_wait_ns = 0, g2s_ns = 0, store_issue_ns = 0;
+  uint64_t g2s_issue_ns = 0, g2s_wait_ns = 0;
+};
 struct GroupedProfile {
   GroupedPanelTimeline* panels = nullptr;
   GroupedTileTimeline* tiles = nullptr;
@@ -30,6 +38,8 @@ struct GroupedProfile {
   int64_t panel_capacity = 0;
   int32_t n_tiles = 0;
   GroupedReadySummary* ready_summary = nullptr;
+  GroupedCommSummary* comm_summary = nullptr;
+  int32_t comm_summary_capacity = 0;
 };
 }  // namespace fuse
 #endif
