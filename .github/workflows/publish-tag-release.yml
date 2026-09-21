@@ -30,6 +30,14 @@ jobs:
               : (process.env.REQUESTED_TAG || "v25.0");
 
             const releases = {
+              "v26.0": {
+                name: "v26.0 — SM103 BF16 Grouped Dispatch adaptive transport",
+                body: [
+                  "核心优化：Grouped Dispatch 支持可选全warp cp.async与TMA；默认M<=128使用cp.async、M>=192使用TMA，显式策略仍可覆盖。负载感知CTASP策略允许空闲计算CTA协助小token搬运，不改变full-K/128-row ready语义。",
+                  "完整重测510点，504点有效。相对v25.1几何平均：EP4 +4.72%，EP8 +5.11%，合计+4.92%；小token M<=128分别+11.17%/+10.89%。",
+                  "两份非零随机输入、Graph10+50、max-rank计时及完整数值/路由/tail校验。6个EP4点显存不足；3个有效EP8点缺历史强GEMM分母。结果与逐点配置见results/sm103/v26.0。",
+                ].join("\n\n"),
+              },
               "v25.1": {
                 name: "v25.1 — SM103 BF16 Dispatch + Grouped GEMM complete bench",
                 body: [

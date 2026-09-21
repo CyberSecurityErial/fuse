@@ -1,5 +1,12 @@
 # SM103 Ulysses forward baseline bench
 
+v26.0 BF16 MoE [Dispatch + Grouped GEMM](GROUPED_GEMM_STUDY.md) adds selectable
+full-warp `cp.async` / TMA transport and a load-aware CTASP policy. The complete
+[v26.0 results](../../results/sm103/v26.0/README.md) rerun 510 EP4/8 points with
+Graph10+50 and full correctness checks: 504 are valid, with +4.92% geometric-mean
+throughput versus v25.1; M<=128 improves +11.03% combined. Projection and SM90
+algorithms are unchanged.
+
 v25.1 BF16 MoE [Dispatch + Grouped GEMM](GROUPED_GEMM_STUDY.md): independent
 CTASP implementation, variable expert row counts, full-buffer default and
 memory-pressure bounded fallback. [Results/configurations](../../results/sm103/v25.1/README.md)
