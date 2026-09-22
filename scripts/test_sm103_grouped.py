@@ -10,6 +10,152 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GroupedScheduleTests(unittest.TestCase):
+    def test_stock_and_native_consumer_orders_are_independent_of_umma_width(self):
+        compiler=shutil.which('c++')
+        if not compiler: self.skipTest('C++ compiler unavailable')
+        path=ROOT/'csrc/operators/sm103/detail/grouped/producer_consumer.cuh'
+        body='\n'.join(x for x in path.read_text().splitlines()
+                       if not x.startswith(('#include','#pragma once')))
+        # Oracle: pinned CUTLASS sm90_tile_scheduler_group.hpp, cluster_id /
+        # major_count and cluster_id % major_count at effective swizzle=1.
+        # Derive physical CTA coordinates first, then divide paired M by SmMode.
+        source=r'''
+#include <cassert>
+#include <cstdint>
+#include <random>
+#include <vector>
+#define CUTLASS_HOST_DEVICE
+''' + body + r'''
+int main() {
+  using namespace fuse::detail;
+  std::mt19937 rng(20260922);
+  for(int trial=0;trial<500;++trial) for(int sm:{1,2}) {
+    int experts=1+rng()%12,n=1+rng()%17;
+    std::vector<int64_t> prefix(1,0);
+    for(int e=0;e<experts;++e) {
+      int rows=(trial%7==0)?0:int(rng()%2049);
+      prefix.push_back(prefix.back()+(rows+128*sm-1)/(128*sm));
+    }
+    for(bool along:{false,true}) for(int sw:{1,2,4,8}) {
+      GroupedTileOrder requested{prefix.data(),experts,n,sw,along};
+      auto native=grouped_consumer_order(requested,false);
+      auto stock=grouped_consumer_order(requested,true);
+      for(int e=0;e<experts;++e) {
+        int mt=int(prefix[e+1]-prefix[e]);
+        for(int cluster=0;cluster<mt*n;++cluster) {
+          auto id=prefix[e]*n+cluster;
+          auto a=requested.decode(id),b=native.decode(id),s=stock.decode(id);
+          assert(a.valid && b.valid && s.valid);
+          assert(a.expert==b.expert && a.m==b.m && a.n==b.n);
+          for(int member=0;member<sm;++member) {
+            int physical_m=(along?cluster/n:cluster%mt)*sm+member;
+            int physical_n=along?cluster%n:cluster/mt;
+            assert(s.expert==e && s.m==physical_m/sm && s.n==physical_n);
+          }
+        }
+      }
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='fuse-grouped-scheduler-') as tmp:
+            binary=str(Path(tmp)/'test')
+            subprocess.run([compiler,'-std=c++17','-O2','-x','c++','-','-o',binary],
+                           input=source,text=True,check=True,capture_output=True)
+            subprocess.run([binary],check=True)
+
+    def test_arrival_reset_matches_delivery_granularity(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('C++ compiler unavailable')
+        private=ROOT/'csrc/operators/sm103/detail/grouped'
+        schedule='\n'.join(x for x in (private/'producer_consumer.cuh').read_text().splitlines()
+                           if not x.startswith(('#include','#pragma once')))
+        condition=re.search(r'if \(p.arrivals && (grouped_dispatch_splits\(.*?\)>1)\)',
+                            (private/'communication.cuh').read_text(),re.S)[1]
+        source=r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <random>
+#define CUTLASS_HOST_DEVICE
+using Bf16=uint16_t;
+''' + schedule + r'''
+using namespace fuse::detail;
+template<int TileM> bool reset(int64_t panels,int num_comm_ctas,int first_wave,int k) {
+  struct { const int64_t* row_tile_offsets; int experts,k; } p{&panels,0,k};
+  return ''' + condition + r''';
+}
+int main() {
+  std::mt19937 rng(20260922);
+  for(int i=0;i<10000;++i) {
+    int panels=1+rng()%512,c=1+rng()%148,first=int(rng()%(panels+2))-1,k=8*(1+rng()%2048);
+    assert(reset<128>(panels,c,first,k)==(grouped_dispatch_splits(panels,c,first,128LL*k*2,128)>1));
+    assert(reset<256>(panels,c,first,k)==(grouped_dispatch_splits(panels,c,first,256LL*k*2,256)>1));
+  }
+  assert(!reset<128>(4,20,4,1024));
+  assert(reset<256>(4,20,4,1024));
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='fuse-grouped-reset-') as tmp:
+            binary=str(Path(tmp)/'test')
+            subprocess.run([compiler,'-std=c++17','-O2','-x','c++','-','-o',binary],
+                           input=source,text=True,check=True,capture_output=True)
+            subprocess.run([binary],check=True)
+
+    def test_stock_cluster_padding_never_waits_for_missing_panel(self):
+        compiler = shutil.which('c++')
+        if not compiler:
+            self.skipTest('C++ compiler unavailable')
+        private = ROOT/'csrc/operators/sm103/detail/grouped'
+        pipeline = (private/'cutlass_pipeline.cuh').read_text()
+        predicate = re.search(r'bool has_input_panel = true;.*?p\.row_tile_offsets\[expert_\];',
+                              pipeline, re.S)[0]
+        api = (ROOT/'csrc/operators/sm103/api/grouped.cuh').read_text()
+        self.assertIn('config.gridDim=G::get_grid_shape(gemm_params.gemm);', api)
+        self.assertNotIn('config.gridDim=dim3(gemm_params.compute_ctas,1,1);', api)
+        source = r'''
+#include <cstdint>
+#include <random>
+#include <vector>
+template<int SmMode> bool waits(const int64_t* offsets,int expert_,int logical_m) {
+  struct { const int64_t* row_tile_offsets; } p{offsets};
+''' + predicate + r'''
+  return has_input_panel;
+}
+int main() {
+  std::mt19937 rng(20260922);
+  for(int trial=0;trial<2000;++trial) {
+    int experts=1+rng()%128;
+    std::vector<int> rows(experts);
+    std::vector<int64_t> prefix(experts+1);
+    for(int e=0;e<experts;++e) {
+      rows[e]=rng()%8193;
+      if(trial%7==0) rows[e]=0;
+      prefix[e+1]=prefix[e]+(rows[e]+255)/256;
+    }
+    for(int sw:{1,2,4,8}) for(int e=0;e<experts;++e) {
+      int panels=(rows[e]+255)/256;
+      int padded=(panels+sw-1)/sw*sw;
+      for(int m=0;m<padded;++m) {
+        bool expected=int64_t(m)*256<rows[e];
+        if(waits<2>(prefix.data(),e,m)!=expected) return 1;
+        if(expected && prefix[e]+m>=prefix[e+1]) return 2;
+      }
+      // Appending/removing experts must never make a nonexistent local panel
+      // look delivered through a neighboring expert's prefix.
+      if(waits<2>(prefix.data(),e,panels)) return 3;
+      if(!waits<1>(prefix.data(),e,0)) return 4;
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='fuse-grouped-ready-') as tmp:
+            binary = str(Path(tmp)/'test')
+            subprocess.run([compiler,'-std=c++17','-O2','-x','c++','-','-o',binary],
+                           input=source, text=True, check=True, capture_output=True)
+            subprocess.run([binary],check=True)
+
     def test_prepare_window_and_actual_rows_properties(self):
         compiler = shutil.which('c++')
         if not compiler:
@@ -178,30 +324,34 @@ int main() {
 #define CUTLASS_HOST_DEVICE
 ''' + body + r'''
 bool check_dispatch(const std::vector<int>& rows,int n,int sw,bool along,int k,
-    int comm,int compute,const fuse::detail::GroupedDispatchServices& service) {
+    int comm,int compute,const fuse::detail::GroupedDispatchServices& service,
+    int sm=1,bool stock=false) {
   using namespace fuse::detail;
+  const int tile_m=128*sm,workers=compute/sm;
   std::vector<int64_t> offsets(1,0),tiles(1,0);
   std::vector<int> expert,valid;
   bool small=true;
   for(int e=0;e<int(rows.size());++e) {
     offsets.push_back(offsets.back()+rows[e]);
-    tiles.push_back(tiles.back()+(rows[e]+127)/128);
+    tiles.push_back(tiles.back()+(rows[e]+tile_m-1)/tile_m);
     if(rows[e]>=192) small=false;
-    for(int start=0;start<rows[e];start+=128) {
-      expert.push_back(e); valid.push_back(std::min(128,rows[e]-start));
+    for(int start=0;start<rows[e];start+=tile_m) {
+      expert.push_back(e); valid.push_back(std::min(tile_m,rows[e]-start));
     }
   }
   const int panels=int(valid.size());
   GroupedTileOrder order{tiles.data(),int(rows.size()),n,sw,along};
+  auto actual_order=order;
+  if(stock) actual_order.swizzle=1;
   std::vector<int> touched(panels);
-  for(int64_t q=0;q<std::min<int64_t>(compute,order.tiles());++q) {
-    const auto tile=order.decode(q);
+  for(int64_t q=0;q<std::min<int64_t>(workers,order.tiles());++q) {
+    const auto tile=actual_order.decode(q);
     touched[tiles[tile.expert]+tile.m]=1;
   }
   const int first=small?int(std::count(touched.begin(),touched.end(),1)):-1;
   // Split selection is separately tested. The queue/row/release oracle below
   // shares only that policy contract, not the scorer's producer arithmetic.
-  const int splits=grouped_dispatch_splits(panels,comm,first,int64_t(256)*k);
+  const int splits=grouped_dispatch_splits(panels,comm,first,int64_t(tile_m)*k*2,tile_m);
   std::vector<double> ready(panels);
   for(int cta=0;cta<comm;++cta) {
     double finish=0;
@@ -222,18 +372,18 @@ bool check_dispatch(const std::vector<int>& rows,int n,int sw,bool along,int k,
   GroupedInputModelResult expected;
   expected.valid=true;
   expected.tiles=int64_t(panels)*n;
-  expected.waves=(expected.tiles+compute-1)/compute;
+  expected.waves=(expected.tiles+workers-1)/workers;
   expected.compute_us=expected.waves*service.tile_us;
   expected.finish_us=expected.compute_us;
   if(panels) {
     expected.copy_us=*std::max_element(ready.begin(),ready.end());
     expected.first_ready_us=*std::min_element(ready.begin(),ready.end());
   }
-  for(int worker=0;worker<compute;++worker) {
+  for(int worker=0;worker<workers;++worker) {
     double finish=0;
     int64_t critical=-1;
-    for(int64_t q=worker;q<expected.tiles;q+=compute) {
-      const auto tile=order.decode(q);
+    for(int64_t q=worker;q<expected.tiles;q+=workers) {
+      const auto tile=actual_order.decode(q);
       const int64_t panel=tiles[tile.expert]+tile.m;
       if(ready[panel]>finish) { finish=ready[panel]; critical=panel; }
       else if(ready[panel]==finish && critical>=0) critical=std::min(critical,panel);
@@ -245,7 +395,13 @@ bool check_dispatch(const std::vector<int>& rows,int n,int sw,bool along,int k,
       expected.critical_panel=std::min(expected.critical_panel,critical);
   }
   expected.exposed_feed_us=expected.finish_us-expected.compute_us;
-  const auto actual=score_grouped_dispatch_candidate(order,offsets.data(),k,comm,compute,service);
+  const auto actual=score_grouped_dispatch_candidate(order,offsets.data(),k,comm,compute,service,sm,stock);
+  const auto released=score_grouped_input_schedule(order,ready.data(),compute,service.tile_us,sm,stock);
+  if(released.valid!=actual.valid || released.finish_us!=actual.finish_us ||
+      released.exposed_feed_us!=actual.exposed_feed_us) return false;
+  const GroupedDispatchCandidate candidate{comm,compute,sw,along,service,sm,stock};
+  const auto selected=select_grouped_dispatch_candidate(order,offsets.data(),k,&candidate,1);
+  if(selected.index!=0 || selected.prediction.finish_us!=actual.finish_us) return false;
   if(actual.valid!=expected.valid || actual.tiles!=expected.tiles ||
       actual.waves!=expected.waves || actual.critical_panel!=expected.critical_panel ||
       actual.compute_us!=expected.compute_us || actual.copy_us!=expected.copy_us ||
@@ -260,7 +416,7 @@ bool check_dispatch(const std::vector<int>& rows,int n,int sw,bool along,int k,
   }
   for(int window:{-1,1,2}) {
     order.window_m=window;
-    if(score_grouped_dispatch_candidate(order,offsets.data(),k,comm,compute,service).valid)
+    if(score_grouped_dispatch_candidate(order,offsets.data(),k,comm,compute,service,sm,stock).valid)
       return false;
   }
   return true;
@@ -325,8 +481,12 @@ int main() {
     for(int& m:rows) m=trial%4==0?0:int(rng()%(trial%4==1?192:513));
     if(trial%4==3) rows[rng()%rows.size()]=4096;
     const int comm=1+rng()%147,compute=1+rng()%(148-comm);
-    if(!check_dispatch(rows,1+rng()%33,1<<int(rng()%4),bool(rng()%2),
-        ks[rng()%7],comm,compute,services[rng()%services.size()])) return 8;
+    for(bool stock:{false,true}) {
+      if(!check_dispatch(rows,1+rng()%33,1<<int(rng()%4),bool(rng()%2),
+          ks[rng()%7],comm,compute,services[rng()%services.size()],1,stock)) return 8;
+      if(compute>=2 && !check_dispatch(rows,1+rng()%33,1<<int(rng()%4),bool(rng()%2),
+          ks[rng()%7],comm,compute/2*2,services[rng()%services.size()],2,stock)) return 9;
+    }
   }
 }
 '''
@@ -475,7 +635,8 @@ int main() {
                 self.assertLessEqual(sum(rounded)-m,15)
         api=(ROOT/'csrc/operators/sm103/api/grouped.cuh').read_text()
         self.assertIn('std::swap(g.mainloop.ptr_A,g.mainloop.ptr_B)',api)
-        self.assertIn('GroupedDispatchComm<>, Selector>>',api)
+        self.assertTrue('GroupedDispatchComm<TileM>,Selector,SeparateRoles>>' in api,
+                        'Dispatch communication must use the GEMM delivery height')
         self.assertIn('prepare_grouped_invocation<TileM,SwapAB>',api)
         scheduler=(ROOT/'csrc/operators/sm103/detail/grouped/persistent_gemm.cuh').read_text()
         self.assertIn('const int physical_m=t.m*SmMode+cluster_rank_;',scheduler)
@@ -528,7 +689,7 @@ int main() {
             while batch_rows<128 and batch_rows*2*k*2<=stage_bytes:
                 batch_rows*=2
             self.assertLessEqual(batch_rows*k*2,stage_bytes)
-            for valid in (1,7,63,127,128):
+            for valid in (1,7,63,127,128,129,192,255,256):
                 rows=[r for begin in range(0,valid,batch_rows)
                       for r in range(begin,min(valid,begin+batch_rows))]
                 self.assertEqual(rows,list(range(valid)))
@@ -540,13 +701,15 @@ int main() {
                             for begin in range(slot*selected,valid,slots*selected)
                             for r in range(begin,min(valid,begin+selected))]
                     self.assertEqual(sorted(copied),list(range(valid)))
-        for valid in (1,7,9,63,127,128):
+        for valid in (1,7,9,63,127,128,129,192,255,256):
             for producers in (1,2,4,8,16):
                 copied=[r for stripe in range(producers)
                         for start in range(stripe*8,valid,8*producers)
                         for r in range(start,min(valid,start+8))]
                 self.assertEqual(sorted(copied),list(range(valid)))
-        self.assertIn('rows>TileM',body)
+        predicate=re.search(r'const bool staged=(.*?);',body,re.S)[1]
+        self.assertNotIn('TileM',predicate)
+        self.assertIn('rows>128',predicate)
         self.assertIn('offset+=warps*producers',body)
         self.assertIn('mbarrier.inval.shared::cta.b64',body)
         self.assertIn('tma_store_wait_all();',body)

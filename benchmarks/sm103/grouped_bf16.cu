@@ -215,7 +215,8 @@ struct GroupedCutlassReference {
   int device;
   GroupedCutlassReference(cudaStream_t stream, const std::vector<int64_t>& rows,
       int capacity, int n, int k, const fuse::Bf16* weights, const fuse::Bf16* inputs,
-      int workers, bool along_n, int swizzle, fuse::Bf16* shared_output=nullptr)
+      int workers, bool along_n, int swizzle, fuse::Bf16* shared_output=nullptr,
+      bool host_shapes=true)
       : a(rows.size()-1),b(rows.size()-1),d(rows.size()-1),shapes(rows.size()-1),
         tiles(rows.size()),sa(rows.size()-1),sb(rows.size()-1),sd(rows.size()-1),
         output((rows.size()-1)*size_t(capacity)*n,shared_output) {
@@ -242,7 +243,10 @@ struct GroupedCutlassReference {
     typename Kernel::Arguments args{};
     args.mode=cutlass::gemm::GemmUniversalMode::kGrouped;
     args.problem_shape.num_groups=experts; args.problem_shape.problem_shapes=shapes.ptr;
-    if constexpr(Stock) args.problem_shape.host_problem_shapes=ps.data();
+    // Standalone library/search may use known host shapes to truncate its
+    // grid/termination bound. The matched diagnostic must not inherit this
+    // shortcut: production accepts device counts that change on Graph replay.
+    if constexpr(Stock) if(host_shapes) args.problem_shape.host_problem_shapes=ps.data();
     args.mainloop.ptr_A=a.ptr; args.mainloop.ptr_B=b.ptr;
     args.mainloop.dA=sa.ptr; args.mainloop.dB=sb.ptr;
     args.epilogue.ptr_D=d.ptr; args.epilogue.dD=sd.ptr;
@@ -434,9 +438,14 @@ struct GroupedWorkload {
   bool swap_ab = false;
   bool trim_swap_tokens = true;
   int mma_sm_count = 1;
+  fuse::GroupedGemmScheduler scheduler = fuse::GroupedGemmScheduler::Default;
   fuse::GroupedDispatchCopy dispatch_copy = fuse::GroupedDispatchCopy::CpAsync;
   int64_t property_seed = -1;  // Validation only; never changes formal samples.
   bool property_dynamic = false;  // Validation-only device policy probe.
+  bool stock_scheduler() const {
+    return scheduler==fuse::GroupedGemmScheduler::Cutlass ||
+        (scheduler==fuse::GroupedGemmScheduler::Default && mma_sm_count==2);
+  }
 };
 
 // This selector is intentionally a validation probe, not the production
@@ -478,6 +487,8 @@ struct GroupedRank {
   int rank, world, capacity, buffer_rows;
   bool property_dynamic;
   int mma_sm_count;
+  fuse::GroupedGemmScheduler scheduler;
+  bool stock_scheduler;
   fuse::GroupedDispatchCopy dispatch_copy;
   Buffer<Bf16> input, a, b, d, output, ref, oracle_a;
   Buffer<const Bf16*> bp;
@@ -512,7 +523,8 @@ struct GroupedRank {
         rank(r), world(w),
         capacity(q.boundary_checks ? w*T : int((int64_t(T)*Top*(q.hot_half?2:1)+E-1)/E)),
         buffer_rows(!IsCombine && q.buffer_rows && q.buffer_rows<capacity ? q.buffer_rows : capacity),
-      property_dynamic(q.property_dynamic),mma_sm_count(q.mma_sm_count),dispatch_copy(q.dispatch_copy),
+      property_dynamic(q.property_dynamic),mma_sm_count(q.mma_sm_count),scheduler(q.scheduler),
+      stock_scheduler(q.stock_scheduler()),dispatch_copy(q.dispatch_copy),
       input(size_t(T)*K), a(size_t(E)*buffer_rows*K), b(size_t(E)*N*K), d(size_t(E)*capacity*N),
       output(size_t(T)*Top*N), ref(size_t(E)*capacity*N), oracle_a(size_t(E)*capacity*K),
       bp(E),dp(E),stage_ap(E),offsets(E+1),routes(size_t(E)*capacity),
@@ -609,6 +621,7 @@ struct GroupedRank {
     p.policy.swap_ab=swap_ab;
     p.policy.trim_swap_tokens=trim_swap_tokens;
     p.policy.mma_sm_count=mma_sm_count;
+    p.policy.scheduler=scheduler;
     p.policy.dispatch_copy=dispatch_copy;
     p.dispatch_buffer_rows=buffer_rows<capacity ? buffer_rows : 0;
 #if FUSE_ENABLE_PROFILING
@@ -654,6 +667,7 @@ struct GroupedRank {
     if (profile_comm) check(cudaMemset(profile_comm->ptr,0,profile_comm->size*sizeof(fuse::GroupedCommSummary)));
   }
   void dump_profile(const char* prefix,int comm,int compute,int tile_n,int tile_k,int sw,bool along) {
+    const int tile_m=128*mma_sm_count;
     if (profile_ready) {
       std::vector<fuse::GroupedRoleTimeline> roles(comm+compute);
       std::vector<fuse::GroupedReadySummary> ready(comm+compute);
@@ -663,6 +677,8 @@ struct GroupedRank {
       out<<"{\"schema\":\"grouped-ready-summary-v1\",\"rank\":"<<rank<<",\"world\":"<<world
          <<",\"n\":"<<N<<",\"k\":"<<K<<",\"tile_n\":"<<tile_n<<",\"tile_k\":"<<tile_k
          <<",\"swizzle\":"<<sw<<",\"along_n\":"<<int(along)<<",\"comm\":"<<comm<<",\"compute\":"<<compute
+         <<",\"tile_m\":"<<tile_m<<",\"mma_sm_count\":"<<mma_sm_count
+         <<",\"stock_scheduler\":"<<int(stock_scheduler)
          <<",\"warmup\":10,\"payload\":1,\"epoch\":13,\"rows\":[";
       for(int e=0;e<E;++e) out<<(e?",":"")<<host_offsets[e+1]-host_offsets[e];
       out<<"],\"ctas\":[";
@@ -670,6 +686,32 @@ struct GroupedRank {
         const auto r=roles[c]; const auto s=ready[c];
         out<<(c?",":"")<<"["<<r.begin<<","<<r.role_end<<","<<r.end<<","
            <<s.checks<<","<<s.wait_ns<<","<<s.max_wait_ns<<","<<s.first_wait_ns<<","<<s.waits_ge_1us<<"]";
+      }
+      // Separate extension preserves the established ready-counter schema.
+      // Physical-CTA indices also identify producers borrowed from idle GEMM.
+      out<<"],\"startup\":[";
+      for(int c=0;c<comm+compute;++c) {
+        const auto r=roles[c]; const auto s=ready[c];
+        out<<(c?",":"")<<"["<<r.first_release_begin<<","<<r.first_release_end
+           <<","<<s.first_wait_begin<<","<<s.first_observed<<"]";
+      }
+      out<<"],\"startup_bytes\":[";
+      for(int c=0;c<comm+compute;++c) {
+        uint64_t bytes=0,remote=0;
+        int64_t panel=roles[c].first_release_panel;
+        if(roles[c].first_release_begin) {
+          for(int e=0;e<E;++e) {
+            const int64_t rows=host_offsets[e+1]-host_offsets[e];
+            const int64_t count=(rows+tile_m-1)/tile_m;
+            if(panel>=count) {panel-=count;continue;}
+            for(int64_t m=panel*tile_m;m<std::min(rows,(panel+1)*tile_m);++m) {
+              bytes+=uint64_t(K)*sizeof(Bf16);
+              if(host_routes[host_offsets[e]+m].rank!=rank) remote+=uint64_t(K)*sizeof(Bf16);
+            }
+            break;
+          }
+        }
+        out<<(c?",":"")<<"["<<bytes<<","<<remote<<"]";
       }
       out<<"]}";
       if(!out) throw std::runtime_error("cannot write grouped ready summary");
@@ -685,10 +727,12 @@ struct GroupedRank {
     check(cudaMemcpy(comm_warps.data(),profile_comm->ptr,
         comm_warps.size()*sizeof(comm_warps[0]),cudaMemcpyDeviceToHost));
     int64_t actual=0;
-    for(int e=0;e<E;++e) actual+=(host_offsets[e+1]-host_offsets[e]+127)/128;
+    for(int e=0;e<E;++e) actual+=(host_offsets[e+1]-host_offsets[e]+tile_m-1)/tile_m;
     const int nt=(N+tile_n-1)/tile_n;
     std::ofstream out(std::string(prefix)+"-rank-"+std::to_string(rank)+".json");
     out<<"{\"schema\":\"grouped-handoff-v1\",\"rank\":"<<rank<<",\"world\":"<<world
+       <<",\"tile_m\":"<<tile_m<<",\"mma_sm_count\":"<<mma_sm_count
+       <<",\"stock_scheduler\":"<<int(stock_scheduler)
        <<",\"n\":"<<N<<",\"k\":"<<K<<",\"tile_n\":"<<tile_n<<",\"tile_k\":"<<tile_k
        <<",\"swizzle\":"<<sw<<",\"along_n\":"<<int(along)<<",\"comm\":"<<comm<<",\"compute\":"<<compute
        <<",\"warmup\":10,\"payload\":1,\"epoch\":13,\"rows\":[";
@@ -709,11 +753,11 @@ struct GroupedRank {
 #endif
 };
 
-template <bool IsCombine, int TileN>
+template <bool IsCombine, int TileN, int SmMode = 1>
 __global__ __launch_bounds__(256,1) void grouped_transport_only(
     fuse::detail::GroupedCommArguments args) {
   using Comm=std::conditional_t<IsCombine,fuse::detail::GroupedCombineComm<TileN>,
-      fuse::detail::GroupedDispatchComm<>>;
+      fuse::detail::GroupedDispatchComm<128 * SmMode>>;
   extern __shared__ char storage[];
   Comm{}(args,storage,blockIdx.x,gridDim.x);
 }
@@ -724,8 +768,10 @@ __global__ __launch_bounds__(256,1) void grouped_transport_only(
 // writes; all rank streams finish before independent output validation. When
 // Dispatch shares panels, its diagnostic includes a graph memset of the arrival
 // counters; production folds that reset into its existing preparation node.
-template <bool IsCombine, int TileN, int TileK>
+template <bool IsCombine, int TileN, int TileK, int SmMode = 1,
+    bool StockScheduler = SmMode == 2>
 struct GroupedTransportReference {
+  static constexpr int TileM = 128 * SmMode;
   Buffer<const fuse::Bf16*> inputs;
   Buffer<fuse::Bf16*> outputs;
   Buffer<int32_t> first_wave{1};
@@ -738,9 +784,9 @@ struct GroupedTransportReference {
       bool along_n, int sw, bool balance_tail=false)
       : inputs(std::max(ranks.size(),size_t(ranks[rank]->E))),
         outputs(inputs.size), ready((tiles.size-1)*
-            size_t((ranks[rank]->capacity+127)/128)*
+            size_t((ranks[rank]->capacity+TileM-1)/TileM)*
             (IsCombine?(ranks[rank]->N+TileN-1)/TileN:1)*fuse::kReadyFlagStride),
-        arrivals(IsCombine?0:(tiles.size-1)*size_t((ranks[rank]->capacity+127)/128)) {
+        arrivals(IsCombine?0:(tiles.size-1)*size_t((ranks[rank]->capacity+TileM-1)/TileM)) {
     check(cudaGetDevice(&device));
     const auto& r=*ranks[rank];
     std::vector<const fuse::Bf16*> pi;
@@ -758,6 +804,7 @@ struct GroupedTransportReference {
     fuse::detail::GroupedCommArguments args{};
     auto& p=args.params;
     p.order={tiles.ptr,r.E,(r.N+TileN-1)/TileN,sw,along_n};
+    p.order=fuse::detail::grouped_consumer_order(p.order,StockScheduler);
     p.balance_tail=balance_tail;
     p.cp_async_g2s=r.dispatch_copy==fuse::GroupedDispatchCopy::CpAsync;
     p.row_offsets=r.offsets.ptr; p.source=r.routes.ptr;
@@ -768,31 +815,36 @@ struct GroupedTransportReference {
       p.arrivals=arrivals.ptr;
       std::vector<int64_t> prefix(1,0);
       for(int e=0;e<r.E;++e)
-        prefix.push_back(prefix.back()+(r.host_offsets[e+1]-r.host_offsets[e]+127)/128);
+        prefix.push_back(prefix.back()+(r.host_offsets[e+1]-r.host_offsets[e]+TileM-1)/TileM);
       panels=prefix.back();
       auto host_order=p.order; host_order.row_tile_offsets=prefix.data();
       const int32_t first=fuse::detail::grouped_use_latency_cohort(
           r.host_offsets.data(),r.E)
-          ? fuse::detail::grouped_first_wave_panels(host_order,compute) : -1;
+          ? fuse::detail::grouped_first_wave_panels(host_order,compute/SmMode) : -1;
       first_wave.copy(std::vector<int32_t>{first}); p.first_wave_panels=first_wave.ptr;
       effective_comm_storage.copy(std::vector<int32_t>{effective_comm});
       p.effective_comm_ctas=effective_comm_storage.ptr;
     }
     p.columns=IsCombine?r.N:r.K; p.topk=r.Top; p.rank=rank;
     p.world_size=r.world; p.num_comm_ctas=effective_comm; p.epoch=1;
+    using Types=std::conditional_t<StockScheduler,
+        fuse::detail::Bf16GroupedStockGemmTypes<TileN,TileK,SmMode>,
+        fuse::detail::Bf16GroupedGemmTypes<TileN,TileK,false,true,SmMode>>;
     using Fused=std::conditional_t<IsCombine,fuse::detail::GroupedGemmA2A<TileN,TileK>,
-        fuse::detail::A2AGroupedGemm<TileN,TileK>>;
+        fuse::detail::GroupedMonolithicGemm<typename Types::DispatchGemm,
+            fuse::detail::GroupedDispatchComm<TileM>,fuse::detail::GroupedExplicitPreparePolicy,
+            StockScheduler || SmMode==2>>;
     constexpr size_t smem=Fused::SharedStorageSize;
-    check(cudaFuncSetAttribute(grouped_transport_only<IsCombine,TileN>,
+    check(cudaFuncSetAttribute(grouped_transport_only<IsCombine,TileN,SmMode>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
     check(cudaStreamBeginCapture(r.stream,cudaStreamCaptureModeThreadLocal));
     if constexpr(!IsCombine) {
       int32_t first=0; check(cudaMemcpy(&first,first_wave.ptr,sizeof(first),cudaMemcpyDeviceToHost));
       if(balance_tail || fuse::detail::grouped_dispatch_splits(
-          panels,effective_comm,first,int64_t(128)*r.K*sizeof(fuse::Bf16))>1)
+          panels,effective_comm,first,int64_t(TileM)*r.K*sizeof(fuse::Bf16),TileM)>1)
         check(cudaMemsetAsync(arrivals.ptr,0,arrivals.size*sizeof(uint32_t),r.stream));
     }
-    grouped_transport_only<IsCombine,TileN><<<effective_comm,256,smem,r.stream>>>(args);
+    grouped_transport_only<IsCombine,TileN,SmMode><<<effective_comm,256,smem,r.stream>>>(args);
     check(cudaGetLastError()); check(cudaStreamEndCapture(r.stream,&graph));
   }
   ~GroupedTransportReference() { cudaSetDevice(device); if(graph) cudaGraphDestroy(graph); }
@@ -829,7 +881,7 @@ void write_grouped_samples(std::ostream& raw,
            <<','<<observed.warmup<<','<<observed.drift<<','<<round<<','<<accepted
            <<','<<p.tile_n<<','<<p.tile_k<<','<<ranks[rank]->buffer_rows
            <<','<<q.balance_tail<<','<<q.hot_half<<','<<q.swap_ab<<','<<q.trim_swap_tokens
-           <<','<<int(q.dispatch_copy)<<'\n';
+           <<','<<int(q.dispatch_copy)<<','<<int(q.scheduler)<<'\n';
   }
   if(!raw) throw std::runtime_error("failed to write grouped sample CSV");
 }
@@ -841,6 +893,10 @@ template <bool IsCombine,int TileN,int TileK,bool Stock=false,int SmMode=1>
 void search_grouped_tile(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& ranks,
     const GroupedWorkload& q,int replay,int compute,int& candidate,double& best) {
   for(bool along:{false,true}) for(int sw:{1,2,4,8}) {
+    // Pinned stock grouped scheduling linearizes the aggregate N extent to
+    // one: requested sw=2/4/8 all resolve to effective sw=1. Search that
+    // kernel once; retain the historical external-reference grid unchanged.
+    if constexpr(Stock) if(!q.external_search && sw!=1) continue;
     std::vector<std::unique_ptr<GroupedCutlassReference<
         TileN,TileK,Stock,false,true,SmMode>>> refs;
     std::vector<grouped_measurement::Operation> ops;
@@ -855,22 +911,23 @@ void search_grouped_tile(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& r
     }
     { grouped_measurement::Timer initial(ops); initial.sample(); }
     for(auto& r:ranks) validate_grouped_reference(*r,refs[r->rank]->output.ptr);
-    // External grid shares one clock warmup per workload/payload. Every
-    // candidate still gets its OWN Graph 10+50 and first-stable-round checks.
-    const auto result=grouped_measurement::measure(ops,!Stock || candidate==0);
+    // Match the isolated winner replay's clock warmup for every family.
+    // Skipping it only for stock kernels changes duty-cycle/clock history
+    // between search and replay. Formal samples remain one operation, 10+50.
+    const auto result=grouped_measurement::measure(ops);
     for(auto& r:ranks) validate_grouped_reference(*r,refs[r->rank]->output.ptr);
     std::ofstream raw(q.timing_csv,std::ios::app); raw<<std::setprecision(9);
-    const char* mode=!Stock?(SmMode==1?"cutlass_search":"cutlass_search_2sm"):
+    const char* mode=q.external_search?"cutlass_stock":!Stock?(SmMode==1?"cutlass_search":"cutlass_search_2sm"):
         (SmMode==1?"cutlass_stock_1sm_budget":"cutlass_stock_2sm_budget");
     write_grouped_samples(raw,ranks,q,replay,mode,result,{0,compute,sw,along,TileN,TileK});
     if(result.drift<=.05) best=std::min(best,result.p50);
-    using Kernel=typename GroupedCutlassReference<TileN,TileK,Stock>::Kernel;
+    using Kernel=typename GroupedCutlassReference<TileN,TileK,Stock,false,true,SmMode>::Kernel;
     cudaFuncAttributes resources{};
     check(cudaFuncGetAttributes(&resources,cutlass::device_kernel<Kernel>));
-    printf("RESULT grouped-search direction=%s payload=%d candidate=%d/32 tile_n=%d tile_k=%d "
+    printf("RESULT grouped-search direction=%s payload=%d candidate=%d/%d tile_n=%d tile_k=%d "
         "along_n=%d swizzle=%d compute=%d p50=%.6f p95=%.6f best=%.6f pflops=%.6f "
         "regs=%d local_bytes=%zu smem=%zu stable=%d verified=1\n",
-        IsCombine?"combine":"dispatch",replay,++candidate,TileN,TileK,int(along),sw,compute,
+        IsCombine?"combine":"dispatch",replay,++candidate,q.external_search?32:80,TileN,TileK,int(along),sw,compute,
         result.p50,result.p95,best,flops/(ranks.size()*result.p50*1e12),resources.numRegs,
         resources.localSizeBytes,sizeof(typename Kernel::SharedStorage),int(result.drift<=.05));
     fflush(stdout);
@@ -921,7 +978,7 @@ void measure_deepgemm(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& rank
       }
     };
     validate();
-    const auto result=grouped_measurement::measure(ops,false);
+    const auto result=grouped_measurement::measure(ops);
     validate();
     std::ofstream raw(q.timing_csv,std::ios::app); raw<<std::setprecision(9);
     write_grouped_samples(raw,ranks,q,replay,block_m==128?"deepgemm_m128":"deepgemm_m256",
@@ -1017,20 +1074,21 @@ void measure_grouped_case(std::vector<std::unique_ptr<GroupedRank<IsCombine>>>& 
 // Fixed-budget transport experiment: reuse the production copy body, without
 // constructing/tuning unrelated GEMM libraries. Keep prefix buffers alive
 // through Graph destruction and retain the fused kernel's reserved SMEM.
-template<int TileN,int TileK,bool SwapAB=false,bool TrimTokens=true,int SmMode=1>
+template<int TileN,int TileK,bool SwapAB=false,bool TrimTokens=true,int SmMode=1,
+    bool StockScheduler=SmMode==2>
 void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>& ranks,
     const GroupedWorkload& q,int replay,bool along,int sw,int comm,int compute) {
   std::vector<std::unique_ptr<Buffer<int64_t>>> tiles;
-  std::vector<std::unique_ptr<GroupedTransportReference<false,TileN,TileK>>> refs;
+  std::vector<std::unique_ptr<GroupedTransportReference<false,TileN,TileK,SmMode,StockScheduler>>> refs;
   std::vector<grouped_measurement::Operation> ops;
   for(auto& r:ranks) {
     check(cudaSetDevice(r->rank));
     std::vector<int64_t> prefix(1,0);
     for(int e=0;e<r->E;++e)
-      prefix.push_back(prefix.back()+(r->host_offsets[e+1]-r->host_offsets[e]+127)/128);
+      prefix.push_back(prefix.back()+(r->host_offsets[e+1]-r->host_offsets[e]+128*SmMode-1)/(128*SmMode));
     tiles.push_back(std::make_unique<Buffer<int64_t>>(prefix.size()));
     tiles.back()->copy(prefix);
-    refs.push_back(std::make_unique<GroupedTransportReference<false,TileN,TileK>>(
+    refs.push_back(std::make_unique<GroupedTransportReference<false,TileN,TileK,SmMode,StockScheduler>>(
         ranks,r->rank,*tiles.back(),comm,compute,along,sw,q.balance_tail));
     ops.push_back({r->rank,r->stream,refs.back()->graph});
   }
@@ -1046,11 +1104,8 @@ void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>
     // independently gathered oracle; tile/raster/swizzle/worker budget match
     // fusion exactly. Serial modes reuse production D after fusion validation
     // to avoid allocating another model-sized output. No communication runs.
-    // The production 2-SM path uses CUTLASS's stock grouped scheduler: its
-    // cluster-pair indexing is part of the kernel ABI. Keep this diagnostic
-    // bit-for-bit on that scheduler instead of silently timing the custom
-    // one-SM traversal generalized to SmMode=2.
-    constexpr bool StockScheduler = SmMode == 2;
+    // Match scheduler identity independently of UMMA width: a native pair
+    // and a stock pair are different kernels even with identical tile sizes.
     std::vector<std::unique_ptr<GroupedCutlassReference<
         TileN,TileK,StockScheduler,SwapAB,TrimTokens,SmMode>>> pure;
     std::vector<grouped_measurement::Operation> pure_ops;
@@ -1059,7 +1114,7 @@ void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>
       pure.push_back(std::make_unique<GroupedCutlassReference<
           TileN,TileK,StockScheduler,SwapAB,TrimTokens,SmMode>>(
           r->stream,r->host_offsets,r->capacity,r->N,r->K,r->b.ptr,r->oracle_a.ptr,
-          compute,along,sw,r->d.ptr));
+          compute,along,sw,r->d.ptr,false));
       // Finish default-stream metadata/output poisoning before replaying on
       // the nonblocking reference stream; this setup is outside all samples.
       check(cudaDeviceSynchronize());
@@ -1075,6 +1130,20 @@ void measure_dispatch_transport(std::vector<std::unique_ptr<GroupedRank<false>>>
         replay,compute,gemm.p50,int(gemm.drift<=.05));fflush(stdout);
   }
   if(!raw) throw std::runtime_error("failed to write dispatch diagnostic samples");
+}
+
+template<int SmMode,bool StockScheduler>
+void measure_dispatch_configuration(std::vector<std::unique_ptr<GroupedRank<false>>>& ranks,
+    const GroupedWorkload& q,int replay,bool along,int sw,int comm,int compute) {
+  if(q.tile_n==128 && q.tile_k==64)
+    measure_dispatch_transport<128,64,false,true,SmMode,StockScheduler>(ranks,q,replay,along,sw,comm,compute);
+  else if(q.tile_n==128 && q.tile_k==128)
+    measure_dispatch_transport<128,128,false,true,SmMode,StockScheduler>(ranks,q,replay,along,sw,comm,compute);
+  else if(q.tile_n==256 && q.tile_k==64)
+    measure_dispatch_transport<256,64,false,true,SmMode,StockScheduler>(ranks,q,replay,along,sw,comm,compute);
+  else if(q.tile_n==256 && q.tile_k==128)
+    measure_dispatch_transport<256,128,false,true,SmMode,StockScheduler>(ranks,q,replay,along,sw,comm,compute);
+  else throw std::runtime_error("unsupported grouped tile");
 }
 
 template<bool IsCombine>
@@ -1376,14 +1445,10 @@ void verify_grouped_ep(int world, bool along_n, int sw, int comm, int compute,
         else if(q.swap_ab && !q.trim_swap_tokens && q.tile_k==128) measure_dispatch_transport<128,128,true,false>(ranks,q,replay,along_n,sw,comm,compute);
         else if(q.swap_ab && q.tile_k==64) measure_dispatch_transport<128,64,true>(ranks,q,replay,along_n,sw,comm,compute);
         else if(q.swap_ab && q.tile_k==128) measure_dispatch_transport<128,128,true>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.mma_sm_count==2 && q.tile_n==128 && q.tile_k==64) measure_dispatch_transport<128,64,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.mma_sm_count==2 && q.tile_n==128 && q.tile_k==128) measure_dispatch_transport<128,128,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.mma_sm_count==2 && q.tile_n==256 && q.tile_k==64) measure_dispatch_transport<256,64,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.mma_sm_count==2 && q.tile_n==256 && q.tile_k==128) measure_dispatch_transport<256,128,false,true,2>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.tile_n==128 && q.tile_k==64) measure_dispatch_transport<128,64>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.tile_n==128 && q.tile_k==128) measure_dispatch_transport<128,128>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.tile_n==256 && q.tile_k==64) measure_dispatch_transport<256,64>(ranks,q,replay,along_n,sw,comm,compute);
-        else if(q.tile_n==256 && q.tile_k==128) measure_dispatch_transport<256,128>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2 && q.stock_scheduler()) measure_dispatch_configuration<2,true>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.mma_sm_count==2) measure_dispatch_configuration<2,false>(ranks,q,replay,along_n,sw,comm,compute);
+        else if(q.stock_scheduler()) measure_dispatch_configuration<1,true>(ranks,q,replay,along_n,sw,comm,compute);
+        else measure_dispatch_configuration<1,false>(ranks,q,replay,along_n,sw,comm,compute);
       }
     } else if(q.timing_csv) {
       if(q.tile_n==128 && q.tile_k==64) measure_grouped_case<IsCombine,128,64>(ranks,q,replay,along_n,sw,comm,compute);
@@ -1465,7 +1530,7 @@ int run_grouped(int argc,char** argv) {
         if(parsed!=item.size()) throw std::runtime_error("invalid grouped policy integer");
         values.push_back(value);
       }
-      if((values.size()<6 || values.size()>10) || (values[0]!=128 && values[0]!=256) ||
+      if((values.size()<6 || values.size()>11) || (values[0]!=128 && values[0]!=256) ||
           (values[1]!=64 && values[1]!=128) || (values[2]!=0 && values[2]!=1) ||
           (values[3]!=1 && values[3]!=2 && values[3]!=4 && values[3]!=8) ||
           values[4]<=0 || values[5]<=0 ||
@@ -1476,16 +1541,21 @@ int run_grouped(int argc,char** argv) {
           (values.size()>=9 && (values[8]<1 || values[8]>2 ||
               (values[8]==2 && (values[6] || values[4]%2 || values[5]%2)))))
         throw std::runtime_error(
-            "policy requires N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy]]]]");
+            "policy requires N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy[,scheduler]]]]]");
       policy={values[4],values[5],values[3],bool(values[2]),values[0],values[1]};
       policy.swap_ab=values.size()>=7 && values[6];
       policy.trim_swap_tokens=values.size()<8 || values[7];
       policy.mma_sm_count=values.size()<9 ? 1 : values[8];
-      if(values.size()==10) {
+      if(values.size()>=10) {
         if(values[9]<0 || values[9]>1 || direction!="dispatch")
           throw std::runtime_error("invalid grouped copy method");
         policy.dispatch_copy=values[9] ? fuse::GroupedDispatchCopy::Tma :
             fuse::GroupedDispatchCopy::CpAsync;
+      }
+      if(values.size()==11) {
+        if(values[10]<0 || values[10]>2 || direction!="dispatch")
+          throw std::runtime_error("invalid grouped scheduler");
+        policy.scheduler=static_cast<fuse::GroupedGemmScheduler>(values[10]);
       }
       argc-=2;
     }
@@ -1493,6 +1563,9 @@ int run_grouped(int argc,char** argv) {
     if(external_search) --argc;
     const bool gemm_search=argc>=2 && std::string(argv[argc-1])=="--gemm-search";
     if(gemm_search) --argc;
+    if(policy.scheduler!=fuse::GroupedGemmScheduler::Default &&
+        (policy.swap_ab || gemm_search || external_search || (argc==9 && !fused_only)))
+      throw std::runtime_error("explicit scheduler requires unswapped Dispatch; timing requires fused-only");
     if(policy.swap_ab && (direction!="dispatch" || gemm_search || external_search ||
         (argc==9 && !fused_only)))
       throw std::runtime_error("swapAB timing requires fused-only Dispatch; use compute-compare for matched GEMM");
@@ -1532,6 +1605,7 @@ int run_grouped(int argc,char** argv) {
         q.swap_ab=policy.swap_ab;
         q.trim_swap_tokens=policy.trim_swap_tokens;
         q.mma_sm_count=policy.mma_sm_count;
+        q.scheduler=policy.scheduler;
         q.dispatch_copy=policy.dispatch_copy;
         q.gemm_search=gemm_search;
         q.external_search=external_search;
@@ -1553,7 +1627,7 @@ int run_grouped(int argc,char** argv) {
         if(q.timing_csv) {
           std::ofstream out(q.timing_csv);
           if(!out) throw std::runtime_error("cannot create grouped sample CSV");
-          out<<"direction,h,f,total_experts,topk,tokens_per_rank,ep,payload,mode,sample,rank,rank_rows,ms,comm_ctas,compute_ctas,swizzle,along_n,warmup,drift,round,accepted,tile_n,tile_k,buffer_rows,tail_balance,hot_half,swap_ab,trim_swap_tokens,dispatch_copy\n";
+          out<<"direction,h,f,total_experts,topk,tokens_per_rank,ep,payload,mode,sample,rank,rank_rows,ms,comm_ctas,compute_ctas,swizzle,along_n,warmup,drift,round,accepted,tile_n,tile_k,buffer_rows,tail_balance,hot_half,swap_ab,trim_swap_tokens,dispatch_copy,scheduler\n";
         }
         if(direction!="combine") verify_grouped_ep<false>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
         if(direction!="dispatch") verify_grouped_ep<true>(world,policy.along_n,policy.swizzle,policy.num_comm_ctas,policy.num_compute_ctas,q);
@@ -1569,6 +1643,7 @@ int run_grouped(int argc,char** argv) {
         q.swap_ab=policy.swap_ab;
         q.trim_swap_tokens=policy.trim_swap_tokens;
         q.mma_sm_count=policy.mma_sm_count;
+        q.scheduler=policy.scheduler;
         q.dispatch_copy=policy.dispatch_copy;
         q.balance_tail=balance_tail;
         q.buffer_rows=buffer_rows;

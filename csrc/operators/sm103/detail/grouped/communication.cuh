@@ -47,6 +47,7 @@ struct GroupedPrepareParams {
   int32_t* first_wave_panels = nullptr;
   int32_t* effective_comm_ctas = nullptr;
   GroupedTileOrder order{};
+  int32_t mma_sm_count = 1;  // Physical CTAs per logical consumer worker.
   bool balance_tail = false;
   int32_t num_comm_ctas = 0, num_compute_ctas = 0;
   uint32_t* peer_started[kMaxWorldSize]{};
@@ -72,7 +73,7 @@ struct GroupedExplicitPreparePolicy {
   }
   CUTLASS_DEVICE int first_consumer_panels(const GroupedPrepareParams& p) const {
     return grouped_use_latency_cohort(p.row_offsets,p.experts)
-        ? grouped_first_wave_panels(p.order,p.num_compute_ctas) : -1;
+        ? grouped_first_wave_panels(p.order,p.num_compute_ctas/p.mma_sm_count) : -1;
   }
   CUTLASS_DEVICE bool borrow_idle_compute_ctas(const GroupedPrepareParams&) const {
     return false;  // A positive public communication budget is exact.
@@ -174,7 +175,7 @@ CUTLASS_DEVICE void prepare_grouped_invocation_body(
   const int first_wave=p.first_wave_panels?*p.first_wave_panels:0;
   if (p.arrivals && grouped_dispatch_splits(
       p.row_tile_offsets[p.experts],num_comm_ctas,first_wave,
-      int64_t(128)*p.k*sizeof(Bf16))>1)
+      int64_t(TileM)*p.k*sizeof(Bf16),TileM)>1)
     for (int64_t panel=threadIdx.x; panel<p.row_tile_offsets[p.experts]; panel+=blockDim.x)
       p.arrivals[panel]=0;
   else if (p.arrivals && p.balance_tail) {

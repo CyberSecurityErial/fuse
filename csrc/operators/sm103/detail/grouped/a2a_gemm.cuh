@@ -141,7 +141,10 @@ struct GroupedDispatchComm {
         kBulkSlots*(kStageBytes+sizeof(uint64_t)));
     const int batch_shift=__ffs(batch_rows)-1;  // batch_rows is a power of two
 #if FUSE_ENABLE_PROFILING
-    const uint64_t address_begin=read_global_timer();
+    // Ready/startup summaries deliberately omit per-copy clocks. Otherwise a
+    // nominally lightweight capture perturbs the very delivery time it measures.
+    const bool detail=p.profile.comm_summary && lane==0;
+    const uint64_t address_begin=detail?read_global_timer():0;
 #endif
     for(int owned=lane;;owned+=32) {
       const int row=(owned>>batch_shift)*kBulkSlots*batch_rows+
@@ -152,7 +155,7 @@ struct GroupedDispatchComm {
     }
     __syncwarp();
 #if FUSE_ENABLE_PROFILING
-    if(lane==0) {
+    if(detail) {
       ++summary.panels;
       summary.address_ns+=read_global_timer()-address_begin;
     }
@@ -173,12 +176,12 @@ struct GroupedDispatchComm {
       // Keeping the two waits distinct avoids serializing every batch on the
       // previous batch's NVLink/global write completion.
 #if FUSE_ENABLE_PROFILING
-      uint64_t stamp=lane==0?read_global_timer():0;
+      uint64_t stamp=detail?read_global_timer():0;
 #endif
       if(lane==0) cute::tma_store_wait<0>();
       if constexpr (CpAsyncG2S) __syncwarp();
 #if FUSE_ENABLE_PROFILING
-      if(lane==0) {
+      if(detail) {
         summary.store_wait_ns+=read_global_timer()-stamp;
         stamp=read_global_timer();
       }
@@ -196,7 +199,7 @@ struct GroupedDispatchComm {
         }
         cute::cp_async_fence();
 #if FUSE_ENABLE_PROFILING
-        if(lane==0) g2s_issued=read_global_timer();
+        if(detail) g2s_issued=read_global_timer();
 #endif
         cute::cp_async_wait<0>();
         __syncwarp();
@@ -207,16 +210,16 @@ struct GroupedDispatchComm {
           SM100_BULK_COPY_G2S::copy(src,barrier,buffer+int64_t(r)*p.columns,p.columns*sizeof(Bf16));
         }
 #if FUSE_ENABLE_PROFILING
-        g2s_issued=read_global_timer();
+        if(detail) g2s_issued=read_global_timer();
 #endif
       }
 #if FUSE_ENABLE_PROFILING
-      if(lane==0) summary.g2s_issue_ns+=g2s_issued-stamp;
+      if(detail) summary.g2s_issue_ns+=g2s_issued-stamp;
 #endif
       if constexpr (!CpAsyncG2S) cute::wait_barrier(*barrier,phase);
 #if FUSE_ENABLE_PROFILING
-      const uint64_t g2s_done=lane==0?read_global_timer():0;
-      if(lane==0) {
+      const uint64_t g2s_done=detail?read_global_timer():0;
+      if(detail) {
         summary.g2s_wait_ns+=g2s_done-g2s_issued;
         summary.g2s_ns+=g2s_done-stamp;
         stamp=read_global_timer();
@@ -232,7 +235,7 @@ struct GroupedDispatchComm {
         cute::tma_store_arrive();
       }
 #if FUSE_ENABLE_PROFILING
-      if(lane==0) {
+      if(detail) {
         summary.store_issue_ns+=read_global_timer()-stamp;
         ++summary.batches;
         summary.bytes+=uint64_t(count)*p.columns*sizeof(Bf16);
@@ -240,11 +243,11 @@ struct GroupedDispatchComm {
 #endif
     }
 #if FUSE_ENABLE_PROFILING
-    const uint64_t final_wait=lane==0?read_global_timer():0;
+    const uint64_t final_wait=detail?read_global_timer():0;
 #endif
     if(lane==0) tma_store_wait_all();
 #if FUSE_ENABLE_PROFILING
-    if(lane==0) summary.store_wait_ns+=read_global_timer()-final_wait;
+    if(detail) summary.store_wait_ns+=read_global_timer()-final_wait;
 #endif
     if constexpr (!CpAsyncG2S) {
       const uint32_t address=cute::cast_smem_ptr_to_uint(barrier);
@@ -300,9 +303,12 @@ struct GroupedDispatchComm {
       const uint64_t profile_begin = p.profile.panels && threadIdx.x == 0 ? read_global_timer() : 0;
 #endif
       // Shared tail stripes keep their original row ownership and arrival.
-      // Small experts are left unchanged while staged candidates are
-      // evaluated for M>128. No host count readback or model-name dispatch.
-      const bool staged=rows>TileM &&
+      // The copy-method crossover is a workload property, NOT the GEMM's
+      // delivery height. A 2-SM GEMM consumes 256-row panels; that must not
+      // switch 129..256-token experts back to synchronous vector loads.
+      // Staging chunks still fit kStageBytes, including a short final chunk;
+      // TileM only determines when the complete input may be published.
+      const bool staged=rows>128 &&
           int64_t(p.columns)*sizeof(Bf16)<=kStageBytes;
       if(staged) {
         if constexpr(SharedPanels) {
@@ -352,10 +358,18 @@ struct GroupedDispatchComm {
         const bool complete = producers == 1 || arrive_grouped_panel(p.arrivals+task)+1 == producers;
         if (complete) {
 #if FUSE_ENABLE_PROFILING
-          const uint64_t release_begin = p.profile.panels ? read_global_timer() : 0;
+          const bool first_publication = p.profile.ready_summary && p.profile.roles &&
+              !p.profile.roles[blockIdx.x].first_release_begin;
+          const uint64_t release_begin = p.profile.panels || first_publication ? read_global_timer() : 0;
 #endif
           store_release_gpu(p.ready + task * kReadyFlagStride, epoch);
 #if FUSE_ENABLE_PROFILING
+          if (first_publication) {
+            const uint64_t release_end = read_global_timer();
+            p.profile.roles[blockIdx.x].first_release_begin = release_begin;
+            p.profile.roles[blockIdx.x].first_release_end = release_end;
+            p.profile.roles[blockIdx.x].first_release_panel = task;
+          }
           if (p.profile.panels && task < p.profile.panel_capacity)
             p.profile.panels[task] = {profile_begin, release_begin, read_global_timer(), comm, expert, m};
 #endif
@@ -401,14 +415,9 @@ template <int TileN = 128, int TileK = 64, bool SwapAB = false, bool TrimTokens 
 using A2AGroupedGemm = GroupedMonolithicGemm<
     typename Bf16GroupedGemmTypes<TileN, TileK, SwapAB, TrimTokens>::DispatchGemm, GroupedDispatchComm<>>;
 
-template <int TileN = 128, int TileK = 64>
-using RetiringA2AGroupedGemm = GroupedMonolithicGemm<
-    typename Bf16GroupedRetiringGemmTypes<TileN,TileK>::DispatchGemm,
-    GroupedDispatchComm<256>,GroupedExplicitPreparePolicy,true>;
-
 static_assert(GroupedDispatchComm<256>::SharedStorageBytes <=
-    sizeof(Bf16GroupedRetiringGemmTypes<128,64>::DispatchGemm::SharedStorage));
+    sizeof(Bf16GroupedStockGemmTypes<128,64>::DispatchGemm::SharedStorage));
 static_assert(GroupedDispatchComm<256>::SharedStorageBytes <=
-    sizeof(Bf16GroupedRetiringGemmTypes<256,64>::DispatchGemm::SharedStorage));
+    sizeof(Bf16GroupedStockGemmTypes<256,64>::DispatchGemm::SharedStorage));
 
 }  // namespace fuse::detail

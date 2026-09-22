@@ -1,4 +1,21 @@
-# SM103 BF16 Dispatch + Grouped GEMM — v25.1
+# SM103 BF16 Dispatch + Grouped GEMM
+
+## v27.0 accepted baseline
+
+[Final results and replay policies](../../results/sm103/v27.0/README.md) preserve
+the measured native/CUTLASS scheduler independently of 1-/2-CTA UMMA width.
+Communication follows the actual consumer traversal; paired compute clusters
+remain intact. EP4 has 255 final points; EP8 is still the historical v26 cohort.
+The small-token CTA budgets are explicit offline selections, not a new Auto
+default. The diagnostic models below remain tools, not an active tuning task.
+
+The benchmark policy fields are
+`N,K,AlongN,swizzle,commCTAs,computeCTAs,swapAB,trimTokens,mmaSMs,copy,scheduler`.
+Copy is 0=cp.async/1=TMA; scheduler is 0=default/1=native/2=CUTLASS. Use the exact
+released policy: CUTLASS's effective swizzle is 1, whereas native 2-CTA retains
+its selected swizzle. Full-K ready units use 128 or 256 rows respectively.
+
+## Historical v25.1 scope
 
 User-accepted complete benchmark release. This version publishes **Dispatch ->
 expert FC1** only and restores the small-token rows that were omitted from v25.0.

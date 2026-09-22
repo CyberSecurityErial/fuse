@@ -632,10 +632,20 @@ Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终
 “等待时存在其他已 ready 尚未访问的 tile”仅为调度机会，不证明该 tile 的资源
 已经可用，也不等于可回收的端到端时间。单次 trace 不写入正式 benchmark 表。
 
+stock 2-SM Dispatch 的详细 handoff 记录附带 `tile_m=256`、`mma_sm_count=2`。
+通信与 GEMM 分支的物理 CTA 分别编号为通信前缀和计算后缀；二维计算 grid
+仅在记录索引中线性化，不改变实际启动形状。一个双 CTA 逻辑 tile 由首 CTA
+写一次 tile 记录，两个 CTA 均保留 role 边界；不把另一半 CTA 的空 tile 记录
+当作未工作。导出核对实际 pair ownership，不套用原单 CTA 自定义 scheduler。
+现用 CUTLASS stock grouped 将设备端问题线性化为 `(total_ctas,1)`，有效 swizzle
+为1，不能把用户传入的 max_swizzle 当成实际生效值。full handoff 已支持这条路径；
+轻量 ready-summary 按实际 native/stock 后端与 MMA 宽度重放消费遍历，
+分别核对单 CTA 和双 CTA 的 ready 次数；不根据 MMA 宽度猜测调度器。
+
 全矩阵筛查使用 `--grouped-ready-summary`（同时指定 `--grouped-profile`、
 `--grouped-direction dispatch`），支持现有 `--grouped-cases` 常驻批处理。
 只记录每 CTA 的角色边界，以及 load warp 原 ready 检查的次数、总时长、
-最大值、首次时长、至少1us的次数；每卡148×64字节，不分配逐tile记录。
+最大值、首次时长、至少1us的次数；每卡148×112字节，不分配逐tile记录。
 计数在寄存器中累计，角色结束写一次，无新增轮询、原子或热路径同步。
 采集前的默认stream清零必须完成，再启动各rank的nonblocking Graph。
 汇总重放原静态tile遍历核对检查次数；所有rank及数值/路由/尾部校验仍保留。
@@ -647,6 +657,20 @@ Q 终点为全部量化 warp 的最大 quant.end；R/QR 终点包含所有最终
 panel唯一通信CTA的条带假设。汇总结果必须保留 `tail_balance`，不可和关闭均衡
 的旧profile混为同一配置。详细panel条带仍不支持多生产者，有限buffer仍不在
 此profile入口支持范围。诊断和正式吞吐分别构建、分别报告。
+
+轻量汇总的可选 `startup` 扩展按物理 CTA 记录第一次 ready store 前后时间，
+以及计算 load warp 首次检查/观察 ready 的时间。借出的计算 CTA 也按实际
+发布者记录，不假定发布者总在通信前缀。`startup_bytes` 从真实 source 路由
+计算该 CTA 首个完整交付块的有效字节和远端字节；不使用平均 peer 比例。
+首发布两端仅夹住 store 指令，不表示精确的全局可见时刻；首次 acquire 也不是
+首条 MMA。零点为本 GPU 最早 CTA 进入，不包含 Graph prepare 或 host launch。
+轻量模式不执行逐次搬运阶段的时钟读取；详细模式保留原打点。
+
+各 CTA 首次等待不能求和当成 overhead。首发布、首次取得数据、首波消费者的分布
+分开汇报。将各 CTA 完成时刻减去其首次等待再取最大，只是保持后续耗时不变
+的反事实敏感性分析，不是已证明的可回收时间或硬件下界。发布首块集合的
+有效字节/时间属于逻辑交付带宽，不等同于 NVLink 硬件计数器；重复读取、缓存
+命中、在途及其他已完成搬运不包含其中，不能据此宣称物理链路利用率。
 
 ## 编译后二进制检查（非时间线）
 

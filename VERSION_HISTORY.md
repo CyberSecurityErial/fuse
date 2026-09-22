@@ -1,5 +1,12 @@
 # 版本演进手册
 
+## v27.0：BF16 Dispatch＋Grouped GEMM 收口
+
+- 接入native/CUTLASS、单/双CTA UMMA的GEMM优胜配置；通信匹配实际消费遍历。
+- EP4全255点，较v26共同249点融合吞吐GM +11.23%；实际满148SM强GEMM保留率79.71%。
+- 附overhead估算四列表，保留缺测与有限搜索限制；EP8未复测，不新增Auto验收声明。
+- [最终表与复现配置](results/sm103/v27.0/README.md)。
+
 ## v25.0：BF16 Dispatch＋Grouped GEMM 基线
 
 - 新增独立Group CTASP路径，支持GPU侧动态专家token数、Graph replay与尾块。

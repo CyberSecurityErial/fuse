@@ -1,5 +1,11 @@
 # SM103 Ulysses forward baseline bench
 
+v27.0 closes the BF16 grouped Dispatch baseline with exact GEMM scheduler/UMMA
+integration and matching communication traversal. [Final results](../../results/sm103/v27.0/README.md)
+cover all 255 EP4 points (+11.23% versus 249 paired v26 points), with separate
+overhead diagnostics and exact replay policies. EP8 remains the historical v26
+cohort; small-token budget winners are finite offline selections, not new Auto.
+
 v26.0 BF16 MoE [Dispatch + Grouped GEMM](GROUPED_GEMM_STUDY.md) adds selectable
 full-warp `cp.async` / TMA transport and a load-aware CTASP policy. The complete
 [v26.0 results](../../results/sm103/v26.0/README.md) rerun 510 EP4/8 points with

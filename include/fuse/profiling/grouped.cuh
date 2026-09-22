@@ -16,12 +16,19 @@ struct GroupedTileTimeline {
   int32_t cta = -1, expert = -1, m = -1, n = -1;
   int32_t polled = 0;
 };
-struct GroupedRoleTimeline { uint64_t begin = 0, role_end = 0, end = 0; };
+struct GroupedRoleTimeline {
+  uint64_t begin = 0, role_end = 0, end = 0;
+  // First complete input publication by this physical CTA, including borrowed
+  // producers. The store is bracketed, not treated as an exact visibility time.
+  uint64_t first_release_begin = 0, first_release_end = 0;
+  int64_t first_release_panel = -1;
+};
 // One load-warp summary per CTA, flushed once on mainloop destruction. These
 // waits may overlap previously issued MMA; they are NOT Tensor Core idle time.
 struct GroupedReadySummary {
   uint64_t checks = 0, wait_ns = 0, max_wait_ns = 0;
   uint64_t first_wait_ns = 0, waits_ge_1us = 0;
+  uint64_t first_wait_begin = 0, first_observed = 0;
 };
 // Diagnostic-only accumulated serial time for one Dispatch communication
 // warp. Warps overlap each other, so consumers must compare per-warp maxima;
@@ -40,6 +47,9 @@ struct GroupedProfile {
   GroupedReadySummary* ready_summary = nullptr;
   GroupedCommSummary* comm_summary = nullptr;
   int32_t comm_summary_capacity = 0;
+  // Split launches share one trace: communication first, then linearized
+  // physical GEMM CTAs. The production scheduler still sees its original grid.
+  int32_t cta_offset = 0;
 };
 }  // namespace fuse
 #endif

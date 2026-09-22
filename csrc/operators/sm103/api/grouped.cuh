@@ -56,22 +56,24 @@ __global__ void initialize_grouped_strides(SA* a, SB* b, SD* d,
 }
 
 template <bool Combine, int TileN, int TileK, bool SwapAB = false, bool TrimTokens = true,
-    class Selector = GroupedExplicitPreparePolicy, bool RetireCommToGemm = false>
+    class Selector = GroupedExplicitPreparePolicy, bool StockScheduler = false,
+    int SmMode = StockScheduler ? 2 : 1>
 struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
   static_assert(!Combine || !SwapAB);
-  static_assert(!RetireCommToGemm || (!Combine && !SwapAB));
+  static constexpr bool SeparateRoles = StockScheduler || SmMode == 2;
+  static_assert(!SeparateRoles || (!Combine && !SwapAB));
   static constexpr bool DynamicPolicy = !std::is_same_v<Selector, GroupedExplicitPreparePolicy>;
   static_assert(!Combine || !DynamicPolicy, "device policy selection currently supports Dispatch only");
-  static_assert(!RetireCommToGemm || !DynamicPolicy,
-      "retiring communication uses an explicit measured policy");
+  static_assert(!SeparateRoles || !DynamicPolicy,
+      "separate communication/GEMM branches use an explicit measured policy");
   static_assert(std::is_trivially_copyable_v<Selector>, "device selectors must be kernel arguments");
-  static constexpr int TileM=RetireCommToGemm?256:128;
-  using Types = std::conditional_t<RetireCommToGemm,
-      Bf16GroupedRetiringGemmTypes<TileN,TileK>,
-      Bf16GroupedGemmTypes<TileN,TileK,SwapAB,TrimTokens>>;
+  static constexpr int TileM=128*SmMode;
+  using Types = std::conditional_t<StockScheduler,
+      Bf16GroupedStockGemmTypes<TileN,TileK,SmMode>,
+      Bf16GroupedGemmTypes<TileN,TileK,SwapAB,TrimTokens,SmMode>>;
   using Kernel = std::conditional_t<Combine, GroupedGemmA2A<TileN,TileK>,
-      std::conditional_t<RetireCommToGemm,RetiringA2AGroupedGemm<TileN,TileK>,
-      GroupedMonolithicGemm<typename Types::DispatchGemm, GroupedDispatchComm<>, Selector>>>;
+      GroupedMonolithicGemm<typename Types::DispatchGemm,
+          GroupedDispatchComm<TileM>,Selector,SeparateRoles>>;
   using G = std::conditional_t<Combine, typename Types::CombineGemm, typename Types::DispatchGemm>;
   using Shape = GroupedProblemShape::UnderlyingProblemShape;
   using SA = typename G::InternalStrideA;
@@ -88,7 +90,7 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
   PreparePolicy prepare_policy{};
 
   ~GroupedBf16PlanImpl() override {
-    if constexpr (RetireCommToGemm) {
+    if constexpr (SeparateRoles) {
       int previous = 0;
       cudaGetDevice(&previous);
       cudaSetDevice(device);
@@ -114,12 +116,12 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
         int64_t(policy.num_comm_ctas) + policy.num_compute_ctas > prop.multiProcessorCount ||
         (policy.swizzle != 1 && policy.swizzle != 2 && policy.swizzle != 4 && policy.swizzle != 8))
       throw cudaErrorInvalidValue;
-    if constexpr (RetireCommToGemm) {
-      if (policy.mma_sm_count != 2 || policy.num_comm_ctas % 2 ||
-          policy.num_compute_ctas % 2 ||
+    if (policy.mma_sm_count != SmMode) throw cudaErrorInvalidValue;
+    if constexpr (SeparateRoles) {
+      if (policy.num_comm_ctas % SmMode || policy.num_compute_ctas % SmMode ||
           policy.num_comm_ctas + policy.num_compute_ctas != prop.multiProcessorCount ||
           p.dispatch_buffer_rows) throw cudaErrorInvalidValue;
-    } else if (policy.mma_sm_count != 1) throw cudaErrorInvalidValue;
+    }
     for (int r = 0; r < p.world_size; ++r)
       if (!p.peer_started[r] || !p.peer_done[r] ||
           (Combine ? !p.peer_output[r] : !p.peer_input[r])) throw cudaErrorInvalidValue;
@@ -210,18 +212,19 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
     g.epilogue.ptr_D = const_cast<Bf16**>(p.output); g.epilogue.dD = sd;
     g.epilogue.thread.alpha = 1.f; g.epilogue.thread.beta = 0.f;
     g.hw_info.device_id = device;
-    g.hw_info.sm_count = RetireCommToGemm
+    g.hw_info.sm_count = StockScheduler
         ? policy.num_compute_ctas : prop.multiProcessorCount;
-    if constexpr (!RetireCommToGemm) {
+    if constexpr (!StockScheduler) {
       g.scheduler.row_tile_offsets = tiles; g.scheduler.n = p.n;
       g.scheduler.compute_ctas = policy.num_compute_ctas;
-      g.scheduler.block_offset = policy.num_comm_ctas;
+      g.scheduler.block_offset = SeparateRoles ? 0 : policy.num_comm_ctas;
       g.scheduler.window_m = buffer_m;
     }
     g.scheduler.max_swizzle_size = policy.swizzle;
     using Raster = typename G::TileScheduler::RasterOrderOptions;
     g.scheduler.raster_order = policy.along_n ? Raster::AlongN : Raster::AlongM;
     GroupedTileOrder order{tiles, p.experts, n_tiles, policy.swizzle, policy.along_n, buffer_m};
+    order = grouped_consumer_order(order, StockScheduler);
     if constexpr (Combine) {
       g.epilogue.order = order; g.epilogue.ready = ready; g.epilogue.epoch_ptr = epoch;
     } else {
@@ -251,6 +254,7 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
     prepare.shapes = shapes; prepare.epoch = epoch;
     prepare.arrivals = arrivals; prepare.num_comm_ctas = policy.num_comm_ctas;
     prepare.first_wave_panels = first_wave; prepare.order = order;
+    prepare.mma_sm_count = SmMode;
     prepare.effective_comm_ctas = effective_comm;
     prepare.num_compute_ctas = policy.num_compute_ctas;
     prepare.consumed = consumed;
@@ -264,9 +268,13 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
     if (Kernel::initialize_workspace(args, workspace.ptr, nullptr) != cutlass::Status::kSuccess)
       throw cudaErrorUnknown;
     params = Kernel::to_underlying_arguments(args, workspace.ptr);
-    if constexpr (RetireCommToGemm) {
+    if constexpr (SeparateRoles) {
       gemm_params=params; gemm_params.split_role=1;
       comm_params=params; comm_params.split_role=2;
+#if FUSE_ENABLE_PROFILING
+      gemm_params.profile.cta_offset=policy.num_comm_ctas;
+      gemm_params.gemm.mainloop.profile.cta_offset=policy.num_comm_ctas;
+#endif
       check_grouped_cuda(cudaStreamCreateWithFlags(&comm_stream,cudaStreamNonBlocking));
       check_grouped_cuda(cudaEventCreateWithFlags(&fork_event,cudaEventDisableTiming));
       check_grouped_cuda(cudaEventCreateWithFlags(&comm_done_event,cudaEventDisableTiming));
@@ -300,7 +308,7 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
     auto status = cudaGetLastError();
     if (status != cudaSuccess) return status;
     void* packed[] = {&params};
-    if constexpr (!RetireCommToGemm)
+    if constexpr (!SeparateRoles)
       return cudaLaunchCooperativeKernel(reinterpret_cast<void*>(cutlass::device_kernel<Kernel>),
           Kernel::get_grid_shape(params), Kernel::get_block_shape(), packed,
           Kernel::SharedStorageSize, stream);
@@ -313,7 +321,7 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
       attributes[0].id=cudaLaunchAttributeCooperative;
       attributes[0].val.cooperative=1;
       attributes[1].id=cudaLaunchAttributeClusterDimension;
-      attributes[1].val.clusterDim={2,1,1};
+      attributes[1].val.clusterDim={SmMode,1,1};
       cudaLaunchConfig_t config{};
       config.gridDim=dim3(comm_params.num_comm_ctas,1,1);
       config.blockDim=Kernel::get_block_shape();
@@ -325,8 +333,11 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
       if(status!=cudaSuccess) return status;
       cudaLaunchAttribute cluster{};
       cluster.id=cudaLaunchAttributeClusterDimension;
-      cluster.val.clusterDim={2,1,1};
-      config.gridDim=dim3(gemm_params.compute_ctas,1,1);
+      cluster.val.clusterDim={SmMode,1,1};
+      // Stock grouped scheduling uses the physical x/y grid to recover the
+      // CTA's position within a raster/cluster. Flattening (2, C/2) into
+      // (C, 1) preserves the CTA count but changes its logical M coordinate.
+      config.gridDim=G::get_grid_shape(gemm_params.gemm);
       config.stream=stream;
       config.attrs=&cluster;
       config.numAttrs=1;
@@ -340,19 +351,35 @@ struct GroupedBf16PlanImpl final : Bf16GroupedGemmPlan {
 };
 
 template <bool Combine, int TileN, int TileK, bool SwapAB = false, bool TrimTokens = true,
-    bool RetireCommToGemm = false, class Selector = GroupedExplicitPreparePolicy>
+    bool StockScheduler = false, class Selector = GroupedExplicitPreparePolicy,
+    int SmMode = StockScheduler ? 2 : 1>
 cudaError_t create_grouped_tiled_plan(const Bf16GroupedGemmParams& params, Bf16GroupedGemmPlan** out,
     const Selector& selector = {}) {
   if (!out) return cudaErrorInvalidValue;
   *out = nullptr;
   try {
     auto plan = std::make_unique<GroupedBf16PlanImpl<Combine,TileN,TileK,SwapAB,TrimTokens,
-        Selector,RetireCommToGemm>>();
+        Selector,StockScheduler,SmMode>>();
     plan->initialize(params, selector);
     *out = plan.release();
     return cudaSuccess;
   } catch (cudaError_t status) { return status; }
     catch (const std::bad_alloc&) { return cudaErrorMemoryAllocation; }
+}
+
+template <bool StockScheduler, int SmMode, class Selector>
+cudaError_t create_grouped_explicit_scheduler(const Bf16GroupedGemmParams& params,
+    Bf16GroupedGemmPlan** out, const Selector& selector) {
+  const auto& p=params.policy;
+  if(p.tile_n==128 && p.tile_k==64)
+    return create_grouped_tiled_plan<false,128,64,false,true,StockScheduler,Selector,SmMode>(params,out,selector);
+  if(p.tile_n==128 && p.tile_k==128)
+    return create_grouped_tiled_plan<false,128,128,false,true,StockScheduler,Selector,SmMode>(params,out,selector);
+  if(p.tile_n==256 && p.tile_k==64)
+    return create_grouped_tiled_plan<false,256,64,false,true,StockScheduler,Selector,SmMode>(params,out,selector);
+  if(p.tile_n==256 && p.tile_k==128)
+    return create_grouped_tiled_plan<false,256,128,false,true,StockScheduler,Selector,SmMode>(params,out,selector);
+  return cudaErrorInvalidValue;
 }
 
 template <bool Combine, class Selector = GroupedExplicitPreparePolicy>
@@ -361,25 +388,24 @@ cudaError_t create_grouped_plan(const Bf16GroupedGemmParams& params, Bf16Grouped
   if(!out) return cudaErrorInvalidValue;
   *out=nullptr;
   const auto& p=params.policy;
-  if(p.mma_sm_count==2) {
-    // The retiring 2SM path changes the scheduler ABI. Keep it out of the
-    // dynamic-policy template graph instead of merely rejecting it at runtime.
+  if((p.mma_sm_count!=1 && p.mma_sm_count!=2) ||
+      (p.scheduler!=GroupedGemmScheduler::Default &&
+       p.scheduler!=GroupedGemmScheduler::Native &&
+       p.scheduler!=GroupedGemmScheduler::Cutlass)) return cudaErrorInvalidValue;
+  const bool stock=p.scheduler==GroupedGemmScheduler::Cutlass ||
+      (p.scheduler==GroupedGemmScheduler::Default && p.mma_sm_count==2);
+  if(p.mma_sm_count==2 || stock) {
+    // Scheduler identity is independent of the UMMA width. Keep these explicit
+    // offline choices out of the native-1SM device-policy template graph.
     if constexpr (Combine || !std::is_same_v<Selector,GroupedExplicitPreparePolicy>) {
       return cudaErrorInvalidValue;
     } else {
       if(p.swap_ab) return cudaErrorInvalidValue;
-      if(p.tile_n==128 && p.tile_k==64)
-        return create_grouped_tiled_plan<false,128,64,false,true,true>(params,out,selector);
-      if(p.tile_n==128 && p.tile_k==128)
-        return create_grouped_tiled_plan<false,128,128,false,true,true>(params,out,selector);
-      if(p.tile_n==256 && p.tile_k==64)
-        return create_grouped_tiled_plan<false,256,64,false,true,true>(params,out,selector);
-      if(p.tile_n==256 && p.tile_k==128)
-        return create_grouped_tiled_plan<false,256,128,false,true,true>(params,out,selector);
-      return cudaErrorInvalidValue;
+      if(!stock) return create_grouped_explicit_scheduler<false,2>(params,out,selector);
+      if(p.mma_sm_count==1) return create_grouped_explicit_scheduler<true,1>(params,out,selector);
+      return create_grouped_explicit_scheduler<true,2>(params,out,selector);
     }
   }
-  if(p.mma_sm_count!=1) return cudaErrorInvalidValue;
   if(p.swap_ab) {
     if constexpr (Combine) return cudaErrorInvalidValue;
     else {

@@ -143,7 +143,7 @@ class PersistentTileSchedulerSm100Grouped
 // role dispatch, shared-storage maximum, and collective grid join here so
 // grouped scheduling/resource tuning never changes Projection hot paths.
 template <class GemmKernel, class CommOp, class Selector = GroupedExplicitPreparePolicy,
-    bool RetireCommToGemm = false>
+    bool SeparateRoles = false>
 struct GroupedMonolithicGemm {
   static constexpr bool DynamicPolicy =
       !std::is_same_v<Selector,GroupedExplicitPreparePolicy>;
@@ -155,8 +155,8 @@ struct GroupedMonolithicGemm {
   static_assert(MaxThreadsPerBlock == 256);
   static_assert(MaxThreadsPerBlock >= CommOp::kMinThreads);
   static constexpr int ClusterSize=cute::size(typename GemmKernel::ClusterShape{});
-  static_assert((!RetireCommToGemm && ClusterSize == 1) ||
-      (RetireCommToGemm && ClusterSize == 2));
+  static_assert(ClusterSize == 1 || ClusterSize == 2);
+  static_assert(SeparateRoles || ClusterSize == 1);
   static constexpr size_t SharedStorageSize =
       sizeof(typename GemmKernel::SharedStorage) > CommOp::SharedStorageBytes
           ? sizeof(typename GemmKernel::SharedStorage) : CommOp::SharedStorageBytes;
@@ -184,9 +184,9 @@ struct GroupedMonolithicGemm {
     typename CommOp::Params comm;
     int32_t compute_ctas = 0;
     int32_t num_comm_ctas = 0;
-    // Retiring/2SM plans may launch this same statically specialized kernel
-    // as two Graph branches. 0 keeps the original monolithic behavior;
-    // 1 is stock GEMM only; 2 is communication only.
+    // Stock or paired-MMA plans use two Graph branches with disjoint budgets.
+    // A compute cluster always contains only GEMM roles. 0 is the original
+    // native-1SM launch; 1 is GEMM only; 2 is communication only.
     int32_t split_role = 0;
     bool borrow_idle_compute_ctas = false;
     // Optional GPU-prepared invocation state. The host copy still fixes the
@@ -198,7 +198,7 @@ struct GroupedMonolithicGemm {
     if (args.num_comm_ctas <= 0 || args.gemm.hw_info.sm_count <= 0 ||
         args.comm.params.num_comm_ctas != args.num_comm_ctas ||
         !GemmKernel::can_implement(args.gemm) || !CommOp::can_implement(args.comm)) return false;
-    if constexpr (RetireCommToGemm)
+    if constexpr (SeparateRoles)
       return args.num_comm_ctas % ClusterSize == 0 &&
           args.gemm.hw_info.sm_count % ClusterSize == 0;
     else return args.gemm.scheduler.block_offset == args.num_comm_ctas;
@@ -229,7 +229,7 @@ struct GroupedMonolithicGemm {
   }
 
   static dim3 get_grid_shape(const Params& params) {
-    if constexpr (RetireCommToGemm) return dim3(params.compute_ctas,1,1);
+    if constexpr (SeparateRoles) return dim3(params.compute_ctas,1,1);
     else return dim3(params.compute_ctas + params.num_comm_ctas, 1, 1);
   }
 
@@ -248,8 +248,10 @@ struct GroupedMonolithicGemm {
     // descriptor-rich Params into thread-local storage.
     const Params& params = resolve_invocation(launch);
 #if FUSE_ENABLE_PROFILING
+    const int profile_cta = params.profile.cta_offset + int(blockIdx.x +
+        gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z));
     if (params.profile.roles && threadIdx.x == 0)
-      params.profile.roles[blockIdx.x].begin = read_global_timer();
+      params.profile.roles[profile_cta].begin = read_global_timer();
 #endif
     const int32_t block = static_cast<int32_t>(blockIdx.x);
     // A short grouped workload may expose fewer initial GEMM tiles than its
@@ -264,21 +266,11 @@ struct GroupedMonolithicGemm {
     // workload has at least compute_ctas tiles, idle_compute is zero and the
     // ordinary large-token role partition is unchanged. The decision uses
     // device row counts, never a model or benchmark identity.
-    if constexpr (RetireCommToGemm) {
+    if constexpr (SeparateRoles) {
       if (params.split_role == 1) {
         GemmKernel{}(params.gemm,smem);
       } else if (params.split_role == 2) {
         CommOp{}(params.comm,smem,block,params.num_comm_ctas);
-      } else {
-        // Monolithic diagnostic: tail clusters communicate first, then join
-        // the full stock GEMM grid. Production split launch avoids this
-        // measured rendezvous cost.
-        const int32_t comm_begin=params.compute_ctas-params.num_comm_ctas;
-        if (block >= comm_begin) {
-          CommOp{}(params.comm,smem,block-comm_begin,params.num_comm_ctas);
-          __syncthreads();
-        }
-        GemmKernel{}(params.gemm,smem);
       }
     } else {
       const int64_t tiles = params.gemm.scheduler.order.tiles();
@@ -302,11 +294,11 @@ struct GroupedMonolithicGemm {
 #if FUSE_ENABLE_PROFILING
     if (params.profile.roles) {
       __syncthreads();  // Diagnostic role endpoint means ALL CTA threads returned.
-      if (threadIdx.x == 0) params.profile.roles[blockIdx.x].role_end = read_global_timer();
+      if (threadIdx.x == 0) params.profile.roles[profile_cta].role_end = read_global_timer();
     }
 #endif
     if constexpr (CommOp::kNeedsGridFinalize) {
-      if constexpr (RetireCommToGemm) {
+      if constexpr (SeparateRoles) {
         if (params.split_role != 1) {
           cooperative_groups::this_grid().sync();
           CommOp{}.finalize(params.comm);
@@ -319,7 +311,7 @@ struct GroupedMonolithicGemm {
 #if FUSE_ENABLE_PROFILING
     if (params.profile.roles) {
       __syncthreads();
-      if (threadIdx.x == 0) params.profile.roles[blockIdx.x].end = read_global_timer();
+      if (threadIdx.x == 0) params.profile.roles[profile_cta].end = read_global_timer();
     }
 #endif
   }

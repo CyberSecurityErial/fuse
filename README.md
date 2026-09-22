@@ -1,5 +1,12 @@
 # fuse — GEMM + Communication Fusion
 
+## v27.0 — BF16 Dispatch＋Grouped GEMM 收口版本
+
+保留GEMM优胜的调度器、1/2-CTA UMMA与布局，通信按实际消费顺序适配。
+EP4全255点；相对v26共同249点融合吞吐几何平均 **+11.23%**，实际满148SM强GEMM保留率 **79.71%**。
+附完整overhead诊断四列表；估算与实测吞吐分开。EP8保留v26历史结果，不冒充新版复测。
+[完整结果、配置和限制](results/sm103/v27.0/README.md)。
+
 ## v25.0 — BF16 Dispatch＋Grouped GEMM
 
 新增独立的 SM103 MoE Dispatch→专家 FC1 融合：动态专家 token 数、CTASP、

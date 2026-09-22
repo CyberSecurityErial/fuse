@@ -85,7 +85,7 @@ struct GroupedInputReadyMainloop : Base {
   // extra barrier, per-tile arrays, or global writes in the polling loop.
   CUTLASS_DEVICE ~GroupedInputReadyMainloop() {
     if (summary_output_ && summary_.checks)
-      summary_output_[blockIdx.x] = summary_;
+      summary_output_[summary_cta_] = summary_;
   }
 #endif
   template <class Problem>
@@ -117,18 +117,32 @@ struct GroupedInputReadyMainloop : Base {
       const Coord& coord, Iterator k, int count, bool changed) {
     const int physical_m=int(cute::get<SwapAB ? 1 : 0>(coord));
     const int logical_m=physical_m/SmMode;
+    // Stock 2-SM scheduling rounds each expert's grid up to swizzle bands.
+    // Padded M tiles have no producer or ready flag; CUTLASS masks their
+    // memory accesses. Preserve that work, but never wait for nonexistent
+    // delivery (or accidentally wait on the next expert's first panel).
+    bool has_input_panel = true;
+    if constexpr (SmMode == 2)
+      has_input_panel = logical_m < p.row_tile_offsets[expert_ + 1] -
+          p.row_tile_offsets[expert_];
 #if FUSE_ENABLE_PROFILING
     // One record per output tile's FIRST load() call. Prologue/remainder
     // reuse must not overwrite it. No new ready checks or synchronization.
+    const int profile_cta = p.profile.cta_offset + int(blockIdx.x +
+        gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z));
     const int64_t profile_row = p.profile.tiles ? p.row_tile_offsets[expert_] + logical_m : -1;
     const int64_t profile_tile = profile_row * p.profile.n_tiles + int(cute::get<SwapAB ? 0 : 1>(coord));
-    const bool record = p.profile.tiles && count > 0 && profile_tile != profiled_tile_;
+    // A 2-SM pair consumes one logical M tile; record its leading CTA once.
+    // Keep per-CTA ready summaries for BOTH members when requested.
+    const bool record = p.profile.tiles && has_input_panel && physical_m % SmMode == 0 &&
+        int(cute::get<SwapAB ? 0 : 1>(coord)) < p.profile.n_tiles &&
+        count > 0 && profile_tile != profiled_tile_;
     const bool leader = threadIdx.x % 32 == 0;
     const uint64_t wait_begin = record && leader ? read_global_timer() : 0;
     uint64_t observed = wait_begin;
     bool polled = false;
 #endif
-    if (p.ready && count > 0) {
+    if (p.ready && has_input_panel && count > 0) {
       const int64_t row = p.row_tile_offsets[expert_] + logical_m;
       if (row != acquired_) {
         const uint32_t epoch = p.epoch_ptr ? *p.epoch_ptr : p.epoch;
@@ -143,7 +157,12 @@ struct GroupedInputReadyMainloop : Base {
           if (p.profile.ready_summary) {
             const uint64_t elapsed = read_global_timer() - summary_begin;
             summary_output_ = p.profile.ready_summary;
-            if (!summary_.checks) summary_.first_wait_ns = elapsed;
+            summary_cta_ = profile_cta;
+            if (!summary_.checks) {
+              summary_.first_wait_ns = elapsed;
+              summary_.first_wait_begin = summary_begin;
+              summary_.first_observed = summary_begin + elapsed;
+            }
             ++summary_.checks;
             summary_.wait_ns += elapsed;
             summary_.max_wait_ns = elapsed > summary_.max_wait_ns ? elapsed : summary_.max_wait_ns;
@@ -168,7 +187,7 @@ struct GroupedInputReadyMainloop : Base {
     if (record) {
       if (leader && profile_row < p.profile.panel_capacity)
         p.profile.tiles[profile_tile] = {wait_begin, observed, load_begin, read_global_timer(),
-            int(blockIdx.x), expert_, logical_m, int(cute::get<SwapAB ? 0 : 1>(coord)), int(polled)};
+            profile_cta, expert_, logical_m, int(cute::get<SwapAB ? 0 : 1>(coord)), int(polled)};
       profiled_tile_ = profile_tile;
     }
     return result;
@@ -183,6 +202,7 @@ struct GroupedInputReadyMainloop : Base {
   int64_t profiled_tile_ = -1;
   GroupedReadySummary summary_{};
   GroupedReadySummary* summary_output_ = nullptr;
+  int summary_cta_ = 0;
 #endif
 };
 

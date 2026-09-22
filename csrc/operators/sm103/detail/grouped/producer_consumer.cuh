@@ -110,6 +110,20 @@ struct GroupedTileOrder {
   }
 };
 
+// Normalize the GEMM backend's traversal into logical (expert,M,N) order
+// BEFORE deriving communication. Public raster names are not a schedule:
+// the pinned device-only CUTLASS grouped scheduler has effective swizzle=1,
+// and its AlongN advances N first, as does our native decoder at sw=1.
+// A 2-SM pair consumes ONE 256-row tile; P physical CTAs expose P/2 workers.
+// No model identity or token bucket participates in this translation.
+CUTLASS_HOST_DEVICE GroupedTileOrder grouped_consumer_order(
+    GroupedTileOrder requested, bool stock_scheduler = false) {
+  if (stock_scheduler) {
+    requested.swizzle = 1;
+  }
+  return requested;
+}
+
 // Number of distinct input panels touched by the first persistent-GEMM wave.
 // Logical tasks are expert-contiguous and each panel owns exactly n_tiles,
 // but a raster may interleave those panels. Count the prefix analytically;

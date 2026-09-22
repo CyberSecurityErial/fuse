@@ -204,6 +204,18 @@ int main() {
         self.assertEqual(l20d.grouped_policy(selectable_copy)['dispatch_copy'],'tma')
         cp_async=selectable_copy|dict(grouped_policy='256,128,1,4,32,116,0,1,1,0')
         self.assertNotIn('dispatch_copy',l20d.grouped_policy(cp_async))
+        for sm in (1,2):
+            for scheduler in (1,2):
+                exact=selectable_copy|dict(grouped_fused_only=True,grouped_measure=True,
+                    grouped_policy=f'256,128,1,4,20,128,0,1,{sm},1,{scheduler}')
+                self.assertEqual(l20d.grouped_policy(exact)['scheduler'],scheduler)
+                with self.assertRaises(ValueError):
+                    l20d.grouped_policy(exact|dict(grouped_fused_only=False))
+                with self.assertRaises(ValueError):
+                    l20d.grouped_policy(exact|dict(grouped_gemm_search=True))
+        with self.assertRaises(ValueError):
+            l20d.grouped_policy(selectable_copy|dict(
+                grouped_policy='256,128,1,4,20,128,0,1,1,1,3'))
         with self.assertRaises(ValueError):
             l20d.grouped_policy(selectable_copy|dict(grouped_direction='combine'))
         with self.assertRaises(ValueError):

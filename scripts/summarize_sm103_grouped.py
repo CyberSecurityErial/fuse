@@ -53,6 +53,13 @@ def read_run(directory, case_index=None):
             require(actual == stream.extractfile(member).read(), 'Extracted evidence changed')
             data[name.split('/', 1)[1]] = actual
     require(required <= set(data), 'Missing grouped evidence')
+    return _read_case_evidence(root,receipt,data,case_index)
+
+
+def _read_case_evidence(root,receipt,data,case_index):
+    """Validate the same native evidence for fetched and explicitly recovered runs."""
+    attempt=int(receipt['attempt'])
+    csv_name=f'grouped-case-{case_index:04d}.csv' if case_index is not None else 'grouped-samples.csv'
     job = json_bytes(data['job.json'])
     installed = json_bytes(data['source-installed.json'])
     contract = json_bytes(data['grouped-contract.json'])
@@ -155,20 +162,29 @@ def audit_samples(text, world, geometry, expert_rows, search, directions=('dispa
     external = search == 'external'
     require(not transport_compare or (fused_only and not search),'Invalid transport comparison mode')
     require(not compute_compare or transport_compare,'Invalid compute comparison mode')
-    expected_modes = {'fused','transport_body'} if transport_compare else {'fused'} if fused_only else {'cutlass_stock','deepgemm_m128','deepgemm_m256','fused'} if external else {'cutlass_search'} if search else {
+    search_modes = ({'cutlass_search','cutlass_search_2sm',
+        'cutlass_stock_1sm_budget','cutlass_stock_2sm_budget'}
+        if search in ('expanded','compact') else {'cutlass_search'})
+    expected_modes = {'fused','transport_body'} if transport_compare else {'fused'} if fused_only else {'cutlass_stock','deepgemm_m128','deepgemm_m256','fused'} if external else search_modes if search else {
         'fused', 'transport_body', 'cutlass_matched', 'cublas_grouped_default', 'cublaslt_sequence_tuned'}
     if compute_compare:
         expected_modes.add('cutlass_matched')
     require({key[1] for key in results} == expected_modes, 'Missing or unexpected modes')
     if search:
         for direction in directions:
-            configs = {key[2] for key in results if key[0] == direction and
-                       (not external or key[1]=='cutlass_stock')}
-            require(len(configs) == 32 and {c[:4] for c in configs} ==
-                {(n,k,a,s) for n in (128,256) for k in (64,128) for a in (0,1) for s in (1,2,4,8)},
-                'Incomplete compute grid')
-            require(len({c[5] for c in configs}) == 1 and all(c[4] == 0 for c in configs),
-                    'Compute search changed CTA budget')
+            for mode in ({'cutlass_stock'} if external else search_modes):
+                configs = {key[2] for key in results if key[0] == direction and key[1] == mode}
+                swizzles=(1,) if search=='compact' and mode.startswith('cutlass_stock_') else (1,2,4,8)
+                require(len(configs) == 8*len(swizzles) and {c[:4] for c in configs} ==
+                    {(n,k,a,s) for n in (128,256) for k in (64,128) for a in (0,1) for s in swizzles},
+                    'Incomplete compute grid')
+                require(len({c[5] for c in configs}) == 1 and all(c[4] == 0 for c in configs),
+                        'Compute search changed CTA budget')
+                if '2sm' in mode:
+                    require(all(c[5] % 2 == 0 for c in configs),'Incomplete two-SM cluster budget')
+            require(len({key[2][5] for key in results if key[0] == direction and
+                         (not external or key[1] == 'cutlass_stock')}) == 1,
+                    'Compute search families changed CTA budget')
             if external:
                 require(len([key for key in results if key[0]==direction])==35,
                         'Incomplete external grouped comparison')
@@ -194,7 +210,11 @@ def audit_samples(text, world, geometry, expert_rows, search, directions=('dispa
 
 
 def audit_run(directory, case_index=None):
-    root, receipt, job, geometry, data = read_run(directory,case_index)
+    return _audit_case_evidence(*read_run(directory,case_index))
+
+
+def _audit_case_evidence(root,receipt,job,geometry,data):
+    case_index=receipt.get('case_index')
     world = int(job['world'])
     if '_skip_reason' in data:
         return dict(run_id=receipt['run_id'],case_index=case_index,source_id=receipt['source_id'],
@@ -229,6 +249,13 @@ def audit_run(directory, case_index=None):
     require(set(counts) == {(d,p,r) for d in directions for p in (0,1) for r in range(world)},
             'Missing expert distribution')
     search = 'external' if job.get('grouped_external') else bool(job.get('grouped_gemm_search'))
+    if search is True and any(re.search(r'candidate=80/80\b',line) for line in lines):
+        search = 'compact'
+    if search is True and any(re.search(r'candidate=128/(32|128)\b',line) for line in lines):
+        # Historical single-scheduler grids have 32 candidates; current grids
+        # have 32 per scheduler/UMMA family. The completed progress record,
+        # not the set of surviving CSV modes, determines expected coverage.
+        search = 'expanded'
     if search == 'external':
         build=json_bytes(data['grouped-contract.json'])['build']
         require(build.get('external',{}).get('upstream')=='78b69000794d0937b47ae3387eff7663410264d1',
@@ -264,12 +291,20 @@ def audit_run(directory, case_index=None):
                 'Measured swapAB tail trimming differs from request')
         require(int(sample.get('dispatch_copy',0))==int(policy.get('dispatch_copy')=='tma'),
                 'Measured Dispatch copy method differs from request')
+        require(int(sample.get('scheduler',0))==policy.get('scheduler',0),
+                'Measured GEMM scheduler differs from request')
     if policy.get('swap_ab'):
         for row in rows: row['config']['swap_ab'] = True
     if policy.get('trim_swap_tokens') is False:
         for row in rows: row['config']['trim_swap_tokens'] = False
     if policy.get('dispatch_copy') == 'tma':
         for row in rows: row['config']['dispatch_copy'] = 'tma'
+    if policy.get('scheduler'):
+        for row in rows: row['config']['scheduler'] = policy['scheduler']
+    if policy.get('mma_sm_count') == 2:
+        # This launch specialization is frozen in the audited job policy;
+        # legacy CSV rows predate a dedicated UMMA-width column.
+        for row in rows: row['config']['mma_sm_count'] = 2
     for row in rows:
         if search == 'external':
             require(row['config']==policy if row['mode']=='fused' else
@@ -283,7 +318,8 @@ def audit_run(directory, case_index=None):
     for direction in directions:
         candidates = [r for r in rows if r['direction']==direction and r['valid'] and
             r['mode'] in ({'cutlass_stock','deepgemm_m128','deepgemm_m256'} if search=='external' else
-                         {'cutlass_search'} if search else {'cublas_grouped_default','cublaslt_sequence_tuned'})]
+                         {'cutlass_search','cutlass_search_2sm','cutlass_stock_1sm_budget',
+                          'cutlass_stock_2sm_budget'} if search else {'cublas_grouped_default','cublaslt_sequence_tuned'})]
         selected[direction] = min(candidates,key=lambda r:r['ms']) if candidates else None
     return dict(run_id=receipt['run_id'], case_index=case_index, source_id=receipt['source_id'], artifacts=str(root),
                 environment_fingerprint=receipt['environment_fingerprint'],
@@ -302,6 +338,47 @@ def audit_cases(directory):
     job=json.loads((root/'job.json').read_text())
     batch=grouped_batch_cases(job)
     return [audit_run(root,i) for i in range(len(batch))] if batch else [audit_run(root)]
+
+
+def audit_recovered_search(directory):
+    """Explicitly recover complete native search output after a dead controller.
+
+    This does NOT manufacture a successful runner/fetch receipt. Every case
+    must have completed in the original log, and all ordinary source, route,
+    correctness and sample checks still apply. Only search seeds are recovered;
+    independent replay remains necessary before claiming a performance result.
+    """
+    root=Path(directory).resolve()
+    archive=root/'recovered-evidence.tar.gz'
+    data={}
+    with tarfile.open(archive,'r:gz') as stream:
+        for member in stream:
+            name=safe_member(member.name)
+            require('/' not in name and name not in data and member.isfile() and
+                    member.size<=64<<20, 'Invalid recovered evidence member')
+            data[name]=stream.extractfile(member).read()
+    required={'job.json','source-installed.json','environment.json',
+              'grouped-contract.json','status.json'}
+    require(required<=data.keys(), 'Incomplete recovered metadata')
+    job=json_bytes(data['job.json']); receipt=json_bytes(data['status.json'])
+    require(job==json_bytes(read_bytes(root/'job.json',root)), 'Recovered job mismatch')
+    require(job.get('stage')=='grouped-ep' and job.get('grouped_gemm_search') and
+            not job.get('grouped_external'), 'Recovery is limited to pure GEMM searches')
+    batch=grouped_batch_cases(job)
+    require(batch is not None, 'Recovery requires an explicit search batch')
+    log=f'attempt{int(receipt["attempt"])}.log'
+    require(log in data and data[log].decode().rstrip().endswith(
+        'PASSED grouped-batch: completed or explicitly memory-skipped cases; no device reset'),
+        'Native search batch did not finish')
+    records=[]
+    provenance=dict(kind='native_search_recovered_without_runner_exit_receipt',
+        archive_sha256=file_digest(archive),runner_state=receipt.get('state'),
+        runner_exit_code=receipt.get('work_exit_code'))
+    for index in range(len(batch)):
+        record=_audit_case_evidence(*_read_case_evidence(root,receipt,dict(data),index))
+        record['recovery']=dict(provenance)
+        records.append(record)
+    return records
 
 
 def comparison_rows(records):
@@ -399,6 +476,87 @@ def catalog_rows(records):
                         row['attempts']=[dict(run=r['run_id'],case=r.get('case_index'),reason=r.get('reason')) for r in attempts]
                     output.append(row)
     return output
+
+
+def exact_fusion_replay(record, candidate=None):
+    """Build an unmeasured Dispatch replay without substituting its GEMM.
+
+    Search modes identify the actual scheduler and UMMA width; the outer
+    search fixture's policy does not. Keep the measured compute budget, and
+    assign its complement to communication. This is an experiment, not an
+    automatic communication policy or evidence of a stable winning result.
+    A supplied alternative must itself belong to the audited search record.
+    """
+    require(not record.get('skipped') and record.get('search') in
+            (True,'compact','expanded'), 'Replay requires an audited GEMM search')
+    if candidate is None:
+        candidate=record['selected'].get('dispatch')
+    require(candidate is not None and candidate in record['rows'] and
+            candidate['valid'] and candidate['direction']=='dispatch',
+            'Replay candidate is not a valid audited Dispatch measurement')
+    families={'cutlass_search':(1,1), 'cutlass_search_2sm':(1,2),
+              'cutlass_stock_1sm_budget':(2,1), 'cutlass_stock_2sm_budget':(2,2)}
+    require(candidate['mode'] in families, 'Unsupported replay GEMM family')
+    scheduler,sm=families[candidate['mode']]
+    c=candidate['config']; compute=c['compute']; comm=148-compute
+    require(0<compute<148 and compute%sm==0 and comm%sm==0,
+            'Replay requires complete compute/communication clusters')
+    require(not c.get('swap_ab',False), 'Search family does not encode swapped GEMM')
+    values=(c['tile_n'],c['tile_k'],c['along_n'],c['swizzle'],comm,compute,
+            0,int(c.get('trim_swap_tokens',True)),sm,
+            int(c.get('dispatch_copy')=='tma'),scheduler)
+    policy=','.join(map(str,values))
+    grouped_policy(dict(stage='grouped-ep',grouped_policy=policy,
+                        grouped_direction='dispatch',grouped_fused_only=True))
+    g=record['geometry']
+    case=','.join(str(g[k]) for k in ('h','f','experts','topk','target_rows'))
+    p50=[candidate['payloads'][p][-1]['p50'] for p in (0,1)]
+    return dict(case=case,policy=policy,direction='dispatch',
+        argument=f'{case}@{policy}@dispatch',ep=record['world'],
+        status='independent_replay_pending',
+        buffer_rows=record.get('buffer_rows',0),
+        tail_balance=record.get('tail_balance',False),hot_half=record.get('hot_half',False),
+        gemm_seed=dict(run=record['run_id'],case=record.get('case_index'),
+            source_id=record['source_id'],mode=candidate['mode'],config=dict(c),
+            payload_p50_ms=p50,payload_gap=max(p50)/min(p50)-1,
+            recovery=dict(record['recovery']) if record.get('recovery') else None))
+
+
+def exact_fusion_batches(records, batch_size=64):
+    """Prepare independent winner replays, never submit or infer missing points.
+
+    Keep workload-wide flags in separate processes. Policies remain per case,
+    so batching cannot replace the measured scheduler, tile or SM budget.
+    Noisy search winners are retained as pending experiments, not accepted
+    results; their two-payload gap is already carried by exact_fusion_replay.
+    """
+    require(isinstance(batch_size,int) and 1<=batch_size<=64, 'Invalid replay batch size')
+    groups={}; seen=set(); sources=set(); gaps=[]
+    for record in records:
+        g=record['geometry']
+        identity=(record['world'],)+tuple(g[k] for k in
+            ('h','f','experts','topk','target_rows'))
+        require(identity not in seen, 'Duplicate workload in exact replay plan')
+        seen.add(identity); sources.add(record['source_id'])
+        if record.get('skipped'):
+            gaps.append(dict(ep=record['world'],geometry=dict(g),
+                run=record['run_id'],case=record.get('case_index'),
+                reason=record.get('reason'),status='search_missing'))
+            continue
+        entry=exact_fusion_replay(record)
+        key=tuple(entry[k] for k in ('ep','buffer_rows','tail_balance','hot_half'))
+        groups.setdefault(key,[]).append(entry)
+    require(len(sources)<=1, 'Exact replay plan mixes search source versions')
+    batches=[]
+    for (ep,buffer_rows,tail_balance,hot_half),entries in groups.items():
+        for start in range(0,len(entries),batch_size):
+            selected=entries[start:start+batch_size]
+            batches.append(dict(ep=ep,buffer_rows=buffer_rows,
+                tail_balance=tail_balance,hot_half=hot_half,entries=selected,
+                grouped_cases=';'.join(e['argument'] for e in selected)))
+    return dict(status='independent_replay_pending',attempted=len(seen),
+        replay_points=sum(len(b['entries']) for b in batches),
+        search_source_id=next(iter(sources),None),gaps=gaps,batches=batches)
 
 
 def seed_fusion_plan(searches, budgets, eps=(4,8), targets=None):
@@ -667,11 +825,20 @@ def grouped_handoff_trace(ranks):
         require(all(0<a<=b<=c for a,b,c in roles),'Invalid role timestamps')
         origin=min(x[0] for x in roles)
         nt=(r['n']+r['tile_n']-1)//r['tile_n']
-        mt=[(m+127)//128 for m in r['rows']]
+        sm_mode=r.get('mma_sm_count',1); tile_m=r.get('tile_m',128)
+        stock=r.get('stock_scheduler',sm_mode==2)
+        require(sm_mode in (1,2) and tile_m==128*sm_mode,'Invalid profile delivery tile')
+        require(stock in (0,1) and compute%sm_mode==0,'Invalid profile scheduler/worker count')
+        mt=[(m+tile_m-1)//tile_m for m in r['rows']]
         require(len(r['panels'])==sum(mt) and len(r['tiles'])==sum(mt)*nt,'Missing panel/tile records')
         # This probe records the final publisher's copy. The selected cases
         # have one producer per panel; do not mislabel split-panel captures.
-        require(sum(mt)>=comm,'Split-panel diagnostics need per-producer records')
+        # The large-token branch uses complete producer cohorts. With fewer
+        # than two CTAs per panel it still has ONE producer, even when a few
+        # communication CTAs have no work. Do not confuse idle CTAs with a
+        # split panel. Small-token partial cohorts remain unsupported here.
+        single_producer = sum(mt)>=comm or (max(r['rows'],default=0)>=192 and comm<2*sum(mt))
+        require(single_producer,'Split-panel diagnostics need per-producer records')
         panels={}; offset=0
         for e,count in enumerate(mt):
             for m in range(count):
@@ -693,7 +860,12 @@ def grouped_handoff_trace(ranks):
             minor=m if r['along_n'] else n; major=n if r['along_n'] else m
             band=minor//r['swizzle']*r['swizzle']; width=min(r['swizzle'],minor_count-band)
             logical=sum(mt[:e])*nt+band*major_count+major*width+minor-band
-            require(cta==comm+logical%compute,'Wrong compute task ownership')
+            if stock:
+                # Pinned stock scheduler linearizes device-only group shapes
+                # to (total_ctas,1): its effective swizzle is 1, even if the
+                # requested maximum is larger. A pair owns one logical tile.
+                logical=sum(mt[:e])*nt+(m*nt+n if r['along_n'] else n*mt[e]+m)
+            require(cta==comm+(logical*sm_mode)%compute,'Wrong compute task ownership')
             require(roles[cta][0]<=begin<=observed<=load<=end<=roles[cta][1] and begin>0,
                     'Invalid consumer timestamps')
             pa,rb,re,owner=panels[e,m]
@@ -741,7 +913,9 @@ def grouped_handoff_trace(ranks):
                                args=dict(name=f'CTA {c:03d} / {label}')))
             events.append(dict(name='thread_sort_index',ph='M',pid=selected,tid=c*3+lane,args=dict(sort_index=c*3+lane)))
         span('Dispatch role' if c<r['comm'] else 'GEMM role',c*3,a,b,{})
-        span('grid join + finalize',c*3,b,end,{})
+        span('grid join + finalize' if c<r['comm'] or
+             (r.get('mma_sm_count',1)==1 and not r.get('stock_scheduler',False))
+             else 'role exit',c*3,b,end,{})
     for (e,m),(a,b,end,c) in panels.items():
         span('gather + original CTA join',c*3+1,a,b,dict(expert=e,m=m))
         span('ready publication',c*3+1,b,end,dict(expert=e,m=m))
@@ -755,7 +929,8 @@ def grouped_handoff_trace(ranks):
         span('first Base::load call (includes pipeline waits)',c*3+2,l,end,dict(expert=e,m=m,n=n))
     return dict(traceEvents=events,displayTimeUnit='ms',metadata=dict(
         schema='grouped-handoff-perfetto-v1',detail_rank=selected,rank_summaries=summaries,
-        config={k:r[k] for k in ('world','n','k','tile_n','tile_k','comm','compute','swizzle','along_n','rows')},
+        config={k:r[k] for k in ('world','n','k','tile_n','tile_k','comm','compute','swizzle','along_n','rows',
+                                'tile_m','mma_sm_count','stock_scheduler') if k in r},
         note='All ranks validated; detailed tracks show rank with longest local-role envelope (before cross-rank finalize). Per-GPU globaltimer origins. '
              'First load is not MMA execution; ready waits can overlap earlier MMA. '
              'Publication stamps bracket instruction issue/completion, not visibility. '
@@ -791,10 +966,15 @@ def export_grouped_handoff(run):
 def grouped_ready_checks(rank):
     """Replay the existing static tile order; no timing assumptions or tuning."""
     nt=(rank['n']+rank['tile_n']-1)//rank['tile_n']
-    workers=rank['compute']; sw=rank['swizzle']; along=rank['along_n']
+    sm=rank.get('mma_sm_count',1); tile_m=rank.get('tile_m',128)
+    require(sm in (1,2) and tile_m==128*sm and rank['compute']%sm==0,
+            'Invalid ready-summary consumer width')
+    workers=rank['compute']//sm
+    sw=1 if rank.get('stock_scheduler',sm==2) else rank['swizzle']
+    along=rank['along_n']
     last=[-1]*workers; checks=[0]*workers; prefix=0
     for rows in rank['rows']:
-        mt=(rows+127)//128
+        mt=(rows+tile_m-1)//tile_m
         major_count,minor_count=(nt,mt) if along else (mt,nt)
         for local in range(mt*nt):
             begin=local//(major_count*sw)*sw
@@ -806,7 +986,66 @@ def grouped_ready_checks(rank):
             if panel!=last[worker]:
                 checks[worker]+=1; last[worker]=panel
         prefix+=mt
-    return checks
+    return [count for count in checks for _ in range(sm)]
+
+
+def grouped_startup_summary(rank):
+    """Observed input startup, never an asserted unavoidable E2E overhead.
+
+    One GPU clock only. min(publication) brackets the first ready store;
+    min(observation) is the first load warp that actually acquired its input.
+    Neither is the first MMA instruction. First waits of different CTAs overlap.
+    Removing each CTA's first wait while keeping its remaining duration fixed
+    gives a counterfactual sensitivity, not a proven realizable latency bound:
+    earlier starts would also change contention and subsequent pipeline waits.
+    """
+    stamps=rank['startup']; ctas=rank['ctas']
+    require(len(stamps)==len(ctas),'Missing startup CTA')
+    origin=min(c[0] for c in ctas)
+    releases=[]; consumers=[]
+    for c,(s,a) in enumerate(zip(stamps,ctas)):
+        require(len(s)==4 and all(isinstance(v,int) and v>=0 for v in s),'Invalid startup record')
+        rb,re,wb,observed=s
+        begin,end,_,checks,_,_,first,_=a
+        require((rb==re==0) or begin<=rb<=re<=end,'Invalid first publication')
+        if rb:
+            require(checks==0,'Compute CTA published Dispatch input')
+            releases.append((rb,re,c))
+        if checks:
+            require(begin<=wb<=observed<=end and observed-wb==first,'Invalid first acquire')
+            consumers.append((wb,observed,end,first,c))
+        else:
+            require(wb==observed==0,'Acquire on producer/idle CTA')
+    require(releases and consumers,'Missing startup producer/consumer')
+    first_rb=min(x[0] for x in releases); first_re=min(x[1] for x in releases)
+    require(min(x[1] for x in consumers)>=first_rb,'First acquire preceded all publications')
+    q=lambda xs,p: sorted(xs)[int((len(xs)-1)*p)]
+    end=max(x[2] for x in consumers)
+    shifted_end=max(x[2]-x[3] for x in consumers)
+    result=dict(first_publication_lower_us=(first_rb-origin)/1000,
+        first_publication_upper_us=(first_re-origin)/1000,
+        first_acquire_us=(min(x[1] for x in consumers)-origin)/1000,
+        first_check_us=(min(x[0] for x in consumers)-origin)/1000,
+        first_wave_acquire_p50_us=(q([x[1] for x in consumers],.5)-origin)/1000,
+        first_wave_acquire_p95_us=(q([x[1] for x in consumers],.95)-origin)/1000,
+        first_wait_p50_us=q([x[3] for x in consumers],.5)/1000,
+        first_wait_max_us=max(x[3] for x in consumers)/1000,
+        fixed_duration_first_wait_sensitivity_us=(end-shifted_end)/1000,
+        producer_ctas_with_publication=len(releases),active_compute_ctas=len(consumers))
+    if 'startup_bytes' in rank:
+        payload=rank['startup_bytes']
+        require(len(payload)==len(ctas),'Missing startup payload')
+        for c,(total,remote) in enumerate(payload):
+            require(0<=remote<=total and bool(total)==bool(stamps[c][0]),'Invalid startup bytes')
+        cohort_end=max(x[1] for x in releases)
+        total=sum(x[0] for x in payload); remote=sum(x[1] for x in payload)
+        result.update(first_publication_cohort_us=(cohort_end-origin)/1000,
+            first_publication_cohort_bytes=total,first_publication_cohort_remote_bytes=remote,
+            # B/ns = decimal GB/s. Logical delivered bytes, NOT hardware NVLink
+            # counters: reuse/cache and unfinished copies are not accounted for.
+            first_publication_cohort_payload_GBs=total/(cohort_end-origin),
+            first_publication_cohort_remote_GBs=remote/(cohort_end-origin))
+    return result
 
 
 def grouped_ready_summary(ranks):
@@ -821,6 +1060,8 @@ def grouped_ready_summary(ranks):
         require(r['schema']=='grouped-ready-summary-v1' and
                 (r['warmup'],r['payload'],r['epoch'])==(10,1,13),'Invalid ready protocol')
         require(all(r[k]==ranks[0][k] for k in fields),'Rank configuration mismatch')
+        require(all(r.get(k)==ranks[0].get(k) for k in
+                    ('tile_m','mma_sm_count','stock_scheduler')),'Rank GEMM backend mismatch')
         require(r['comm']>0 and r['compute']>0 and r['comm']+r['compute']<=148 and
                 r['tile_n'] in (128,256) and r['swizzle'] in (1,2,4,8) and
                 r['along_n'] in (0,1) and r['n']>0 and r['k']>0 and
@@ -862,10 +1103,30 @@ def grouped_ready_summary(ranks):
             long_check_fraction=sums['long_checks']/sums['checks'],checks=sums['checks'],
             total_role_ns=sums['role_ns'],total_wait_ns=sums['wait_ns'],
             total_rows=sum(r['rows']),panels=sum((m+127)//128 for m in r['rows'])))
+        if 'startup' in r:
+            summaries[-1]['startup']=grouped_startup_summary(r)
     critical=max(summaries,key=lambda r:r['local_role_us'])
     return dict(config={k:ranks[0][k] for k in fields},ranks=summaries,
                 critical=critical,weighted_wait_fraction=sum(r['total_wait_ns'] for r in summaries)/
                 sum(r['total_role_ns'] for r in summaries))
+
+
+def grouped_ready_policy_matches(rank, policy):
+    """Compare requested scheduler enum with the recorded actual backend.
+
+    Native/stock and MMA width are independent. The trace records the backend
+    as stock_scheduler, not the public scheduler enum; never ignore that field
+    or infer every 2-CTA launch is stock.
+    """
+    if not all(rank.get(k)==v for k,v in policy.items()
+               if k not in ('dispatch_copy','scheduler')):
+        return False
+    scheduler=policy.get('scheduler',0)
+    sm=policy.get('mma_sm_count',1)
+    stock=scheduler==2 or (scheduler==0 and sm==2)
+    if scheduler:
+        return rank.get('stock_scheduler')==int(stock) and rank.get('mma_sm_count')==sm
+    return rank.get('stock_scheduler',int(stock))==int(stock)
 
 
 def export_grouped_ready(run):
@@ -907,7 +1168,11 @@ def export_grouped_ready(run):
             ranks=[json.loads(read(f'grouped-ready-{i:04d}-rank-{r}.json')) for r in range(job['world'])]
             g=case['geometry']; p=grouped_policy(job|dict(grouped_policy=case['policy']))
             require(all(r['world']==job['world'] and r['n']==2*g['f'] and r['k']==g['h'] and
-                        all(r[k]==p[k] for k in p) for r in ranks),'Summary differs from requested case')
+                        grouped_ready_policy_matches(r,p) for r in ranks),
+                    'Summary differs from requested case')
+            # Copy mode is supplied by the archived, hash-verified invocation;
+            # legacy v1 rank records carry only the original six policy fields.
+            entry['dispatch_copy']=p.get('dispatch_copy','cp.async')
             require(all(len(r['rows'])==g['experts']//job['world'] for r in ranks) and
                     sum(sum(r['rows']) for r in ranks)==job['world']*g['tokens_per_rank']*g['topk'],
                     'Ready routed row count mismatch')
@@ -1202,7 +1467,12 @@ if __name__ == '__main__':
     if args.handoff_profile:
         if len(args.runs)!=1 or args.plan or args.runs_root or args.all_cases or args.case_index is not None:
             parser.error('--handoff-profile requires exactly one run')
-        print(json.dumps(export_grouped_handoff(args.runs[0]),separators=(',',':'),allow_nan=False))
+        trace=json.dumps(export_grouped_handoff(args.runs[0]),separators=(',',':'),allow_nan=False)
+        if args.output:
+            args.output.write_text(trace+'\n')
+            print(f'Perfetto: {args.output}')
+        else:
+            print(trace)
         sys.exit(0)
     if args.plan is not None:
         if args.runs or args.runs_root is None or args.case_index is not None or args.all_cases or args.comparison or args.catalog:

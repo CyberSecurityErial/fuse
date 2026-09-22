@@ -13,12 +13,12 @@ struct GroupedInputModelResult {
   double exposed_feed_us = 0;
 };
 
-// Offline scorer for the native full-K-panel Dispatch pipeline.
+// Offline scorer for the full-K-panel Dispatch dependency chain.
 //
 // For one candidate CTA split and consumer layout:
 //
 //   C       base communication CTAs
-//   P       compute CTAs (normally launch_ctas - C)
+//   P       logical compute workers (physical compute CTAs / MMA SM count)
 //   T       actual GEMM tiles derived from device row_offsets
 //   q[p]    first logical tile which consumes panel p under Along/swizzle
 //   R[p]    panel-p release under THIS complete candidate (C, P, L, copy policy)
@@ -57,6 +57,10 @@ struct GroupedInputModelResult {
 // read on every Graph replay, without a model-name or benchmark-row lookup.
 //
 // Along/swizzle change q[p], even when T and the wave count are unchanged.
+// Scheduler identity and MMA width are independent: native 2-CTA retains
+// its requested swizzle, while pinned CUTLASS grouped traversal has effective
+// swizzle=1 for both widths. Callers must pass the measured scheduler, not
+// infer it from the number of CTAs in an MMA cluster.
 // R[p] may be unordered because producers run concurrently; no in-order
 // completion is assumed. tau must be calibrated for the exact tile, K, layout
 // and compute budget, and must already include steady pipeline cost. Changing
@@ -74,10 +78,14 @@ struct GroupedInputModelResult {
 // otherwise-idle compute CTAs. A positive explicit C is exact and never lends.
 // Runtime selection reads geometry and device row_offsets only: no online
 // timing, host readback, model-name lookup, allocation, or Graph recapture.
-CUTLASS_HOST_DEVICE inline GroupedInputModelResult score_grouped_input_schedule(
-    const GroupedTileOrder& order, const double* ready_us,
-    int compute_ctas, double tile_us) {
+CUTLASS_HOST_DEVICE GroupedInputModelResult score_grouped_input_schedule(
+    GroupedTileOrder order, const double* ready_us,
+    int compute_ctas, double tile_us, int mma_sm_count = 1,
+    bool stock_scheduler = false) {
   GroupedInputModelResult result;
+  if ((mma_sm_count != 1 && mma_sm_count != 2) || compute_ctas % mma_sm_count) return result;
+  order = grouped_consumer_order(order,stock_scheduler);
+  compute_ctas /= mma_sm_count;
   if (!order.row_tile_offsets || order.experts <= 0 || order.n_tiles <= 0 ||
       compute_ctas <= 0 || !(tile_us > 0 && tile_us <= DBL_MAX) ||
       (order.swizzle != 1 && order.swizzle != 2 && order.swizzle != 4 && order.swizzle != 8) ||
@@ -132,15 +140,20 @@ struct GroupedDispatchServices {
 //   CTA  = work % C             (next work for this CTA is work + C)
 //   R[p] = max(end of p's nonempty stripes)
 // Every expert uses its own routed row count, including short/empty tails.
-// Domain: native full-buffer Dispatch, no optional last-cohort tail sharing.
+// Domain: full-buffer Dispatch, no optional last-cohort tail sharing.
 // Unsupported policies must use their own model, not silently reuse this one.
 // This diagnostic scorer is O(panels * splits); device selection cost must be
 // measured before enabling it in production preparation.
-CUTLASS_HOST_DEVICE inline GroupedInputModelResult score_grouped_dispatch_candidate(
-    const GroupedTileOrder& order, const int64_t* row_offsets, int k,
-    int comm_ctas, int compute_ctas, const GroupedDispatchServices& service) {
+CUTLASS_HOST_DEVICE GroupedInputModelResult score_grouped_dispatch_candidate(
+    GroupedTileOrder order, const int64_t* row_offsets, int k,
+    int comm_ctas, int compute_ctas, const GroupedDispatchServices& service,
+    int mma_sm_count = 1, bool stock_scheduler = false) {
   constexpr int kMaxCtas = 148;
   GroupedInputModelResult result;
+  if ((mma_sm_count != 1 && mma_sm_count != 2) || compute_ctas % mma_sm_count) return result;
+  const int tile_m=128*mma_sm_count;
+  const int workers=compute_ctas/mma_sm_count;
+  order=grouped_consumer_order(order,stock_scheduler);
   auto positive = [](double v) { return v > 0 && v <= DBL_MAX; };
   if (!row_offsets || !order.row_tile_offsets || order.experts <= 0 || order.n_tiles <= 0 ||
       row_offsets[0] != 0 || order.row_tile_offsets[0] != 0 || order.window_m != 0 ||
@@ -152,18 +165,18 @@ CUTLASS_HOST_DEVICE inline GroupedInputModelResult score_grouped_dispatch_candid
   for (int e=0; e<order.experts; ++e) {
     const int64_t rows=row_offsets[e+1]-row_offsets[e];
     if (row_offsets[e+1] < row_offsets[e] || rows > INT32_MAX ||
-        order.row_tile_offsets[e+1]-order.row_tile_offsets[e] != (rows+127)/128) return result;
+        order.row_tile_offsets[e+1]-order.row_tile_offsets[e] != (rows+tile_m-1)/tile_m) return result;
   }
   const int64_t panels=order.row_tiles();
   if (panels < 0 || panels > INT64_MAX/order.n_tiles) return result;
   result.tiles=panels*order.n_tiles;
-  result.waves=result.tiles/compute_ctas+(result.tiles%compute_ctas!=0);
+  result.waves=result.tiles/workers+(result.tiles%workers!=0);
   result.compute_us=result.waves*service.tile_us;
   result.finish_us=result.compute_us;
   result.first_ready_us=panels ? DBL_MAX : 0;
   const int first_wave=grouped_use_latency_cohort(row_offsets,order.experts)
-      ? grouped_first_wave_panels(order,compute_ctas) : -1;
-  const int splits=grouped_dispatch_splits(panels,comm_ctas,first_wave,int64_t(128)*k*2);
+      ? grouped_first_wave_panels(order,workers) : -1;
+  const int splits=grouped_dispatch_splits(panels,comm_ctas,first_wave,int64_t(tile_m)*k*2,tile_m);
   double producer_end[kMaxCtas]{};
   for (int e=0; e<order.experts; ++e) {
     const int64_t rows=row_offsets[e+1]-row_offsets[e];
@@ -172,7 +185,7 @@ CUTLASS_HOST_DEVICE inline GroupedInputModelResult score_grouped_dispatch_candid
         (splits>1 ? service.staged_stripe_row_us : service.staged_row_us);
     for (int64_t p=order.row_tile_offsets[e]; p<order.row_tile_offsets[e+1]; ++p) {
       const int m=int(p-order.row_tile_offsets[e]);
-      const int valid=int(rows-int64_t(m)*128 < 128 ? rows-int64_t(m)*128 : 128);
+      const int valid=int(rows-int64_t(m)*tile_m < tile_m ? rows-int64_t(m)*tile_m : tile_m);
       const int groups=(valid+7)/8;
       const int producers=splits<groups ? splits : groups;
       double ready=0;
@@ -187,7 +200,7 @@ CUTLASS_HOST_DEVICE inline GroupedInputModelResult score_grouped_dispatch_candid
       if (ready>result.copy_us) result.copy_us=ready;
       if (ready<result.first_ready_us) result.first_ready_us=ready;
       const int64_t first=order.linear(e,m,0);
-      const int64_t remain=(result.tiles-1-first)/compute_ctas+1;
+      const int64_t remain=(result.tiles-1-first)/workers+1;
       const double endpoint=ready+remain*service.tile_us;
       if (endpoint>result.finish_us) {
         result.finish_us=endpoint;
@@ -205,6 +218,8 @@ struct GroupedDispatchCandidate {
   int comm_ctas = 0, compute_ctas = 0, swizzle = 1;
   bool along_n = false;
   GroupedDispatchServices service{};
+  int mma_sm_count = 1;
+  bool stock_scheduler = false;
 };
 
 struct GroupedDispatchSelection {
@@ -218,7 +233,7 @@ struct GroupedDispatchSelection {
 // either case, predict the releases anew for each candidate's actual layout.
 // Borrowing is deliberately absent: choose the base producer budget first.
 // Invalid/unsupported candidates are not a license to invent service rates.
-CUTLASS_HOST_DEVICE inline GroupedDispatchSelection select_grouped_dispatch_candidate(
+CUTLASS_HOST_DEVICE GroupedDispatchSelection select_grouped_dispatch_candidate(
     GroupedTileOrder order, const int64_t* row_offsets, int k,
     const GroupedDispatchCandidate* candidates, int count) {
   GroupedDispatchSelection best;
@@ -228,7 +243,8 @@ CUTLASS_HOST_DEVICE inline GroupedDispatchSelection select_grouped_dispatch_cand
     order.swizzle=candidate.swizzle;
     order.along_n=candidate.along_n;
     const auto prediction=score_grouped_dispatch_candidate(order,row_offsets,k,
-        candidate.comm_ctas,candidate.compute_ctas,candidate.service);
+        candidate.comm_ctas,candidate.compute_ctas,candidate.service,
+        candidate.mma_sm_count,candidate.stock_scheduler);
     if (!prediction.valid) continue;
     if (best.index<0 || prediction.finish_us<best.prediction.finish_us ||
         (prediction.finish_us==best.prediction.finish_us &&

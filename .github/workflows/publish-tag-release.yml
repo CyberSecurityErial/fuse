@@ -30,6 +30,15 @@ jobs:
               : (process.env.REQUESTED_TAG || "v25.0");
 
             const releases = {
+              "v27.0": {
+                name: "v27.0 — SM103 BF16 Dispatch + Grouped GEMM",
+                body: [
+                  "核心优化：精确接入native/CUTLASS、单/双CTA UMMA的GEMM优胜参数；通信按实际GEMM消费遍历适配，保持完整计算cluster与full-K ready协议。小token保留20/32/40通信CTA有限搜索优胜配置。",
+                  "EP4全255点融合结果有效；相对v26共同249点吞吐几何平均+11.23%（小token+7.24%，大token+15.00%），实际满148SM强GEMM保留率79.71%。EP8未复测，历史结果保留在v26。",
+                  "附overhead四列诊断：93.54% / 93.17% / 92.91% / 85.16%。overhead为三次profile敏感性估计，不是可保证消除的时间；六个搬运测量缺口保留。Graph10+50双随机输入完整校验，小token搜索优胜尚未独立全量复验，不宣称全局最优或新Auto。",
+                  "最终表、配置、复现与限制：results/sm103/v27.0。BF16 Dispatch基线到此收口；不附调优流水账、profile或依赖。",
+                ].join("\n\n"),
+              },
               "v26.0": {
                 name: "v26.0 — SM103 BF16 Grouped Dispatch adaptive transport",
                 body: [

@@ -2,18 +2,134 @@
 import csv
 import io
 import json
+import random
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
 from summarize_sm103_grouped import audit_samples, comparison_rows, catalog_rows, seed_fusion_plan, collect_plan, catalog_markdown, collect_external_plan, external_markdown, grouped_handoff_trace
 from summarize_sm103_grouped import (grouped_ready_checks, grouped_ready_summary,
-    component_headroom, component_headroom_markdown)
+    component_headroom, component_headroom_markdown, exact_fusion_replay, exact_fusion_batches)
 import summarize_sm103_grouped
 
 
 class GroupedSummaryTests(unittest.TestCase):
+    def test_ready_policy_checks_actual_scheduler_and_width(self):
+        rng=random.Random(20260922)
+        for _ in range(100):
+            sm=rng.choice((1,2)); scheduler=rng.choice((0,1,2))
+            policy=dict(tile_n=rng.choice((128,256)),compute=128,
+                        mma_sm_count=sm,scheduler=scheduler,dispatch_copy='tma')
+            stock=int(scheduler==2 or (scheduler==0 and sm==2))
+            rank=dict(tile_n=policy['tile_n'],compute=128,
+                      mma_sm_count=sm,stock_scheduler=stock)
+            check=summarize_sm103_grouped.grouped_ready_policy_matches
+            self.assertTrue(check(rank,policy))
+            self.assertFalse(check(rank|dict(stock_scheduler=1-stock),policy))
+            self.assertFalse(check(rank|dict(mma_sm_count=3-sm),policy))
+            if scheduler:
+                missing=dict(rank);del missing['stock_scheduler']
+                self.assertFalse(check(missing,policy))
+
+    def test_recovery_is_explicit_and_preserves_missing_runner_receipt(self):
+        job=dict(stage='grouped-ep',world=4,grouped_measure=True,grouped_gemm_search=True,
+            grouped_direction='dispatch',grouped_cases='64,64,4,1,8')
+        receipt=dict(attempt=1,state='running')
+        footer='PASSED grouped-batch: completed or explicitly memory-skipped cases; no device reset'
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'job.json').write_text(json.dumps(job))
+            def archive(log):
+                content={'job.json':json.dumps(job),'status.json':json.dumps(receipt),
+                    'source-installed.json':'{}','environment.json':'{}',
+                    'grouped-contract.json':'{}','attempt1.log':log}
+                with tarfile.open(root/'recovered-evidence.tar.gz','w:gz') as tar:
+                    for name,text in content.items():
+                        raw=text.encode();member=tarfile.TarInfo(name);member.size=len(raw)
+                        tar.addfile(member,io.BytesIO(raw))
+            archive('CASE grouped index=0 state=running total=1\n')
+            with self.assertRaisesRegex(ValueError,'did not finish'):
+                summarize_sm103_grouped.audit_recovered_search(root)
+            archive(footer+'\n')
+            # The wrapper cannot replace ordinary per-case checks with a footer.
+            with patch.object(summarize_sm103_grouped,'_read_case_evidence',
+                              side_effect=ValueError('Missing sample CSV')):
+                with self.assertRaisesRegex(ValueError,'Missing sample CSV'):
+                    summarize_sm103_grouped.audit_recovered_search(root)
+            self.assertFalse((root/'fetched.json').exists())
+        skipped=summarize_sm103_grouped._audit_case_evidence(Path('.'),
+            dict(run_id='run',case_index=3,source_id='hash',environment_fingerprint='env'),
+            dict(world=4,grouped_direction='dispatch',grouped_gemm_search=True),{},
+            {'_skip_reason':'insufficient_memory'})
+        self.assertEqual(skipped['case_index'],3)
+
+    def test_expanded_gemm_search_keeps_all_scheduler_families(self):
+        modes=('cutlass_search','cutlass_search_2sm',
+               'cutlass_stock_1sm_budget','cutlass_stock_2sm_budget')
+        geometry=dict(h=64,f=64,experts=1,topk=1,tokens_per_rank=32)
+        counts={('dispatch',p,0):[32] for p in (0,1)}
+        samples=[]
+        for mode in modes:
+            for n in (128,256):
+                for k in (64,128):
+                    for a in (0,1):
+                        for sw in (1,2,4,8):
+                            for payload in (0,1):
+                                for sample in range(50):
+                                    samples.append(dict(direction='dispatch',mode=mode,ep=1,
+                                        h=64,f=64,total_experts=1,topk=1,tokens_per_rank=32,
+                                        tile_n=n,tile_k=k,along_n=a,swizzle=sw,comm_ctas=0,
+                                        compute_ctas=128,payload=payload,round=0,sample=sample,
+                                        rank=0,rank_rows=32,ms=1.,warmup=10,drift=0.,accepted=1))
+        def audit(rows,grid='expanded'):
+            out=io.StringIO(); writer=csv.DictWriter(out,fieldnames=samples[0].keys())
+            writer.writeheader();writer.writerows(rows)
+            return audit_samples(out.getvalue(),1,geometry,counts,grid,('dispatch',))
+        baseline=audit(samples)
+        random.Random(20260922).shuffle(samples)
+        shuffled=audit(samples)
+        normalize=lambda rows: sorted((r['mode'],tuple(sorted(r['config'].items())),r['ms']) for r in rows)
+        self.assertEqual(normalize(baseline),normalize(shuffled))
+        self.assertEqual(len(baseline),128)
+        compact=[s for s in samples if not s['mode'].startswith('cutlass_stock_') or s['swizzle']==1]
+        self.assertEqual(len(audit(compact,'compact')),80)
+        with self.assertRaisesRegex(ValueError,'compute grid'):audit(compact)
+        for absent in modes:
+            with self.assertRaisesRegex(ValueError,'Missing or unexpected modes'):
+                audit([r for r in samples if r['mode']!=absent])
+        with self.assertRaisesRegex(ValueError,'rank samples'):
+            audit(samples[:-1])
+
+    def test_startup_clock_translation_and_overlapping_waits(self):
+        # Property: changing the arbitrary GPU clock origin cannot change a
+        # duration. Two CTA startup waits overlap; they must never be summed.
+        rng=random.Random(20260922)
+        for _ in range(100):
+            shift=rng.randrange(1,10**12)
+            wait=rng.randrange(100,5000)
+            rank=dict(ctas=[[100,10100,12100,0,0,0,0,0],
+                [100,11100,12100,1,wait,wait,wait,0],
+                [100,11000,12100,1,wait,wait,wait,0]],
+                startup=[[200,220,0,0],[0,0,220,220+wait],[0,0,230,230+wait]],
+                startup_bytes=[[4096,2048],[0,0],[0,0]])
+            base=summarize_sm103_grouped.grouped_startup_summary(rank)
+            for a in rank['ctas']:
+                for k in range(3): a[k]+=shift
+            for a in rank['startup']:
+                for k in range(4):
+                    if a[k]: a[k]+=shift
+            translated=summarize_sm103_grouped.grouped_startup_summary(rank)
+            self.assertEqual(base,translated)
+            self.assertAlmostEqual(base['fixed_duration_first_wait_sensitivity_us'],wait/1000)
+            self.assertEqual(base['first_publication_lower_us'],.1)
+            self.assertEqual(base['first_publication_upper_us'],.12)
+            self.assertEqual(base['first_publication_cohort_bytes'],4096)
+            self.assertAlmostEqual(base['first_publication_cohort_remote_GBs'],2048/120)
+            rank['startup'][1][3]+=1
+            with self.assertRaisesRegex(ValueError,'first acquire'):
+                summarize_sm103_grouped.grouped_startup_summary(rank)
+
     def test_auditor_records_explicit_tma_copy_method(self):
         source=Path(summarize_sm103_grouped.__file__).read_text()
         self.assertIn("sample.get('dispatch_copy',0)",source)
@@ -135,6 +251,43 @@ class GroupedSummaryTests(unittest.TestCase):
                 (duplicate/'fetched.json').write_text('{}')
                 with self.assertRaises(ValueError): collect_external_plan(plan,runs)
 
+    def test_grouped_handoff_scheduler_width_and_tail_properties(self):
+        import copy
+        from itertools import product
+        for sm,stock,along,sw in product((1,2),(False,True),(0,1),(1,2,4,8)):
+            rows=[0,1,127,128,129,255,256,257,512,768]
+            height=128*sm
+            rank=dict(schema='grouped-handoff-v1',rank=0,world=1,n=512,k=3072,
+                tile_n=256,tile_k=64,tile_m=height,mma_sm_count=sm,stock_scheduler=stock,
+                comm=2,compute=4,swizzle=sw,along_n=along,rows=rows,warmup=10,payload=1,epoch=13,
+                roles=[[100,100000,100010] for _ in range(6)],panels=[],tiles=[])
+            prefix=0; last=[None]*(4//sm); checks=[0]*(4//sm)
+            for e,count in enumerate(rows):
+                mt=(count+height-1)//height
+                width=1 if stock else sw
+                major,minor=(2,mt) if along else (mt,2)
+                coordinates=[]
+                for band in range(0,minor,width):
+                    for a in range(major):
+                        for b in range(band,min(band+width,minor)):
+                            coordinates.append((b,a) if along else (a,b))
+                order={coord:prefix*2+i for i,coord in enumerate(coordinates)}
+                for m,n in coordinates:
+                    worker=order[m,n]%(4//sm)
+                    if last[worker]!=(e,m): checks[worker]+=1; last[worker]=(e,m)
+                for m in range(mt):
+                    p=prefix+m; a=200+p*10
+                    rank['panels'].append([a,a+3,a+4,p%2,e,m])
+                    for n in range(2):
+                        logical=order[m,n]; cta=2+(sm*logical)%4; t=20000+logical*100
+                        rank['tiles'].append([t,t+10,t+20,t+40,cta,e,m,n,1])
+                prefix+=mt
+            trace=grouped_handoff_trace([rank])
+            self.assertEqual(trace['metadata']['rank_summaries'][0]['panels'],prefix)
+            self.assertEqual(grouped_ready_checks(rank),[c for c in checks for _ in range(sm)])
+            broken=copy.deepcopy(rank);broken['tiles'][-1][4]+=1
+            with self.assertRaises(ValueError):grouped_handoff_trace([broken])
+
     def test_grouped_handoff_observations_not_e2e_wait(self):
         import copy
         rank=dict(schema='grouped-handoff-v1',rank=0,world=1,n=256,k=128,tile_n=256,
@@ -155,6 +308,19 @@ class GroupedSummaryTests(unittest.TestCase):
             if change=='wrong_coord':bad['tiles'][0][6]=1
             if change=='prepublication':bad['tiles'][0][1]=140
             with self.assertRaises(ValueError):grouped_handoff_trace([bad])
+
+    def test_grouped_handoff_idle_producers_are_not_split_panels(self):
+        for rows in (192,193,255,256):
+            rank=dict(schema='grouped-handoff-v1',rank=0,world=1,n=256,k=2048,
+                tile_n=256,tile_k=64,tile_m=256,mma_sm_count=2,comm=3,compute=4,
+                swizzle=8,along_n=1,rows=[rows,rows],warmup=10,payload=1,epoch=13,
+                roles=[[100,1000,1100] for _ in range(7)],
+                panels=[[110,150,155,e,e,0] for e in range(2)],
+                tiles=[[160,170,180,200,3+2*e,e,0,0,1] for e in range(2)])
+            self.assertEqual(grouped_handoff_trace([rank])['metadata']['rank_summaries'][0]['panels'],2)
+            rank['comm']=4
+            rank['roles'].append([100,1000,1100])
+            with self.assertRaisesRegex(ValueError,'Split-panel'): grouped_handoff_trace([rank])
 
     def test_markdown_preserves_missing_and_config(self):
         base=dict(models=['model'],ep=4,target_rows=128,direction='dispatch')
@@ -313,6 +479,94 @@ class GroupedSummaryTests(unittest.TestCase):
         self.assertEqual(sum(r['status']=='not_measured' for r in rows),len(rows)-1)
         self.assertTrue(all(r['status']=='not_measured' for r in catalog_rows([skip|dict(search=True)])))
         with self.assertRaises(ValueError): catalog_rows([skip,skip|dict(source_id='different')])
+
+    def test_exact_replay_preserves_measured_family_and_budget(self):
+        rng=random.Random(103)
+        families={'cutlass_search':(1,1),'cutlass_search_2sm':(1,2),
+                  'cutlass_stock_1sm_budget':(2,1),'cutlass_stock_2sm_budget':(2,2)}
+        for mode,(scheduler,sm) in families.items():
+            for _ in range(50):
+                compute=rng.choice((108,120,128,132,136,140))
+                config=dict(tile_n=rng.choice((128,256)),tile_k=rng.choice((64,128)),
+                    along_n=rng.randrange(2),swizzle=rng.choice((1,2,4,8)),
+                    comm=0,compute=compute,dispatch_copy=rng.choice(('tma','cp.async')))
+                # Search's outer fixture is not the candidate's UMMA family.
+                config['mma_sm_count']=1
+                winner=dict(valid=True,direction='dispatch',mode=mode,config=config,
+                            payloads={0:[dict(p50=.1)],1:[dict(p50=.125)]})
+                record=dict(search='compact',run_id='search',source_id='hash',case_index=2,
+                    world=rng.choice((4,8)),rows=[winner],selected={'dispatch':winner},
+                    geometry=dict(h=4096,f=1024,experts=256,topk=8,
+                                  target_rows=rng.choice((1,128,192,512,8192))),
+                    tail_balance=True,hot_half=False)
+                before=json.dumps(record,sort_keys=True)
+                replay=exact_fusion_replay(record)
+                values=list(map(int,replay['policy'].split(',')))
+                self.assertEqual(values[:4],[config[k] for k in
+                    ('tile_n','tile_k','along_n','swizzle')])
+                self.assertEqual(values[4:],[148-compute,compute,0,1,sm,
+                    int(config['dispatch_copy']=='tma'),scheduler])
+                self.assertEqual(replay['ep'],record['world'])
+                self.assertTrue(replay['tail_balance'])
+                self.assertEqual(replay['gemm_seed']['mode'],mode)
+                self.assertAlmostEqual(replay['gemm_seed']['payload_gap'],.25)
+                self.assertEqual(replay['status'],'independent_replay_pending')
+                self.assertEqual(before,json.dumps(record,sort_keys=True))
+        invalid=winner|dict(valid=False)
+        with self.assertRaises(ValueError): exact_fusion_replay(record,invalid)
+        with self.assertRaises(ValueError): exact_fusion_replay(record|dict(skipped=True))
+        with self.assertRaises(ValueError): exact_fusion_replay(record|dict(search='external'))
+        unsupported=winner|dict(mode='deepgemm_m128')
+        with self.assertRaises(ValueError):
+            exact_fusion_replay(record|dict(rows=[unsupported]),unsupported)
+        no_comm=winner|dict(config=config|dict(compute=148))
+        with self.assertRaises(ValueError):
+            exact_fusion_replay(record|dict(rows=[no_comm]),no_comm)
+
+    def test_exact_replay_batches_preserve_all_workloads_and_flags(self):
+        rng=random.Random(10326)
+        records=[]
+        modes=('cutlass_search','cutlass_search_2sm',
+               'cutlass_stock_1sm_budget','cutlass_stock_2sm_budget')
+        for index in range(173):
+            mode=rng.choice(modes)
+            winner=dict(valid=True,direction='dispatch',mode=mode,
+                config=dict(tile_n=rng.choice((128,256)),tile_k=rng.choice((64,128)),
+                    along_n=rng.randrange(2),swizzle=rng.choice((1,2,4,8)),
+                    compute=rng.choice((108,128,136)),dispatch_copy=rng.choice(('tma','cp.async'))),
+                payloads={0:[dict(p50=.1)],1:[dict(p50=.125)]})
+            records.append(dict(search='compact',run_id='search',source_id='hash',
+                case_index=index,world=4 if index<80 else rng.choice((4,8)),
+                rows=[winner],selected={'dispatch':winner},
+                geometry=dict(h=4096,f=1024,experts=256,topk=8,target_rows=index+1),
+                buffer_rows=0,tail_balance=False if index<80 else bool(rng.randrange(2)),
+                hot_half=False if index<80 else bool(rng.randrange(2))))
+        records[-1].update(skipped=True,reason='insufficient_memory')
+        before=json.dumps(records,sort_keys=True)
+        expected={exact_fusion_replay(r)['argument']:exact_fusion_replay(r)
+                  for r in records if not r.get('skipped')}
+        for size in (1,7,64):
+            result=exact_fusion_batches(records,size)
+            self.assertEqual((result['attempted'],result['replay_points']),(173,172))
+            self.assertEqual(result['gaps'][0]['case'],172)
+            actual={}
+            for batch in result['batches']:
+                self.assertTrue(1<=len(batch['entries'])<=size)
+                self.assertEqual(batch['grouped_cases'],
+                    ';'.join(e['argument'] for e in batch['entries']))
+                for entry in batch['entries']:
+                    self.assertNotIn(entry['argument'],actual)
+                    actual[entry['argument']]=entry
+                    for key in ('ep','buffer_rows','tail_balance','hot_half'):
+                        self.assertEqual(entry[key],batch[key])
+            self.assertEqual(actual,expected)
+        self.assertEqual(before,json.dumps(records,sort_keys=True))
+        with self.assertRaises(ValueError): exact_fusion_batches(records+[records[0]])
+        with self.assertRaises(ValueError):
+            exact_fusion_batches([records[0],records[1]|dict(source_id='different')])
+        for invalid in (0,65,2.5):
+            with self.assertRaises(ValueError): exact_fusion_batches(records,invalid)
+        self.assertEqual(exact_fusion_batches([])['replay_points'],0)
 
     def test_full_plan_records_ep_and_token_fallbacks(self):
         # Loading the catalog also installs the benchmark catalog import path.

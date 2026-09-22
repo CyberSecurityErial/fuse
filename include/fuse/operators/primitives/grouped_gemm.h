@@ -12,6 +12,7 @@ struct GroupedTokenSource {
 };
 
 enum class GroupedDispatchCopy : int32_t { CpAsync = 0, Tma = 1 };
+enum class GroupedGemmScheduler : int32_t { Default = 0, Native = 1, Cutlass = 2 };
 
 struct GroupedGemmPolicy {
   int32_t num_comm_ctas = 20;
@@ -19,11 +20,12 @@ struct GroupedGemmPolicy {
   int32_t swizzle = 1;
   bool along_n = false;
   // Explicit CUTLASS configuration; no shape-name heuristic or online search.
-  // M is 128; N=128/256, K=64/128. Stage count follows the SMEM carveout.
+  // M is 128 * mma_sm_count; N=128/256, K=64/128.
+  // Stage count follows the SMEM carveout.
   int32_t tile_n = 128, tile_k = 64;
   // 1: ordinary one-CTA UMMA. 2: Blackwell two-CTA UMMA; Dispatch-only and
-  // explicit for now. Paired producer CTAs retire into the full-SM GEMM after
-  // their queues drain; use only when that measured rendezvous cost is repaid.
+  // explicit for now. Every compute cluster remains a complete pair; its
+  // members never switch independently between communication and GEMM.
   int32_t mma_sm_count = 1;
   // Remote scattered rows favor full-warp cp.async at small transfer sizes;
   // TMA remains available for large/continuous workloads. Selection is fixed
@@ -40,6 +42,10 @@ struct GroupedGemmPolicy {
   // Diagnostic control: isolate the transposed layout from tail-MMA savings.
   // Ignored without swap_ab; selected once on the host, not in the K loop.
   bool trim_swap_tokens = true;
+  // Preserve the measured scheduler as well as its tile/UMMA width. Default
+  // keeps the existing native-1SM / CUTLASS-2SM behavior. Explicit selection
+  // is for offline GEMM winners; it does not run an online search.
+  GroupedGemmScheduler scheduler = GroupedGemmScheduler::Default;
 };
 
 // Device arrays contain one matrix pointer per LOCAL expert. Matrices are

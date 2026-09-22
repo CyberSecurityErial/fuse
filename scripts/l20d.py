@@ -403,8 +403,8 @@ def grouped_case_geometry(job):
         profile_bytes = 0
         if job.get('grouped_profile'):
             panels = local_experts*((capacity+127)//128)
-            profile_bytes = (148*64 if job.get('grouped_ready_summary') else
-                             panels*(40 + ((n+127)//128)*56) + 148*24)
+            profile_bytes = (148*112 if job.get('grouped_ready_summary') else
+                             panels*(40 + ((n+127)//128)*56) + 148*48)
         estimates.append(values*2 + ready + tokens*topk*12 + profile_bytes)
         allocated = max(estimates)
     # Fused-only Dispatch never constructs the library timing references or
@@ -426,14 +426,15 @@ def grouped_policy(job):
     value = job.get('grouped_policy')
     if value is None:
         return None
-    if job.get('stage') != 'grouped-ep' or not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){5,9}', value):
-        raise ValueError('grouped policy requires grouped-ep and N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy]]]]')
+    if job.get('stage') != 'grouped-ep' or not isinstance(value, str) or not re.fullmatch(r'[0-9]+(?:,[0-9]+){5,10}', value):
+        raise ValueError('grouped policy requires grouped-ep and N,K,AlongN,swizzle,comm,compute[,swapAB[,trimTokens[,mmaSMs[,copy[,scheduler]]]]]')
     values = list(map(int, value.split(',')))
     n, k, along, swizzle, comm, compute = values[:6]
     swap = values[6] if len(values)>=7 else 0
     trim = values[7] if len(values)>=8 else 1
     mma_sms = values[8] if len(values)>=9 else 1
-    copy = values[9] if len(values)==10 else 0
+    copy = values[9] if len(values)>=10 else 0
+    scheduler = values[10] if len(values)==11 else 0
     if trim not in (0,1) or (len(values)==8 and not swap) or (
             len(values)>=9 and not swap and trim!=1):
         raise ValueError('trimTokens requires swapAB and a boolean value')
@@ -446,13 +447,21 @@ def grouped_policy(job):
     if mma_sms not in (1,2) or (mma_sms==2 and
             (swap or job.get('grouped_direction')!='dispatch' or comm%2 or compute%2 or comm+compute!=148)):
         raise ValueError('2SM MMA requires unswapped Dispatch, even CTA budgets, and all 148 SMs')
-    if copy not in (0,1) or (len(values)==10 and job.get('grouped_direction')!='dispatch'):
+    if copy not in (0,1) or (len(values)>=10 and job.get('grouped_direction')!='dispatch'):
         raise ValueError('grouped copy method must be 0=cp.async or 1=TMA on Dispatch')
+    if scheduler not in (0,1,2) or (scheduler and (
+            swap or job.get('grouped_direction')!='dispatch' or
+            job.get('grouped_gemm_search') or job.get('grouped_external') or
+            (job.get('grouped_measure') and not job.get('grouped_fused_only')))):
+        raise ValueError('explicit scheduler requires unswapped Dispatch; timing requires fused-only')
+    if scheduler==2 and comm+compute!=148:
+        raise ValueError('stock scheduler requires a complete explicit CTA budget')
     result = dict(tile_n=n, tile_k=k, along_n=along, swizzle=swizzle, comm=comm, compute=compute)
     if swap: result['swap_ab'] = True
     if swap and not trim: result['trim_swap_tokens'] = False
     if mma_sms==2: result['mma_sm_count'] = 2
     if copy: result['dispatch_copy'] = 'tma'
+    if scheduler: result['scheduler'] = scheduler
     return result
 
 

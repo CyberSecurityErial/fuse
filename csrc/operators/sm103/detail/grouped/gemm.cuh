@@ -42,33 +42,25 @@ struct Bf16GroupedGemmTypes {
   using Mainloop = std::conditional_t<SwapAB, GroupedSwapABMainloop<BaseMainloop,TrimTokens>, BaseMainloop>;
   using PureGemm = cutlass::gemm::kernel::GemmUniversal<Problem, Mainloop, Epi>;
   using DispatchGemm = cutlass::gemm::kernel::GemmUniversal<Problem,
-      GroupedInputReadyMainloop<Mainloop,SwapAB>, GroupedInputReleaseEpilogue<Epi,SwapAB>>;
+      GroupedInputReadyMainloop<Mainloop,SwapAB,SmMode>, GroupedInputReleaseEpilogue<Epi,SwapAB>>;
   using CombineGemm = cutlass::gemm::kernel::GemmUniversal<Problem,
       Mainloop, GroupedSignalingEpilogue<Epi,SwapAB>>;
 };
 
-// Long-token Dispatch candidate: stock CUTLASS grouped scheduling and
-// Blackwell two-CTA UMMA. Two physical 128-row CTAs share one logical 256-row
-// input-ready panel. Communication CTAs later retire into this full-SM GEMM.
-template <int TileN = 128, int TileK = 64>
-struct Bf16GroupedRetiringGemmTypes {
-  using Tile = cute::Shape<cute::_256, cute::Int<TileN>, cute::Int<TileK>>;
-  using Cluster = cute::Shape<cute::_2,cute::_1,cute::_1>;
+// Same collectives as the native scheduler, with CUTLASS's grouped traversal.
+// Scheduler choice and one/two-CTA UMMA are independent search dimensions.
+template <int TileN = 128, int TileK = 64, int SmMode = 2>
+struct Bf16GroupedStockGemmTypes {
+  using Collectives = Bf16GroupedGemmTypes<TileN,TileK,false,true,SmMode>;
+  using Tile = typename Collectives::Tile;
+  using Cluster = typename Collectives::Cluster;
   using Problem = cutlass::gemm::GroupProblemShape<
       cute::Shape<int32_t,int32_t,int32_t>>;
-  using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, Tile, Cluster,
-      cutlass::epilogue::collective::EpilogueTileAuto, float, float,
-      void, cutlass::layout::RowMajor*, 8, Bf16, cutlass::layout::RowMajor*, 8,
-      cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm>::CollectiveOp;
-  using BaseMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-      Bf16, cutlass::layout::RowMajor*, 8, Bf16, cutlass::layout::ColumnMajor*, 8,
-      float, Tile, Cluster,
-      cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epi::SharedStorage)>,
-      cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100>::CollectiveOp;
+  using Epi = typename Collectives::Epi;
+  using BaseMainloop = typename Collectives::BaseMainloop;
+  using PureGemm = cutlass::gemm::kernel::GemmUniversal<Problem,BaseMainloop,Epi>;
   using DispatchGemm = cutlass::gemm::kernel::GemmUniversal<Problem,
-      GroupedInputReadyMainloop<BaseMainloop,false,2>,
+      GroupedInputReadyMainloop<BaseMainloop,false,SmMode>,
       GroupedInputReleaseEpilogue<Epi>>;
   // The plan's common type plumbing names both directions before the
   // Dispatch-only static assertion is applied. This alias is never launched.
